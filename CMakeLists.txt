@@ -134,6 +134,7 @@ set(EXTENSION_SOURCES
     src/operator/gpu_physical_filter.cpp
     src/operator/gpu_physical_grouped_aggregate.cpp
     src/operator/gpu_physical_hash_join.cpp
+    src/operator/gpu_physical_asof_join.cpp
     src/operator/gpu_physical_limit.cpp
     src/operator/gpu_physical_nested_loop_join.cpp
     src/operator/gpu_physical_order.cpp
@@ -203,6 +204,7 @@ set(CUDA_SOURCES
     src/cuda/cudf/cudf_duplicate_elimination.cu
     src/cuda/cudf/cudf_groupby.cu
     src/cuda/cudf/cudf_join.cu
+    src/cuda/cudf/cudf_asof_join.cu
     src/cuda/cudf/cudf_orderby.cu
     src/cuda/cudf/cudf_utils.cu
     src/cuda/expression_executor/gpu_dispatch_materialize.cu
