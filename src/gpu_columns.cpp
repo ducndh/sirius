@@ -452,6 +452,26 @@ void GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* g
     scalar_ptr        = s.data();
     scalar_size       = sizeof(int32_t);
     data_wrapper.type = GPUColumnType(GPUColumnTypeId::DATE);
+  } else if (scalar_type.id() == cudf::type_id::TIMESTAMP_SECONDS) {
+    auto& s           = static_cast<cudf::numeric_scalar<int64_t>&>(cudf_scalar);
+    scalar_ptr        = s.data();
+    scalar_size       = sizeof(int64_t);
+    data_wrapper.type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_SEC);
+  } else if (scalar_type.id() == cudf::type_id::TIMESTAMP_MILLISECONDS) {
+    auto& s           = static_cast<cudf::numeric_scalar<int64_t>&>(cudf_scalar);
+    scalar_ptr        = s.data();
+    scalar_size       = sizeof(int64_t);
+    data_wrapper.type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_MS);
+  } else if (scalar_type.id() == cudf::type_id::TIMESTAMP_MICROSECONDS) {
+    auto& s           = static_cast<cudf::numeric_scalar<int64_t>&>(cudf_scalar);
+    scalar_ptr        = s.data();
+    scalar_size       = sizeof(int64_t);
+    data_wrapper.type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_US);
+  } else if (scalar_type.id() == cudf::type_id::TIMESTAMP_NANOSECONDS) {
+    auto& s           = static_cast<cudf::numeric_scalar<int64_t>&>(cudf_scalar);
+    scalar_ptr        = s.data();
+    scalar_size       = sizeof(int64_t);
+    data_wrapper.type = GPUColumnType(GPUColumnTypeId::TIMESTAMP_NS);
   } else if (scalar_type.id() == cudf::type_id::STRING) {
     auto& typed_scalar = static_cast<cudf::string_scalar&>(cudf_scalar);
     size_t string_size = typed_scalar.size();

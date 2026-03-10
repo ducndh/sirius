@@ -388,6 +388,14 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>>& column,
         data_type[expr] = DATE;
         break;
       }
+      case GPUColumnTypeId::TIMESTAMP_SEC:
+      case GPUColumnTypeId::TIMESTAMP_MS:
+      case GPUColumnTypeId::TIMESTAMP_US:
+      case GPUColumnTypeId::TIMESTAMP_NS: {
+        total_bytes += sizeof(int64_t);
+        data_type[expr] = INT64;
+        break;
+      }
       case GPUColumnTypeId::VARCHAR: {
         std::string lower_string = filter_constant[expr]->constant.ToString();
         total_bytes += lower_string.size();
@@ -460,6 +468,18 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>>& column,
         casted_val = constant_val.DefaultCastAs(LogicalType::DOUBLE);
         break;
       case GPUColumnTypeId::DATE: casted_val = constant_val.DefaultCastAs(LogicalType::DATE); break;
+      case GPUColumnTypeId::TIMESTAMP_SEC:
+        casted_val = constant_val.DefaultCastAs(LogicalType::TIMESTAMP_S);
+        break;
+      case GPUColumnTypeId::TIMESTAMP_MS:
+        casted_val = constant_val.DefaultCastAs(LogicalType::TIMESTAMP_MS);
+        break;
+      case GPUColumnTypeId::TIMESTAMP_US:
+        casted_val = constant_val.DefaultCastAs(LogicalType::TIMESTAMP);
+        break;
+      case GPUColumnTypeId::TIMESTAMP_NS:
+        casted_val = constant_val.DefaultCastAs(LogicalType::TIMESTAMP_NS);
+        break;
       case GPUColumnTypeId::VARCHAR:
         casted_val = constant_val.DefaultCastAs(LogicalType::VARCHAR);
         break;
@@ -484,6 +504,16 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>>& column,
       }
       case GPUColumnTypeId::INT64: {
         int64_t temp = casted_val.GetValue<int64_t>();
+        memcpy(constant_compare + init_offset, &temp, sizeof(int64_t));
+        constant_offset[expr] = init_offset;
+        init_offset += sizeof(int64_t);
+        break;
+      }
+      case GPUColumnTypeId::TIMESTAMP_SEC:
+      case GPUColumnTypeId::TIMESTAMP_MS:
+      case GPUColumnTypeId::TIMESTAMP_US:
+      case GPUColumnTypeId::TIMESTAMP_NS: {
+        int64_t temp = casted_val.GetValueUnsafe<int64_t>();
         memcpy(constant_compare + init_offset, &temp, sizeof(int64_t));
         constant_offset[expr] = init_offset;
         init_offset += sizeof(int64_t);
