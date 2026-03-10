@@ -21,8 +21,29 @@
 #include "gpu_physical_plan_generator.hpp"
 #include "operator/gpu_physical_hash_join.hpp"
 #include "operator/gpu_physical_nested_loop_join.hpp"
+#include "operator/gpu_physical_asof_join.hpp"
 
 namespace duckdb {
+
+unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::PlanAsOfJoin(LogicalComparisonJoin& op)
+{
+  D_ASSERT(op.children.size() == 2);
+  idx_t lhs_cardinality        = op.children[0]->EstimateCardinality(context);
+  idx_t rhs_cardinality        = op.children[1]->EstimateCardinality(context);
+  auto  left                   = CreatePlan(*op.children[0]);
+  auto  right                  = CreatePlan(*op.children[1]);
+  left->estimated_cardinality  = lhs_cardinality;
+  right->estimated_cardinality = rhs_cardinality;
+
+  auto asof = make_uniq<GPUPhysicalAsOfJoin>(op,
+                                             std::move(left),
+                                             std::move(right),
+                                             std::move(op.conditions),
+                                             op.left_projection_map,
+                                             op.right_projection_map,
+                                             op.estimated_cardinality);
+  return asof;
+}
 
 unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::PlanComparisonJoin(
   LogicalComparisonJoin& op)
@@ -254,8 +275,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalComp
 {
   switch (op.type) {
     case LogicalOperatorType::LOGICAL_ASOF_JOIN:
-      // return PlanAsOfJoin(op);
-      throw NotImplementedException("Asof join not supported in GPU");
+      return PlanAsOfJoin(op);
     case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: return PlanComparisonJoin(op);
     case LogicalOperatorType::LOGICAL_DELIM_JOIN: return PlanDelimJoin(op);
     default: throw InternalException("Unrecognized operator type for LogicalComparisonJoin");

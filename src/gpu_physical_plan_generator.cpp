@@ -164,8 +164,6 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalOper
       // plan = CreatePlan(op.Cast<LogicalAnyJoin>());
       break;
     case LogicalOperatorType::LOGICAL_ASOF_JOIN:
-      throw NotImplementedException("Asof join not supported");
-      break;
     case LogicalOperatorType::LOGICAL_DELIM_JOIN:
     case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
       plan = CreatePlan(op.Cast<LogicalComparisonJoin>());
