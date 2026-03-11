@@ -61,6 +61,17 @@ class SiriusExtension : public Extension {
                                                    vector<LogicalType>& return_types,
                                                    vector<string>& names);
 
+  // Graph analytics (implemented in graph_table_functions.cu)
+  static void GPUGraphBFSFunction(ClientContext& context, TableFunctionInput& data_p, DataChunk& output);
+  static unique_ptr<FunctionData> GPUGraphBFSBind(ClientContext& context, TableFunctionBindInput& input,
+                                                   vector<LogicalType>& return_types, vector<string>& names);
+  static void GPUGraphPageRankFunction(ClientContext& context, TableFunctionInput& data_p, DataChunk& output);
+  static unique_ptr<FunctionData> GPUGraphPageRankBind(ClientContext& context, TableFunctionBindInput& input,
+                                                       vector<LogicalType>& return_types, vector<string>& names);
+  static void GPUGraphWCCFunction(ClientContext& context, TableFunctionInput& data_p, DataChunk& output);
+  static unique_ptr<FunctionData> GPUGraphWCCBind(ClientContext& context, TableFunctionBindInput& input,
+                                                   vector<LogicalType>& return_types, vector<string>& names);
+
   static bool buffer_is_initialized;
 };
 

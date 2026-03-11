@@ -610,6 +610,38 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
+
+  // gpu_graph_bfs(table, src_col, dst_col, source_vertex [, depth_limit])
+  TableFunctionSet gpu_graph_bfs_set("gpu_graph_bfs");
+  gpu_graph_bfs_set.AddFunction(
+    TableFunction({LogicalType::VARCHAR, LogicalType::VARCHAR,
+                   LogicalType::VARCHAR, LogicalType::VARCHAR},
+                  GPUGraphBFSFunction, GPUGraphBFSBind));
+  gpu_graph_bfs_set.AddFunction(
+    TableFunction({LogicalType::VARCHAR, LogicalType::VARCHAR,
+                   LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER},
+                  GPUGraphBFSFunction, GPUGraphBFSBind));
+  CreateTableFunctionInfo gpu_graph_bfs_info(gpu_graph_bfs_set);
+  catalog.CreateTableFunction(transaction, gpu_graph_bfs_info);
+
+  // gpu_graph_pagerank(table, src_col, dst_col [, damping, tolerance, max_iterations])
+  TableFunction gpu_graph_pagerank("gpu_graph_pagerank",
+                                   {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                                    LogicalType::VARCHAR},
+                                   GPUGraphPageRankFunction, GPUGraphPageRankBind);
+  gpu_graph_pagerank.named_parameters["damping"]        = LogicalType::FLOAT;
+  gpu_graph_pagerank.named_parameters["tolerance"]      = LogicalType::FLOAT;
+  gpu_graph_pagerank.named_parameters["max_iterations"] = LogicalType::INTEGER;
+  CreateTableFunctionInfo gpu_graph_pagerank_info(gpu_graph_pagerank);
+  catalog.CreateTableFunction(transaction, gpu_graph_pagerank_info);
+
+  // gpu_graph_wcc(table, src_col, dst_col)
+  TableFunction gpu_graph_wcc("gpu_graph_wcc",
+                              {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                               LogicalType::VARCHAR},
+                              GPUGraphWCCFunction, GPUGraphWCCBind);
+  CreateTableFunctionInfo gpu_graph_wcc_info(gpu_graph_wcc);
+  catalog.CreateTableFunction(transaction, gpu_graph_wcc_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)

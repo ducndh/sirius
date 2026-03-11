@@ -30,6 +30,7 @@ option(ENABLE_STREAM_CHECK
 
 # Dependencies
 find_package(cudf REQUIRED CONFIG)
+# cugraph runs out-of-process via scripts/graph_worker.py; no compile-time dependency
 find_package(spdlog REQUIRED CONFIG)
 find_package(libconfig++ REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
@@ -220,7 +221,9 @@ set(CUDA_SOURCES
     src/cuda/operator/strlen_from_offsets.cu
     src/cuda/operator/empty_str_check.cu
     src/cuda/print.cu
-    src/cuda/utils.cu)
+    src/cuda/utils.cu
+    src/cuda/cugraph/vertex_renumber.cu
+    src/cuda/cugraph/graph_table_functions.cu)
 # cmake-format: on
 
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
