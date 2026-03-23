@@ -19,6 +19,8 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
 
+#include <cudf/utilities/traits.hpp>
+#include <cudf/wrappers/timestamps.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
 #include <type_traits>
@@ -57,6 +59,14 @@ struct MakeColumnFromConstant {
                                                 stream,
                                                 mr);
       return cudf::make_column_from_scalar(scalar, count, stream, mr);
+    } else if constexpr (cudf::is_timestamp<T>()) {
+      // Timestamp types: extract the raw integer representation and construct a timestamp_scalar.
+      // DuckDB DATE is int32_t (days since epoch), TIMESTAMP is int64_t (microseconds since epoch).
+      using duration_type = typename T::duration;
+      auto raw_val       = expr.value.GetValueUnsafe<typename T::rep>();
+      auto ts_scalar =
+        cudf::timestamp_scalar<T>(duration_type{raw_val}, true, stream, mr);
+      return cudf::make_column_from_scalar(ts_scalar, count, stream, mr);
     } else {
       auto scalar = cudf::numeric_scalar<T>(expr.value.GetValue<T>(), true, stream, mr);
       return cudf::make_column_from_scalar(scalar, count, stream, mr);
@@ -93,6 +103,21 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConstant
         expr, input_count, resource_ref, execution_stream);
     case cudf::type_id::DECIMAL64:
       return MakeColumnFromConstant<numeric::decimal64>::Do(
+        expr, input_count, resource_ref, execution_stream);
+    case cudf::type_id::TIMESTAMP_DAYS:
+      return MakeColumnFromConstant<cudf::timestamp_D>::Do(
+        expr, input_count, resource_ref, execution_stream);
+    case cudf::type_id::TIMESTAMP_SECONDS:
+      return MakeColumnFromConstant<cudf::timestamp_s>::Do(
+        expr, input_count, resource_ref, execution_stream);
+    case cudf::type_id::TIMESTAMP_MILLISECONDS:
+      return MakeColumnFromConstant<cudf::timestamp_ms>::Do(
+        expr, input_count, resource_ref, execution_stream);
+    case cudf::type_id::TIMESTAMP_MICROSECONDS:
+      return MakeColumnFromConstant<cudf::timestamp_us>::Do(
+        expr, input_count, resource_ref, execution_stream);
+    case cudf::type_id::TIMESTAMP_NANOSECONDS:
+      return MakeColumnFromConstant<cudf::timestamp_ns>::Do(
         expr, input_count, resource_ref, execution_stream);
     default:
       throw InternalException("Execute[Constant]: Unknown cudf type: %d",
