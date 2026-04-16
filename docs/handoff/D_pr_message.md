@@ -28,7 +28,9 @@ DuckDB's on-disk compressed blocks (bitpacking, dictionary, FSST, RLE,
 constant, uncompressed) directly on the GPU, parsing block metadata on the
 device and skipping the buffer-manager Pin path for read-only databases.
 
-**Results (warm):**
+**Terminology:** *warm* = iter-2 in same session (DuckDB buffer pool warm, OS page cache hot, GPU pool allocated). *Cold* = first query in a fresh DuckDB process; *disk-cold* = caches dropped before each query.
+
+**Warm results:**
 
 | Workload | `dev` (pre-branch) | This PR | Δ |
 |---|---|---|---|
@@ -38,6 +40,21 @@ device and skipping the buffer-manager Pin path for read-only databases.
 | ClickBench 100-shard GPU (GH200) | OOM / 29.3s | **5.00s** | −83% |
 
 Dev Q1 6.80s → ~0.25s (**27×**), Q19 7.14s → ~0.25s (**28×**). GPU wins on 15/22 TPC-H queries at SF=100 on GH200.
+
+**Cold results:**
+
+| Workload | Cold (per-query avg) | Warm (suite) | Notes |
+|---|---|---|---|
+| TPC-H SF=100 GH200, lazy mmap (default) | **2.4s/q** (~52.8s suite) | 5.33s | GH200 auto-detect, commit `27b049e` |
+| TPC-H SF=100 GH200, MADV_POPULATE_READ (old) | 16.4s/q | — | faulted whole DB, polluted OS cache |
+| TPC-H SF=100 GH200, no mmap (`Pin()`) | 1.1s/q | — | lowest cold, but warm regresses |
+| ClickBench 100-shard GH200, lazy mmap | **3.3s/q** | 5.00s | |
+| ClickBench 10M RTX6000, lazy mmap | **2.94s** | 2.10s | was 12.80s with prefault |
+| TPC-H SF=10 RTX6000 iter 1 (buffer-cold) | **6.94s** | 5.37s | pool fills during first pass |
+
+**6.9× GH200 cold win** from dropping `MADV_POPULATE_READ` — the prefault faulted the entire DB file on first mmap for zero benefit on ATS. Warm is unchanged.
+
+Cold-start tiers on Q1 lineitem (SF=10 RTX6000): **disk-cold 3.78s → buffer-cold 0.93s → warm 0.26s**. DuckDB CPU has the same 29× cold-to-warm ratio — not Sirius-specific.
 
 ---
 

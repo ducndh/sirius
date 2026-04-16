@@ -12,18 +12,57 @@ that decodes `.duckdb` block storage directly on the GPU. The branch adds
 four major pieces (scan task, GPU decode kernels, `Pin()` bypass, parallel
 scheduling) and a long tail of smaller optimizations.
 
+### Warm vs cold terminology
+
+- **Warm** = iter 2+ in the same session. DuckDB buffer pool populated,
+  OS page cache hot, Sirius GPU pool already allocated. Steady-state
+  query latency.
+- **Cold (iter 1)** = first query in a fresh DuckDB process. OS page
+  cache may still be warm from prior runs; DuckDB's buffer pool is empty
+  and fills during the first scan.
+- **Disk-cold** = OS page cache dropped between queries (`echo 3 >
+  /proc/sys/vm/drop_caches`). Post-reboot / container-start state.
+
+All warm numbers below are single-session iter 2. Cold rows specify
+which tier they measure.
+
+### Warm headline
+
 | Benchmark | Before | After | Change |
 |---|---|---|---|
 | **TPC-H SF=10 warm (RTX6000) vs dev `duckdb_scan_task`** | **26.15s** | **5.37s** | **4.9× (−79%)** |
-| TPC-H SF=10 warm (RTX6000) — intra-branch (post first fused-bp) | 10.49s | 5.37s | −49% within branch |
-| TPC-H SF=100 warm (GH200) — intra-branch | 6.26s | **5.33s** | −15%, now **1.33× CPU** |
-| ClickBench 10M warm (RTX6000) — intra-branch | 3.37s | **2.10s** | −38% within branch |
+| TPC-H SF=10 warm (RTX6000) — intra-branch waypoint | 10.49s | 5.37s | −49% within branch |
+| TPC-H SF=100 warm (GH200) — intra-branch waypoint | 6.26s | **5.33s** | −15%, now **1.33× CPU** |
+| ClickBench 10M warm (RTX6000) — intra-branch waypoint | 3.37s | **2.10s** | −38% within branch |
 | ClickBench 100-shard warm (GH200) | OOM / 29.3s | **5.00s** | −83% |
-| TPC-H SF=100 cold (GH200) prefault → lazy mmap | 16.4s/q | **2.4s/q** | 6.9× |
 
 Dev baseline per-query worst offenders: Q1 6.80s → ~0.25s (**27×**), Q19 7.14s → ~0.25s (**28×**). 50% of dev's wall-time was CPU `process_chunk` copying DuckDB vectors into host buffers — gone entirely.
 
-The 10.49s / 6.26s / 3.37s rows are intra-branch waypoints, kept so the per-optimization deltas below (e.g. "−26% from fused bitpacking") stay consistent with commit-to-commit measurements.
+### Cold headline
+
+| Workload / variant | Cold (per-query avg) | Warm | Notes |
+|---|---|---|---|
+| **TPC-H SF=100 GH200, lazy mmap (default)** | **2.4s/q** (~52.8s suite) | 5.33s suite | GH200 auto-detect (commit `27b049e`) |
+| TPC-H SF=100 GH200, MADV_POPULATE_READ (old) | 16.4s/q | — | faulted whole DB, polluted OS cache |
+| TPC-H SF=100 GH200, no mmap (`Pin()`) | 1.1s/q | — | lowest cold, but warm regresses |
+| **ClickBench 100-shard GH200, lazy mmap** | **3.3s/q** | 5.00s suite | |
+| ClickBench 100-shard GH200, MADV_POPULATE_READ | 19.7s/q | — | |
+| **TPC-H SF=10 RTX6000 iter-1 (buffer-cold, OS warm)** | **6.94s** suite | 5.37s suite | ~29% overhead vs warm |
+| **ClickBench 10M RTX6000 iter-1, lazy mmap** | **2.94s** | 2.10s | was 12.80s with prefault |
+
+**GH200 cold is 6.9× faster** after dropping MADV_POPULATE_READ (was faulting the entire DB file on first mmap, for zero perf benefit on ATS).
+
+### Cold-start tiers — Q1 lineitem TPC-H SF=10 RTX6000 (measured 2026-04-15)
+
+| Tier | Q1 | When you see it |
+|---|---|---|
+| Disk-cold (OS cache empty) | 3.78s | post-reboot, container start, `drop_caches` |
+| Buffer-pool cold (OS cache warm, DuckDB pool empty) | 0.93s | every new DuckDB process, first scan of each table |
+| Warm | 0.26s | 2nd+ query on same table in same session |
+
+DuckDB CPU shows the same 3-tier pattern (cold 1.40s → warm 0.049s = 29× ratio) — not Sirius-specific.
+
+The 10.49s / 6.26s / 3.37s rows in the warm headline are intra-branch waypoints, kept so the per-optimization deltas below (e.g. "−26% from fused bitpacking") stay consistent with commit-to-commit measurements.
 
 **Where the remaining cost lives (Q1 SF=100 warm):** GPU kernel time
 608ms, of which our decode kernels are **11%** (the rest is cuDF

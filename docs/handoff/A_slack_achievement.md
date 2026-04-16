@@ -3,14 +3,32 @@
 Branch: `feature/gpu-native-scan-task` (replaces DuckDB's CPU `duckdb_scan_task`
 with a Sirius-native scan + GPU decode for `.duckdb` files).
 
+## Terminology
+
+- **Warm** = 2nd iteration in same session. DuckDB buffer pool populated, OS page cache hot, Sirius GPU pool already allocated. Steady-state query latency.
+- **Cold (iter 1)** = first query in a fresh DuckDB process. OS page cache may be warm from prior runs; DuckDB buffer pool empty.
+- **Disk-cold** = OS page cache dropped (`echo 3 > /proc/sys/vm/drop_caches`). What post-reboot / container-start looks like.
+
+All warm numbers below are single-session iter-2. Cold numbers specify their tier.
+
 ## Headline
 
-**TPC-H SF=100 on GH200, warm, all 22 queries:**
+**TPC-H SF=100 on GH200, all 22 queries:**
 
 | | **GPU** | **CPU** | **GPU/CPU** |
 |---|---|---|---|
-| Total | **5.33s** | 7.08s | **1.33× (GPU wins)** |
-| Queries where GPU wins | **15 / 22** | | |
+| Warm (iter 2) | **5.33s** | 7.08s | **1.33× (GPU wins, 15/22 queries)** |
+| Disk-cold (per-query avg, caches dropped) | **2.4s/q** (~52.8s suite) | — | lazy mmap auto-detected on GH200 |
+
+GH200 cold detail (per-query avg, caches dropped between queries):
+
+| Variant | TPC-H cold | ClickBench cold |
+|---|---|---|
+| A: mmap + MADV_POPULATE_READ (old default) | 16.4s | 19.7s |
+| **B: mmap + lazy faults (GH200 default now)** | **2.4s** | **3.3s** |
+| C: no mmap, via `Pin()` | 1.1s | 1.0s |
+
+**6.9× GH200 cold win** from dropping MADV_POPULATE_READ — was faulting the whole DB file on first mmap, polluting OS cache with zero perf benefit on ATS. Lazy mmap now auto-selected on unified-memory hardware (commit `27b049e`).
 
 Biggest per-query wins on SF=100 warm:
 
@@ -24,25 +42,35 @@ Biggest per-query wins on SF=100 warm:
 | Q2 | 0.061s | 0.108s | **1.77×** |
 | Q9 | 0.574s | 0.902s | **1.57×** |
 
-**TPC-H SF=10 on RTX 6000 (PCIe), warm, 22 queries:**
+**TPC-H SF=10 on RTX 6000 (PCIe), 22 queries:**
 
-| Version | Total | Speedup |
+| Version | Warm | Cold (iter 1, OS cache warm, buffer pool empty) |
 |---|---|---|
-| dev (Sirius GPU via `duckdb_scan_task`) | **26.15s** | — |
-| **this branch** | **5.37s** | **4.9× vs dev** |
-| DuckDB CPU | 2.84s | (GPU still 1.9× slower than CPU at this scale — crossover at SF100) |
+| dev (Sirius GPU via `duckdb_scan_task`) | **26.15s** | — (dev was only measured with hot OS cache) |
+| **this branch** | **5.37s** (**4.9× vs dev**) | **6.94s** (first iter in session) |
+| DuckDB CPU | 2.84s | — |
 
-Per-query worst offenders on dev → now: Q1 6.80s → ~0.25s (**27×**), Q19 7.14s → ~0.25s (**28×**). 50% of dev's wall-time was `process_chunk` copying DuckDB CPU vectors into host buffers — we skip that entirely.
+Per-query dev → now (warm): Q1 6.80s → ~0.25s (**27×**), Q19 7.14s → ~0.25s (**28×**). 50% of dev's wall-time was CPU `process_chunk` copying DuckDB vectors into host buffers — gone.
 
-**ClickBench 10M on RTX 6000, warm, 29 queries:**
+Cold-start tiers on Q1 lineitem (500Mi batch, 2026-04-15):
 
-| Version | Total | Notes |
+| Tier | Q1 | When you see it |
 |---|---|---|
-| pre-batched-string (early this branch) | 3.37s | baseline before string-decode opts |
-| **this branch (current)** | **2.10s** | −38% within branch |
-| DuckDB CPU | 1.46s | wide-table not our target workload |
+| Disk-cold (caches dropped) | 3.78s | post-reboot / container start / manual flush |
+| Buffer-pool cold (OS cache warm, DuckDB pool cold) | 0.93s | new DuckDB process, first scan per table |
+| Warm | 0.26s | 2nd+ query on same table in same session |
 
-(Dev `duckdb_scan_task` was not benchmarked on ClickBench — the OOM on 100-shard below implies it wouldn't have completed at scale.)
+DuckDB CPU shows the same pattern (cold 1.40s → warm 0.049s = 29× ratio) — not Sirius-specific.
+
+**ClickBench 10M on RTX 6000, 29 queries:**
+
+| Version | Cold (iter 1) | Warm (iter 2) |
+|---|---|---|
+| MADV_POPULATE_READ (removed) | 12.80s | 2.09s (prefaulted entire 2.9GB DB file) |
+| **this branch (lazy mmap)** | **2.94s** | **2.10s** |
+| DuckDB CPU | — | 1.46s |
+
+Dropping MADV_POPULATE_READ: cold **−77%**, warm unchanged. Dev `duckdb_scan_task` was not benchmarked on ClickBench; 100-shard below implies it OOM'd at scale.
 
 **ClickBench 100-shard on GH200, warm, 16 queries tested:**
 
