@@ -14,11 +14,16 @@ scheduling) and a long tail of smaller optimizations.
 
 | Benchmark | Before | After | Change |
 |---|---|---|---|
-| TPC-H SF=10 warm (RTX6000) | 10.49s | **5.37s** | −49% |
-| TPC-H SF=100 warm (GH200) | 6.26s | **5.33s** | −15%, now **1.33× CPU** |
-| ClickBench 10M warm (RTX6000) | 3.37s | **2.10s** | −38% |
+| **TPC-H SF=10 warm (RTX6000) vs dev `duckdb_scan_task`** | **26.15s** | **5.37s** | **4.9× (−79%)** |
+| TPC-H SF=10 warm (RTX6000) — intra-branch (post first fused-bp) | 10.49s | 5.37s | −49% within branch |
+| TPC-H SF=100 warm (GH200) — intra-branch | 6.26s | **5.33s** | −15%, now **1.33× CPU** |
+| ClickBench 10M warm (RTX6000) — intra-branch | 3.37s | **2.10s** | −38% within branch |
 | ClickBench 100-shard warm (GH200) | OOM / 29.3s | **5.00s** | −83% |
-| TPC-H SF=100 cold (GH200) | 16.4s/q | **2.4s/q** | 6.9× |
+| TPC-H SF=100 cold (GH200) prefault → lazy mmap | 16.4s/q | **2.4s/q** | 6.9× |
+
+Dev baseline per-query worst offenders: Q1 6.80s → ~0.25s (**27×**), Q19 7.14s → ~0.25s (**28×**). 50% of dev's wall-time was CPU `process_chunk` copying DuckDB vectors into host buffers — gone entirely.
+
+The 10.49s / 6.26s / 3.37s rows are intra-branch waypoints, kept so the per-optimization deltas below (e.g. "−26% from fused bitpacking") stay consistent with commit-to-commit measurements.
 
 **Where the remaining cost lives (Q1 SF=100 warm):** GPU kernel time
 608ms, of which our decode kernels are **11%** (the rest is cuDF

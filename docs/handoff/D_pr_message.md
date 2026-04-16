@@ -28,16 +28,16 @@ DuckDB's on-disk compressed blocks (bitpacking, dictionary, FSST, RLE,
 constant, uncompressed) directly on the GPU, parsing block metadata on the
 device and skipping the buffer-manager Pin path for read-only databases.
 
-**Results (warm, this branch vs main):**
+**Results (warm):**
 
-| Workload | Main | This PR | Δ |
+| Workload | `dev` (pre-branch) | This PR | Δ |
 |---|---|---|---|
-| TPC-H SF=10 GPU (RTX 6000) | ~10.5s | **5.37s** | −49% |
-| TPC-H SF=100 GPU (GH200) | 8.4s | **5.33s** | −37%; **1.33× vs CPU** |
-| ClickBench 10M GPU (RTX 6000) | 3.37s | **2.10s** | −38% |
+| **TPC-H SF=10 GPU (RTX 6000)** | **26.15s** (via `duckdb_scan_task`) | **5.37s** | **4.9× (−79%)** |
+| TPC-H SF=100 GPU (GH200) | 8.4s (intra-branch) | **5.33s** | −37%; **1.33× vs CPU** |
+| ClickBench 10M GPU (RTX 6000) | 3.37s (intra-branch) | **2.10s** | −38% |
 | ClickBench 100-shard GPU (GH200) | OOM / 29.3s | **5.00s** | −83% |
 
-GPU wins on 15/22 TPC-H queries at SF=100 on GH200.
+Dev Q1 6.80s → ~0.25s (**27×**), Q19 7.14s → ~0.25s (**28×**). GPU wins on 15/22 TPC-H queries at SF=100 on GH200.
 
 ---
 

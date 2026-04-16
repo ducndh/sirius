@@ -26,19 +26,23 @@ Biggest per-query wins on SF=100 warm:
 
 **TPC-H SF=10 on RTX 6000 (PCIe), warm, 22 queries:**
 
-| Version | Total | vs baseline |
+| Version | Total | Speedup |
 |---|---|---|
-| old GPU pin path | ~10.5s | 3.7× slower than CPU |
-| **this branch** | **5.37s** | **−49% vs old GPU** |
-| DuckDB CPU | 2.84s | GPU still 1.9× slower |
+| dev (Sirius GPU via `duckdb_scan_task`) | **26.15s** | — |
+| **this branch** | **5.37s** | **4.9× vs dev** |
+| DuckDB CPU | 2.84s | (GPU still 1.9× slower than CPU at this scale — crossover at SF100) |
+
+Per-query worst offenders on dev → now: Q1 6.80s → ~0.25s (**27×**), Q19 7.14s → ~0.25s (**28×**). 50% of dev's wall-time was `process_chunk` copying DuckDB CPU vectors into host buffers — we skip that entirely.
 
 **ClickBench 10M on RTX 6000, warm, 29 queries:**
 
-| Version | Total |
-|---|---|
-| old GPU path | 3.37s |
-| **this branch** | **2.10s** (−38%) |
-| DuckDB CPU | 1.46s |
+| Version | Total | Notes |
+|---|---|---|
+| pre-batched-string (early this branch) | 3.37s | baseline before string-decode opts |
+| **this branch (current)** | **2.10s** | −38% within branch |
+| DuckDB CPU | 1.46s | wide-table not our target workload |
+
+(Dev `duckdb_scan_task` was not benchmarked on ClickBench — the OOM on 100-shard below implies it wouldn't have completed at scale.)
 
 **ClickBench 100-shard on GH200, warm, 16 queries tested:**
 
