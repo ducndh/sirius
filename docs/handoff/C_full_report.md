@@ -300,6 +300,25 @@ Do not re-litigate these without fresh data.
 
 ---
 
+## Already landed on this branch (don't re-litigate)
+
+Earlier drafts of this doc listed these as "next phase" — they have
+since been implemented. Flagging explicitly so reviewers don't chase them:
+
+- **Adaptive chunking for string decode** (`3d9c8d0` "adaptive chunking
+  — 19× faster dict decode", `b98b86d` chunked FSST gather with
+  precomputed compressed offsets, `39a09a6` chunked FSST lengths).
+  `expand_to_chunks()` in `gpu_decode_batched_string.cu` queries
+  `cudaDeviceProp::multiProcessorCount`, splits segments into row-chunks
+  to hit `target_ctas`. Hardware-adaptive (GH200 132 SMs, RTX6000 76
+  SMs, etc.).
+- **Vectorized string writes** (`78f5f59` "vectorize string copy in
+  dict and uncompressed gather", `637fcb0` "adaptive symbol writes in
+  FSST gather"). Byte-by-byte loops replaced with `memcpy` for dict /
+  uncomp gather and with length-specialized 2/3/4-byte stores + generic
+  `memcpy` for FSST symbol writes. Lines 442, 549–559, 629–632, 675 in
+  `gpu_decode_batched_string.cu`.
+
 ## Where to pick this up
 
 Ordered by where we'd spend next-sprint engineering:
@@ -308,22 +327,31 @@ Ordered by where we'd spend next-sprint engineering:
    At SF=100 warm Q1, our decode is 11% of GPU kernel time and cuDF
    `hash_group_by_single_pass_shmem_aggregate` is 56%. Scan is close to
    its limit; the next 2× lives downstream.
-2. **String decode GPU utilization** — dict/FSST gather launches with
-   grid = 5–17 CTAs (SM util 13–22%). One CTA per 256-row chunk within
-   a segment would bring it to 500+ CTAs. Expected: **~219ms saved on
-   Q1 SF=100.** Sketch in `docs/scan-optimization-guide.md` §0.
-3. **Vectorized string writes** — dict/FSST gather currently byte-copies;
-   `memcpy` compiles to vector loads/stores. Expected 1.5–2× on gather
-   kernels. `docs/scan-optimization-guide.md` §1.
-4. **DICT_FSST decode-once** — for DICT_FSST columns, FSST-decode only
-   the dictionary (small), then gather from decoded table. ClickBench
-   Q21 est. ~2300ms → ~300ms.
-5. **Ring buffer + pinned + dual-stream overlap** — ~58ms on Q1 SF=10
-   (−23% total). Design doc in `active_scan_interleaving.md`. Worth doing
-   but lower leverage than items 1–4.
-6. **GPU table cache (`table_gpu`)** — only matters if we expect
+2. **ALP / ALPRD fixed-width decode** — DuckDB's default codec for
+   FLOAT / DOUBLE. Any analytics table with numeric measures falls back
+   to `duckdb_scan_task`; one segment of ALP poisons the whole scan's
+   viability check. Biggest coverage gap by far. Est. 2 weeks.
+3. **DICT_FSST decode** — newer hybrid codec (compression_type=15).
+   Absent from our dispatch. Add a path that FSST-decodes the
+   dictionary once, then gathers from the decoded table. ClickBench
+   Q21 est. ~2300ms → ~300ms. Smaller incremental.
+4. **ROARING validity** — sparse-null columns get ROARING; we only
+   decode UNCOMPRESSED validity. Covers real-world tables with optional
+   fields. ~1 week, mostly a bitmap-expansion kernel.
+5. **ZSTD segment decode via nvCOMP** — DuckDB's general-purpose
+   fallback. Medium effort, mostly plumbing.
+6. **Ring buffer + pinned + dual-stream overlap** — ~58ms on Q1 SF=10
+   (−23% total). Design doc in `active_scan_interleaving.md`. Net
+   regression at SF=10 when last tested (commit `e3e2719`), but may be
+   positive at SF=100+ on GH200 — needs re-measurement.
+7. **GPU table cache (`table_gpu`)** — only matters if we expect
    repeated queries against the same table in a session. Warm pin is
    already 1.5ms. Defer.
+
+Note the reordering: ALP moved up because it's a coverage bug, not a
+perf nice-to-have. Without ALP support we can't claim generic
+analytics-table acceleration — TPC-H and ClickBench just happen to not
+use ALP.
 
 ---
 
