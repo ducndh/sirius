@@ -340,13 +340,18 @@ Ordered by where we'd spend next-sprint engineering:
    fields. ~1 week, mostly a bitmap-expansion kernel.
 5. **ZSTD segment decode via nvCOMP** — DuckDB's general-purpose
    fallback. Medium effort, mostly plumbing.
-6. **Ring buffer + pinned + dual-stream overlap** — ~58ms on Q1 SF=10
-   (−23% total). Design doc in `active_scan_interleaving.md`. Net
-   regression at SF=10 when last tested (commit `e3e2719`), but may be
-   positive at SF=100+ on GH200 — needs re-measurement.
-7. **GPU table cache (`table_gpu`)** — only matters if we expect
-   repeated queries against the same table in a session. Warm pin is
-   already 1.5ms. Defer.
+6. **GPU table cache (`table_gpu`)** — already implemented
+   (`src/op/scan/duckdb_scan_executor.cpp:154,232`, enabled via
+   `cache_scan_level=table_gpu`). Only matters for repeated queries on
+   the same table in a session; warm pin is already 1.5ms. Turn on via
+   config when workload justifies it. No new code needed.
+
+**Explicitly not on this list: ring buffer + pinned + dual-stream
+overlap.** That package was tested and reverted (commit `e3e2719`,
+−8% at SF=10); pinned-memory staging was independently tested slower
+(CPU memcpy to WC memory at 8 GB/s negates the 12 GB/s PCIe gain).
+Both live in the "tested and rejected" table above. Do not resurrect
+without fresh SF=100+ data showing a win there — SF=10 is decided.
 
 Note the reordering: ALP moved up because it's a coverage bug, not a
 perf nice-to-have. Without ALP support we can't claim generic
