@@ -13,22 +13,23 @@ All warm numbers below are single-session iter-2. Cold numbers specify their tie
 
 ## Headline
 
-**TPC-H SF=100 on GH200, all 22 queries:**
+**TPC-H SF=100 on GH200, 22 queries (suite totals):**
 
 | | **GPU** | **CPU** | **GPU/CPU** |
 |---|---|---|---|
 | Warm (iter 2) | **5.33s** | 7.08s | **1.33× (GPU wins, 15/22 queries)** |
-| Disk-cold (per-query avg, caches dropped) | **2.4s/q** (~52.8s suite) | — | lazy mmap auto-detected on GH200 |
+| Cold (disk-cold, lazy mmap — default) | **~52.8s** | 15.5s | 0.29× (CPU wins cold) |
 
-GH200 cold detail (per-query avg, caches dropped between queries):
+**ClickBench 100-shard on GH200, 29 queries (suite totals):**
 
-| Variant | TPC-H cold | ClickBench cold |
-|---|---|---|
-| A: mmap + MADV_POPULATE_READ (old default) | 16.4s | 19.7s |
-| **B: mmap + lazy faults (GH200 default now)** | **2.4s** | **3.3s** |
-| C: no mmap, via `Pin()` | 1.1s | 1.0s |
+| | GPU | CPU | GPU/CPU |
+|---|---|---|---|
+| Warm | 5.00s | 2.54s | 0.51× |
+| Cold (disk-cold, lazy mmap) | ~95.7s | 5.23s | 0.05× |
 
-**6.9× GH200 cold win** from dropping MADV_POPULATE_READ — was faulting the whole DB file on first mmap, polluting OS cache with zero perf benefit on ATS. Lazy mmap now auto-selected on unified-memory hardware (commit `27b049e`).
+**Correction to my earlier claim:** Cold is *not* roughly equal to CPU at GH200 SF=100. At disk-cold with caches dropped between every query, CPU wins by ~3× on TPC-H and ~18× on ClickBench. CPU scan amortizes page faults inside a vectorized loop over 72 Grace cores; GPU cold still pays the first-pass mmap fault + H2D transfer on top of that. Where cold *is* roughly equal to CPU: smaller scale on PCIe (TPC-H SF=10 RTX6000 buffer-cold 6.94s vs CPU cold ~5-6s estimated; ClickBench 10M 2.94s vs CPU cold ~3-4s estimated).
+
+Still a huge improvement over where we were: lazy mmap cut GH200 cold from **360s → 52.8s (6.9× win)** vs the old MADV_POPULATE_READ prefault that was faulting the whole DB file on first mmap for zero benefit on ATS (commit `27b049e`).
 
 Biggest per-query wins on SF=100 warm:
 

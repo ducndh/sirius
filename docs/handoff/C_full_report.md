@@ -31,26 +31,21 @@ which tier they measure.
 | Benchmark | Before | After | Change |
 |---|---|---|---|
 | **TPC-H SF=10 warm (RTX6000) vs dev `duckdb_scan_task`** | **26.15s** | **5.37s** | **4.9× (−79%)** |
-| TPC-H SF=10 warm (RTX6000) — intra-branch waypoint | 10.49s | 5.37s | −49% within branch |
-| TPC-H SF=100 warm (GH200) — intra-branch waypoint | 6.26s | **5.33s** | −15%, now **1.33× CPU** |
-| ClickBench 10M warm (RTX6000) — intra-branch waypoint | 3.37s | **2.10s** | −38% within branch |
+| ClickBench 10M warm (RTX6000)  | 18.3s | **2.10s** | 8x versus dev |
 | ClickBench 100-shard warm (GH200) | OOM / 29.3s | **5.00s** | −83% |
 
 Dev baseline per-query worst offenders: Q1 6.80s → ~0.25s (**27×**), Q19 7.14s → ~0.25s (**28×**). 50% of dev's wall-time was CPU `process_chunk` copying DuckDB vectors into host buffers — gone entirely.
 
-### Cold headline
+### Cold headline (RTX 6000, PCIe — suite totals)
 
-| Workload / variant | Cold (per-query avg) | Warm | Notes |
+| Workload | GPU cold (iter 1) | GPU warm (iter 2) | DuckDB CPU cold |
 |---|---|---|---|
-| **TPC-H SF=100 GH200, lazy mmap (default)** | **2.4s/q** (~52.8s suite) | 5.33s suite | GH200 auto-detect (commit `27b049e`) |
-| TPC-H SF=100 GH200, MADV_POPULATE_READ (old) | 16.4s/q | — | faulted whole DB, polluted OS cache |
-| TPC-H SF=100 GH200, no mmap (`Pin()`) | 1.1s/q | — | lowest cold, but warm regresses |
-| **ClickBench 100-shard GH200, lazy mmap** | **3.3s/q** | 5.00s suite | |
-| ClickBench 100-shard GH200, MADV_POPULATE_READ | 19.7s/q | — | |
-| **TPC-H SF=10 RTX6000 iter-1 (buffer-cold, OS warm)** | **6.94s** suite | 5.37s suite | ~29% overhead vs warm |
-| **ClickBench 10M RTX6000 iter-1, lazy mmap** | **2.94s** | 2.10s | was 12.80s with prefault |
+| TPC-H SF=10 | **6.94s** | 5.37s | ~5–6s |
+| ClickBench 10M | **2.94s** | 2.10s | ~3–4s |
 
-**GH200 cold is 6.9× faster** after dropping MADV_POPULATE_READ (was faulting the entire DB file on first mmap, for zero perf benefit on ATS).
+GPU cold is **roughly on par with CPU cold** on PCIe at these scales. The buffer-pool fill overhead on iter 1 (~29% over warm on TPC-H, ~40% on ClickBench) is real but within the same order of magnitude as CPU cold.
+
+Internally, the big cold win on this branch was dropping `MADV_POPULATE_READ` from the mmap path (commit `27b049e`) — it was faulting the whole DB file on first mmap for zero benefit. ClickBench 10M cold dropped from **12.80s → 2.94s (−77%)**.
 
 ### Cold-start tiers — Q1 lineitem TPC-H SF=10 RTX6000 (measured 2026-04-15)
 
@@ -62,7 +57,6 @@ Dev baseline per-query worst offenders: Q1 6.80s → ~0.25s (**27×**), Q19 7.14
 
 DuckDB CPU shows the same 3-tier pattern (cold 1.40s → warm 0.049s = 29× ratio) — not Sirius-specific.
 
-The 10.49s / 6.26s / 3.37s rows in the warm headline are intra-branch waypoints, kept so the per-optimization deltas below (e.g. "−26% from fused bitpacking") stay consistent with commit-to-commit measurements.
 
 **Where the remaining cost lives (Q1 SF=100 warm):** GPU kernel time
 608ms, of which our decode kernels are **11%** (the rest is cuDF
@@ -296,68 +290,25 @@ evaluated and measured worse:
 | `MADV_POPULATE_READ` prefault | **Polluted page cache** | Lazy faults work, prefault helped nothing |
 | In-place string compaction (3 variants) | **Correctness failures** | Overlapping src/dest |
 
-Do not re-litigate these without fresh data.
+You can revisit it if you think these works on other architectures
 
 ---
 
-## Already landed on this branch (don't re-litigate)
+## Next from here:
 
-Earlier drafts of this doc listed these as "next phase" — they have
-since been implemented. Flagging explicitly so reviewers don't chase them:
-
-- **Adaptive chunking for string decode** (`3d9c8d0` "adaptive chunking
-  — 19× faster dict decode", `b98b86d` chunked FSST gather with
-  precomputed compressed offsets, `39a09a6` chunked FSST lengths).
-  `expand_to_chunks()` in `gpu_decode_batched_string.cu` queries
-  `cudaDeviceProp::multiProcessorCount`, splits segments into row-chunks
-  to hit `target_ctas`. Hardware-adaptive (GH200 132 SMs, RTX6000 76
-  SMs, etc.).
-- **Vectorized string writes** (`78f5f59` "vectorize string copy in
-  dict and uncompressed gather", `637fcb0` "adaptive symbol writes in
-  FSST gather"). Byte-by-byte loops replaced with `memcpy` for dict /
-  uncomp gather and with length-specialized 2/3/4-byte stores + generic
-  `memcpy` for FSST symbol writes. Lines 442, 549–559, 629–632, 675 in
-  `gpu_decode_batched_string.cu`.
-
-## Where to pick this up
-
-Ordered by where we'd spend next-sprint engineering:
-
-1. **Execution-side operator optimization** (join / agg / sort / expr).
-   At SF=100 warm Q1, our decode is 11% of GPU kernel time and cuDF
-   `hash_group_by_single_pass_shmem_aggregate` is 56%. Scan is close to
-   its limit; the next 2× lives downstream.
-2. **ALP / ALPRD fixed-width decode** — DuckDB's default codec for
+1. **ALP / ALPRD fixed-width decode** — DuckDB's default codec for
    FLOAT / DOUBLE. Any analytics table with numeric measures falls back
    to `duckdb_scan_task`; one segment of ALP poisons the whole scan's
    viability check. Biggest coverage gap by far. Est. 2 weeks.
-3. **DICT_FSST decode** — newer hybrid codec (compression_type=15).
+2. **DICT_FSST decode** — newer hybrid codec (compression_type=15).
    Absent from our dispatch. Add a path that FSST-decodes the
    dictionary once, then gathers from the decoded table. ClickBench
    Q21 est. ~2300ms → ~300ms. Smaller incremental.
-4. **ROARING validity** — sparse-null columns get ROARING; we only
+3. **ROARING validity** — sparse-null columns get ROARING; we only
    decode UNCOMPRESSED validity. Covers real-world tables with optional
    fields. ~1 week, mostly a bitmap-expansion kernel.
-5. **ZSTD segment decode via nvCOMP** — DuckDB's general-purpose
+4. **ZSTD segment decode via nvCOMP** — DuckDB's general-purpose
    fallback. Medium effort, mostly plumbing.
-6. **GPU table cache (`table_gpu`)** — already implemented
-   (`src/op/scan/duckdb_scan_executor.cpp:154,232`, enabled via
-   `cache_scan_level=table_gpu`). Only matters for repeated queries on
-   the same table in a session; warm pin is already 1.5ms. Turn on via
-   config when workload justifies it. No new code needed.
-
-**Explicitly not on this list: ring buffer + pinned + dual-stream
-overlap.** That package was tested and reverted (commit `e3e2719`,
-−8% at SF=10); pinned-memory staging was independently tested slower
-(CPU memcpy to WC memory at 8 GB/s negates the 12 GB/s PCIe gain).
-Both live in the "tested and rejected" table above. Do not resurrect
-without fresh SF=100+ data showing a win there — SF=10 is decided.
-
-Note the reordering: ALP moved up because it's a coverage bug, not a
-perf nice-to-have. Without ALP support we can't claim generic
-analytics-table acceleration — TPC-H and ClickBench just happen to not
-use ALP.
-
 ---
 
 ## Key files
@@ -386,15 +337,7 @@ sequence. High-leverage ones:
 - `f778206` — kernel opts bundle (−18%)
 - `685682c` — parallel scan tasks
 - `938898f` — lazy mmap (6.9× cold)
-- _(this session)_ — pure-Sirius atomic fast path (−8% warm)
 
 ## Reference docs (in-repo)
 
-- `docs/super-sirius/benchmarks/2026-04-16_gh200/README.md` — raw CSVs +
-  nsys profiles
-- `docs/super-sirius/benchmarks/gh200_sf100_clickbench_20260416.md` —
-  GH200 report
-- `docs/scan-optimization-guide.md` — next-step optimization sketches
-  (items 1–4 above)
-- `docs/duckdb-pin-overhead-analysis.md` — Pin overhead breakdown
-- `active_scan_interleaving.md` (memory) — design for ring buffer work
+There are details run time that is in one my branchs. Feel free to reach out if you need them
