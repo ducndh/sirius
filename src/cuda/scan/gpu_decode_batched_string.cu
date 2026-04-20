@@ -175,6 +175,94 @@ struct fsst_decoder_compact {
 };
 
 //===----------------------------------------------------------------------===//
+// DICT_FSST: header + descriptor + host helpers
+//
+// Segment on-disk layout (each region 8-byte aligned):
+//   [header 16B]
+//   [dict bytes        dict_size bytes]               (raw UTF-8 or FSST-compressed)
+//   [symbol table      symbol_table_size bytes]       (only if mode != DICTIONARY)
+//   [string_lengths    bitpacked at string_lengths_width]
+//   [dictionary_indices bitpacked at dictionary_indices_width]   (absent for FSST_ONLY)
+//
+// dict_count includes a reserved index 0 that represents NULL (length 0).
+// For FSST_ONLY, dictionary_indices is implicit — row i maps to dict entry i+1.
+//===----------------------------------------------------------------------===//
+
+/// DICT_FSST compression header — mirrors duckdb::dict_fsst::dict_fsst_compression_header_t (16B).
+struct dict_fsst_header_t {
+  uint32_t dict_size;
+  uint32_t dict_count;
+  uint8_t  mode;
+  uint8_t  string_lengths_width;
+  uint8_t  dictionary_indices_width;
+  uint8_t  _pad;
+  uint32_t symbol_table_size;
+};
+
+enum : uint8_t {
+  DICT_FSST_MODE_DICTIONARY = 0,
+  DICT_FSST_MODE_DICT_FSST  = 1,
+  DICT_FSST_MODE_FSST_ONLY  = 2,
+};
+
+/// Per-segment descriptor for the DICT_FSST decode path.
+struct alignas(8) batched_dict_fsst_desc {
+  const uint8_t* d_block;             // device pointer to the 256KB block
+  uint32_t block_offset;              // offset of segment base within block
+  uint32_t row_count;
+  uint32_t global_row_start;          // prefix sum of row counts across this column
+  uint32_t seg_row_start;             // row offset within segment (0 for non-chunked)
+  uint32_t dict_data_block_off;       // within block, to raw/compressed dict bytes
+  uint32_t dict_indices_block_off;    // within block, to bitpacked dictionary_indices
+  uint32_t seg_dict_offset_base;      // starting index into d_byte_offsets/d_decoded_offsets
+                                      // (both arrays carry dict_count+1 entries per segment)
+  uint32_t seg_decoder_idx;           // index into d_decoders; unused when mode == DICTIONARY
+  uint8_t dict_indices_width;
+  uint8_t mode;
+  uint8_t _pad[2];
+};
+
+/// Round `n` up to the nearest multiple of 8 — matches DuckDB's AlignValue<idx_t>.
+static inline uint32_t align_up8(uint32_t n) { return (n + 7u) & ~7u; }
+
+/// Unpack one bitpacked value on host.  DuckDB's BitpackingPrimitives packs
+/// values in 32-element groups that are bit-dense and exactly (32*width/8) =
+/// (4*width) bytes each, so group boundaries fall on 32-bit boundaries with
+/// no bit rollover — straightforward horizontal bit extraction matches the
+/// on-disk layout.  Matches the GPU-side `unpack_value` in gpu_decode.cuh.
+template <typename T>
+static inline T host_unpack_bitpacked(const uint8_t* packed, uint32_t idx, uint32_t width)
+{
+  if (width == 0) return T(0);
+  uint64_t bit_pos = static_cast<uint64_t>(idx) * width;
+  uint32_t byte_off = static_cast<uint32_t>(bit_pos >> 3);
+  uint32_t bit_off  = static_cast<uint32_t>(bit_pos & 7u);
+  uint64_t combined;
+  std::memcpy(&combined, packed + byte_off, sizeof(uint64_t));
+  uint64_t mask = (width >= 64) ? ~0ULL : ((1ULL << width) - 1);
+  return static_cast<T>((combined >> bit_off) & mask);
+}
+
+/// Return the decompressed length of an FSST-compressed byte run without
+/// producing output — used to precompute per-dict-entry decoded lengths.
+static inline size_t fsst_decompressed_length_host(
+  const fsst_decoder_compact& dec, const uint8_t* src, size_t src_len)
+{
+  size_t pos = 0;
+  size_t dec_len = 0;
+  while (pos < src_len) {
+    uint8_t code = src[pos++];
+    if (code < FSST_ESC) {
+      dec_len += dec.len[code];
+    } else {
+      ++pos;       // skip escaped literal byte
+      ++dec_len;
+    }
+  }
+  return dec_len;
+}
+
+//===----------------------------------------------------------------------===//
 // Pass 1 kernels: compute string lengths
 //===----------------------------------------------------------------------===//
 
@@ -680,6 +768,159 @@ __global__ void kernel_gather_uncompressed(const batched_seg_desc* __restrict__ 
 }
 
 //===----------------------------------------------------------------------===//
+// DICT_FSST pass 1: compute decoded string length per row.
+//
+// Host precomputes cumulative decoded-byte offsets per dict entry
+// (d_decoded_offsets, size = dict_count+1 per segment).  Length of entry i
+// is decoded_offsets[i+1] - decoded_offsets[i].  Index 0 is NULL → length 0.
+// FSST_ONLY has no bitpacked indices; row i maps to entry i+1.
+//===----------------------------------------------------------------------===//
+__global__ void kernel_compute_lengths_dict_fsst(
+  const batched_dict_fsst_desc* __restrict__ descs,
+  uint32_t* __restrict__ d_lengths,
+  const uint32_t* __restrict__ d_decoded_offsets,
+  uint32_t num_segments)
+{
+  uint32_t seg_idx = blockIdx.x;
+  if (seg_idx >= num_segments) return;
+
+  const auto& desc        = descs[seg_idx];
+  const uint32_t* dec_off = d_decoded_offsets + desc.seg_dict_offset_base;
+  const uint32_t* d_idx   = reinterpret_cast<const uint32_t*>(
+    desc.d_block + desc.dict_indices_block_off);
+  const bool fsst_only = (desc.mode == DICT_FSST_MODE_FSST_ONLY);
+
+  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    uint32_t seg_i = desc.seg_row_start + i;
+    uint32_t idx;
+    if (fsst_only) {
+      idx = seg_i + 1;
+    } else {
+      idx = unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
+    }
+    uint32_t len = (idx == 0) ? 0u : (dec_off[idx + 1] - dec_off[idx]);
+    d_lengths[desc.global_row_start + i] = len;
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// DICT_FSST pass 2: gather strings.
+//
+// For DICTIONARY mode (raw dict bytes), straight memcpy from dict region.
+// For DICT_FSST / FSST_ONLY, inline FSST decompress from the dict region
+// using a per-segment symbol table loaded into shared memory.
+//===----------------------------------------------------------------------===//
+__global__ void kernel_gather_dict_fsst(
+  const batched_dict_fsst_desc* __restrict__ descs,
+  const int32_t* __restrict__ d_offsets,
+  uint8_t* __restrict__ d_chars,
+  const uint32_t* __restrict__ d_byte_offsets,
+  const fsst_decoder_compact* __restrict__ d_decoders,
+  uint32_t num_segments)
+{
+  uint32_t seg_idx = blockIdx.x;
+  if (seg_idx >= num_segments) return;
+
+  const auto& desc          = descs[seg_idx];
+  const uint8_t* dict_base  = desc.d_block + desc.dict_data_block_off;
+  const uint32_t* byte_off  = d_byte_offsets + desc.seg_dict_offset_base;
+  const uint32_t* d_idx     = reinterpret_cast<const uint32_t*>(
+    desc.d_block + desc.dict_indices_block_off);
+  const bool need_fsst = (desc.mode != DICT_FSST_MODE_DICTIONARY);
+  const bool fsst_only = (desc.mode == DICT_FSST_MODE_FSST_ONLY);
+
+  __shared__ uint8_t sh_len[255];
+  __shared__ unsigned long long sh_sym[255];
+  if (need_fsst) {
+    const fsst_decoder_compact& dec = d_decoders[desc.seg_decoder_idx];
+    for (uint32_t i = threadIdx.x; i < 255; i += blockDim.x) {
+      sh_len[i] = dec.len[i];
+      sh_sym[i] = dec.symbol[i];
+    }
+  }
+  __syncthreads();
+
+  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    uint32_t seg_i = desc.seg_row_start + i;
+    uint32_t idx;
+    if (fsst_only) {
+      idx = seg_i + 1;
+    } else {
+      idx = unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
+    }
+    if (idx == 0) continue;
+
+    uint32_t stored_start = byte_off[idx];
+    uint32_t stored_len   = byte_off[idx + 1] - stored_start;
+    const uint8_t* src    = dict_base + stored_start;
+    uint32_t out_pos      = static_cast<uint32_t>(d_offsets[desc.global_row_start + i]);
+
+    if (!need_fsst) {
+      for (uint32_t k = 0; k < stored_len; ++k) {
+        d_chars[out_pos + k] = src[k];
+      }
+    } else {
+      uint32_t pos = 0;
+      while (pos < stored_len) {
+        uint8_t code = src[pos++];
+        if (code < FSST_ESC) {
+          unsigned long long sym = sh_sym[code];
+          uint8_t sym_len        = sh_len[code];
+          switch (sym_len) {
+            case 1: d_chars[out_pos] = static_cast<uint8_t>(sym); break;
+            case 2: memcpy(d_chars + out_pos, &sym, 2); break;
+            case 3: memcpy(d_chars + out_pos, &sym, 3); break;
+            case 4: memcpy(d_chars + out_pos, &sym, 4); break;
+            default: memcpy(d_chars + out_pos, &sym, sym_len); break;
+          }
+          out_pos += sym_len;
+        } else {
+          d_chars[out_pos++] = src[pos++];
+        }
+      }
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// DICT_FSST null marking.
+//
+// DICT_FSST (and DICTIONARY) encode NULL inline in the data codec: dict
+// index 0 is reserved for NULL.  On disk this means the validity segment
+// is usually "Empty Validity" (COMPRESSION_EMPTY), so the bitmap overlay
+// path skips the column and everything looks valid.  For correctness the
+// null mask must reflect rows whose dict_idx == 0 — clear those bits.
+// FSST_ONLY maps row i to idx = i+1, so it can never produce idx == 0
+// and this kernel becomes a no-op there.
+//===----------------------------------------------------------------------===//
+__global__ void kernel_dict_fsst_mark_nulls(
+  const batched_dict_fsst_desc* __restrict__ descs,
+  unsigned long long* __restrict__ null_mask,
+  uint32_t num_segments)
+{
+  uint32_t seg_idx = blockIdx.x;
+  if (seg_idx >= num_segments) return;
+
+  const auto& desc     = descs[seg_idx];
+  const bool fsst_only = (desc.mode == DICT_FSST_MODE_FSST_ONLY);
+  if (fsst_only) return;
+
+  const uint32_t* d_idx = reinterpret_cast<const uint32_t*>(
+    desc.d_block + desc.dict_indices_block_off);
+
+  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    uint32_t seg_i = desc.seg_row_start + i;
+    uint32_t idx   = unpack_value<uint32_t>(d_idx, seg_i, desc.dict_indices_width);
+    if (idx == 0) {
+      uint32_t abs_row = desc.global_row_start + i;
+      uint32_t word    = abs_row >> 6;
+      uint32_t bit     = abs_row & 63u;
+      atomicAnd(null_mask + word, ~(1ULL << bit));
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // Validity + null count kernels are shared with gpu_native_decode.cu
 // via gpu_decode_validity.cuh — do not duplicate them here.
 //===----------------------------------------------------------------------===//
@@ -786,6 +1027,15 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
   size_t cum_rows          = 0;
   size_t cum_chars_upper   = 0;  // CPU upper-bound on total string bytes
 
+  // DICT_FSST host-precomputed per-dict-entry offset tables.  Both offset
+  // arrays hold dict_count+1 cumulative entries per segment, packed
+  // back-to-back across all DICT_FSST segments; desc.seg_dict_offset_base
+  // points at entry 0 of that segment's tables.
+  std::vector<batched_dict_fsst_desc> dict_fsst_descs;
+  std::vector<uint32_t> dict_fsst_byte_offsets;     // stored bytes (raw or FSST-compressed)
+  std::vector<uint32_t> dict_fsst_decoded_offsets;  // decoded (user-visible) bytes
+  std::vector<fsst_decoder_compact> dict_fsst_decoders;
+
   for (auto const& seg : col_scan.data.segments) {
     if (seg.row_count == 0) {
       cum_rows += seg.row_count;
@@ -835,6 +1085,96 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
         break;
       }
       case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED: uncomp_descs.push_back(desc); break;
+      case duckdb::CompressionType::COMPRESSION_DICT_FSST: {
+        // Host pre-parses this segment: header → region offsets → unpack
+        // string_lengths → (optionally) import FSST decoder + decode each
+        // dict entry to compute its decoded length.  The final byte/decoded
+        // offset arrays are pushed back on the shared vectors and the
+        // descriptor records the base index.
+        const uint8_t* seg_host_base = seg.data_ptr;
+        dict_fsst_header_t hdr;
+        std::memcpy(&hdr, seg_host_base, sizeof(hdr));
+
+        uint32_t dict_count         = hdr.dict_count;
+        uint32_t dict_size          = hdr.dict_size;
+        uint32_t sym_table_size     = hdr.symbol_table_size;
+        uint8_t  mode               = hdr.mode;
+        uint8_t  slen_width         = hdr.string_lengths_width;
+        uint8_t  didx_width         = hdr.dictionary_indices_width;
+
+        uint32_t dict_dest          = align_up8(sizeof(dict_fsst_header_t));
+        uint32_t sym_table_dest     = align_up8(dict_dest + dict_size);
+        uint32_t string_lengths_dest = align_up8(sym_table_dest + sym_table_size);
+        // BitpackingPrimitives::GetRequiredSize: round dict_count up to group
+        // size (32), then bytes = (rounded * width) / 8.
+        uint32_t slen_rounded       = (dict_count + 31u) & ~31u;
+        uint32_t slen_space         = (slen_rounded * slen_width) / 8u;
+        uint32_t dict_indices_dest  = align_up8(string_lengths_dest + slen_space);
+
+        // Unpack per-entry stored lengths, build forward cumulative byte offsets.
+        std::vector<uint32_t> entry_stored_len(dict_count);
+        const uint8_t* slen_packed = seg_host_base + string_lengths_dest;
+        for (uint32_t i = 0; i < dict_count; ++i) {
+          entry_stored_len[i] = host_unpack_bitpacked<uint32_t>(slen_packed, i, slen_width);
+        }
+
+        uint32_t base_off = static_cast<uint32_t>(dict_fsst_byte_offsets.size());
+        dict_fsst_byte_offsets.resize(base_off + dict_count + 1);
+        dict_fsst_decoded_offsets.resize(base_off + dict_count + 1);
+        dict_fsst_byte_offsets[base_off]    = 0;
+        dict_fsst_decoded_offsets[base_off] = 0;
+
+        uint32_t seg_decoder_idx = static_cast<uint32_t>(dict_fsst_decoders.size());
+        fsst_decoder_compact compact{};
+        bool fsst_mode = (mode != DICT_FSST_MODE_DICTIONARY);
+        if (fsst_mode) {
+          fsst_decoder_gpu full_dec;
+          std::memset(&full_dec, 0, sizeof(full_dec));
+          duckdb_fsst_import(&full_dec,
+                             const_cast<unsigned char*>(seg_host_base + sym_table_dest));
+          std::memcpy(compact.len, full_dec.len, 255);
+          std::memcpy(compact.symbol, full_dec.symbol, 255 * sizeof(unsigned long long));
+        }
+        // Always push a decoder slot so seg_decoder_idx is valid — the
+        // kernel only reads it for non-DICTIONARY modes.
+        dict_fsst_decoders.push_back(compact);
+
+        const uint8_t* dict_bytes = seg_host_base + dict_dest;
+        uint32_t stored_cum  = 0;
+        uint32_t decoded_cum = 0;
+        for (uint32_t i = 0; i < dict_count; ++i) {
+          stored_cum += entry_stored_len[i];
+          uint32_t decoded_len;
+          if (!fsst_mode) {
+            decoded_len = entry_stored_len[i];
+          } else if (i == 0) {
+            // Reserved NULL entry: length always 0 regardless of stored bytes.
+            decoded_len = 0;
+          } else {
+            uint32_t start = (i == 0) ? 0 : dict_fsst_byte_offsets[base_off + i];
+            decoded_len = static_cast<uint32_t>(
+              fsst_decompressed_length_host(compact, dict_bytes + start, entry_stored_len[i]));
+          }
+          decoded_cum += decoded_len;
+          dict_fsst_byte_offsets[base_off + i + 1]    = stored_cum;
+          dict_fsst_decoded_offsets[base_off + i + 1] = decoded_cum;
+        }
+
+        batched_dict_fsst_desc df{};
+        df.d_block                 = d_block;
+        df.block_offset            = static_cast<uint32_t>(seg.block_offset);
+        df.row_count               = static_cast<uint32_t>(seg.row_count);
+        df.global_row_start        = static_cast<uint32_t>(cum_rows);
+        df.seg_row_start           = 0;
+        df.dict_data_block_off     = static_cast<uint32_t>(seg.block_offset) + dict_dest;
+        df.dict_indices_block_off  = static_cast<uint32_t>(seg.block_offset) + dict_indices_dest;
+        df.seg_dict_offset_base    = base_off;
+        df.seg_decoder_idx         = seg_decoder_idx;
+        df.dict_indices_width      = didx_width;
+        df.mode                    = mode;
+        dict_fsst_descs.push_back(df);
+        break;
+      }
       default: break;
     }
     cum_rows += seg.row_count;
@@ -923,6 +1263,41 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
                               static_cast<uint8_t*>(fsst_arena_buf.data()) + off_starts);
   auto* d_fsst_decoders   = reinterpret_cast<fsst_decoder_compact*>(
                               static_cast<uint8_t*>(fsst_arena_buf.data()) + off_decs);
+
+  // DICT_FSST arena: descriptors + byte_offsets + decoded_offsets + decoders.
+  const size_t bytes_df_descs   = dict_fsst_descs.size() * sizeof(batched_dict_fsst_desc);
+  const size_t bytes_df_byte    = dict_fsst_byte_offsets.size() * sizeof(uint32_t);
+  const size_t bytes_df_decoded = dict_fsst_decoded_offsets.size() * sizeof(uint32_t);
+  const size_t bytes_df_decs    = dict_fsst_decoders.size() * sizeof(fsst_decoder_compact);
+  const size_t off_df_descs     = 0;
+  const size_t off_df_byte      = align_up(off_df_descs + bytes_df_descs, kAlign);
+  const size_t off_df_decoded   = align_up(off_df_byte + bytes_df_byte, kAlign);
+  const size_t off_df_decs      = align_up(off_df_decoded + bytes_df_decoded, kAlign);
+  const size_t df_arena_bytes   = off_df_decs + bytes_df_decs;
+
+  std::vector<uint8_t> h_df_arena(df_arena_bytes);
+  if (bytes_df_descs)
+    std::memcpy(h_df_arena.data() + off_df_descs, dict_fsst_descs.data(), bytes_df_descs);
+  if (bytes_df_byte)
+    std::memcpy(h_df_arena.data() + off_df_byte, dict_fsst_byte_offsets.data(), bytes_df_byte);
+  if (bytes_df_decoded)
+    std::memcpy(h_df_arena.data() + off_df_decoded, dict_fsst_decoded_offsets.data(),
+                bytes_df_decoded);
+  if (bytes_df_decs)
+    std::memcpy(h_df_arena.data() + off_df_decs, dict_fsst_decoders.data(), bytes_df_decs);
+
+  rmm::device_buffer df_arena_buf(df_arena_bytes, stream, mr);
+  if (df_arena_bytes > 0) {
+    bounce_h2d_async(df_arena_buf.data(), h_df_arena.data(), df_arena_bytes, stream.value());
+  }
+  auto* d_df_descs    = reinterpret_cast<batched_dict_fsst_desc*>(
+                          static_cast<uint8_t*>(df_arena_buf.data()) + off_df_descs);
+  auto* d_df_byte     = reinterpret_cast<uint32_t*>(
+                          static_cast<uint8_t*>(df_arena_buf.data()) + off_df_byte);
+  auto* d_df_decoded  = reinterpret_cast<uint32_t*>(
+                          static_cast<uint8_t*>(df_arena_buf.data()) + off_df_decoded);
+  auto* d_df_decoders = reinterpret_cast<fsst_decoder_compact*>(
+                          static_cast<uint8_t*>(df_arena_buf.data()) + off_df_decs);
 
   //===--------------------------------------------------------------------===//
   // Phase 4: Pass 1 — compute string lengths (batched)
@@ -1025,6 +1400,15 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
       d_uncomp_chunks, d_lengths.data(), static_cast<uint32_t>(uncomp_chunks.size()));
   }
 
+  if (!dict_fsst_descs.empty()) {
+    kernel_compute_lengths_dict_fsst<<<static_cast<uint32_t>(dict_fsst_descs.size()),
+                                       THREADS,
+                                       0,
+                                       stream.value()>>>(
+      d_df_descs, d_lengths.data(), d_df_decoded,
+      static_cast<uint32_t>(dict_fsst_descs.size()));
+  }
+
   //===--------------------------------------------------------------------===//
   // Phase 5: Global CUB ExclusiveSum + sentinel + ONE sync
   //===--------------------------------------------------------------------===//
@@ -1114,6 +1498,13 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
       d_uncomp_chunks, d_offsets.data(), d_chars_ptr, static_cast<uint32_t>(uncomp_chunks.size()));
   }
 
+  if (!dict_fsst_descs.empty()) {
+    kernel_gather_dict_fsst<<<static_cast<uint32_t>(dict_fsst_descs.size()),
+                              THREADS, 0, stream.value()>>>(
+      d_df_descs, d_offsets.data(), d_chars_ptr, d_df_byte, d_df_decoders,
+      static_cast<uint32_t>(dict_fsst_descs.size()));
+  }
+
   //===--------------------------------------------------------------------===//
   // Phase 8: Cleanup temp buffers
   //===--------------------------------------------------------------------===//
@@ -1172,6 +1563,17 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
       val_row_offset += vseg.row_count;
     }
 
+    // DICT_FSST encodes NULL inline via dict_idx == 0.  The validity segment
+    // is usually "Empty Validity" for those columns, so without this step
+    // the mask stays all-valid and NULL rows appear as empty strings.
+    if (!dict_fsst_descs.empty()) {
+      kernel_dict_fsst_mark_nulls<<<static_cast<uint32_t>(dict_fsst_descs.size()),
+                                    THREADS, 0, stream.value()>>>(
+        d_df_descs,
+        reinterpret_cast<unsigned long long*>(d_mask),
+        static_cast<uint32_t>(dict_fsst_descs.size()));
+    }
+
     rmm::device_uvector<uint32_t> d_vc(1, stream, mr);
     cudaMemsetAsync(d_vc.data(), 0, sizeof(uint32_t), stream.value());
     if (d_valid_count_out) {
@@ -1192,12 +1594,13 @@ std::unique_ptr<cudf::column> decode_string_column_batched(
 
   SIRIUS_LOG_INFO(
     "[gpu_native_decode] batched string col: {} rows, {} chars, "
-    "{} dict segs, {} fsst segs, {} uncomp segs",
+    "{} dict segs, {} fsst segs, {} uncomp segs, {} dict_fsst segs",
     total_rows,
     alloc_chars,
     dict_descs.size(),
     fsst_descs.size(),
-    uncomp_descs.size());
+    uncomp_descs.size(),
+    dict_fsst_descs.size());
 
   return cudf::make_strings_column(static_cast<cudf::size_type>(total_rows),
                                    std::move(offsets_col),
