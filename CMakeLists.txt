@@ -237,6 +237,7 @@ set(CUDA_SOURCES
     src/cuda/operator/strlen_from_offsets.cu
     src/cuda/operator/empty_str_check.cu
     src/cuda/print.cu
+    src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_batched_string.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_dictionary.cu
@@ -358,6 +359,7 @@ set(TEST_SOURCES
     test/cpp/exec/test_interruptible_mpmc.cpp
     test/cpp/expression_executor/test_gpu_expression_executor.cpp
     test/cpp/expression_executor/test_gpu_expression_translator.cpp
+    test/cpp/integration/test_gpu_execution_alp.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/memory/test_host_table_utils.cpp
