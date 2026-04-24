@@ -172,6 +172,29 @@ void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> que
   }
 }
 
+// Returns true if the scan's pipeline has any operator with an unmet FULL-barrier
+// dependency (i.e., a hash table that isn't built yet).  Such scans must not be
+// started eagerly: their data would land in HBM with no consumer, wasting the
+// memory the hash-table build needs.  notify_downstream_pipelines() will trigger
+// them once the upstream FULL-barrier pipeline completes.
+static bool scan_has_unmet_full_barrier(op::sirius_physical_operator* scan_op)
+{
+  auto pipeline = scan_op->get_pipeline();
+  if (!pipeline) { return false; }
+
+  // After is_ready() reversal, operators[0] is the first consumer after the source.
+  // insert_repository() always places FULL-barrier ports on operators[0] (or the sink
+  // when there are no intermediate operators), so checking just that node is sufficient.
+  const auto& ops       = pipeline->get_operators();
+  auto*       check_op  = !ops.empty() ? &ops[0].get()
+                        : (pipeline->get_sink() ? pipeline->get_sink().get() : nullptr);
+  if (!check_op) { return false; }
+
+  auto hint = check_op->get_next_task_hint();
+  return hint.has_value() &&
+         hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA;
+}
+
 std::future<void> pipeline_executor::start_query()
 {
   // Create a new completion handler for this query
@@ -184,12 +207,22 @@ std::future<void> pipeline_executor::start_query()
     gpu_exec->set_completion_handler(_completion_handler.get());
   }
 
-  constexpr int k_initial_scans = 2;
+  // Schedule only scans whose downstream operators have no unmet FULL-barrier
+  // dependencies.  Probe-side scans are left out: they will be triggered by
+  // notify_downstream_pipelines() after the corresponding build pipeline finishes.
+  // This prevents fully-decoded probe data from parking in HBM while the hash
+  // table build is still competing for that same memory.
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
-  for (int i = 0; i < k_initial_scans && !_priority_scans.empty(); ++i) {
+  while (!_priority_scans.empty()) {
     auto* scan_op = _priority_scans.front();
-    _task_creator->schedule(scan_op);
     _priority_scans.pop();
+    if (!scan_has_unmet_full_barrier(scan_op)) {
+      SIRIUS_LOG_DEBUG("start_query: scheduling build-side scan {}", scan_op->get_name());
+      _task_creator->schedule(scan_op);
+    } else {
+      SIRIUS_LOG_DEBUG("start_query: deferring probe-side scan {} (unmet FULL barrier)",
+                       scan_op->get_name());
+    }
   }
 
   return future;
