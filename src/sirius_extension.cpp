@@ -47,6 +47,7 @@ extern "C" int cudaProfilerStop();
 #endif
 #include "duckdb/main/connection_manager.hpp"
 #include "log/logging.hpp"
+#include "op/scan/gpu_preload_region.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
@@ -683,6 +684,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
+
+  RegisterGpuPreloadRegionFunctions(transaction, catalog);
 
   // Profiler control functions for nsys --capture-range=cudaProfilerApi
   TableFunction profiler_start(

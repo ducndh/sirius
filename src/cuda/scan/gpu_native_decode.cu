@@ -226,6 +226,15 @@ struct device_block_map {
   size_t total_bytes = 0;
 };
 
+}  // anonymous namespace
+
+std::pair<std::unordered_map<int64_t, std::size_t>, rmm::device_buffer> stage_blocks_bulk_h2d(
+  const std::vector<column_scan_result>& col_scans,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+namespace {
+
 std::pair<device_block_map, rmm::device_buffer> transfer_blocks_bulk_h2d(
   const std::vector<column_scan_result>& col_scans,
   rmm::cuda_stream_view stream,
@@ -583,10 +592,22 @@ std::unique_ptr<cudf::column> decode_fixed_width_column(
 // Public API
 //===----------------------------------------------------------------------===//
 
-std::unique_ptr<cudf::table> gpu_decode_table(std::vector<column_scan_result>& col_scans,
-                                              const std::vector<duckdb::LogicalType>& col_types,
-                                              rmm::cuda_stream_view stream,
-                                              rmm::device_async_resource_ref mr)
+std::pair<std::unordered_map<int64_t, std::size_t>, rmm::device_buffer> stage_blocks_bulk_h2d(
+  const std::vector<column_scan_result>& col_scans,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto pair = transfer_blocks_bulk_h2d(col_scans, stream, mr);
+  return {std::move(pair.first.offsets), std::move(pair.second)};
+}
+
+std::unique_ptr<cudf::table> gpu_decode_table(
+  std::vector<column_scan_result>& col_scans,
+  const std::vector<duckdb::LogicalType>& col_types,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  const std::unordered_map<int64_t, std::size_t>* preloaded_block_offsets,
+  const std::uint8_t* preloaded_base)
 {
   using clock  = std::chrono::steady_clock;
   auto t_start = clock::now();
@@ -594,13 +615,33 @@ std::unique_ptr<cudf::table> gpu_decode_table(std::vector<column_scan_result>& c
   if (col_scans.size() != col_types.size()) {
     throw std::invalid_argument("gpu_decode_table: col_scans and col_types size mismatch");
   }
+  if ((preloaded_block_offsets == nullptr) != (preloaded_base == nullptr)) {
+    throw std::invalid_argument(
+      "gpu_decode_table: preloaded_block_offsets and preloaded_base must both be set or both null");
+  }
 
   size_t total_rows = col_scans.empty() ? 0 : col_scans[0].data.total_rows;
   size_t num_cols   = col_scans.size();
 
-  // 1. Bulk-stage every unique block to device in one coalesced H2D pass.
-  auto [blocks, staging_buf] = transfer_blocks_bulk_h2d(col_scans, stream, mr);
-  auto* d_staging            = static_cast<uint8_t*>(staging_buf.data());
+  // 1. Bulk-stage every unique block to device in one coalesced H2D pass —
+  //    UNLESS the caller supplied a preloaded device region containing every
+  //    block we'd reference, in which case we reuse that and skip the H2D.
+  device_block_map blocks;
+  rmm::device_buffer staging_buf;
+  uint8_t* d_staging = nullptr;
+  if (preloaded_block_offsets != nullptr) {
+    // Non-owning view: we copy the offsets map (small — a few thousand entries
+    // even at SF=100) so the rest of the pipeline can keep using device_block_map
+    // unchanged. The base pointer is the externally owned region buffer.
+    blocks.offsets    = *preloaded_block_offsets;
+    blocks.total_bytes = 0;
+    d_staging          = const_cast<uint8_t*>(preloaded_base);
+  } else {
+    auto pair  = transfer_blocks_bulk_h2d(col_scans, stream, mr);
+    blocks     = std::move(pair.first);
+    staging_buf = std::move(pair.second);
+    d_staging  = static_cast<uint8_t*>(staging_buf.data());
+  }
 
   auto t_stage = clock::now();
 

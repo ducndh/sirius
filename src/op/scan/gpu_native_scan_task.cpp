@@ -5,7 +5,11 @@
 
 #include "op/scan/gpu_native_scan_task.hpp"
 
+#include "op/scan/scan_region.hpp"
+
 #include <cuda/scan/gpu_native_decode.cuh>
+#include <cudf/concatenate.hpp>
+#include <cudf/table/table.hpp>
 
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -26,6 +30,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 
 namespace sirius::op::scan {
 
@@ -379,6 +384,16 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
   size_t num_cols   = col_indices.size();
   auto mr           = g.gpu_space()->get_default_allocator();
 
+  // Snapshot the active preloaded scan_region (if any). The shared_ptr keeps
+  // the region alive for our entire compute_task even if gpu_release_region()
+  // races on another thread. nullptr → today's path.
+  auto region = g.sirius_ctx()->get_active_region();
+  const sirius::op::scan::preloaded_table* preloaded = nullptr;
+  if (region) {
+    auto it = region->tables.find(&g.storage());
+    if (it != region->tables.end()) { preloaded = &it->second; }
+  }
+
   using clock = std::chrono::steady_clock;
   auto us     = [](clock::time_point a, clock::time_point b) {
     return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
@@ -410,36 +425,95 @@ std::unique_ptr<op::operator_data> gpu_native_scan_task::compute_task(rmm::cuda_
 
     auto t0 = clock::now();
 
-    // Pin segments for the claimed row groups.
-    std::vector<column_scan_result> col_scans(num_cols);
-    for (size_t ci = 0; ci < num_cols; ++ci) {
-      std::vector<duckdb::RowGroup*> batch_rgs(row_groups.begin() + range->start_idx,
-                                               row_groups.begin() + range->start_idx + range->count);
-      col_scans[ci] =
-        direct_block_scan_column_range(g.storage(), col_indices[ci], g.context(), batch_rgs);
+    std::unique_ptr<cudf::table> gpu_table;
+    size_t total_rows = 0;
+    double pin_ms     = 0.0;
+    double decode_ms  = 0.0;
+
+    if (preloaded != nullptr && region->m == sirius::op::scan::scan_region::mode::DECODED) {
+      // DECODED mode: gather pre-decoded per-(rg,col) cudf::columns for the
+      // batch's row groups, concatenate per scan column. No host pin, no decode.
+      std::vector<std::unique_ptr<cudf::column>> out_cols;
+      out_cols.reserve(num_cols);
+      for (size_t ci = 0; ci < num_cols; ++ci) {
+        std::vector<cudf::column_view> per_rg_views;
+        per_rg_views.reserve(range->count);
+        size_t col_rows = 0;
+        for (size_t r = range->start_idx; r < range->start_idx + range->count; ++r) {
+          auto* rg_ptr = row_groups[r];
+          auto rg_it   = preloaded->decoded_columns.find(rg_ptr);
+          if (rg_it == preloaded->decoded_columns.end()) {
+            throw std::runtime_error(
+              "gpu_native_scan: DECODED region missing row group — preload spec didn't cover it");
+          }
+          auto col_it = rg_it->second.find(col_indices[ci].GetPrimaryIndex());
+          if (col_it == rg_it->second.end()) {
+            throw std::runtime_error(
+              "gpu_native_scan: DECODED region missing column for row group — preload spec "
+              "didn't list this column");
+          }
+          per_rg_views.push_back(col_it->second->view());
+          col_rows += static_cast<size_t>(col_it->second->size());
+        }
+        if (ci == 0) total_rows = col_rows;
+        // cudf::concatenate produces a freshly owned column on `stream` from `mr`.
+        // Per-rg views remain valid in the region; we don't take ownership.
+        out_cols.push_back(cudf::concatenate(per_rg_views, stream, mr));
+      }
+      auto t1 = clock::now();
+      pin_ms  = 0.0;
+      gpu_table = std::make_unique<cudf::table>(std::move(out_cols));
+      // Sync once so the data_batch downstream sees a settled column.
+      stream.synchronize();
+      decode_ms = us(t0, clock::now()) / 1000.0;
+      (void)t1;
+    } else {
+      // ENCODED mode (preloaded) and native (no preload) share the pin+decode
+      // call path. The only difference is whether gpu_decode_table consults
+      // the region's encoded_pool (skipping H2D) or stages its own.
+      std::vector<column_scan_result> col_scans(num_cols);
+      for (size_t ci = 0; ci < num_cols; ++ci) {
+        std::vector<duckdb::RowGroup*> batch_rgs(
+          row_groups.begin() + range->start_idx,
+          row_groups.begin() + range->start_idx + range->count);
+        col_scans[ci] =
+          direct_block_scan_column_range(g.storage(), col_indices[ci], g.context(), batch_rgs);
+      }
+
+      auto t1_pin = clock::now();
+      pin_ms      = us(t0, t1_pin) / 1000.0;
+
+      const std::unordered_map<int64_t, std::size_t>* preloaded_offsets = nullptr;
+      const std::uint8_t* preloaded_base                                = nullptr;
+      if (preloaded != nullptr && region->m == sirius::op::scan::scan_region::mode::ENCODED) {
+        preloaded_offsets = &preloaded->block_offsets;
+        preloaded_base    = static_cast<const std::uint8_t*>(preloaded->encoded_pool.data());
+      }
+
+      gpu_table = sirius::cuda::scan::gpu_decode_table(
+        col_scans, col_types, stream, mr, preloaded_offsets, preloaded_base);
+
+      auto t2_decode = clock::now();
+      decode_ms      = us(t1_pin, t2_decode) / 1000.0;
+      total_rows     = col_scans.empty() ? 0 : col_scans[0].data.total_rows;
     }
 
-    auto t1_pin = clock::now();
-
-    // Decode — bulk H2D + per-segment kernels + single sync are all inside.
-    auto gpu_table = sirius::cuda::scan::gpu_decode_table(col_scans, col_types, stream, mr);
-
-    auto t2_decode = clock::now();
-
-    size_t total_rows = col_scans.empty() ? 0 : col_scans[0].data.total_rows;
     batches.push_back(sirius::make_data_batch(std::move(gpu_table), *g.gpu_space()));
 
     SIRIUS_LOG_INFO(
       "[gpu_native_scan] task {}: {} rows, {} cols | "
-      "pin={:.1f}ms decode={:.1f}ms total={:.1f}ms (rg {}-{})",
+      "pin={:.1f}ms decode={:.1f}ms total={:.1f}ms (rg {}-{}) region={}",
       task_id_,
       total_rows,
       num_cols,
-      us(t0, t1_pin) / 1000.0,
-      us(t1_pin, t2_decode) / 1000.0,
-      us(t0, t2_decode) / 1000.0,
+      pin_ms,
+      decode_ms,
+      pin_ms + decode_ms,
       range->start_idx,
-      range->start_idx + range->count - 1);
+      range->start_idx + range->count - 1,
+      preloaded == nullptr
+        ? "none"
+        : (region->m == sirius::op::scan::scan_region::mode::ENCODED ? "enc" : "dec"));
 
     ++batches_this_task;
     if (batches_this_task < MAX_BATCHES_PER_TASK) {

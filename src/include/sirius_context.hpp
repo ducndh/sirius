@@ -19,6 +19,7 @@
 #include "creator/task_creator.hpp"
 #include "downgrade/downgrade_executor.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/scan_region.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "planner/query.hpp"
@@ -155,6 +156,22 @@ class SiriusContext : public ClientContextState {
   /// \brief Get the current Sirius configuration (mutable, e.g. for SET command callbacks).
   [[nodiscard]] sirius::sirius_config& get_config() noexcept { return config_; }
 
+  /// \brief Snapshot the active preloaded scan_region (or nullptr if none).
+  /// Returns a shared_ptr so the scan task can hold the region alive for the
+  /// duration of its compute_task even if gpu_release_region() races.
+  [[nodiscard]] std::shared_ptr<sirius::op::scan::scan_region> get_active_region() const noexcept
+  {
+    std::lock_guard<std::mutex> g(active_region_mu_);
+    return active_region_;
+  }
+
+  /// \brief Replace the active preloaded scan_region. Pass nullptr to clear.
+  void set_active_region(std::shared_ptr<sirius::op::scan::scan_region> region) noexcept
+  {
+    std::lock_guard<std::mutex> g(active_region_mu_);
+    active_region_ = std::move(region);
+  }
+
  private:
   void throw_if_not_initialized() const;
 
@@ -174,6 +191,12 @@ class SiriusContext : public ClientContextState {
   std::vector<std::unique_ptr<sirius::parallel::downgrade_executor>> downgrade_executors_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
   duckdb::shared_ptr<sirius::planner::query> query_;
+
+  // Per-experiment preloaded scan staging area. Set/cleared by SQL functions
+  // gpu_preload_region(...) and gpu_release_region(); read by the scan task.
+  // Spans across multiple gpu_execution(...) calls within one connection.
+  mutable std::mutex active_region_mu_;
+  std::shared_ptr<sirius::op::scan::scan_region> active_region_;
 };
 
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius
