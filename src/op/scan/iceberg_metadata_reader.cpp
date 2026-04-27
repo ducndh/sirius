@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -88,9 +89,11 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
 
   auto meta_result = conn.Query(query);
   if (meta_result->HasError()) {
-    SIRIUS_LOG_WARN(
-      "[iceberg] iceberg_metadata() failed for '{}': {}", table_path, meta_result->GetError());
-    return result;
+    // Returning an empty discovery here would silently treat a V2/V3 table as
+    // V1 (no deletes), producing wrong results. Throw so the outer
+    // read_iceberg_delete_data converts it into a query failure.
+    throw std::runtime_error("[iceberg] iceberg_metadata() failed for '" + table_path +
+                             "': " + meta_result->GetError());
   }
 
   static constexpr auto kPositionDeletes = "POSITION_DELETES";
@@ -100,7 +103,13 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
 
   // Cache manifest reads by path to avoid N+1 re-reads for multiple DVs
   // in the same manifest (iceberg_metadata() doesn't expose DV-specific fields).
+  // We track "visited" separately from "cached non-empty" because an empty
+  // result (manifest with no DV entries that interest us) is a perfectly
+  // valid outcome — without the visited set, the empty-vector check would
+  // re-trigger read_iceberg_manifest_entries() on every DV row whose
+  // manifest had no matching DV entry.
   std::unordered_map<std::string, std::vector<IcebergDeleteFileEntry>> dv_manifest_cache;
+  std::unordered_set<std::string> dv_manifest_visited;
 
   while (true) {
     auto chunk = meta_result->Fetch();
@@ -119,7 +128,9 @@ IcebergManifestDiscovery discover_from_manifests(duckdb::ClientContext& context,
           // Avro reader for the containing manifest.
           auto manifest_path = chunk->GetValue(4, i).ToString();
           auto& cached       = dv_manifest_cache[manifest_path];
-          if (cached.empty()) { cached = read_iceberg_manifest_entries(manifest_path, 1); }
+          if (dv_manifest_visited.insert(manifest_path).second) {
+            cached = read_iceberg_manifest_entries(manifest_path, 1);
+          }
           for (auto& dv : cached) {
             if (dv.is_deletion_vector()) { result.deletion_vector_entries.push_back(dv); }
           }
@@ -429,8 +440,18 @@ std::shared_ptr<const IcebergDeleteData> read_iceberg_delete_data(
     }
 
   } catch (std::exception const& e) {
-    SIRIUS_LOG_WARN("[iceberg] Failed for '{}': {}. Treating as V1.", table_path, e.what());
-    return std::make_shared<IcebergDeleteData>();
+    // Returning a fresh empty IcebergDeleteData here would silently drop any
+    // partially-materialized deletes and produce wrong query results — the
+    // caller would think the table is V1-with-no-deletes when it might be a
+    // V2/V3 table whose delete metadata we couldn't fully load. Re-throw so
+    // the query fails loudly rather than returning unfiltered data.
+    SIRIUS_LOG_ERROR(
+      "[iceberg] Failed loading delete metadata for '{}': {}. Failing query rather than "
+      "silently returning unfiltered data — this may indicate corrupt manifests, a missing "
+      "snapshot, or an unsupported manifest layout.",
+      table_path,
+      e.what());
+    throw;
   }
 
   return data;

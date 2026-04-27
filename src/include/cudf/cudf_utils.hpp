@@ -213,9 +213,17 @@ inline std::unique_ptr<cudf::scalar> value_to_cudf_scalar(duckdb::Value const& v
         numeric::scale_type{-static_cast<int32_t>(t.decimal_scale())},
         true,
         stream);
-    // For unsupported types (DECIMAL128, STRUCT, etc.), fall back to string.
-    // Better than crashing — the column will be STRING instead of native type.
-    default: return std::make_unique<cudf::string_scalar>(val.ToString(), true, stream);
+    // Unsupported types (DECIMAL128, STRUCT, etc.). Returning a string_scalar
+    // here was the previous behavior — it produced silent type-mismatch crashes
+    // downstream when concatenate / column operations expected the native type
+    // and got STRING instead. Throw so the caller falls back to CPU explicitly
+    // rather than producing GPU corruption later.
+    default:
+      throw duckdb::InvalidInputException(
+        "value_to_cudf_scalar: no scalar conversion for cudf type %d (sirius type %s) — "
+        "this code path needs CPU fallback rather than a string_scalar substitution.",
+        static_cast<int>(cudf_type.id()),
+        t.to_string());
   }
 }
 
@@ -342,9 +350,15 @@ inline std::unique_ptr<cudf::scalar> DuckDBValueToCudfScalar(Value const& val,
         numeric::scale_type{-DecimalType::GetScale(logical_type)},
         true,
         stream);
-    // For unsupported types (DECIMAL128, STRUCT, etc.), fall back to string.
-    // Better than crashing — the column will be STRING instead of native type.
-    default: return std::make_unique<cudf::string_scalar>(val.ToString(), true, stream);
+    // Unsupported types (DECIMAL128, STRUCT, etc.). See value_to_cudf_scalar
+    // — silently returning a string_scalar here causes downstream type-mismatch
+    // crashes (e.g. cudf::concatenate). Throw so the caller falls back to CPU.
+    default:
+      throw InvalidInputException(
+        "DuckDBValueToCudfScalar: no scalar conversion for cudf type %d (DuckDB type %s) — "
+        "this code path needs CPU fallback rather than a string_scalar substitution.",
+        static_cast<int>(cudf_type.id()),
+        logical_type.ToString());
   }
 }
 

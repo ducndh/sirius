@@ -34,6 +34,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -54,7 +55,20 @@ namespace {
 
 static std::vector<uint8_t> inflate_deflate(const uint8_t* data, size_t size)
 {
-  std::vector<uint8_t> out(size * 4);  // initial guess
+  // Cap the output buffer growth at 256 MiB to prevent OOM on a crafted input
+  // claiming an unbounded expansion ratio. Iceberg Avro manifests should not
+  // come close to this size in practice — a real production manifest is in
+  // the low-MB range.
+  constexpr size_t kMaxOutputBytes = size_t{256} << 20;
+
+  // miniz's avail_in is `unsigned int`; if the compressed block exceeds 4 GiB
+  // the cast silently truncates and we'd start decoding from byte 0 of the
+  // truncated stream. Refuse upfront — no legitimate Avro manifest is that big.
+  if (size > std::numeric_limits<unsigned int>::max()) {
+    throw std::runtime_error("avro: deflate input block exceeds 4 GiB (refusing to truncate)");
+  }
+
+  std::vector<uint8_t> out(std::min<size_t>(size * 4, kMaxOutputBytes));
   duckdb_miniz::mz_stream strm{};
   // -15 = raw deflate (no zlib/gzip header)
   int ret = duckdb_miniz::mz_inflateInit2(&strm, -15);
@@ -68,9 +82,14 @@ static std::vector<uint8_t> inflate_deflate(const uint8_t* data, size_t size)
     ret = duckdb_miniz::mz_inflate(&strm, duckdb_miniz::MZ_FINISH);
     if (ret == duckdb_miniz::MZ_STREAM_END) break;
     if (ret == duckdb_miniz::MZ_BUF_ERROR) {
+      if (out.size() >= kMaxOutputBytes) {
+        duckdb_miniz::mz_inflateEnd(&strm);
+        throw std::runtime_error(
+          "avro: deflate output exceeds 256 MiB cap (likely malformed or hostile input)");
+      }
       // Output buffer too small — grow and retry.
       size_t used = out.size() - strm.avail_out;
-      out.resize(out.size() * 2);
+      out.resize(std::min(out.size() * 2, kMaxOutputBytes));
       strm.next_out  = out.data() + used;
       strm.avail_out = static_cast<unsigned int>(out.size() - used);
     } else if (ret != duckdb_miniz::MZ_OK) {
@@ -92,12 +111,17 @@ static int64_t read_vlong(const uint8_t*& p, const uint8_t* end)
 {
   uint64_t n = 0;
   int shift  = 0;
+  // Avro varints are at most 10 bytes (9 continuation bytes + 1 final), encoding
+  // 64 bits. Bounding shift < 64 prevents UB from `<< shift` past the type width
+  // on a malformed input stream that keeps emitting continuation bytes.
   while (p < end && (*p & 0x80u)) {
+    if (shift >= 64) { throw std::runtime_error("avro: variable-length integer exceeds 64 bits"); }
     n |= uint64_t(*p & 0x7Fu) << shift;
     shift += 7;
     ++p;
   }
   if (p >= end) { throw std::runtime_error("avro: truncated variable-length integer"); }
+  if (shift >= 64) { throw std::runtime_error("avro: variable-length integer exceeds 64 bits"); }
   n |= uint64_t(*p++) << shift;
   return int64_t((n >> 1) ^ -(n & 1));
 }
@@ -465,6 +489,14 @@ static void skip_avro_value(const AvroType& t, const uint8_t*& p, const uint8_t*
           }
           p += byte_count;
         } else {
+          // Bound count by the remaining bytes — even a 1-byte value can't fit
+          // more than (end - p) entries. A crafted manifest claiming 2^62 rows
+          // would otherwise spin in the inner loop until it ran out of bytes
+          // anyway, but we'd allocate / push into receiving structures along
+          // the way. Better to refuse upfront.
+          if (count > static_cast<int64_t>(end - p)) {
+            throw std::runtime_error("avro: array block row count exceeds remaining bytes");
+          }
           for (int64_t i = 0; i < count; ++i) {
             skip_avro_value(t.item_type(), p, end);
           }
@@ -482,6 +514,9 @@ static void skip_avro_value(const AvroType& t, const uint8_t*& p, const uint8_t*
           }
           p += byte_count;
         } else {
+          if (count > static_cast<int64_t>(end - p)) {
+            throw std::runtime_error("avro: map block row count exceeds remaining bytes");
+          }
           for (int64_t i = 0; i < count; ++i) {
             skip_bytes_val(p, end);  // key (always string in avro maps)
             skip_avro_value(t.item_type(), p, end);
@@ -751,13 +786,34 @@ std::vector<IcebergDeleteFileEntry> read_iceberg_manifest_entries(const std::str
 
   AvroHeader hdr = parse_avro_header(p, end);
 
+  // Top-level status field (int) — Iceberg manifest spec: 0=EXISTING, 1=ADDED, 2=DELETED.
+  // DELETED entries refer to data/delete files removed by later compaction; emitting them
+  // would cause us to look up files that no longer exist.
+  int status_idx = find_field(hdr.schema, "status");
+
   // Top-level sequence_number field (union [null, long]).
   int seq_idx = find_field(hdr.schema, "sequence_number");
 
   int df_idx = find_field(hdr.schema, "data_file");
   if (df_idx < 0) { throw std::runtime_error("avro: data_file field not found in manifest"); }
 
-  const AvroType& df_type = hdr.schema.record_fields[df_idx].type;
+  // Some Iceberg writers encode data_file as a nullable union ["null", record]
+  // rather than a bare record. Unwrap the non-null branch so find_field on the
+  // inner record fields works regardless of the writer's choice.
+  const AvroType& df_field_type = hdr.schema.record_fields[df_idx].type;
+  AvroType const* df_type_ptr   = &df_field_type;
+  if (df_field_type.kind == AvroKind::Union) {
+    for (auto const& branch : df_field_type.union_branches) {
+      if (branch.kind == AvroKind::Record) {
+        df_type_ptr = &branch;
+        break;
+      }
+    }
+    if (df_type_ptr->kind != AvroKind::Record) {
+      throw std::runtime_error("avro: data_file union has no record branch");
+    }
+  }
+  const AvroType& df_type = *df_type_ptr;
 
   // Locate all fields we care about inside data_file.
   // Required fields:
@@ -799,17 +855,46 @@ std::vector<IcebergDeleteFileEntry> read_iceberg_manifest_entries(const std::str
   AvroBlockDecoder block;
   while (block.next(p, end, hdr.codec)) {
     for (int64_t row = 0; row < block.count; ++row) {
-      // Read sequence_number from top-level before advancing to data_file.
-      int64_t entry_seq = 0;
-      if (seq_idx >= 0 && seq_idx < df_idx) {
-        advance_to_field(seq_idx, hdr.schema, block.data, block.end);
-        entry_seq =
-          read_optional_long(hdr.schema.record_fields[seq_idx].type, block.data, block.end);
-        for (int i = seq_idx + 1; i < df_idx; ++i) {
+      // Pre-data_file: read status (skip DELETED rows) and optional sequence_number.
+      // Both are nominally before data_file in the manifest entry schema.
+      int32_t entry_status = 1;  // default to ADDED if status field is missing
+      int64_t entry_seq    = 0;
+
+      // Walk top-level fields in order up to data_file, picking off status/seq.
+      for (int i = 0; i < df_idx; ++i) {
+        auto const& tf = hdr.schema.record_fields[i].type;
+        if (i == status_idx) {
+          entry_status = read_vint(block.data, block.end);
+        } else if (i == seq_idx) {
+          entry_seq = read_optional_long(tf, block.data, block.end);
+        } else {
+          skip_avro_value(tf, block.data, block.end);
+        }
+      }
+
+      // Skip DELETED entries (status=2): the file they reference has been
+      // removed by compaction and looking it up will fail.
+      if (entry_status == 2) {
+        // Still need to advance past data_file and any trailing fields.
+        skip_avro_value(df_field_type, block.data, block.end);
+        for (std::size_t i = df_idx + 1; i < hdr.schema.record_fields.size(); ++i) {
           skip_avro_value(hdr.schema.record_fields[i].type, block.data, block.end);
         }
-      } else {
-        advance_to_field(df_idx, hdr.schema, block.data, block.end);
+        continue;
+      }
+
+      // If data_file is wrapped in a [null, record] union, consume the branch tag
+      // before reading the record fields.
+      if (df_field_type.kind == AvroKind::Union) {
+        int64_t branch = read_vlong(block.data, block.end);
+        if (branch < 0 || static_cast<std::size_t>(branch) >= df_field_type.union_branches.size() ||
+            df_field_type.union_branches[branch].kind != AvroKind::Record) {
+          // Null branch (or unexpected) — entry has no data_file to read.
+          for (std::size_t i = df_idx + 1; i < hdr.schema.record_fields.size(); ++i) {
+            skip_avro_value(hdr.schema.record_fields[i].type, block.data, block.end);
+          }
+          continue;
+        }
       }
 
       IcebergDeleteFileEntry entry;

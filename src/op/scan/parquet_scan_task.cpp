@@ -706,16 +706,34 @@ void parquet_scan_task_global_state::build_schema_reconciliation(
     auto it                                          = file_col_sets.find(file_path);
     if (it != file_col_sets.end()) { file_cols = &it->second; }
 
+    // Release the input table once so we can MOVE its columns into the output
+    // (zero-copy). Calling `cudf::column(column_view, stream)` per column would
+    // deep-copy GPU memory — wasteful and unnecessary.
+    auto data_columns        = tbl->release();
+    auto const num_data_cols = static_cast<size_t>(data_columns.size());
+
     std::vector<std::unique_ptr<cudf::column>> out;
     out.reserve(output_cols.size());
 
-    cudf::size_type data_col = 0;
+    size_t data_col = 0;
     for (auto const& col : output_cols) {
-      bool in_parquet =
-        col.always_partition ? false : (file_cols ? file_cols->count(col.name) > 0 : true);
+      // When file_cols is null (path lookup miss — see file_col_sets keying
+      // assumption above) we fall through to "treat as data column," but only
+      // if the per-file batch actually still has a column to consume. Without
+      // this guard, an unmatched lookup could read past the end of data_columns
+      // (UB / crash in release builds).
+      bool const in_parquet = col.always_partition ? false
+                                                   : (file_cols ? file_cols->count(col.name) > 0
+                                                                : data_col < num_data_cols);
 
       if (in_parquet) {
-        out.push_back(std::make_unique<cudf::column>(tbl->get_column(data_col++), stream));
+        if (data_col >= num_data_cols) {
+          throw std::runtime_error(
+            "[schema_reconciliation] output_layout expects more data columns "
+            "than the parquet batch produced (file: " +
+            file_path + ")");
+        }
+        out.push_back(std::move(data_columns[data_col++]));
       } else {
         auto pit = partitions.find(col.name);
         if (pit != partitions.end()) {

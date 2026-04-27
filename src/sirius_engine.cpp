@@ -265,7 +265,14 @@ static std::string resolve_iceberg_table_path(op::sirius_physical_table_scan& sc
 {
   if (!scan_op.parameters.empty()) { return scan_op.parameters[0].ToString(); }
 
-  // REST catalog: derive from bind_data file list.
+  // REST catalog: derive from bind_data file list. The heuristic strips
+  // "/data/" — the convention for files under an Iceberg table root — to get
+  // back to the metadata location. This is fragile for non-standard layouts
+  // (e.g. tables that put parquet files at the table root or in a custom
+  // subdirectory). When the heuristic fails we currently return empty, and
+  // the caller treats the table as having no deletes — which silently
+  // produces wrong results for V2/V3 tables with deletes. Log loudly so the
+  // failure is visible.
   if (scan_op.bind_data) {
     auto& bind_data = scan_op.bind_data->Cast<duckdb::MultiFileBindData>();
     if (bind_data.file_list && !bind_data.file_list->IsEmpty()) {
@@ -275,6 +282,11 @@ static std::string resolve_iceberg_table_path(op::sirius_physical_table_scan& sc
         // Strip "/data/<filename>" to get table root.
         auto data_pos = first_path.rfind("/data/");
         if (data_pos != std::string::npos) { return first_path.substr(0, data_pos); }
+        SIRIUS_LOG_WARN(
+          "[iceberg] resolve_iceberg_table_path: file '{}' has no '/data/' segment — "
+          "REST-catalog table-root heuristic failed. Iceberg deletes will NOT be applied "
+          "for this scan.",
+          first_path);
       }
     }
   }
