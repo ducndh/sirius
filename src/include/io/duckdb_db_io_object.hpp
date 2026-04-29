@@ -11,10 +11,6 @@
 #include <memory>
 #include <string>
 
-namespace duckdb {
-class BlockManager;
-}  // namespace duckdb
-
 namespace sirius::io {
 
 //===----------------------------------------------------------------------===//
@@ -70,16 +66,13 @@ class duckdb_db_io_object : public sirius_io_object {
  public:
   /// Construct from a resolved absolute path. Reads file size via stat().
   /// Throws on stat failure (file missing, permission denied).
-  explicit duckdb_db_io_object(std::string absolute_path);
-
-  /// Construct from a DuckDB BlockManager. Resolves the path via the
-  /// BlockManager's underlying file handle and queries size via the
-  /// BlockManager's metadata.
   ///
-  /// WIP: today this delegates to the path-based ctor by querying the
-  /// BlockManager's path. A future iteration may use BlockManager APIs
-  /// directly to avoid the filesystem hop and pick up live size updates.
-  explicit duckdb_db_io_object(duckdb::BlockManager& block_manager);
+  /// TODO: a BlockManager-based ctor is the natural API for the
+  /// `direct_block_scan` integration but the right BlockManager accessor
+  /// for the underlying file path isn't settled yet (DuckDB's BufferManager
+  /// → BlockManager → filesystem path traversal is private). Settle the
+  /// API before wiring into direct_block_scan, then add an overload here.
+  explicit duckdb_db_io_object(std::string absolute_path);
 
   ~duckdb_db_io_object() override = default;
 

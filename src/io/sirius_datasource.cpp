@@ -107,8 +107,18 @@ size_t copy_pinned_slices_to_device(
   size_t attrs_idx      = 0;
   size_t fail_idx       = 0;
 
-  auto err = cudaMemcpyBatchAsync(
-    dsts.data(), srcs.data(), sizes.data(), n_nonempty, &attrs, &attrs_idx, 1, stream.value());
+  // CUDA 12.9 / 13: cudaMemcpyBatchAsync gained a `failIdx*` arg (8th param)
+  // before the stream. Casting srcs to void** since the API takes non-const
+  // pointers — the data isn't actually mutated.
+  auto err = cudaMemcpyBatchAsync(dsts.data(),
+                                  const_cast<void**>(srcs.data()),
+                                  sizes.data(),
+                                  n_nonempty,
+                                  &attrs,
+                                  &attrs_idx,
+                                  1,
+                                  &fail_idx,
+                                  stream.value());
   if (err != cudaSuccess)
     throw std::runtime_error(std::string("sirius_ioctx: cudaMemcpyBatchAsync failed at idx ") +
                              std::to_string(fail_idx) + ": " + cudaGetErrorString(err));

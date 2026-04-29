@@ -5,8 +5,6 @@
 
 #include "io/duckdb_db_io_object.hpp"
 
-#include <duckdb/storage/block_manager.hpp>
-
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -40,17 +38,6 @@ duckdb_db_io_object::duckdb_db_io_object(std::string absolute_path)
     throw std::invalid_argument("[duckdb_db_io_object] absolute_path must be non-empty");
   }
   _size_bytes = stat_file_size(_absolute_path);
-}
-
-duckdb_db_io_object::duckdb_db_io_object(duckdb::BlockManager& block_manager)
-  : duckdb_db_io_object(block_manager.GetDB().GetCatalog().GetName())
-{
-  // WIP: this ctor delegates to the path-based ctor via a BlockManager → path
-  // lookup. The above line uses the catalog name as a stand-in; it's almost
-  // certainly wrong for non-default attached databases. Once we know which
-  // BlockManager API exposes the underlying file path, swap to that.
-  // TODO: replace with `block_manager.GetMetadataManager().GetMetadataFile()`
-  // or equivalent path accessor before wiring into direct_block_scan.
 }
 
 }  // namespace sirius::io
