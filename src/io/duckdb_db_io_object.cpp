@@ -5,10 +5,11 @@
 
 #include "io/duckdb_db_io_object.hpp"
 
+#include <sys/stat.h>
+
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
-#include <sys/stat.h>
 #include <utility>
 
 namespace sirius::io {
@@ -17,10 +18,10 @@ namespace {
 
 std::size_t stat_file_size(std::string const& path)
 {
-  struct ::stat st {};
+  struct ::stat st{};
   if (::stat(path.c_str(), &st) != 0) {
-    throw std::runtime_error(
-      "[duckdb_db_io_object] stat() failed for '" + path + "': " + std::strerror(errno));
+    throw std::runtime_error("[duckdb_db_io_object] stat() failed for '" + path +
+                             "': " + std::strerror(errno));
   }
   if (st.st_size < 0) {
     throw std::runtime_error("[duckdb_db_io_object] stat() returned negative size for '" + path +

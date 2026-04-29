@@ -67,22 +67,21 @@ TEST_CASE("duckdb_native_split_provider - rejects mismatched row_groups/row_grou
           "[scan_manager][duckdb_native_split_provider]")
 {
   duckdb_native_scan_info info;
-  info.storage = reinterpret_cast<duckdb::DataTable*>(0x1);
-  info.context = reinterpret_cast<duckdb::ClientContext*>(0x1);
+  info.storage          = reinterpret_cast<duckdb::DataTable*>(0x1);
+  info.context          = reinterpret_cast<duckdb::ClientContext*>(0x1);
   info.row_groups       = {reinterpret_cast<duckdb::RowGroup*>(0x1),
                            reinterpret_cast<duckdb::RowGroup*>(0x2)};
   info.row_group_starts = {0};
   REQUIRE_THROWS_AS(duckdb_native_split_provider{std::move(info)}, std::invalid_argument);
 }
 
-TEST_CASE(
-  "duckdb_native_split_provider - rejects mismatched projected_cols/projected_types",
-  "[scan_manager][duckdb_native_split_provider]")
+TEST_CASE("duckdb_native_split_provider - rejects mismatched projected_cols/projected_types",
+          "[scan_manager][duckdb_native_split_provider]")
 {
   duckdb_native_scan_info info;
-  info.storage    = reinterpret_cast<duckdb::DataTable*>(0x1);
-  info.context    = reinterpret_cast<duckdb::ClientContext*>(0x1);
-  info.row_groups = {reinterpret_cast<duckdb::RowGroup*>(0x1)};
+  info.storage          = reinterpret_cast<duckdb::DataTable*>(0x1);
+  info.context          = reinterpret_cast<duckdb::ClientContext*>(0x1);
+  info.row_groups       = {reinterpret_cast<duckdb::RowGroup*>(0x1)};
   info.row_group_starts = {0};
   info.projected_cols   = {projected_column{}, projected_column{}};
   info.projected_types  = {};

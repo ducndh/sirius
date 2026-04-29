@@ -16,8 +16,7 @@
 
 namespace sirius::scan_manager {
 
-duckdb_native_split_provider::duckdb_native_split_provider(
-  op::scan::duckdb_native_scan_info info)
+duckdb_native_split_provider::duckdb_native_split_provider(op::scan::duckdb_native_scan_info info)
   : _info(std::move(info))
 {
   if (_info.storage == nullptr) {

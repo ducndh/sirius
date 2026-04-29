@@ -77,8 +77,7 @@ class duckdb_native_split_provider : public split_provider {
   /// in `op::operator_data` so it flows through the existing connector
   /// machinery. The consumer (gpu duckdb-native scan operator) downcasts.
   struct split_payload : public op::operator_data {
-    explicit split_payload(op::scan::partitioned_duckdb_native_metadata m)
-      : metadata(std::move(m))
+    explicit split_payload(op::scan::partitioned_duckdb_native_metadata m) : metadata(std::move(m))
     {
     }
     op::scan::partitioned_duckdb_native_metadata metadata;
