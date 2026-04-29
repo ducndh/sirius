@@ -7,6 +7,7 @@
 
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/duckdb_native_scan_info.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "scan_manager/split_provider.hpp"
 
 #include <cstddef>
