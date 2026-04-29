@@ -241,6 +241,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_recursive_cte.cpp
     src/planner/sirius_plan_top_n.cpp
+    src/scan_manager/duckdb_native_split_provider.cpp
     src/scan_manager/parquet_split_provider.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
@@ -398,6 +399,7 @@ set(TEST_SOURCES
     test/cpp/scan/test_parquet_scan_task.cpp
     test/cpp/scan/test_scan_executor.cpp
     test/cpp/scan/test_split_connector.cpp
+    test/cpp/scan/test_duckdb_native_split_provider.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/sirius_test_env.cpp
     test/cpp/utils/utils.cpp)
