@@ -159,6 +159,7 @@ set(EXTENSION_SOURCES
     src/expression_executor/specializations/gpu_execute_operator.cpp
     src/expression_executor/specializations/gpu_execute_reference.cpp
     src/io/admission_control.cpp
+    src/io/duckdb_db_io_object.cpp
     src/io/prefetching_cache.cpp
     src/io/sirius_datasource.cpp
     src/io/uring/uring_ioctx.cpp
@@ -366,6 +367,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_native_scan.cpp
     test/cpp/integration/test_transparent_execution.cpp
+    test/cpp/io/test_duckdb_db_io_object.cpp
     test/cpp/memory/test_host_table_utils.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
