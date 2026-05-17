@@ -375,8 +375,6 @@ pinned_segment_bytes decode_roaring_validity(duckdb::DatabaseInstance& db,
   return out;
 }
 
-<<<<<<< HEAD
-=======
 //===----------------------------------------------------------------------===//
 // Per-split staging
 //===----------------------------------------------------------------------===//
@@ -464,7 +462,6 @@ pinned_segment_bytes read_block_payload(::sirius::io::sirius_ioctx* io_ctx,
   if (via_io) {
     if (additional_block_ids.empty()) {
       return read_block_via_io(*io_ctx, *io_obj, bm, block_id, block_offset);
->>>>>>> 9e9bda03 (fix(native-scan): pad staging dst_offset to 16B per segment)
     }
     staged_cols.push_back(stage_one_column(pinned,
                                            src_ptrs,

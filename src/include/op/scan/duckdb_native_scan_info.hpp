@@ -20,7 +20,9 @@
 #include "op/scan/duckdb_native_metadata.hpp"
 #include "op/scan/scan_info.hpp"
 
+#include <duckdb/common/types/column/column_data_collection.hpp>
 #include <duckdb/main/client_context.hpp>
+#include <duckdb/planner/table_filter.hpp>
 #include <duckdb/storage/data_table.hpp>
 
 #include <cstddef>
@@ -39,8 +41,19 @@ struct duckdb_native_scan_info : public scan_info {
   duckdb::DataTable* storage     = nullptr;
   duckdb::ClientContext* context = nullptr;
 
+  // projected_cols / projected_types are sized to the FULL scan output (includes filter-only
+  // columns appended by sirius_plan_get.cpp). Filter application + projection down to
+  // output_types happens inside decode_duckdb_native_split.
   std::vector<projected_column> projected_cols;
   std::vector<sirius::logical_type> projected_types;
+
+  // Context for table_filter application inside the scan task. Mirrors what
+  // sirius_physical_table_scan carries.
+  duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
+  duckdb::vector<duckdb::ColumnIndex> column_ids;
+  duckdb::vector<duckdb::idx_t> projection_ids;
+  duckdb::vector<sirius::logical_type> returned_types;
+  duckdb::vector<sirius::logical_type> output_types;
 
   std::string db_path;
 
