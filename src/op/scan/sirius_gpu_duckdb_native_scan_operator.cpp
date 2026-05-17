@@ -15,8 +15,11 @@
  */
 
 #include <data/data_batch_utils.hpp>
+#include <expression/expression.hpp>
+#include <expression_executor/gpu_expression_executor.hpp>
 #include <log/logging.hpp>
 #include <op/scan/duckdb_native_scan_task.hpp>
+#include <op/scan/scan_utils.hpp>
 #include <op/scan/sirius_gpu_duckdb_native_scan_operator.hpp>
 #include <scan_manager/duckdb_native_split_provider.hpp>
 #include <scan_manager/split_connector.hpp>
@@ -24,6 +27,7 @@
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cudf/utilities/default_stream.hpp>
 
 #include <stdexcept>
 #include <utility>
@@ -103,6 +107,54 @@ std::unique_ptr<operator_data> sirius_gpu_duckdb_native_scan_operator::execute(
     split->row_groups.size(),
     table->num_rows(),
     table->num_columns());
+
+  // Mirror sirius_physical_table_scan::execute(): apply table_filters via gpu_expression_executor,
+  // then project filter-only columns away. The decode emits columns in `source_ids` order
+  // (= projection_ids unsorted), so we build a custom column_index → batch_position map
+  // rather than using build_batch_column_map (which sorts by column index).
+  auto const& info = *split->scan_info;
+  auto mr_ref      = mem_space->get_default_allocator();
+
+  auto const& source_ids = !info.projection_ids.empty()
+                             ? info.projection_ids
+                             : [&] {
+                                 duckdb::vector<duckdb::idx_t> all;
+                                 all.reserve(info.column_ids.size());
+                                 for (duckdb::idx_t i = 0; i < info.column_ids.size(); ++i) {
+                                   all.push_back(i);
+                                 }
+                                 return all;
+                               }();
+
+  std::vector<std::optional<std::size_t>> emission_order_map(info.column_ids.size());
+  for (std::size_t k = 0; k < source_ids.size(); ++k) {
+    emission_order_map[source_ids[k]] = k;
+  }
+
+  if (info.table_filters && !info.table_filters->filters.empty()) {
+    auto filter_expr_duckdb = convert_table_filters_to_expression(
+      *info.table_filters, info.column_ids, info.returned_types, emission_order_map);
+    if (filter_expr_duckdb) {
+      auto filter_expr = sirius::wrap(std::move(filter_expr_duckdb));
+      sirius::gpu_expression_executor exec(filter_expr, mr_ref, stream);
+      table = exec.select(table->view());
+    }
+  }
+
+  // Project down to output_types if the scan emitted trailing filter-only columns.
+  // After filtering, scan_output emission order matches source_ids, so the first
+  // output_types.size() positions are the original projection columns.
+  std::size_t const expected_out = info.output_types.size();
+  if (expected_out > 0 &&
+      static_cast<std::size_t>(table->num_columns()) > expected_out) {
+    auto cols = table->release();
+    std::vector<std::unique_ptr<cudf::column>> selected;
+    selected.reserve(expected_out);
+    for (std::size_t i = 0; i < expected_out; ++i) {
+      selected.push_back(std::move(cols[i]));
+    }
+    table = std::make_unique<cudf::table>(std::move(selected));
+  }
 
   auto batch = sirius::make_data_batch(std::move(table), *mem_space);
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
