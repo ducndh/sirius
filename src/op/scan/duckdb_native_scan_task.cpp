@@ -112,6 +112,7 @@ bool is_supported_fixed_width_codec(duckdb::CompressionType c)
 bool is_supported_varchar_codec(duckdb::CompressionType c)
 {
   switch (c) {
+    case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
     case duckdb::CompressionType::COMPRESSION_DICTIONARY:
     case duckdb::CompressionType::COMPRESSION_FSST:
     case duckdb::CompressionType::COMPRESSION_DICT_FSST: return true;
