@@ -302,9 +302,13 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
                                                                return all;
                                                              }();
 
+  // Emit ALL source_ids columns from the scan (includes filter-only columns appended by
+  // sirius_plan_get.cpp's pushdown-merge); decode_duckdb_native_split applies table_filters
+  // and projects down to scan_op.types — same pattern as sirius_physical_table_scan::execute.
   scan_info->projected_cols.reserve(source_ids.size());
   scan_info->projected_types.reserve(source_ids.size());
-  for (auto pid : source_ids) {
+  for (std::size_t k = 0; k < source_ids.size(); ++k) {
+    auto pid            = source_ids[k];
     auto const& col_idx = scan_op.column_ids[pid];
     op::scan::projected_column pc;
     pc.is_rowid = col_idx.IsRowIdColumn();
@@ -312,8 +316,27 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
       pc.storage_idx = duckdb::StorageIndex(col_idx.GetPrimaryIndex());
     }
     scan_info->projected_cols.push_back(pc);
-    scan_info->projected_types.push_back(scan_op.types[pid]);
+
+    sirius::logical_type t;
+    if (k < scan_op.types.size()) {
+      t = scan_op.types[k];
+    } else {
+      t = scan_op.returned_types.at(col_idx.GetPrimaryIndex());
+    }
+    scan_info->projected_types.push_back(t);
   }
+
+  // Pass filter context to decode_duckdb_native_split.
+  if (scan_op.table_filters) {
+    scan_info->table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+    for (auto& [col_idx, filt] : scan_op.table_filters->filters) {
+      scan_info->table_filters->filters[col_idx] = filt->Copy();
+    }
+  }
+  scan_info->column_ids       = scan_op.column_ids;
+  scan_info->projection_ids   = scan_op.projection_ids;
+  scan_info->returned_types   = scan_op.returned_types;
+  scan_info->output_types     = scan_op.types;
 
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_duckdb_native_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));
