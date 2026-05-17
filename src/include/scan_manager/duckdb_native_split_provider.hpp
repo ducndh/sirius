@@ -37,6 +37,11 @@ class duckdb_native_split_provider : public split_provider {
     std::shared_ptr<op::scan::duckdb_native_scan_info const> scan_info;
   };
 
+  struct row_group_batch {
+    std::size_t first_idx;
+    std::size_t count;
+  };
+
   explicit duckdb_native_split_provider(op::scan::duckdb_native_scan_info info);
 
   ~duckdb_native_split_provider() override;
@@ -51,11 +56,6 @@ class duckdb_native_split_provider : public split_provider {
   std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override;
 
  private:
-  struct row_group_batch {
-    std::size_t first_idx;
-    std::size_t count;
-  };
-
   std::shared_ptr<op::scan::duckdb_native_scan_info const> _scan_info;
   op::scan::duckdb_native_metadata _metadata;
   std::vector<row_group_batch> _batches;
