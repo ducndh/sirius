@@ -16,10 +16,16 @@
 
 #include "pipeline/sirius_pipeline_converter.hpp"
 
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
 #include "duckdb/common/shared_ptr_ipp.hpp"
+#include "duckdb/function/table/table_scan.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 #include "log/logging.hpp"
 #include "op/scan/parquet_scan_info.hpp"
+#include "op/scan/duckdb_native_scan_info.hpp"
+#include "op/scan/sirius_gpu_duckdb_native_scan_operator.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_concat.hpp"
@@ -104,8 +110,12 @@ sirius_pipeline_converter::sirius_pipeline_converter(
   const pipeline_build_context& ctx,
   const sirius::operator_params& op_params,
   const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
-    iceberg_cache)
-  : build_ctx_(ctx), op_params_(op_params), iceberg_cache_(iceberg_cache)
+    iceberg_cache,
+  duckdb::ClientContext* client_context)
+  : build_ctx_(ctx),
+    op_params_(op_params),
+    iceberg_cache_(iceberg_cache),
+    client_context_(client_context)
 {
 }
 
@@ -256,6 +266,62 @@ void sirius_pipeline_converter::insert_parquet_scan_operator(
   inserted_operators_.push_back(std::move(gpu_scan_op));
 }
 
+void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
+  duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
+{
+  auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
+  if (!scan_op.bind_data) {
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] seq_scan has no bind_data");
+  }
+  auto& bind_data = scan_op.bind_data->Cast<duckdb::TableScanBindData>();
+  auto& table     = bind_data.table.Cast<duckdb::DuckTableEntry>();
+
+  if (client_context_ == nullptr) {
+    throw std::runtime_error(
+      "[sirius_pipeline_converter::insert_duckdb_native_scan_operator] no client_context passed "
+      "to converter; seq_scan GPU-native path requires it");
+  }
+
+  auto scan_info             = std::make_unique<op::scan::duckdb_native_scan_info>();
+  scan_info->storage         = &table.GetStorage();
+  scan_info->context         = client_context_;
+  scan_info->db_path         = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
+  scan_info->approximate_batch_size = op_params_.scan_task_batch_size;
+
+  auto const& source_ids = !scan_op.projection_ids.empty() ? scan_op.projection_ids
+                                                           : [&] {
+                                                               std::vector<std::size_t> all;
+                                                               all.reserve(scan_op.column_ids.size());
+                                                               for (std::size_t i = 0;
+                                                                    i < scan_op.column_ids.size();
+                                                                    ++i) {
+                                                                 all.push_back(i);
+                                                               }
+                                                               return all;
+                                                             }();
+
+  scan_info->projected_cols.reserve(source_ids.size());
+  scan_info->projected_types.reserve(source_ids.size());
+  for (auto pid : source_ids) {
+    auto const& col_idx = scan_op.column_ids[pid];
+    op::scan::projected_column pc;
+    pc.is_rowid = col_idx.IsRowIdColumn();
+    if (!pc.is_rowid) {
+      pc.storage_idx = duckdb::StorageIndex(col_idx.GetPrimaryIndex());
+    }
+    scan_info->projected_cols.push_back(pc);
+    scan_info->projected_types.push_back(scan_op.types[pid]);
+  }
+
+  auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_duckdb_native_scan_operator>(
+    scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));
+
+  auto* gpu_scan_ptr = gpu_scan_op.get();
+  current_pipeline->operators.insert(current_pipeline->operators.begin(), *gpu_scan_ptr);
+  inserted_operators_.push_back(std::move(gpu_scan_op));
+}
+
 void sirius_pipeline_converter::split_table_scan_source(
   duckdb::shared_ptr<sirius_pipeline>& current_pipeline)
 {
@@ -265,6 +331,11 @@ void sirius_pipeline_converter::split_table_scan_source(
   // If parquet scan, route to metadata scan + gpu scan operator pipeline
   if (scan_op.function.name == "parquet_scan" || scan_op.function.name == "read_parquet") {
     insert_parquet_scan_operator(current_pipeline);
+    return;
+  }
+
+  if (scan_op.function.name == "seq_scan" && op_params_.enable_gpu_duckdb_native_scan) {
+    insert_duckdb_native_scan_operator(current_pipeline);
     return;
   }
 
@@ -1140,6 +1211,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<void*>(scan_port->repo));
         }
       } else if (first_op.type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
+                 first_op.type == op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  first_op.type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||
@@ -1184,6 +1256,7 @@ void sirius_pipeline_converter::log_pipeline_debug_info() const
                           static_cast<void*>(scan_port->repo));
         }
       } else if (sink->type == op::SiriusPhysicalOperatorType::GPU_PARQUET_SCAN ||
+                 sink->type == op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::ICEBERG_SCAN ||
                  sink->type == op::SiriusPhysicalOperatorType::CPU_SOURCE ||

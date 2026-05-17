@@ -44,6 +44,7 @@ class buffer_pool;
 
 namespace sirius::op::scan {
 class sirius_gpu_parquet_scan_operator;
+class sirius_gpu_duckdb_native_scan_operator;
 }  // namespace sirius::op::scan
 
 namespace sirius::planner {
@@ -229,6 +230,11 @@ class sirius_scan_manager {
   std::unique_ptr<split_provider> create_provider_for(
     op::scan::sirius_gpu_parquet_scan_operator* op);
 
+  /// \brief Interim factory for the duckdb-native scan path. Replaced when
+  ///        Kevin's PR-F (polymorphic scan_info + virtual make_provider) lands.
+  std::unique_ptr<split_provider> create_provider_for(
+    op::scan::sirius_gpu_duckdb_native_scan_operator* op);
+
   /// \brief Run providers sequentially: start each, wait on its future, advance.
   void start_metadata_processing();
 
@@ -244,6 +250,10 @@ class sirius_scan_manager {
   std::unordered_map<op::scan::sirius_gpu_parquet_scan_operator*, std::unique_ptr<split_provider>>
     _providers_by_op;
   std::vector<op::scan::sirius_gpu_parquet_scan_operator*> _scan_op_order;
+  std::unordered_map<op::scan::sirius_gpu_duckdb_native_scan_operator*,
+                     std::unique_ptr<split_provider>>
+    _duckdb_native_providers_by_op;
+  std::vector<op::scan::sirius_gpu_duckdb_native_scan_operator*> _duckdb_native_scan_op_order;
   std::unordered_map<std::string, pinned_entry> _pinned_entries;
 };
 
