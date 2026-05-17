@@ -23,6 +23,7 @@
 
 #include "op/scan/duckdb_native_scan_task.hpp"
 
+#include "cuda/scan/gpu_decode_strings.cuh"
 #include "cuda/scan/gpu_native_decode.cuh"
 #include "cudf/cudf_utils.hpp"
 #include "helper/type_conversions.hpp"
@@ -46,15 +47,25 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <duckdb/common/types/validity_mask.hpp>
+#include <duckdb/common/types/vector.hpp>
+#include <duckdb/function/partition_stats.hpp>
 #include <duckdb/main/attached_database.hpp>
+#include <duckdb/main/database.hpp>
 #include <duckdb/storage/block_manager.hpp>
 #include <duckdb/storage/buffer/buffer_handle.hpp>
 #include <duckdb/storage/buffer_manager.hpp>
+#include <duckdb/storage/compression/roaring/roaring.hpp>
+#include <duckdb/storage/statistics/base_statistics.hpp>
+#include <duckdb/storage/statistics/numeric_stats.hpp>
+#include <duckdb/storage/statistics/string_stats.hpp>
 #include <duckdb/storage/storage_manager.hpp>
+#include <duckdb/storage/table/column_segment.hpp>
 
 #include <algorithm>
 #include <cstring>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -67,12 +78,15 @@ namespace {
 using ::sirius::cuda::scan::gpu_codec_run;
 using ::sirius::cuda::scan::gpu_column_decode_input;
 using ::sirius::cuda::scan::gpu_segment_desc;
+using ::sirius::cuda::scan::gpu_string_codec_run;
+using ::sirius::cuda::scan::gpu_string_column_decode_input;
+using ::sirius::cuda::scan::gpu_string_segment_desc;
 
 constexpr char const* kTag = "[sirius_gpu_duckdb_native_scan]";
 
 void throw_unsupported(std::string what)
 {
-  throw std::runtime_error(std::string(kTag) + " unsupported in V1 spike: " + std::move(what));
+  throw std::runtime_error(std::string(kTag) + " unsupported: " + std::move(what));
 }
 
 bool is_constant_or_empty_validity(duckdb::CompressionType c)
@@ -81,12 +95,23 @@ bool is_constant_or_empty_validity(duckdb::CompressionType c)
          c == duckdb::CompressionType::COMPRESSION_EMPTY;
 }
 
-bool is_supported_v1_data_codec(duckdb::CompressionType c)
+bool is_supported_fixed_width_codec(duckdb::CompressionType c)
 {
   switch (c) {
     case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
+    case duckdb::CompressionType::COMPRESSION_CONSTANT:
     case duckdb::CompressionType::COMPRESSION_RLE:
     case duckdb::CompressionType::COMPRESSION_BITPACKING: return true;
+    default: return false;
+  }
+}
+
+bool is_supported_varchar_codec(duckdb::CompressionType c)
+{
+  switch (c) {
+    case duckdb::CompressionType::COMPRESSION_DICTIONARY:
+    case duckdb::CompressionType::COMPRESSION_FSST:
+    case duckdb::CompressionType::COMPRESSION_DICT_FSST: return true;
     default: return false;
   }
 }
@@ -94,172 +119,411 @@ bool is_supported_v1_data_codec(duckdb::CompressionType c)
 bool column_has_real_nulls(duckdb_column_metadata const& col)
 {
   for (auto const& v : col.validity_segments) {
-    if (v.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) { return true; }
+    auto c = v.compression;
+    if (c == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED ||
+        c == duckdb::CompressionType::COMPRESSION_ROARING) {
+      return true;
+    }
   }
   return false;
 }
 
 cudf::data_type sirius_to_cudf_type(sirius::logical_type const& t)
 {
-  // Round-trip through DuckDB::LogicalType to reuse GetCudfType, which already
-  // handles DECIMAL precision/scale and timestamp units correctly.
   duckdb::vector<sirius::logical_type> wrap{t};
   auto duckdb_vec = sirius::to_duckdb_vec(wrap);
   return duckdb::GetCudfType(duckdb_vec[0]);
 }
 
+duckdb::LogicalType sirius_to_duckdb_type(sirius::logical_type const& t)
+{
+  duckdb::vector<sirius::logical_type> wrap{t};
+  auto duckdb_vec = sirius::to_duckdb_vec(wrap);
+  return duckdb_vec[0];
+}
+
 //===----------------------------------------------------------------------===//
-// Host-side block pinning
+// Host bytes for a segment.
 //
-// V1 uses BlockManager::RegisterBlock + BufferManager::Pin to get block-level
-// host bytes. Each pinned BufferHandle keeps the underlying buffer resident
-// for its lifetime; we hold a vector of them until the H2D memcpy is queued
-// on the stream. The kernel reads only what its codec header dictates, so
-// the bytes_size upper bound (block-end minus block_offset) is safe.
+// Three sources: a pinned BufferHandle (normal block), owned host bytes
+// (CONSTANT extracted from stats, ROARING host-decoded, or main+additional
+// blocks concatenated), or both (BufferHandle pinning the main block plus
+// owned bytes from the additional-block concat that follows). We keep the
+// handle alive until H2D is queued.
 //===----------------------------------------------------------------------===//
 
 struct pinned_segment_bytes {
-  duckdb::BufferHandle handle;
+  std::vector<duckdb::BufferHandle> handles;  // empty when source is owned_bytes only
+  std::vector<uint8_t> owned_bytes;           // used for CONSTANT, ROARING, concat
   uint8_t const* host_ptr = nullptr;
   std::size_t bytes       = 0;
 };
 
+// Pin a single block and return its host pointer + remaining bytes from
+// `block_offset` to end-of-block.
 pinned_segment_bytes pin_block(duckdb::BlockManager& block_manager,
                                duckdb::BufferManager& buffer_manager,
                                duckdb::block_id_t block_id,
                                std::size_t block_offset)
 {
-  if (block_id < 0) {
-    throw std::runtime_error(std::string(kTag) +
-                             " pin_block called with block_id<0 (CONSTANT segment?)");
-  }
-  auto handle  = block_manager.RegisterBlock(block_id);
-  auto pinned  = buffer_manager.Pin(handle);
-  auto* base   = pinned.Ptr();
-  auto bytes   = block_manager.GetBlockSize();
+  auto handle = block_manager.RegisterBlock(block_id);
+  auto pinned = buffer_manager.Pin(handle);
+  auto* base  = pinned.Ptr();
+  auto bytes  = block_manager.GetBlockSize();
   if (block_offset > bytes) {
     throw std::runtime_error(std::string(kTag) + " block_offset (" + std::to_string(block_offset) +
                              ") exceeds block size (" + std::to_string(bytes) + ")");
   }
   pinned_segment_bytes out;
-  out.handle   = std::move(pinned);
+  out.handles.push_back(std::move(pinned));
   out.host_ptr = base + block_offset;
   out.bytes    = bytes - block_offset;
   return out;
 }
 
+// Pin main block + each additional block; concatenate into one owned buffer.
+// The descriptor's block_offset applies only to the main block; additional
+// blocks are taken whole-block. The resulting buffer has main-block bytes
+// (from block_offset to end) followed by each additional block's full bytes.
+//
+// Whether the on-disk codec actually arranges its dictionary/heap to be
+// readable as one contiguous slab is codec-dependent. For FSST/DICT_FSST
+// inline-symbol-table segments the main block alone is enough; the concat
+// is here for codecs that visit_block_ids.
+pinned_segment_bytes pin_block_with_additional(
+  duckdb::BlockManager& block_manager,
+  duckdb::BufferManager& buffer_manager,
+  duckdb::block_id_t main_block_id,
+  std::size_t block_offset,
+  std::vector<duckdb::block_id_t> const& additional_block_ids)
+{
+  auto main_pinned       = block_manager.RegisterBlock(main_block_id);
+  auto main_handle       = buffer_manager.Pin(main_pinned);
+  auto block_size        = block_manager.GetBlockSize();
+  auto main_payload_size = block_size > block_offset ? block_size - block_offset : std::size_t{0};
+
+  std::vector<duckdb::BufferHandle> handles;
+  handles.push_back(std::move(main_handle));
+  std::vector<uint8_t> concat;
+  concat.resize(main_payload_size);
+  std::memcpy(concat.data(), handles.front().Ptr() + block_offset, main_payload_size);
+
+  for (auto add_id : additional_block_ids) {
+    auto add_handle = block_manager.RegisterBlock(add_id);
+    auto h          = buffer_manager.Pin(add_handle);
+    auto offset     = concat.size();
+    concat.resize(offset + block_size);
+    std::memcpy(concat.data() + offset, h.Ptr(), block_size);
+    handles.push_back(std::move(h));
+  }
+
+  pinned_segment_bytes out;
+  out.owned_bytes = std::move(concat);
+  out.handles     = std::move(handles);
+  out.host_ptr    = out.owned_bytes.data();
+  out.bytes       = out.owned_bytes.size();
+  return out;
+}
+
+//===----------------------------------------------------------------------===//
+// CONSTANT extraction.
+//
+// CONSTANT segments have block_id == -1; the constant value lives in
+// per-(rg, col) statistics. We pull stats from PartitionRowGroup at scan
+// time and copy the value into an owned buffer the kernel can read.
+//===----------------------------------------------------------------------===//
+
+template <typename T>
+void store_typed_min(duckdb::BaseStatistics const& stats, std::vector<uint8_t>& out)
+{
+  auto v = duckdb::NumericStats::GetMin<T>(stats);
+  out.resize(sizeof(T));
+  std::memcpy(out.data(), &v, sizeof(T));
+}
+
+pinned_segment_bytes extract_constant_bytes(duckdb::BaseStatistics const& stats,
+                                            sirius::logical_type const& sirius_type)
+{
+  auto duckdb_type = sirius_to_duckdb_type(sirius_type);
+  pinned_segment_bytes out;
+  switch (duckdb_type.InternalType()) {
+    case duckdb::PhysicalType::BOOL:
+    case duckdb::PhysicalType::INT8: store_typed_min<int8_t>(stats, out.owned_bytes); break;
+    case duckdb::PhysicalType::INT16: store_typed_min<int16_t>(stats, out.owned_bytes); break;
+    case duckdb::PhysicalType::INT32: store_typed_min<int32_t>(stats, out.owned_bytes); break;
+    case duckdb::PhysicalType::INT64: store_typed_min<int64_t>(stats, out.owned_bytes); break;
+    case duckdb::PhysicalType::UINT8: store_typed_min<uint8_t>(stats, out.owned_bytes); break;
+    case duckdb::PhysicalType::UINT16: store_typed_min<uint16_t>(stats, out.owned_bytes); break;
+    case duckdb::PhysicalType::UINT32: store_typed_min<uint32_t>(stats, out.owned_bytes); break;
+    case duckdb::PhysicalType::UINT64: store_typed_min<uint64_t>(stats, out.owned_bytes); break;
+    case duckdb::PhysicalType::FLOAT: store_typed_min<float>(stats, out.owned_bytes); break;
+    case duckdb::PhysicalType::DOUBLE: store_typed_min<double>(stats, out.owned_bytes); break;
+    default:
+      throw_unsupported("CONSTANT extraction for physical type " +
+                        std::to_string(static_cast<int>(duckdb_type.InternalType())));
+  }
+  out.host_ptr = out.owned_bytes.data();
+  out.bytes    = out.owned_bytes.size();
+  return out;
+}
+
+//===----------------------------------------------------------------------===//
+// ROARING validity host-decode.
+//
+// Walker output gives us block_id + block_offset + segment_count but no
+// ColumnSegment*. We reconstruct one via ColumnSegment::CreatePersistentSegment
+// (public factory) and drive RoaringScanState to fill a host bitmap. The
+// bitmap then ships to the device as plain UNCOMPRESSED validity.
+//===----------------------------------------------------------------------===//
+
+pinned_segment_bytes decode_roaring_validity(duckdb::DatabaseInstance& db,
+                                             duckdb::BlockManager& block_manager,
+                                             duckdb_segment_descriptor const& desc)
+{
+  auto validity_type = duckdb::LogicalType(duckdb::LogicalTypeId::VALIDITY);
+  auto seg           = duckdb::ColumnSegment::CreatePersistentSegment(
+    db,
+    block_manager,
+    desc.block_id,
+    desc.block_offset,
+    validity_type,
+    desc.segment_count,
+    duckdb::CompressionType::COMPRESSION_ROARING,
+    duckdb::BaseStatistics::CreateEmpty(validity_type),
+    /*segment_state=*/nullptr);
+
+  auto const row_count = static_cast<duckdb::idx_t>(desc.segment_count);
+  pinned_segment_bytes out;
+  std::size_t const words = (row_count + 63) / 64;
+  out.owned_bytes.assign(words * sizeof(uint64_t), 0xff);
+
+  duckdb::roaring::RoaringScanState rs(*seg);
+  constexpr duckdb::idx_t CHUNK =
+    static_cast<duckdb::idx_t>(duckdb::roaring::ROARING_CONTAINER_SIZE);
+  duckdb::Vector tmp(duckdb::LogicalType::BOOLEAN, CHUNK);
+
+  for (duckdb::idx_t scanned = 0; scanned < row_count; scanned += CHUNK) {
+    auto const to_scan = std::min<duckdb::idx_t>(CHUNK, row_count - scanned);
+    auto& vm           = duckdb::FlatVector::Validity(tmp);
+    vm.SetAllValid(CHUNK);
+    rs.ScanPartial(scanned, tmp, /*offset=*/0, to_scan);
+    if (!vm.AllValid()) {
+      std::size_t const byte_offset   = scanned / 8;
+      std::size_t const bytes_to_copy = (to_scan + 7) / 8;
+      std::memcpy(out.owned_bytes.data() + byte_offset,
+                  reinterpret_cast<uint8_t const*>(vm.GetData()),
+                  bytes_to_copy);
+    }
+  }
+
+  out.host_ptr = out.owned_bytes.data();
+  out.bytes    = out.owned_bytes.size();
+  return out;
+}
+
 //===----------------------------------------------------------------------===//
 // Per-split staging
-//
-// All segments across all columns get concatenated into one device buffer.
-// Each gpu_segment_desc points at the right slice. One H2D memcpy per
-// segment via cudaMemcpyAsync — coalescing into a single bulk copy is a
-// V2 optimization.
 //===----------------------------------------------------------------------===//
 
 struct staged_segment {
-  std::size_t device_offset = 0;
-  std::size_t bytes         = 0;
-  uint32_t row_offset       = 0;
-  uint32_t row_count        = 0;
+  std::size_t device_offset    = 0;
+  std::size_t bytes            = 0;
+  uint32_t row_offset          = 0;
+  uint32_t row_count           = 0;
+  uint32_t max_string_length   = 0;
   duckdb::CompressionType compression{duckdb::CompressionType::COMPRESSION_AUTO};
 };
 
 struct staged_column {
   std::vector<staged_segment> data;
   std::vector<staged_segment> validity;
-  bool has_nulls = false;
+  bool has_nulls         = false;
   std::size_t total_rows = 0;
+  bool is_varchar        = false;
 };
 
-void stage_segment(std::vector<pinned_segment_bytes>& pinned,
-                   std::vector<uint8_t const*>& src_ptrs,
-                   std::vector<std::size_t>& src_sizes,
-                   std::vector<std::size_t>& dst_offsets,
-                   std::size_t& running_offset,
-                   duckdb::BlockManager& block_manager,
-                   duckdb::BufferManager& buffer_manager,
-                   duckdb_segment_descriptor const& desc,
-                   staged_segment& out_seg)
-{
-  auto p = pin_block(block_manager, buffer_manager, desc.block_id, desc.block_offset);
-  // additional_blocks (FSST/DICT heaps) are V2; the V1 codec set
-  // (UNCOMPRESSED/RLE/BITPACKING) never produces them on fixed-width columns.
-  if (!desc.additional_blocks.empty()) {
-    throw_unsupported("additional_blocks (variable-width payload) not staged in V1");
-  }
+struct staging_state {
+  std::vector<pinned_segment_bytes> pinned;
+  std::vector<uint8_t const*> src_ptrs;
+  std::vector<std::size_t> src_sizes;
+  std::vector<std::size_t> dst_offsets;
+  std::size_t running_offset = 0;
+};
 
-  out_seg.bytes         = p.bytes;
-  out_seg.device_offset = running_offset;
-  src_ptrs.push_back(p.host_ptr);
-  src_sizes.push_back(p.bytes);
-  dst_offsets.push_back(running_offset);
-  running_offset += p.bytes;
-  pinned.push_back(std::move(p));
+void record_staged(staging_state& s, pinned_segment_bytes p, staged_segment& out)
+{
+  out.bytes         = p.bytes;
+  out.device_offset = s.running_offset;
+  s.src_ptrs.push_back(p.host_ptr);
+  s.src_sizes.push_back(p.bytes);
+  s.dst_offsets.push_back(s.running_offset);
+  s.running_offset += p.bytes;
+  s.pinned.push_back(std::move(p));
 }
 
-staged_column stage_one_column(std::vector<pinned_segment_bytes>& pinned,
-                               std::vector<uint8_t const*>& src_ptrs,
-                               std::vector<std::size_t>& src_sizes,
-                               std::vector<std::size_t>& dst_offsets,
-                               std::size_t& running_offset,
-                               duckdb::BlockManager& block_manager,
-                               duckdb::BufferManager& buffer_manager,
-                               std::vector<duckdb_row_group_metadata> const& row_groups,
-                               std::size_t projected_col_idx)
+duckdb::BaseStatistics const& constant_stats_for(
+  std::vector<duckdb::PartitionStatistics> const& partition_stats,
+  duckdb::idx_t rg_idx,
+  duckdb::idx_t storage_idx,
+  std::vector<std::unique_ptr<duckdb::BaseStatistics>>& owned_stats_cache)
+{
+  if (rg_idx >= partition_stats.size() || !partition_stats[rg_idx].partition_row_group) {
+    throw std::runtime_error(std::string(kTag) +
+                             " no PartitionRowGroup for CONSTANT lookup on rg " +
+                             std::to_string(rg_idx));
+  }
+  auto stats = partition_stats[rg_idx].partition_row_group->GetColumnStatistics(
+    duckdb::StorageIndex(storage_idx));
+  if (!stats) {
+    throw std::runtime_error(std::string(kTag) +
+                             " PartitionRowGroup returned null stats for CONSTANT lookup");
+  }
+  owned_stats_cache.push_back(std::move(stats));
+  return *owned_stats_cache.back();
+}
+
+staged_column stage_one_fixed_width_column(
+  staging_state& s,
+  duckdb::DatabaseInstance& db,
+  duckdb::BlockManager& block_manager,
+  duckdb::BufferManager& buffer_manager,
+  std::vector<duckdb::PartitionStatistics> const& partition_stats,
+  std::vector<std::unique_ptr<duckdb::BaseStatistics>>& owned_stats_cache,
+  std::vector<duckdb_row_group_metadata> const& row_groups,
+  std::size_t projected_col_idx,
+  sirius::logical_type const& projected_type)
 {
   staged_column out;
 
   uint32_t row_cursor = 0;
-  for (auto const& rg : row_groups) {
+  for (std::size_t rg_i = 0; rg_i < row_groups.size(); ++rg_i) {
+    auto const& rg     = row_groups[rg_i];
     auto const& col_md = rg.columns.at(projected_col_idx);
     for (auto const& seg : col_md.data_segments) {
-      if (!is_supported_v1_data_codec(seg.compression)) {
-        throw_unsupported("data codec " + std::to_string(static_cast<int>(seg.compression)) +
-                          " (column " + std::to_string(col_md.column_id) + ")");
+      if (!is_supported_fixed_width_codec(seg.compression)) {
+        throw_unsupported("fixed-width data codec " +
+                          std::to_string(static_cast<int>(seg.compression)) + " (column " +
+                          std::to_string(col_md.column_id) + ")");
       }
-      staged_segment s;
-      s.row_offset  = row_cursor + static_cast<uint32_t>(seg.segment_start);
-      s.row_count   = static_cast<uint32_t>(seg.segment_count);
-      s.compression = seg.compression;
-      stage_segment(pinned,
-                    src_ptrs,
-                    src_sizes,
-                    dst_offsets,
-                    running_offset,
-                    block_manager,
-                    buffer_manager,
-                    seg,
-                    s);
-      out.data.push_back(s);
+      staged_segment ss;
+      ss.row_offset  = row_cursor + static_cast<uint32_t>(seg.segment_start);
+      ss.row_count   = static_cast<uint32_t>(seg.segment_count);
+      ss.compression = seg.compression;
+
+      pinned_segment_bytes p;
+      if (seg.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+        auto const& stats = constant_stats_for(
+          partition_stats, rg.row_group_index, col_md.column_id, owned_stats_cache);
+        p = extract_constant_bytes(stats, projected_type);
+      } else if (!seg.additional_blocks.empty()) {
+        p = pin_block_with_additional(
+          block_manager, buffer_manager, seg.block_id, seg.block_offset, seg.additional_blocks);
+      } else {
+        p = pin_block(block_manager, buffer_manager, seg.block_id, seg.block_offset);
+      }
+      record_staged(s, std::move(p), ss);
+      out.data.push_back(ss);
     }
 
     if (column_has_real_nulls(col_md)) { out.has_nulls = true; }
     for (auto const& vseg : col_md.validity_segments) {
-      if (is_constant_or_empty_validity(vseg.compression)) {
-        // Decoder's all-valid pre-fill is correct; do not stage.
-        continue;
-      }
+      if (is_constant_or_empty_validity(vseg.compression)) { continue; }
+      staged_segment vs;
+      vs.row_offset = row_cursor + static_cast<uint32_t>(vseg.segment_start);
+      vs.row_count  = static_cast<uint32_t>(vseg.segment_count);
+      // GPU validity dispatcher only knows UNCOMPRESSED, so report whatever
+      // we ship as UNCOMPRESSED — even when source was ROARING.
+      vs.compression = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED;
+
+      pinned_segment_bytes p;
       if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
-        throw_unsupported("ROARING validity (column " + std::to_string(col_md.column_id) + ")");
-      }
-      if (vseg.compression != duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
+        p = decode_roaring_validity(db, block_manager, vseg);
+      } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
+        if (!vseg.additional_blocks.empty()) {
+          p = pin_block_with_additional(
+            block_manager, buffer_manager, vseg.block_id, vseg.block_offset, vseg.additional_blocks);
+        } else {
+          p = pin_block(block_manager, buffer_manager, vseg.block_id, vseg.block_offset);
+        }
+      } else {
         throw_unsupported("validity codec " + std::to_string(static_cast<int>(vseg.compression)) +
                           " (column " + std::to_string(col_md.column_id) + ")");
       }
+      record_staged(s, std::move(p), vs);
+      out.validity.push_back(vs);
+    }
+    row_cursor += static_cast<uint32_t>(rg.row_count);
+  }
+
+  out.total_rows = row_cursor;
+  return out;
+}
+
+staged_column stage_one_varchar_column(
+  staging_state& s,
+  duckdb::DatabaseInstance& db,
+  duckdb::BlockManager& block_manager,
+  duckdb::BufferManager& buffer_manager,
+  std::vector<duckdb_row_group_metadata> const& row_groups,
+  std::size_t projected_col_idx)
+{
+  staged_column out;
+  out.is_varchar = true;
+
+  uint32_t row_cursor = 0;
+  for (std::size_t rg_i = 0; rg_i < row_groups.size(); ++rg_i) {
+    auto const& rg     = row_groups[rg_i];
+    auto const& col_md = rg.columns.at(projected_col_idx);
+    for (auto const& seg : col_md.data_segments) {
+      if (!is_supported_varchar_codec(seg.compression)) {
+        throw_unsupported("varchar data codec " +
+                          std::to_string(static_cast<int>(seg.compression)) + " (column " +
+                          std::to_string(col_md.column_id) + ")");
+      }
+      if (seg.block_id < 0) {
+        throw_unsupported("varchar CONSTANT segment (column " +
+                          std::to_string(col_md.column_id) + ")");
+      }
+      staged_segment ss;
+      ss.row_offset        = row_cursor + static_cast<uint32_t>(seg.segment_start);
+      ss.row_count         = static_cast<uint32_t>(seg.segment_count);
+      ss.compression       = seg.compression;
+      ss.max_string_length = seg.max_string_length;
+
+      auto p = !seg.additional_blocks.empty()
+                 ? pin_block_with_additional(block_manager,
+                                             buffer_manager,
+                                             seg.block_id,
+                                             seg.block_offset,
+                                             seg.additional_blocks)
+                 : pin_block(block_manager, buffer_manager, seg.block_id, seg.block_offset);
+      record_staged(s, std::move(p), ss);
+      out.data.push_back(ss);
+    }
+
+    if (column_has_real_nulls(col_md)) { out.has_nulls = true; }
+    for (auto const& vseg : col_md.validity_segments) {
+      if (is_constant_or_empty_validity(vseg.compression)) { continue; }
       staged_segment vs;
       vs.row_offset  = row_cursor + static_cast<uint32_t>(vseg.segment_start);
       vs.row_count   = static_cast<uint32_t>(vseg.segment_count);
-      vs.compression = vseg.compression;
-      stage_segment(pinned,
-                    src_ptrs,
-                    src_sizes,
-                    dst_offsets,
-                    running_offset,
-                    block_manager,
-                    buffer_manager,
-                    vseg,
-                    vs);
+      vs.compression = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED;
+
+      pinned_segment_bytes p;
+      if (vseg.compression == duckdb::CompressionType::COMPRESSION_ROARING) {
+        p = decode_roaring_validity(db, block_manager, vseg);
+      } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
+        if (!vseg.additional_blocks.empty()) {
+          p = pin_block_with_additional(
+            block_manager, buffer_manager, vseg.block_id, vseg.block_offset, vseg.additional_blocks);
+        } else {
+          p = pin_block(block_manager, buffer_manager, vseg.block_id, vseg.block_offset);
+        }
+      } else {
+        throw_unsupported("validity codec " + std::to_string(static_cast<int>(vseg.compression)) +
+                          " (varchar column " + std::to_string(col_md.column_id) + ")");
+      }
+      record_staged(s, std::move(p), vs);
       out.validity.push_back(vs);
     }
     row_cursor += static_cast<uint32_t>(rg.row_count);
@@ -270,37 +534,32 @@ staged_column stage_one_column(std::vector<pinned_segment_bytes>& pinned,
 }
 
 //===----------------------------------------------------------------------===//
-// Bulk H2D copy onto the stream.
+// Bulk H2D copy.
 //===----------------------------------------------------------------------===//
 
 void copy_staged_to_device(rmm::device_buffer& device_buf,
-                           std::vector<uint8_t const*> const& src_ptrs,
-                           std::vector<std::size_t> const& src_sizes,
-                           std::vector<std::size_t> const& dst_offsets,
+                           staging_state const& s,
                            rmm::cuda_stream_view stream)
 {
   auto* device_base = static_cast<uint8_t*>(device_buf.data());
-  for (std::size_t i = 0; i < src_ptrs.size(); ++i) {
-    RMM_CUDA_TRY(cudaMemcpyAsync(device_base + dst_offsets[i],
-                                 src_ptrs[i],
-                                 src_sizes[i],
+  for (std::size_t i = 0; i < s.src_ptrs.size(); ++i) {
+    RMM_CUDA_TRY(cudaMemcpyAsync(device_base + s.dst_offsets[i],
+                                 s.src_ptrs[i],
+                                 s.src_sizes[i],
                                  cudaMemcpyHostToDevice,
                                  stream.value()));
   }
-  // Buffer-handle release after this returns is safe: pageable-source H2D
-  // semantics block on the source buffer being valid for the duration of
-  // the call.  cudaMemcpyAsync from pageable host into device is in fact
-  // synchronous w.r.t. the host (CUDA API guarantee) so by the time we
-  // unwind, every byte has left host memory.
+  // cudaMemcpyAsync from pageable host is sync-wrt-host (CUDA API guarantee),
+  // so by the time we unwind the BufferHandle / owned_bytes can be released.
 }
 
 //===----------------------------------------------------------------------===//
-// Build per-codec runs from a staged_column.
+// Build codec runs from staged segments.
 //===----------------------------------------------------------------------===//
 
-void fill_runs(std::vector<staged_segment> const& staged,
-               rmm::device_buffer const& device_buf,
-               std::vector<gpu_codec_run>& out_runs)
+void fill_fixed_width_runs(std::vector<staged_segment> const& staged,
+                           rmm::device_buffer const& device_buf,
+                           std::vector<gpu_codec_run>& out_runs)
 {
   out_runs.clear();
   duckdb::CompressionType current = duckdb::CompressionType::COMPRESSION_AUTO;
@@ -319,12 +578,31 @@ void fill_runs(std::vector<staged_segment> const& staged,
   }
 }
 
+void fill_string_runs(std::vector<staged_segment> const& staged,
+                      rmm::device_buffer const& device_buf,
+                      std::vector<gpu_string_codec_run>& out_runs)
+{
+  out_runs.clear();
+  duckdb::CompressionType current = duckdb::CompressionType::COMPRESSION_AUTO;
+  auto* device_base = static_cast<uint8_t const*>(device_buf.data());
+  for (auto const& s : staged) {
+    if (out_runs.empty() || s.compression != current) {
+      out_runs.push_back({s.compression, {}});
+      current = s.compression;
+    }
+    gpu_string_segment_desc seg{};
+    seg.d_bytes           = device_base + s.device_offset;
+    seg.bytes_size        = static_cast<uint32_t>(std::min<std::size_t>(s.bytes, UINT32_MAX));
+    seg.row_offset        = s.row_offset;
+    seg.row_count         = s.row_count;
+    seg.seg_row_start     = 0;
+    seg.max_string_length = s.max_string_length;
+    out_runs.back().segments.push_back(seg);
+  }
+}
+
 //===----------------------------------------------------------------------===//
-// Rowid synthesis.
-//
-// For each row group in the split, write a sequence starting at
-// rg.row_group_start. Output is a non-nullable INT64 column whose rows are
-// the absolute row IDs of the scanned rows.
+// Rowid synthesis via cudf::sequence + cudf::concatenate.
 //===----------------------------------------------------------------------===//
 
 std::unique_ptr<cudf::column> build_rowid_column(
@@ -337,19 +615,16 @@ std::unique_ptr<cudf::column> build_rowid_column(
   per_rg.reserve(row_groups.size());
   for (auto const& rg : row_groups) {
     if (rg.row_count == 0) continue;
-    auto init = cudf::numeric_scalar<std::int64_t>(static_cast<std::int64_t>(rg.row_group_start),
-                                                   true,
-                                                   stream,
-                                                   mr);
+    auto init = cudf::numeric_scalar<std::int64_t>(
+      static_cast<std::int64_t>(rg.row_group_start), true, stream, mr);
     per_rg.push_back(cudf::sequence(static_cast<cudf::size_type>(rg.row_count), init, stream, mr));
   }
   if (per_rg.empty()) {
-    auto empty = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
-                                           total_rows,
-                                           cudf::mask_state::UNALLOCATED,
-                                           stream,
-                                           mr);
-    return empty;
+    return cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                     total_rows,
+                                     cudf::mask_state::UNALLOCATED,
+                                     stream,
+                                     mr);
   }
   if (per_rg.size() == 1) { return std::move(per_rg[0]); }
   std::vector<cudf::column_view> views;
@@ -399,9 +674,15 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
   auto& storage         = *scan_info.storage;
   auto& context         = *scan_info.context;
 
+  auto& db             = duckdb::DatabaseInstance::GetDatabase(context);
   auto& sm             = storage.GetAttached().GetStorageManager();
   auto& block_manager  = sm.GetBlockManager();
   auto& buffer_manager = duckdb::BufferManager::GetBufferManager(context);
+
+  // PartitionRowGroup lookup needed for CONSTANT segments + held alive for the
+  // duration of the decode (its destructor releases an internal reference).
+  auto partition_stats = storage.GetPartitionStats(context);
+  std::vector<std::unique_ptr<duckdb::BaseStatistics>> owned_stats_cache;
 
   auto mr_ref = mem_space.get_default_allocator();
 
@@ -409,18 +690,12 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
 
   std::size_t total_rows = 0;
   for (auto const& rg : split.row_groups) { total_rows += rg.row_count; }
-
   if (total_rows > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
     throw std::runtime_error(std::string(kTag) + " split rows (" + std::to_string(total_rows) +
                              ") exceed cudf::size_type max");
   }
 
-  std::vector<pinned_segment_bytes> pinned;
-  std::vector<uint8_t const*> src_ptrs;
-  std::vector<std::size_t> src_sizes;
-  std::vector<std::size_t> dst_offsets;
-  std::size_t running_offset = 0;
-
+  staging_state staging;
   std::vector<staged_column> staged_cols;
   staged_cols.reserve(num_cols);
   std::vector<bool> is_rowid_col(num_cols, false);
@@ -429,60 +704,79 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
     auto const& pcol = scan_info.projected_cols[ci];
     if (pcol.is_rowid) {
       is_rowid_col[ci] = true;
-      staged_cols.emplace_back();  // placeholder; rowids handled separately
+      staged_cols.emplace_back();
       staged_cols.back().total_rows = total_rows;
       continue;
     }
     if (scan_info.projected_types[ci].is_varchar()) {
-      throw_unsupported("VARCHAR column (projected_idx=" + std::to_string(ci) + ")");
+      staged_cols.push_back(stage_one_varchar_column(
+        staging, db, block_manager, buffer_manager, split.row_groups, ci));
+    } else {
+      staged_cols.push_back(stage_one_fixed_width_column(staging,
+                                                         db,
+                                                         block_manager,
+                                                         buffer_manager,
+                                                         partition_stats,
+                                                         owned_stats_cache,
+                                                         split.row_groups,
+                                                         ci,
+                                                         scan_info.projected_types[ci]));
     }
-    staged_cols.push_back(stage_one_column(pinned,
-                                           src_ptrs,
-                                           src_sizes,
-                                           dst_offsets,
-                                           running_offset,
-                                           block_manager,
-                                           buffer_manager,
-                                           split.row_groups,
-                                           ci));
   }
 
-  rmm::device_buffer device_buf(running_offset, stream, mr_ref);
-  if (running_offset > 0) {
-    copy_staged_to_device(device_buf, src_ptrs, src_sizes, dst_offsets, stream);
-  }
+  rmm::device_buffer device_buf(staging.running_offset, stream, mr_ref);
+  if (staging.running_offset > 0) { copy_staged_to_device(device_buf, staging, stream); }
 
-  // Build fixed-width column inputs for gpu_decode_table.
+  // Group fixed-width columns for a single gpu_decode_table call; varchar
+  // columns each go through gpu_decode_strings_column separately.
   std::vector<gpu_column_decode_input> fw_inputs;
   std::vector<std::size_t> fw_to_final_idx;
+  std::vector<gpu_string_column_decode_input> vc_inputs;
+  std::vector<std::size_t> vc_to_final_idx;
   fw_inputs.reserve(num_cols);
   fw_to_final_idx.reserve(num_cols);
 
   for (std::size_t ci = 0; ci < num_cols; ++ci) {
     if (is_rowid_col[ci]) continue;
-
     auto const& staged = staged_cols[ci];
-    gpu_column_decode_input input;
-    input.out_type   = sirius_to_cudf_type(scan_info.projected_types[ci]);
-    input.total_rows = static_cast<uint32_t>(staged.total_rows);
-    input.has_nulls  = staged.has_nulls;
-    fill_runs(staged.data, device_buf, input.data);
-    fill_runs(staged.validity, device_buf, input.validity);
-    fw_inputs.push_back(std::move(input));
-    fw_to_final_idx.push_back(ci);
+    if (staged.is_varchar) {
+      gpu_string_column_decode_input input;
+      input.total_rows = static_cast<uint32_t>(staged.total_rows);
+      input.has_nulls  = staged.has_nulls;
+      fill_string_runs(staged.data, device_buf, input.data);
+      fill_fixed_width_runs(staged.validity, device_buf, input.validity);
+      vc_inputs.push_back(std::move(input));
+      vc_to_final_idx.push_back(ci);
+    } else {
+      gpu_column_decode_input input;
+      input.out_type   = sirius_to_cudf_type(scan_info.projected_types[ci]);
+      input.total_rows = static_cast<uint32_t>(staged.total_rows);
+      input.has_nulls  = staged.has_nulls;
+      fill_fixed_width_runs(staged.data, device_buf, input.data);
+      fill_fixed_width_runs(staged.validity, device_buf, input.validity);
+      fw_inputs.push_back(std::move(input));
+      fw_to_final_idx.push_back(ci);
+    }
   }
 
-  std::unique_ptr<cudf::table> decoded_table;
+  std::vector<std::unique_ptr<cudf::column>> fw_cols;
   if (!fw_inputs.empty()) {
-    decoded_table = ::sirius::cuda::scan::gpu_decode_table(fw_inputs, stream, mr_ref);
+    auto fw_table = ::sirius::cuda::scan::gpu_decode_table(fw_inputs, stream, mr_ref);
+    fw_cols       = fw_table->release();
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> vc_cols;
+  vc_cols.reserve(vc_inputs.size());
+  for (auto const& vc : vc_inputs) {
+    vc_cols.push_back(::sirius::cuda::scan::gpu_decode_strings_column(vc, stream, mr_ref));
   }
 
   std::vector<std::unique_ptr<cudf::column>> final_cols(num_cols);
-  std::vector<std::unique_ptr<cudf::column>> fw_cols;
-  if (decoded_table) { fw_cols = decoded_table->release(); }
-
   for (std::size_t fi = 0; fi < fw_cols.size(); ++fi) {
     final_cols[fw_to_final_idx[fi]] = std::move(fw_cols[fi]);
+  }
+  for (std::size_t vi = 0; vi < vc_cols.size(); ++vi) {
+    final_cols[vc_to_final_idx[vi]] = std::move(vc_cols[vi]);
   }
   for (std::size_t ci = 0; ci < num_cols; ++ci) {
     if (!is_rowid_col[ci]) continue;
