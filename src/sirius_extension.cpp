@@ -64,6 +64,19 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "log/logging.hpp"
 #include "pin_table.hpp"
+#include "op/scan/duckdb_native_metadata.hpp"
+#include "op/scan/duckdb_native_scan_info.hpp"
+#include "op/scan/duckdb_native_scan_task.hpp"
+#include "scan_manager/duckdb_native_split_provider.hpp"
+#include "helper/type_conversions.hpp"
+
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "sirius_interface.hpp"
@@ -726,6 +739,11 @@ unique_ptr<FunctionData> SiriusExtension::PinTableBind(ClientContext& context,
     result->args.n_rows = n_rows_it->second.GetValue<int64_t>();
   }
 
+  auto table_it = input.named_parameters.find("table");
+  if (table_it != input.named_parameters.end() && !table_it->second.IsNull()) {
+    result->args.source_table = table_it->second.ToString();
+  }
+
   return_types.emplace_back(LogicalType::BOOLEAN);
   names.emplace_back("Success");
   return std::move(result);
@@ -773,19 +791,26 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     file_paths.push_back(f.path);
   }
 
-  // Only parquet files are supported. Validate by extension before reading.
-  auto has_parquet_ext = [](std::string const& p) {
-    constexpr std::string_view kExt = ".parquet";
-    if (p.size() < kExt.size()) { return false; }
-    auto tail = p.substr(p.size() - kExt.size());
+  // Source-file family: parquet or DuckDB native (.duckdb / .db). Mixed paths are rejected.
+  auto has_ext = [](std::string const& p, std::string_view ext) {
+    if (p.size() < ext.size()) { return false; }
+    auto tail = p.substr(p.size() - ext.size());
     std::transform(
       tail.begin(), tail.end(), tail.begin(), [](unsigned char c) { return std::tolower(c); });
-    return tail == kExt;
+    return tail == ext;
   };
-  for (auto const& path : file_paths) {
-    if (!has_parquet_ext(path)) {
-      throw InvalidInputException("pin_table only supports parquet files, got non-parquet path: " +
-                                  path);
+  auto is_duckdb_path = [&](std::string const& p) {
+    return has_ext(p, ".duckdb") || has_ext(p, ".db");
+  };
+  bool all_duckdb =
+    !file_paths.empty() &&
+    std::all_of(file_paths.begin(), file_paths.end(), is_duckdb_path);
+  if (!all_duckdb) {
+    for (auto const& path : file_paths) {
+      if (!has_ext(path, ".parquet")) {
+        throw InvalidInputException(
+          "pin_table only supports parquet or .duckdb files, got: " + path);
+      }
     }
   }
 
@@ -821,7 +846,114 @@ void SiriusExtension::PinTableFunction(ClientContext& context,
     stream_view = pin_stream->view();
   }
 
-  if (!file_paths.empty()) {
+  if (all_duckdb) {
+    if (file_paths.size() != 1) {
+      throw InvalidInputException(
+        "pin_table: .duckdb source must resolve to exactly one file, got " +
+        std::to_string(file_paths.size()));
+    }
+    std::string const& db_path = file_paths[0];
+    std::string source_table   =
+      data.args.source_table.has_value() ? *data.args.source_table : data.args.name;
+
+    // Caller must have ATTACHed the .duckdb file already; we look it up by path
+    // among existing attached databases. Internal ATTACH was tried first and hung
+    // (deadlock suspected against the outer table-function's catalog hold).
+    auto& db_manager = duckdb::DatabaseManager::Get(context);
+    duckdb::AttachedDatabase* matched = nullptr;
+    for (auto& adb : db_manager.GetDatabases(context)) {
+      if (!adb) { continue; }
+      // Resolve the AttachedDatabase's underlying storage path.
+      auto& sm = adb->GetStorageManager();
+      if (sm.GetDBPath() == db_path) {
+        matched = adb.get();
+        break;
+      }
+    }
+    if (!matched) {
+      throw InvalidInputException(
+        "pin_table: .duckdb file '" + db_path +
+        "' is not ATTACHed in this session. Run ATTACH '" + db_path +
+        "' AS <alias> (READ_ONLY) first.");
+    }
+
+    auto& target_ctx = context;
+    auto& cat        = matched->GetCatalog();
+    auto& generic_entry =
+      cat.GetEntry(target_ctx, duckdb::CatalogType::TABLE_ENTRY, "main", source_table);
+    auto& table_entry = generic_entry.Cast<duckdb::DuckTableEntry>();
+    auto& storage = table_entry.GetStorage();
+
+    // Build projected_cols / projected_types for the requested columns (or all).
+    auto const& column_defs = table_entry.GetColumns();
+    std::vector<std::pair<std::size_t, std::string>> selected;
+    if (!cols.empty()) {
+      for (auto const& c : cols) {
+        auto const& def = column_defs.GetColumn(c);  // throws if missing
+        selected.emplace_back(def.StorageOid(), c);
+      }
+    } else {
+      for (auto const& def : column_defs.Physical()) {
+        selected.emplace_back(def.StorageOid(), def.GetName());
+      }
+    }
+
+    std::vector<sirius::op::scan::projected_column> projected_cols;
+    std::vector<sirius::logical_type> projected_types;
+    projected_cols.reserve(selected.size());
+    projected_types.reserve(selected.size());
+    read_column_names.reserve(selected.size());
+    for (auto const& [storage_oid, col_name] : selected) {
+      sirius::op::scan::projected_column pc;
+      pc.is_rowid    = false;
+      pc.storage_idx = duckdb::StorageIndex(storage_oid);
+      projected_cols.push_back(pc);
+      projected_types.push_back(
+        sirius::from_duckdb(column_defs.GetColumn(col_name).GetType()));
+      read_column_names.push_back(col_name);
+    }
+
+    // Walk metadata + viability gate.
+    auto metadata = sirius::op::scan::walk_duckdb_native_metadata(
+      storage, target_ctx, projected_cols, projected_types);
+    if (!metadata.viable) {
+      throw InvalidInputException(
+        "pin_table: source table not viable for GPU-native scan: " +
+        metadata.viability_failure_reason);
+    }
+
+    // Build a single split containing all row groups + decode.
+    auto scan_info_shared = std::make_shared<sirius::op::scan::duckdb_native_scan_info>();
+    scan_info_shared->storage         = &storage;
+    scan_info_shared->context         = &target_ctx;
+    scan_info_shared->db_path         = db_path;
+    scan_info_shared->projected_cols  = std::move(projected_cols);
+    scan_info_shared->projected_types = std::move(projected_types);
+
+    sirius::scan_manager::duckdb_native_split_provider::split_payload split;
+    split.scan_info  = scan_info_shared;
+    split.row_groups = std::move(metadata.row_groups);
+
+    auto decode_stream = pin_stream.has_value() ? stream_view : rmm::cuda_stream_view{};
+    if (!pin_stream.has_value()) {
+      pin_stream.emplace();
+      decode_stream = pin_stream->view();
+    }
+    auto decoded =
+      sirius::op::scan::decode_duckdb_native_split(split, gpu_mem_space, decode_stream);
+    decode_stream.synchronize();
+
+    if (data.args.tier == "host") {
+      cucascade::gpu_table_representation gpu_repr(std::move(decoded), gpu_mem_space);
+      auto host_repr = sirius::converter_registry::get()
+                         .convert<cucascade::host_data_representation>(
+                           gpu_repr, host_mem_space, decode_stream);
+      decode_stream.synchronize();
+      host_chunks.emplace_back(std::move(host_repr));
+    } else {
+      tables.emplace_back(std::move(decoded));
+    }
+  } else if (!file_paths.empty()) {
     cudf::io::chunked_parquet_reader reader(chunk_read_limit, opts);
     while (reader.has_next()) {
       auto chunk = reader.read_chunk();
@@ -1025,6 +1157,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   pin_table.named_parameters["name"]   = LogicalType::VARCHAR;
   pin_table.named_parameters["cols"]   = LogicalType::LIST(LogicalType::VARCHAR);
   pin_table.named_parameters["n_rows"] = LogicalType::BIGINT;
+  pin_table.named_parameters["table"]  = LogicalType::VARCHAR;
   CreateTableFunctionInfo pin_table_info(pin_table);
   catalog.CreateTableFunction(transaction, pin_table_info);
 
