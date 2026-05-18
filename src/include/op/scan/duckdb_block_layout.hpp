@@ -32,7 +32,8 @@ namespace sirius::op::scan {
 //   then blocks start at BLOCK_START = FILE_HEADER_SIZE * 3 = 12288.
 //   For each block_id ∈ [0, num_blocks):
 //     [block_start, block_start + block_header_size)        — checksum
-//     [block_start + block_header_size, block_start + alloc) — payload (BlockManager::GetBlockSize() bytes)
+//     [block_start + block_header_size, block_start + alloc) — payload
+//     (BlockManager::GetBlockSize() bytes)
 //   where:
 //     alloc        = bm.GetBlockSize() + bm.GetBlockHeaderSize()
 //     block_start  = BLOCK_START + block_id * alloc
@@ -46,8 +47,8 @@ inline std::size_t duckdb_block_payload_offset(duckdb::BlockManager const& bm,
 {
   constexpr std::size_t BLOCK_START =
     static_cast<std::size_t>(duckdb::Storage::FILE_HEADER_SIZE) * 3;
-  const std::size_t alloc = static_cast<std::size_t>(bm.GetBlockSize()) +
-                            static_cast<std::size_t>(bm.GetBlockHeaderSize());
+  const std::size_t alloc =
+    static_cast<std::size_t>(bm.GetBlockSize()) + static_cast<std::size_t>(bm.GetBlockHeaderSize());
   return BLOCK_START + static_cast<std::size_t>(block_id) * alloc +
          static_cast<std::size_t>(bm.GetBlockHeaderSize());
 }

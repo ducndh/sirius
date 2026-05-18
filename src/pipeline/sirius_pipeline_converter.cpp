@@ -23,8 +23,8 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "log/logging.hpp"
-#include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/duckdb_native_scan_info.hpp"
+#include "op/scan/parquet_scan_info.hpp"
 #include "op/scan/sirius_gpu_duckdb_native_scan_operator.hpp"
 #include "op/scan/sirius_gpu_parquet_scan_operator.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -284,23 +284,20 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
       "to converter; seq_scan GPU-native path requires it");
   }
 
-  auto scan_info             = std::make_unique<op::scan::duckdb_native_scan_info>();
-  scan_info->storage         = &table.GetStorage();
-  scan_info->context         = client_context_;
-  scan_info->db_path         = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
+  auto scan_info     = std::make_unique<op::scan::duckdb_native_scan_info>();
+  scan_info->storage = &table.GetStorage();
+  scan_info->context = client_context_;
+  scan_info->db_path = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
   scan_info->approximate_batch_size = op_params_.scan_task_batch_size;
 
-  auto const& source_ids = !scan_op.projection_ids.empty() ? scan_op.projection_ids
-                                                           : [&] {
-                                                               std::vector<std::size_t> all;
-                                                               all.reserve(scan_op.column_ids.size());
-                                                               for (std::size_t i = 0;
-                                                                    i < scan_op.column_ids.size();
-                                                                    ++i) {
-                                                                 all.push_back(i);
-                                                               }
-                                                               return all;
-                                                             }();
+  auto const& source_ids = !scan_op.projection_ids.empty() ? scan_op.projection_ids : [&] {
+    std::vector<std::size_t> all;
+    all.reserve(scan_op.column_ids.size());
+    for (std::size_t i = 0; i < scan_op.column_ids.size(); ++i) {
+      all.push_back(i);
+    }
+    return all;
+  }();
 
   // Emit ALL source_ids columns from the scan (includes filter-only columns appended by
   // sirius_plan_get.cpp's pushdown-merge); decode_duckdb_native_split applies table_filters
@@ -312,9 +309,7 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
     auto const& col_idx = scan_op.column_ids[pid];
     op::scan::projected_column pc;
     pc.is_rowid = col_idx.IsRowIdColumn();
-    if (!pc.is_rowid) {
-      pc.storage_idx = duckdb::StorageIndex(col_idx.GetPrimaryIndex());
-    }
+    if (!pc.is_rowid) { pc.storage_idx = duckdb::StorageIndex(col_idx.GetPrimaryIndex()); }
     scan_info->projected_cols.push_back(pc);
 
     sirius::logical_type t;
@@ -333,10 +328,10 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
       scan_info->table_filters->filters[col_idx] = filt->Copy();
     }
   }
-  scan_info->column_ids       = scan_op.column_ids;
-  scan_info->projection_ids   = scan_op.projection_ids;
-  scan_info->returned_types   = scan_op.returned_types;
-  scan_info->output_types     = scan_op.types;
+  scan_info->column_ids     = scan_op.column_ids;
+  scan_info->projection_ids = scan_op.projection_ids;
+  scan_info->returned_types = scan_op.returned_types;
+  scan_info->output_types   = scan_op.types;
 
   auto gpu_scan_op = duckdb::make_uniq<op::scan::sirius_gpu_duckdb_native_scan_operator>(
     scan_op.types, scan_op.estimated_cardinality, std::move(scan_info));

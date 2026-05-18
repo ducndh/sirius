@@ -126,8 +126,7 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
 
       SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] registered parquet op_id={}",
                        op->get_operator_id());
-    } else if (source->type ==
-               ::sirius::op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN) {
+    } else if (source->type == ::sirius::op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN) {
       // Interim dispatch — replace with polymorphic make_provider when Kevin's
       // PR-F lands. See scan_manager_hpp for the parallel map declarations.
       auto* op = &source->Cast<op::scan::sirius_gpu_duckdb_native_scan_operator>();
@@ -199,16 +198,15 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
         "db_path='{}'",
         pinned_name,
         info->db_path);
-      auto info_shared =
-        std::shared_ptr<op::scan::duckdb_native_scan_info const>(std::move(info));
+      auto info_shared = std::shared_ptr<op::scan::duckdb_native_scan_info const>(std::move(info));
       return std::make_unique<duckdb_native_cached_split_provider>(
         std::move(info_shared), std::move(resolved), *entry.memory_space);
     }
   }
 
   return std::make_unique<duckdb_native_split_provider>(std::move(*info), _io_ctx);
-{
-  _pinned_entries.erase(name);
-}
+  {
+    _pinned_entries.erase(name);
+  }
 
 }  // namespace sirius::scan_manager

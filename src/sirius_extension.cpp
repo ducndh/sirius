@@ -1249,9 +1249,7 @@ static void SetEnableGpuExecution(ClientContext& context, SetScope scope, Value&
   SIRIUS_LOG_DEBUG("Updated gpu_execution to {}", BooleanValue::Get(parameter));
 }
 
-static void SetEnableGpuDuckdbNativeScan(ClientContext& context,
-                                         SetScope scope,
-                                         Value& parameter)
+static void SetEnableGpuDuckdbNativeScan(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params = get_operator_params(context);
   if (!params) { return; }

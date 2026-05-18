@@ -19,9 +19,10 @@
 #include "scan_manager/duckdb_native_split_provider.hpp"
 
 #include <cudf/table/table.hpp>
-#include <cucascade/memory/memory_space.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+
+#include <cucascade/memory/memory_space.hpp>
 
 #include <memory>
 

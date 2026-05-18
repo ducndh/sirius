@@ -74,7 +74,7 @@ class sirius_pipeline_converter {
     const pipeline_build_context& ctx,
     const sirius::operator_params& op_params,
     const std::unordered_map<std::string, std::shared_ptr<const op::scan::IcebergDeleteData>>*
-      iceberg_cache    = nullptr,
+      iceberg_cache                       = nullptr,
     duckdb::ClientContext* client_context = nullptr);
 
   //! Convert meta-pipelines into execution-ready pipelines.

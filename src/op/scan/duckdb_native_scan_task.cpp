@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-// sirius_context.hpp must be included before anything that opens the
-// sirius::cuda namespace (e.g. cuda/scan/gpu_native_decode.cuh). Otherwise
-// resource_ref_utils.hpp's unqualified `cuda::stream_ref` reference inside
-// namespace sirius::memory resolves to the (empty) sirius::cuda namespace
-// instead of the global ::cuda namespace from CCCL.
+// clang-format off
+// sirius_context.hpp must precede cuda/scan/*: resource_ref_utils.hpp
+// references ::cuda::stream_ref unqualified, and an earlier sirius::cuda
+// open would shadow it.
 #include "sirius_context.hpp"
+// clang-format on
 
 #include "op/scan/duckdb_native_scan_task.hpp"
 
@@ -43,13 +43,11 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
-#include <rmm/detail/error.hpp>
-
-#include <cucascade/memory/memory_space.hpp>
-
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/detail/error.hpp>
 #include <rmm/device_buffer.hpp>
 
+#include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/common/types/vector.hpp>
 #include <duckdb/function/partition_stats.hpp>
@@ -330,11 +328,11 @@ pinned_segment_bytes decode_roaring_validity(duckdb::DatabaseInstance& db,
 //===----------------------------------------------------------------------===//
 
 struct staged_segment {
-  std::size_t device_offset    = 0;
-  std::size_t bytes            = 0;
-  uint32_t row_offset          = 0;
-  uint32_t row_count           = 0;
-  uint32_t max_string_length   = 0;
+  std::size_t device_offset  = 0;
+  std::size_t bytes          = 0;
+  uint32_t row_offset        = 0;
+  uint32_t row_count         = 0;
+  uint32_t max_string_length = 0;
   duckdb::CompressionType compression{duckdb::CompressionType::COMPRESSION_AUTO};
 };
 
@@ -444,8 +442,11 @@ staged_column stage_one_fixed_width_column(
         p = decode_roaring_validity(db, block_manager, vseg);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
         if (!vseg.additional_blocks.empty()) {
-          p = pin_block_with_additional(
-            block_manager, buffer_manager, vseg.block_id, vseg.block_offset, vseg.additional_blocks);
+          p = pin_block_with_additional(block_manager,
+                                        buffer_manager,
+                                        vseg.block_id,
+                                        vseg.block_offset,
+                                        vseg.additional_blocks);
         } else {
           p = pin_block(block_manager, buffer_manager, vseg.block_id, vseg.block_offset);
         }
@@ -463,13 +464,12 @@ staged_column stage_one_fixed_width_column(
   return out;
 }
 
-staged_column stage_one_varchar_column(
-  staging_state& s,
-  duckdb::DatabaseInstance& db,
-  duckdb::BlockManager& block_manager,
-  duckdb::BufferManager& buffer_manager,
-  std::vector<duckdb_row_group_metadata> const& row_groups,
-  std::size_t projected_col_idx)
+staged_column stage_one_varchar_column(staging_state& s,
+                                       duckdb::DatabaseInstance& db,
+                                       duckdb::BlockManager& block_manager,
+                                       duckdb::BufferManager& buffer_manager,
+                                       std::vector<duckdb_row_group_metadata> const& row_groups,
+                                       std::size_t projected_col_idx)
 {
   staged_column out;
   out.is_varchar = true;
@@ -485,8 +485,8 @@ staged_column stage_one_varchar_column(
                           std::to_string(col_md.column_id) + ")");
       }
       if (seg.block_id < 0) {
-        throw_unsupported("varchar CONSTANT segment (column " +
-                          std::to_string(col_md.column_id) + ")");
+        throw_unsupported("varchar CONSTANT segment (column " + std::to_string(col_md.column_id) +
+                          ")");
       }
       staged_segment ss;
       ss.row_offset        = row_cursor + static_cast<uint32_t>(seg.segment_start);
@@ -494,13 +494,11 @@ staged_column stage_one_varchar_column(
       ss.compression       = seg.compression;
       ss.max_string_length = seg.max_string_length;
 
-      auto p = !seg.additional_blocks.empty()
-                 ? pin_block_with_additional(block_manager,
-                                             buffer_manager,
-                                             seg.block_id,
-                                             seg.block_offset,
-                                             seg.additional_blocks)
-                 : pin_block(block_manager, buffer_manager, seg.block_id, seg.block_offset);
+      auto p =
+        !seg.additional_blocks.empty()
+          ? pin_block_with_additional(
+              block_manager, buffer_manager, seg.block_id, seg.block_offset, seg.additional_blocks)
+          : pin_block(block_manager, buffer_manager, seg.block_id, seg.block_offset);
       record_staged(s, std::move(p), ss);
       out.data.push_back(ss);
     }
@@ -518,8 +516,11 @@ staged_column stage_one_varchar_column(
         p = decode_roaring_validity(db, block_manager, vseg);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
         if (!vseg.additional_blocks.empty()) {
-          p = pin_block_with_additional(
-            block_manager, buffer_manager, vseg.block_id, vseg.block_offset, vseg.additional_blocks);
+          p = pin_block_with_additional(block_manager,
+                                        buffer_manager,
+                                        vseg.block_id,
+                                        vseg.block_offset,
+                                        vseg.additional_blocks);
         } else {
           p = pin_block(block_manager, buffer_manager, vseg.block_id, vseg.block_offset);
         }
@@ -570,7 +571,7 @@ void fill_fixed_width_runs(std::vector<staged_segment> const& staged,
 {
   out_runs.clear();
   duckdb::CompressionType current = duckdb::CompressionType::COMPRESSION_AUTO;
-  auto* device_base = static_cast<uint8_t const*>(device_buf.data());
+  auto* device_base               = static_cast<uint8_t const*>(device_buf.data());
   for (auto const& s : staged) {
     if (out_runs.empty() || s.compression != current) {
       out_runs.push_back({s.compression, {}});
@@ -591,7 +592,7 @@ void fill_string_runs(std::vector<staged_segment> const& staged,
 {
   out_runs.clear();
   duckdb::CompressionType current = duckdb::CompressionType::COMPRESSION_AUTO;
-  auto* device_base = static_cast<uint8_t const*>(device_buf.data());
+  auto* device_base               = static_cast<uint8_t const*>(device_buf.data());
   for (auto const& s : staged) {
     if (out_runs.empty() || s.compression != current) {
       out_runs.push_back({s.compression, {}});
@@ -627,16 +628,15 @@ std::unique_ptr<cudf::column> build_rowid_column(
     per_rg.push_back(cudf::sequence(static_cast<cudf::size_type>(rg.row_count), init, stream, mr));
   }
   if (per_rg.empty()) {
-    return cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
-                                     total_rows,
-                                     cudf::mask_state::UNALLOCATED,
-                                     stream,
-                                     mr);
+    return cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT64}, total_rows, cudf::mask_state::UNALLOCATED, stream, mr);
   }
   if (per_rg.size() == 1) { return std::move(per_rg[0]); }
   std::vector<cudf::column_view> views;
   views.reserve(per_rg.size());
-  for (auto const& c : per_rg) { views.push_back(c->view()); }
+  for (auto const& c : per_rg) {
+    views.push_back(c->view());
+  }
   return cudf::concatenate(views, stream, mr);
 }
 
@@ -652,8 +652,8 @@ cucascade::memory::memory_space* pick_gpu_memory_space_for_duckdb_native_scan(
   if (scan_info.context == nullptr) {
     throw std::runtime_error(std::string(kTag) + " scan_info.context is null");
   }
-  auto& ctx       = *scan_info.context;
-  auto sirius_st  = ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  auto& ctx      = *scan_info.context;
+  auto sirius_st = ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (!sirius_st) {
     throw std::runtime_error(std::string(kTag) + " no sirius_state on the ClientContext");
   }
@@ -696,7 +696,9 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
   std::size_t const num_cols = scan_info.projected_cols.size();
 
   std::size_t total_rows = 0;
-  for (auto const& rg : split.row_groups) { total_rows += rg.row_count; }
+  for (auto const& rg : split.row_groups) {
+    total_rows += rg.row_count;
+  }
   if (total_rows > static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
     throw std::runtime_error(std::string(kTag) + " split rows (" + std::to_string(total_rows) +
                              ") exceed cudf::size_type max");
@@ -716,8 +718,8 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
       continue;
     }
     if (scan_info.projected_types[ci].is_varchar()) {
-      staged_cols.push_back(stage_one_varchar_column(
-        staging, db, block_manager, buffer_manager, split.row_groups, ci));
+      staged_cols.push_back(
+        stage_one_varchar_column(staging, db, block_manager, buffer_manager, split.row_groups, ci));
     } else {
       staged_cols.push_back(stage_one_fixed_width_column(staging,
                                                          db,
@@ -787,10 +789,8 @@ std::unique_ptr<cudf::table> decode_duckdb_native_split(
   }
   for (std::size_t ci = 0; ci < num_cols; ++ci) {
     if (!is_rowid_col[ci]) continue;
-    final_cols[ci] = build_rowid_column(split.row_groups,
-                                        static_cast<cudf::size_type>(total_rows),
-                                        stream,
-                                        mr_ref);
+    final_cols[ci] = build_rowid_column(
+      split.row_groups, static_cast<cudf::size_type>(total_rows), stream, mr_ref);
   }
 
   return std::make_unique<cudf::table>(std::move(final_cols));

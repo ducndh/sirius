@@ -409,7 +409,7 @@ duckdb_native_metadata walk_duckdb_native_metadata(
       // per-varchar byte cap) treats 0 as "unknown" and falls back to slower or
       // looser paths. The stat is essentially free on the row-group cache hit,
       // and DuckDB tracks it on all varchar segments regardless of codec.
-      max_string_length = max_len_resolver.get(rg_idx, seg.column_id, ci);
+      max_string_length        = max_len_resolver.get(rg_idx, seg.column_id, ci);
       const bool needs_max_len = compression == duckdb::CompressionType::COMPRESSION_DICTIONARY ||
                                  compression == duckdb::CompressionType::COMPRESSION_FSST ||
                                  compression == duckdb::CompressionType::COMPRESSION_DICT_FSST;

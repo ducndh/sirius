@@ -53,9 +53,8 @@ class duckdb_native_split_provider : public split_provider {
     std::size_t count;
   };
 
-  explicit duckdb_native_split_provider(
-    op::scan::duckdb_native_scan_info info,
-    std::shared_ptr<sirius::io::sirius_ioctx> io_ctx = nullptr);
+  explicit duckdb_native_split_provider(op::scan::duckdb_native_scan_info info,
+                                        std::shared_ptr<sirius::io::sirius_ioctx> io_ctx = nullptr);
 
   ~duckdb_native_split_provider() override;
 
