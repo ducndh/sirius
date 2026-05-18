@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+#include <cudf/utilities/default_stream.hpp>
+
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
 #include <expression/expression.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
@@ -24,11 +29,6 @@
 #include <scan_manager/duckdb_native_split_provider.hpp>
 #include <scan_manager/split_connector.hpp>
 
-#include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/memory/memory_space.hpp>
-#include <cudf/utilities/default_stream.hpp>
-
 #include <stdexcept>
 #include <utility>
 
@@ -38,9 +38,8 @@ sirius_gpu_duckdb_native_scan_operator::sirius_gpu_duckdb_native_scan_operator(
   duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   std::unique_ptr<duckdb_native_scan_info> scan_info)
-  : sirius_physical_operator(SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN,
-                             std::move(types),
-                             estimated_cardinality),
+  : sirius_physical_operator(
+      SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN, std::move(types), estimated_cardinality),
     _split_connector(std::make_unique<scan_manager::split_connector>()),
     _scan_info(std::move(scan_info))
 {
@@ -49,8 +48,7 @@ sirius_gpu_duckdb_native_scan_operator::sirius_gpu_duckdb_native_scan_operator(
 
 sirius_gpu_duckdb_native_scan_operator::~sirius_gpu_duckdb_native_scan_operator() = default;
 
-std::unique_ptr<duckdb_native_scan_info>
-sirius_gpu_duckdb_native_scan_operator::take_scan_info()
+std::unique_ptr<duckdb_native_scan_info> sirius_gpu_duckdb_native_scan_operator::take_scan_info()
 {
   return std::move(_scan_info);
 }
@@ -115,16 +113,14 @@ std::unique_ptr<operator_data> sirius_gpu_duckdb_native_scan_operator::execute(
   auto const& info = *split->scan_info;
   auto mr_ref      = mem_space->get_default_allocator();
 
-  auto const& source_ids = !info.projection_ids.empty()
-                             ? info.projection_ids
-                             : [&] {
-                                 duckdb::vector<duckdb::idx_t> all;
-                                 all.reserve(info.column_ids.size());
-                                 for (duckdb::idx_t i = 0; i < info.column_ids.size(); ++i) {
-                                   all.push_back(i);
-                                 }
-                                 return all;
-                               }();
+  auto const& source_ids = !info.projection_ids.empty() ? info.projection_ids : [&] {
+    duckdb::vector<duckdb::idx_t> all;
+    all.reserve(info.column_ids.size());
+    for (duckdb::idx_t i = 0; i < info.column_ids.size(); ++i) {
+      all.push_back(i);
+    }
+    return all;
+  }();
 
   std::vector<std::optional<std::size_t>> emission_order_map(info.column_ids.size());
   for (std::size_t k = 0; k < source_ids.size(); ++k) {
@@ -145,8 +141,7 @@ std::unique_ptr<operator_data> sirius_gpu_duckdb_native_scan_operator::execute(
   // After filtering, scan_output emission order matches source_ids, so the first
   // output_types.size() positions are the original projection columns.
   std::size_t const expected_out = info.output_types.size();
-  if (expected_out > 0 &&
-      static_cast<std::size_t>(table->num_columns()) > expected_out) {
+  if (expected_out > 0 && static_cast<std::size_t>(table->num_columns()) > expected_out) {
     auto cols = table->release();
     std::vector<std::unique_ptr<cudf::column>> selected;
     selected.reserve(expected_out);

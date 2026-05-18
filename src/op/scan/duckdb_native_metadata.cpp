@@ -402,19 +402,22 @@ duckdb_native_metadata walk_duckdb_native_metadata(
 
     std::uint32_t max_string_length = 0;
     if (!validity_seg && projected_types[ci].is_varchar()) {
-      // Dictionary-family codecs need the stat to size the host-side
-      // pre-decode buffer.
+      // Fetch the row-group MaxStringLength stat for every varchar segment, not
+      // just dictionary-family codecs. DICT/FSST/DICT_FSST need it to size their
+      // host-side pre-decode buffers; UNCOMPRESSED doesn't need it for decode,
+      // but downstream (cum_chars_upper in gpu_decode_strings_column, partitioner
+      // per-varchar byte cap) treats 0 as "unknown" and falls back to slower or
+      // looser paths. The stat is essentially free on the row-group cache hit,
+      // and DuckDB tracks it on all varchar segments regardless of codec.
+      max_string_length        = max_len_resolver.get(rg_idx, seg.column_id, ci);
       const bool needs_max_len = compression == duckdb::CompressionType::COMPRESSION_DICTIONARY ||
                                  compression == duckdb::CompressionType::COMPRESSION_FSST ||
                                  compression == duckdb::CompressionType::COMPRESSION_DICT_FSST;
-      if (needs_max_len) {
-        max_string_length = max_len_resolver.get(rg_idx, seg.column_id, ci);
-        if (max_string_length == 0) {
-          refuse("varchar segment on column " + std::to_string(seg.column_id) + " row group " +
-                 std::to_string(rg_idx) + ": codec \"" + seg.compression_type +
-                 "\" needs max_string_length stat but row group did not advertise one");
-          return md;
-        }
+      if (needs_max_len && max_string_length == 0) {
+        refuse("varchar segment on column " + std::to_string(seg.column_id) + " row group " +
+               std::to_string(rg_idx) + ": codec \"" + seg.compression_type +
+               "\" needs max_string_length stat but row group did not advertise one");
+        return md;
       }
     }
 
