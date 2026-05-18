@@ -94,19 +94,44 @@ std::unique_ptr<operator_data> sirius_gpu_duckdb_native_scan_operator::execute(
       "[sirius_gpu_duckdb_native_scan_operator] split payload missing scan_info");
   }
 
-  auto* mem_space = pick_gpu_memory_space_for_duckdb_native_scan(*split->scan_info);
-  if (mem_space == nullptr) {
-    throw std::runtime_error(
-      "[sirius_gpu_duckdb_native_scan_operator] no GPU memory space available");
+  cucascade::memory::memory_space* mem_space = nullptr;
+  std::unique_ptr<cudf::table> table;
+  bool from_cache = !split->cached_columns.empty();
+  if (from_cache) {
+    mem_space = split->cached_mem_space != nullptr
+                  ? split->cached_mem_space
+                  : pick_gpu_memory_space_for_duckdb_native_scan(*split->scan_info);
+    if (mem_space == nullptr) {
+      throw std::runtime_error(
+        "[sirius_gpu_duckdb_native_scan_operator] cached path: no GPU memory space available");
+    }
+    // Build a view-backed cudf::table over the shared pinned columns; clone into
+    // owning columns so downstream lifecycle stays consistent. Cloning is cheap on
+    // GPU (rmm copy), but a future optimization could forward the view directly.
+    auto mr_ref = mem_space->get_default_allocator();
+    std::vector<std::unique_ptr<cudf::column>> owned_cols;
+    owned_cols.reserve(split->cached_columns.size());
+    for (auto const& shared_col : split->cached_columns) {
+      owned_cols.push_back(std::make_unique<cudf::column>(shared_col->view(), stream, mr_ref));
+    }
+    table = std::make_unique<cudf::table>(std::move(owned_cols));
+    SIRIUS_LOG_DEBUG(
+      "[sirius_gpu_duckdb_native_scan_operator] served from pinned cache: rows={} cols={}",
+      table->num_rows(),
+      table->num_columns());
+  } else {
+    mem_space = pick_gpu_memory_space_for_duckdb_native_scan(*split->scan_info);
+    if (mem_space == nullptr) {
+      throw std::runtime_error(
+        "[sirius_gpu_duckdb_native_scan_operator] no GPU memory space available");
+    }
+    table = decode_duckdb_native_split(*split, *mem_space, stream);
+    SIRIUS_LOG_DEBUG(
+      "[sirius_gpu_duckdb_native_scan_operator] decoded split: row_groups={} rows={} cols={}",
+      split->row_groups.size(),
+      table->num_rows(),
+      table->num_columns());
   }
-
-  auto table = decode_duckdb_native_split(*split, *mem_space, stream);
-
-  SIRIUS_LOG_DEBUG(
-    "[sirius_gpu_duckdb_native_scan_operator] decoded split: row_groups={} rows={} cols={}",
-    split->row_groups.size(),
-    table->num_rows(),
-    table->num_columns());
 
   // Mirror sirius_physical_table_scan::execute(): apply table_filters via gpu_expression_executor,
   // then project filter-only columns away. The decode emits columns in `source_ids` order

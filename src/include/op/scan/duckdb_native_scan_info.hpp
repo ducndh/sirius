@@ -39,6 +39,10 @@ struct duckdb_native_scan_info {
   // output_types happens inside decode_duckdb_native_split.
   std::vector<projected_column> projected_cols;
   std::vector<sirius::logical_type> projected_types;
+  /// Parallel to projected_cols: the source column name for each entry (empty for rowid).
+  /// Populated by the converter so the scan_manager can look up pinned entries by name
+  /// without re-querying the catalog.
+  std::vector<std::string> projected_names;
 
   // Context for table_filter application inside the scan task. Mirrors what
   // sirius_physical_table_scan carries.
@@ -49,6 +53,9 @@ struct duckdb_native_scan_info {
   duckdb::vector<sirius::logical_type> output_types;
 
   std::string db_path;
+  /// Table name within `db_path` — used by the scan_manager to match pinned entries
+  /// keyed by (db_path, table_name). Populated by the converter.
+  std::string table_name;
 
   std::size_t approximate_batch_size = 0;
 };

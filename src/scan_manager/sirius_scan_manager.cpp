@@ -149,11 +149,112 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
   start_metadata_processing();
 }
 
+// Inline cached split provider for pinned .duckdb tables: emits one split carrying
+// shared cudf::column references into the scan operator's split_payload, which
+// short-circuits decode and applies filter/projection on the pinned columns.
+namespace {
+
+class duckdb_native_cached_split_provider : public split_provider {
+ public:
+  duckdb_native_cached_split_provider(
+    std::shared_ptr<op::scan::duckdb_native_scan_info const> scan_info,
+    std::vector<std::shared_ptr<cudf::column>> cached_columns,
+    cucascade::memory::memory_space& mem_space)
+    : _scan_info(std::move(scan_info)),
+      _cached_columns(std::move(cached_columns)),
+      _mem_space(&mem_space)
+  {
+  }
+
+  [[nodiscard]] bool has_more_splits() const override
+  {
+    return !_consumed.load(std::memory_order_acquire);
+  }
+
+  std::function<std::vector<std::unique_ptr<op::operator_data>>()> next_split_provider() override
+  {
+    bool prev = _consumed.exchange(true, std::memory_order_acq_rel);
+    if (prev) { return nullptr; }
+    auto scan_info_local      = _scan_info;
+    auto cached_columns_local = _cached_columns;
+    auto* mem_space_local     = _mem_space;
+    return [scan_info_local, cached_columns_local, mem_space_local]()
+             -> std::vector<std::unique_ptr<op::operator_data>> {
+      auto payload               = std::make_unique<duckdb_native_split_provider::split_payload>();
+      payload->scan_info         = scan_info_local;
+      payload->cached_columns    = cached_columns_local;
+      payload->cached_mem_space  = mem_space_local;
+      std::vector<std::unique_ptr<op::operator_data>> out;
+      out.push_back(std::move(payload));
+      return out;
+    };
+  }
+
+ private:
+  std::shared_ptr<op::scan::duckdb_native_scan_info const> _scan_info;
+  std::vector<std::shared_ptr<cudf::column>> _cached_columns;
+  cucascade::memory::memory_space* _mem_space;
+  std::atomic<bool> _consumed{false};
+};
+
+}  // namespace
+
 std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
   op::scan::sirius_gpu_duckdb_native_scan_operator* op)
 {
   auto info = op->take_scan_info();
   if (!info) { return nullptr; }
+
+  // Pinned-entry lookup. Match by (db_path, table_name): pinned entry's file_paths
+  // must be exactly [db_path] AND its name must equal table_name. Only GPU tier is
+  // wired here; HOST tier falls through to the regular decode path.
+  if (!info->db_path.empty() && !info->table_name.empty()) {
+    for (auto const& [pinned_name, entry] : _pinned_entries) {
+      if (entry.tier != cucascade::memory::Tier::GPU) { continue; }
+      if (entry.file_paths.size() != 1) { continue; }
+      if (entry.file_paths[0] != info->db_path) { continue; }
+      if (pinned_name != info->table_name) { continue; }
+      if (entry.memory_space == nullptr) { continue; }
+
+      // Resolve shared columns in projected_cols order. Names were captured by the
+      // converter into scan_info->projected_names so we don't need to re-query the
+      // catalog here. Cache miss on rowid columns or any name not in the pin.
+      std::vector<std::shared_ptr<cudf::column>> resolved;
+      resolved.reserve(info->projected_cols.size());
+      bool all_resolved = info->projected_names.size() == info->projected_cols.size();
+      for (std::size_t i = 0; all_resolved && i < info->projected_cols.size(); ++i) {
+        if (info->projected_cols[i].is_rowid) {
+          all_resolved = false;
+          break;
+        }
+        auto const& col_name = info->projected_names[i];
+        auto col_it          = entry.data_batches_by_column.find(col_name);
+        if (col_it == entry.data_batches_by_column.end() || col_it->second.empty()) {
+          all_resolved = false;
+          break;
+        }
+        // Single-chunk only (which is what .duckdb pin emits today). Multi-chunk would
+        // need concatenation here.
+        if (col_it->second.size() != 1) {
+          all_resolved = false;
+          break;
+        }
+        resolved.push_back(col_it->second.front());
+      }
+      if (!all_resolved) { continue; }
+
+      SIRIUS_LOG_INFO(
+        "[sirius_scan_manager::create_provider_for] duckdb-native cache hit: pinned='{}' "
+        "db_path='{}'",
+        pinned_name,
+        info->db_path);
+      auto info_shared =
+        std::shared_ptr<op::scan::duckdb_native_scan_info const>(std::move(info));
+      return std::make_unique<duckdb_native_cached_split_provider>(
+        std::move(info_shared), std::move(resolved), *entry.memory_space);
+    }
+  }
+
   return std::make_unique<duckdb_native_split_provider>(std::move(*info));
 }
 

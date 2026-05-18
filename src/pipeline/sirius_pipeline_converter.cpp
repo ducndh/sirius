@@ -287,6 +287,7 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   scan_info->storage         = &table.GetStorage();
   scan_info->context         = client_context_;
   scan_info->db_path         = table.GetStorage().GetAttached().GetStorageManager().GetDBPath();
+  scan_info->table_name      = table.name;
   scan_info->approximate_batch_size = op_params_.scan_task_batch_size;
 
   auto const& source_ids = !scan_op.projection_ids.empty() ? scan_op.projection_ids
@@ -304,8 +305,10 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
   // Emit ALL source_ids columns from the scan (includes filter-only columns appended by
   // sirius_plan_get.cpp's pushdown-merge); decode_duckdb_native_split applies table_filters
   // and projects down to scan_op.types — same pattern as sirius_physical_table_scan::execute.
+  auto const& table_columns = table.GetColumns();
   scan_info->projected_cols.reserve(source_ids.size());
   scan_info->projected_types.reserve(source_ids.size());
+  scan_info->projected_names.reserve(source_ids.size());
   for (std::size_t k = 0; k < source_ids.size(); ++k) {
     auto pid            = source_ids[k];
     auto const& col_idx = scan_op.column_ids[pid];
@@ -323,6 +326,14 @@ void sirius_pipeline_converter::insert_duckdb_native_scan_operator(
       t = scan_op.returned_types.at(col_idx.GetPrimaryIndex());
     }
     scan_info->projected_types.push_back(t);
+
+    if (pc.is_rowid) {
+      scan_info->projected_names.emplace_back();
+    } else {
+      scan_info->projected_names.push_back(
+        table_columns.GetColumn(duckdb::PhysicalIndex(pc.storage_idx.GetPrimaryIndex()))
+          .GetName());
+    }
   }
 
   // Pass filter context to decode_duckdb_native_split.

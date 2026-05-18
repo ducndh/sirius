@@ -21,6 +21,9 @@
 #include "op/sirius_physical_operator.hpp"
 #include "scan_manager/split_provider.hpp"
 
+#include <cudf/column/column.hpp>
+#include <cucascade/memory/memory_space.hpp>
+
 #include <atomic>
 #include <cstddef>
 #include <functional>
@@ -35,6 +38,11 @@ class duckdb_native_split_provider : public split_provider {
   struct split_payload : public op::operator_data {
     std::vector<op::scan::duckdb_row_group_metadata> row_groups;
     std::shared_ptr<op::scan::duckdb_native_scan_info const> scan_info;
+    /// Set by the cached split provider for .duckdb-pinned entries. When non-empty,
+    /// the scan operator wraps these columns directly (after optional filter) and
+    /// skips decode_duckdb_native_split. Indexed in projected_cols order.
+    std::vector<std::shared_ptr<cudf::column>> cached_columns;
+    cucascade::memory::memory_space* cached_mem_space = nullptr;
   };
 
   struct row_group_batch {

@@ -29,6 +29,9 @@ struct PinTableArgs {
   std::string name;
   std::optional<std::vector<std::string>> cols;
   std::optional<int64_t> n_rows;
+  /// Source table name within a .duckdb file. Required when `path` ends in
+  /// `.duckdb` / `.db`; ignored otherwise. Defaults to `name` when unset.
+  std::optional<std::string> source_table;
 };
 
 void pin_table_to(const PinTableArgs& args);
