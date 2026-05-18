@@ -89,6 +89,12 @@ struct rle_segment_desc {
   uint8_t const* d_bytes;
   uint32_t bytes_size;
   uint32_t segment_row_count;
+  /// Per-value byte width (1/2/4/8). Used by parse_rle_metadata to compute
+  /// the EXACT real-count entry count from the values-region size — DuckDB's
+  /// bytes_size includes zero-padded slack at the block tail when the
+  /// segment is the last in its block, and walking past the real counts
+  /// into that slack used to trip a spurious malformed flag.
+  uint32_t type_size;
 };
 
 /**
@@ -132,7 +138,13 @@ struct BlockPrefixCallbackOp {
  */
 struct rle_parsed_metadata {
   rle_count_t const* counts_ptr;
-  uint32_t n_counts_max;
+  /// Number of count entries we should actually read. Computed as
+  /// `(counts_offset - RLE_HEADER_SIZE) / type_size` — the RLE format has a
+  /// 1:1 invariant between values and counts (one count per unique value),
+  /// so the values region length tells us exactly how many counts there are.
+  /// Iterating only up to this stops the kernel from reading into the zero-
+  /// padded slack at the tail of DuckDB's block-allocated segment.
+  uint32_t n_counts_real;
   bool is_malformed;
 };
 
@@ -156,9 +168,27 @@ __device__ __forceinline__ rle_parsed_metadata parse_rle_metadata(rle_segment_de
     md.is_malformed = true;
     return md;
   }
+  // Compute the EXACT real-count entry count from the values-region length.
+  // RLE format invariant: 1:1 between values and counts. The values region
+  // is [RLE_HEADER_SIZE, counts_offset); its byte length divided by per-value
+  // byte width gives the real count of entries to read.
+  //
+  // Defensive: if type_size is 0 (unexpected) or the values region isn't a
+  // multiple of type_size (corrupt segment header), fall back to the
+  // bytes-derived bound (n_counts_max) — better to over-read into zero
+  // slack and rely on the malformed-vs-match swap below than to under-read
+  // and miss real data.
+  const uint64_t values_region_bytes = counts_offset - RLE_HEADER_SIZE;
+  const uint64_t counts_region_bytes = desc.bytes_size - counts_offset;
+  uint64_t n_real = 0;
+  if (desc.type_size > 0 && (values_region_bytes % desc.type_size) == 0) {
+    n_real = values_region_bytes / desc.type_size;
+  } else {
+    n_real = counts_region_bytes / sizeof(rle_count_t);  // bytes-derived fallback
+  }
 
-  md.counts_ptr   = reinterpret_cast<rle_count_t const*>(desc.d_bytes + counts_offset);
-  md.n_counts_max = static_cast<uint32_t>((desc.bytes_size - counts_offset) / sizeof(rle_count_t));
+  md.counts_ptr    = reinterpret_cast<rle_count_t const*>(desc.d_bytes + counts_offset);
+  md.n_counts_real = static_cast<uint32_t>(n_real);
   return md;
 }
 
@@ -220,10 +250,14 @@ __global__ void kernel_build_rle(rle_segment_desc const* __restrict__ segment_de
 
   auto const n_segment_rows = segment_descriptor.segment_row_count;
   auto const* counts_ptr    = s_md.counts_ptr;
-  // (Defensively) cap iteration at the per-segment prefix-sum slot so BlockStore can't write past
-  // the slot.
+  // Cap iteration at the EXACT real-count entry count (computed from the
+  // values-region length and per-value byte width — RLE has a 1:1 invariant
+  // between values and counts), clamped to the prefix-sum slot size so
+  // BlockStore can't write past the slot. Using n_counts_real instead of
+  // a bytes_size-derived bound prevents reading into zero-padded slack at
+  // the tail of DuckDB's block-allocated segments.
   auto const n_counts_max = ::cuda::std::min(
-    s_md.n_counts_max, static_cast<uint32_t>(PREFIX_SUM_BUFFER_ENTRIES_PER_SEGMENT));
+    s_md.n_counts_real, static_cast<uint32_t>(PREFIX_SUM_BUFFER_ENTRIES_PER_SEGMENT));
   auto* prefix_sum_ptr =
     d_prefix_sums + static_cast<size_t>(segment_id) * PREFIX_SUM_BUFFER_ENTRIES_PER_SEGMENT;
 
@@ -292,12 +326,22 @@ __global__ void kernel_build_rle(rle_segment_desc const* __restrict__ segment_de
     if (threadIdx.x == 0) { s_first_match = tile_first_match; }
     __syncthreads();
 
-    if (s_is_malformed) {
-      if (threadIdx.x == 0) { d_counts[segment_id] = MALFORMED_FLAG; }
-      return;
-    }
+    // ZERO-COLUMN FIX (2026-05-18): check match BEFORE malformed. The build
+    // kernel walks `n_counts_real` entries (math-bounded from values region
+    // length, see parse_rle_metadata). The bound is right for well-formed
+    // segments, but the fallback path uses the bytes-derived bound which
+    // can over-read into zero-padded slack at the tail of DuckDB's block-
+    // allocated segments. If we already found a tile entry whose prefix sum
+    // equals n_segment_rows, the segment is well-formed up to that point —
+    // return the match. DuckDB's RLE encoder never emits count==0 in real
+    // data (per comment line 238-239), so a zero count past the match point
+    // is always padding, never corruption.
     if (s_first_match != NO_MATCH) {
       if (threadIdx.x == 0) { d_counts[segment_id] = s_first_match; }
+      return;
+    }
+    if (s_is_malformed) {
+      if (threadIdx.x == 0) { d_counts[segment_id] = MALFORMED_FLAG; }
       return;
     }
   }
@@ -501,8 +545,10 @@ void decode_rle_data(gpu_codec_run const& run,
   // Build per-segment build descriptors.
   std::vector<rle_segment_desc> h_build_descs(num_live_segments);
   for (size_t i = 0; i < num_live_segments; ++i) {
-    h_build_descs[i] = {
-      live_segments[i]->d_bytes, live_segments[i]->bytes_size, live_segments[i]->row_count};
+    h_build_descs[i] = {live_segments[i]->d_bytes,
+                        live_segments[i]->bytes_size,
+                        live_segments[i]->row_count,
+                        type_size};
   }
 
   // Worst-case allocation: 352 KiB/segment.
