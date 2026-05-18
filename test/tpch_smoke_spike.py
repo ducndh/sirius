@@ -59,7 +59,7 @@ def query_text(n: int) -> str:
     return (QDIR / f"q{n}.sql").read_text().strip().rstrip(";")
 
 
-def run_gpu(qsql: str, batch_size: str | None) -> tuple[int, str, str, float]:
+def run_gpu(qsql: str, batch_size: str | None, db: Path) -> tuple[int, str, str, float]:
     settings = [
         "SET sirius_log_level='info';",
         "SET enable_gpu_duckdb_native_scan=true;",
@@ -69,13 +69,17 @@ def run_gpu(qsql: str, batch_size: str | None) -> tuple[int, str, str, float]:
     # gpu_execution is a TABLE FUNCTION — feed the query as a string literal.
     escaped = qsql.replace("'", "''")
     sql = "\n".join(settings) + f"\nCALL gpu_execution('{escaped}');\n"
-    return run_cli(sql)
+    return run_cli(sql, db=db)
 
 
-def run_cpu(qsql: str) -> tuple[int, str, str, float]:
-    # Sirius autoloads on attach and its teardown segfaults the CLI (rc=-11) AFTER the
-    # result is already on stdout — so we ignore rc and trust the table block parse.
-    return run_cli(qsql + ";\n")
+def run_cpu(qsql: str, db: Path) -> tuple[int, str, str, float]:
+    # Disable sirius transparent execution so we get a true DuckDB-CPU baseline.
+    # Without this, sirius would intercept and run through its legacy scan path —
+    # still correct, but not a pure CPU comparison.
+    # Also avoids the static-link sirius teardown SIGSEGV that fires after any
+    # transparent-execution-intercepted query.
+    sql = "SET gpu_execution=false;\n" + qsql + ";\n"
+    return run_cli(sql, db=db)
 
 
 def summarize_result(out: str) -> tuple[int, str, str]:
@@ -92,15 +96,20 @@ def summarize_result(out: str) -> tuple[int, str, str]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--query", type=int, default=0, help="Run a single query 1..22 (0=all)")
-    ap.add_argument("--batch-size", default=None, help="e.g. '5Gi' to stress big-batch path")
+    ap.add_argument("--batch-size", default=None, help="e.g. '5368709120' to stress big-batch path")
     ap.add_argument("--skip", type=str, default="",
                     help="Comma-separated list of qNN to skip")
+    ap.add_argument("--db", type=Path, default=DB, help="Path to the .duckdb fixture")
     args = ap.parse_args()
+
+    db = args.db
+    if not db.exists():
+        raise SystemExit(f"--db path does not exist: {db}")
 
     skip = {int(s) for s in args.skip.split(",") if s.strip()}
     qs = [args.query] if args.query else range(1, 23)
 
-    print(f"DB: {DB}  batch_size={args.batch_size or 'default'}")
+    print(f"DB: {db}  batch_size={args.batch_size or 'default'}")
     print(f"{'Q':>4}  {'GPU rc':>6} {'CPU rc':>6}  {'GPU s':>6} {'CPU s':>6}  match  notes")
     print("-" * 78)
 
@@ -109,8 +118,8 @@ def main():
             print(f"q{q:<3}  skipped")
             continue
         qsql = query_text(q)
-        rc_gpu, out_gpu, err_gpu, t_gpu = run_gpu(qsql, args.batch_size)
-        rc_cpu, out_cpu, err_cpu, t_cpu = run_cpu(qsql)
+        rc_gpu, out_gpu, err_gpu, t_gpu = run_gpu(qsql, args.batch_size, db)
+        rc_cpu, out_cpu, err_cpu, t_cpu = run_cpu(qsql, db)
         nrows_gpu, first_gpu, h_gpu = summarize_result(out_gpu)
         nrows_cpu, first_cpu, h_cpu = summarize_result(out_cpu)
         # Sirius shutdown segfaults the CLI (-11) AFTER the result is on stdout, so we
