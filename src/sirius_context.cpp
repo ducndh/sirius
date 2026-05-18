@@ -307,8 +307,16 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   task_creator_->set_task_scheduler(*task_scheduler_);
   task_scheduler_->set_task_creator(*task_creator_);
 
+  auto scan_manager_cfg = config_.get_scan_manager_config();
+  // SPIKE: duckdb-native scan path requires the sirius_io substrate to route
+  // .db block reads through sirius_ioctx::host_read. Force-enable here when a
+  // host_fsmr is available so the smoke harness (which doesn't load a YAML
+  // config) gets a non-null io_ctx. When no host_fsmr, leave the YAML default
+  // — scan_manager would throw at construction otherwise.
+  // At PR-cut time this becomes conditional on enable_gpu_duckdb_native_scan.
+  if (host_fsmr != nullptr) { scan_manager_cfg.use_sirius_datasource = true; }
   scan_manager_ = std::make_unique<sirius::scan_manager::sirius_scan_manager>(
-    config_.get_scan_manager_config(), host_fsmr);
+    std::move(scan_manager_cfg), host_fsmr);
 
   // Wire the pipeline task queue into downgrade executors now that task_scheduler_
   // has been constructed.

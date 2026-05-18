@@ -28,6 +28,11 @@
 #include <string>
 #include <vector>
 
+namespace sirius::io {
+class sirius_ioctx;
+class sirius_io_object;
+}  // namespace sirius::io
+
 namespace sirius::scan_manager {
 
 class duckdb_native_split_provider : public split_provider {
@@ -35,6 +40,12 @@ class duckdb_native_split_provider : public split_provider {
   struct split_payload : public op::operator_data {
     std::vector<op::scan::duckdb_row_group_metadata> row_groups;
     std::shared_ptr<op::scan::duckdb_native_scan_info const> scan_info;
+    /// sirius_io substrate handles. Set by the regular (non-cached) split path so
+    /// the scan task can read .db blocks via sirius_ioctx::host_read instead of
+    /// going through DuckDB's BufferManager. Both null when the scan_manager
+    /// was configured with use_sirius_datasource=false (falls back to BufferManager).
+    std::shared_ptr<sirius::io::sirius_ioctx> io_ctx;
+    std::shared_ptr<sirius::io::sirius_io_object> db_io_object;
   };
 
   struct row_group_batch {
@@ -42,7 +53,9 @@ class duckdb_native_split_provider : public split_provider {
     std::size_t count;
   };
 
-  explicit duckdb_native_split_provider(op::scan::duckdb_native_scan_info info);
+  explicit duckdb_native_split_provider(
+    op::scan::duckdb_native_scan_info info,
+    std::shared_ptr<sirius::io::sirius_ioctx> io_ctx = nullptr);
 
   ~duckdb_native_split_provider() override;
 
@@ -60,6 +73,8 @@ class duckdb_native_split_provider : public split_provider {
   op::scan::duckdb_native_metadata _metadata;
   std::vector<row_group_batch> _batches;
   std::atomic<std::size_t> _next_batch_idx{0};
+  std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
+  std::shared_ptr<sirius::io::sirius_io_object> _db_io_object;
 };
 
 }  // namespace sirius::scan_manager

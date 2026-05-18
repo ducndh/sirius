@@ -16,6 +16,8 @@
 
 #include "scan_manager/duckdb_native_split_provider.hpp"
 
+#include "io/io_context.hpp"
+#include "io/types.hpp"
 #include "log/logging.hpp"
 
 #include <algorithm>
@@ -118,8 +120,10 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
 
 }  // namespace
 
-duckdb_native_split_provider::duckdb_native_split_provider(op::scan::duckdb_native_scan_info info)
-  : _scan_info(std::make_shared<op::scan::duckdb_native_scan_info const>(std::move(info)))
+duckdb_native_split_provider::duckdb_native_split_provider(
+  op::scan::duckdb_native_scan_info info, std::shared_ptr<sirius::io::sirius_ioctx> io_ctx)
+  : _scan_info(std::make_shared<op::scan::duckdb_native_scan_info const>(std::move(info))),
+    _io_ctx(std::move(io_ctx))
 {
   if (_scan_info->storage == nullptr) {
     throw std::invalid_argument(
@@ -151,6 +155,13 @@ duckdb_native_split_provider::duckdb_native_split_provider(op::scan::duckdb_nati
                              _metadata.viability_failure_reason);
   }
 
+  // Mint the .db io_object once per query when the manager exposes sirius_ioctx.
+  // The scan task threads this onto every split so reads of .db blocks go through
+  // sirius_ioctx::host_read instead of DuckDB's BufferManager.
+  if (_io_ctx && !_scan_info->db_path.empty()) {
+    _db_io_object = _io_ctx->create_io_object(_scan_info->db_path);
+  }
+
   _batches = partition_row_groups_into_batches(
     _metadata.row_groups, _scan_info->approximate_batch_size, _scan_info->projected_types);
 }
@@ -170,8 +181,10 @@ duckdb_native_split_provider::next_split_provider()
 
   row_group_batch batch = _batches[idx];
   return [this, batch]() -> std::vector<std::unique_ptr<op::operator_data>> {
-    auto payload       = std::make_unique<split_payload>();
-    payload->scan_info = _scan_info;
+    auto payload          = std::make_unique<split_payload>();
+    payload->scan_info    = _scan_info;
+    payload->io_ctx       = _io_ctx;
+    payload->db_io_object = _db_io_object;
     payload->row_groups.reserve(batch.count);
     for (std::size_t i = batch.first_idx; i < batch.first_idx + batch.count; ++i) {
       payload->row_groups.push_back(_metadata.row_groups[i]);
