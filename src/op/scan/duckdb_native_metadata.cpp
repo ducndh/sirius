@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -124,12 +125,16 @@ bool is_supported_logical_type(const sirius::logical_type& type, std::string& re
   return false;
 }
 
-std::uint32_t lookup_max_string_length(duckdb::PartitionRowGroup& prg,
-                                       const duckdb::StorageIndex& storage_idx)
+// Returns nullopt when DuckDB did not advertise the stat at all (legitimate
+// "unknown"), or the advertised value when present. A present value of 0 is a
+// real signal — it means every string in the segment is empty (e.g. clickbench
+// Title row groups where every Title is "") — not the same as "stat missing".
+std::optional<std::uint32_t> lookup_max_string_length(duckdb::PartitionRowGroup& prg,
+                                                      const duckdb::StorageIndex& storage_idx)
 {
   auto stats = prg.GetColumnStatistics(storage_idx);
-  if (!stats) { return 0; }
-  if (!duckdb::StringStats::HasMaxStringLength(*stats)) { return 0; }
+  if (!stats) { return std::nullopt; }
+  if (!duckdb::StringStats::HasMaxStringLength(*stats)) { return std::nullopt; }
   return duckdb::StringStats::MaxStringLength(*stats);
 }
 
@@ -144,13 +149,17 @@ class varchar_max_length_resolver {
   {
   }
 
-  /// Returns 0 when the row group did not advertise the stat.
-  std::uint32_t get(duckdb::idx_t rg_idx, duckdb::idx_t col_id, std::size_t projected_ci)
+  /// nullopt = stat truly absent (no statistics for the segment). Some(N) = stat
+  /// present with value N — including N==0, which is the legitimate all-empty
+  /// segment case and must not be conflated with "absent".
+  std::optional<std::uint32_t> get(duckdb::idx_t rg_idx,
+                                   duckdb::idx_t col_id,
+                                   std::size_t projected_ci)
   {
     const auto k = key(rg_idx, col_id);
     auto it      = _cache.find(k);
     if (it != _cache.end()) { return it->second; }
-    std::uint32_t max_len = 0;
+    std::optional<std::uint32_t> max_len = std::nullopt;
     if (rg_idx < _handles.size() && _handles[rg_idx].second) {
       max_len = lookup_max_string_length(*_handles[rg_idx].second,
                                          _projected_cols[projected_ci].storage_idx);
@@ -168,7 +177,7 @@ class varchar_max_length_resolver {
 
   const row_group_handles& _handles;
   const std::vector<projected_column>& _projected_cols;
-  std::unordered_map<std::uint64_t, std::uint32_t> _cache;
+  std::unordered_map<std::uint64_t, std::optional<std::uint32_t>> _cache;
 };
 
 duckdb_segment_descriptor build_segment_descriptor(const duckdb::ColumnSegmentInfo& seg,
@@ -402,20 +411,24 @@ duckdb_native_metadata walk_duckdb_native_metadata(
 
     std::uint32_t max_string_length = 0;
     if (!validity_seg && projected_types[ci].is_varchar()) {
-      // Dictionary-family codecs need the stat to size the host-side
-      // pre-decode buffer.
+      // DICT/FSST/DICT_FSST decoders treat a known max_string_length as an
+      // upper bound on chars allocation; absent it, downstream (cum_chars_upper
+      // in gpu_decode_strings, partitioner per-varchar byte cap) falls back to
+      // FALLBACK_BYTES per row / exact-total sync. The walker only refuses
+      // when the stat is *truly absent* — a present value of 0 means every
+      // string in the segment is empty (clickbench Title row groups), which
+      // is real data and must flow through.
+      auto stat = max_len_resolver.get(rg_idx, seg.column_id, ci);
       const bool needs_max_len = compression == duckdb::CompressionType::COMPRESSION_DICTIONARY ||
                                  compression == duckdb::CompressionType::COMPRESSION_FSST ||
                                  compression == duckdb::CompressionType::COMPRESSION_DICT_FSST;
-      if (needs_max_len) {
-        max_string_length = max_len_resolver.get(rg_idx, seg.column_id, ci);
-        if (max_string_length == 0) {
-          refuse("varchar segment on column " + std::to_string(seg.column_id) + " row group " +
-                 std::to_string(rg_idx) + ": codec \"" + seg.compression_type +
-                 "\" needs max_string_length stat but row group did not advertise one");
-          return md;
-        }
+      if (needs_max_len && !stat.has_value()) {
+        refuse("varchar segment on column " + std::to_string(seg.column_id) + " row group " +
+               std::to_string(rg_idx) + ": codec \"" + seg.compression_type +
+               "\" needs max_string_length stat but row group did not advertise one");
+        return md;
       }
+      max_string_length = stat.value_or(0);
     }
 
     auto desc    = build_segment_descriptor(seg, compression, max_string_length);
