@@ -18,18 +18,25 @@
 
 #include "helper/logical_type.hpp"
 #include "op/scan/duckdb_native_metadata.hpp"
+#include "op/scan/scan_info.hpp"
 
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/storage/data_table.hpp>
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
+namespace sirius::scan_manager {
+class split_provider;
+class sirius_scan_manager;
+}  // namespace sirius::scan_manager
+
 namespace sirius::op::scan {
 
-struct duckdb_native_scan_info {
-  duckdb::DataTable* storage = nullptr;
+struct duckdb_native_scan_info : public scan_info {
+  duckdb::DataTable* storage     = nullptr;
   duckdb::ClientContext* context = nullptr;
 
   std::vector<projected_column> projected_cols;
@@ -37,7 +44,8 @@ struct duckdb_native_scan_info {
 
   std::string db_path;
 
-  std::size_t approximate_batch_size = 0;
+  std::unique_ptr<scan_manager::split_provider> make_provider(
+    scan_manager::sirius_scan_manager& manager) override;
 };
 
 }  // namespace sirius::op::scan
