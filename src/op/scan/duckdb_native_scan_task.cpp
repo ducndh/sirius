@@ -168,6 +168,10 @@ pinned_segment_bytes pin_block(duckdb::BlockManager& block_manager,
                                duckdb::block_id_t block_id,
                                std::size_t block_offset)
 {
+  if (block_id < 0) {
+    throw std::runtime_error(std::string(kTag) +
+                             " pin_block called with block_id<0 (CONSTANT segment?)");
+  }
   auto handle = block_manager.RegisterBlock(block_id);
   auto pinned = buffer_manager.Pin(handle);
   auto* base  = pinned.Ptr();
@@ -227,9 +231,95 @@ pinned_segment_bytes pin_block_with_additional(
   return out;
 }
 
+// sirius_io variant: read .db block payloads via sirius_ioctx::host_read.
+//
+// Equivalent to pin_block / pin_block_with_additional but bypasses DuckDB's
+// BufferManager. Used when the scan_manager is configured with
+// use_sirius_datasource=true so the duckdb-native scan path goes through the
+// same I/O substrate as parquet. Output shape matches BufferManager.Pin: a
+// payload-only host pointer with `block_size - block_offset` bytes for the
+// main block, plus full-block payloads concatenated for additional blocks.
 //===----------------------------------------------------------------------===//
-// CONSTANT extraction. block_id == -1; the value lives in PartitionRowGroup
-// stats. We copy it into an owned buffer the kernel can read.
+
+pinned_segment_bytes read_block_via_io(::sirius::io::sirius_ioctx& ctx,
+                                       ::sirius::io::sirius_io_object& obj,
+                                       duckdb::BlockManager const& bm,
+                                       duckdb::block_id_t block_id,
+                                       std::size_t block_offset)
+{
+  const std::size_t block_size  = bm.GetBlockSize();
+  const std::size_t payload_off = duckdb_block_payload_offset(bm, block_id);
+  pinned_segment_bytes out;
+  out.owned_bytes.resize(block_size);
+  const std::size_t got = ctx.host_read(obj, payload_off, block_size, out.owned_bytes.data());
+  if (got != block_size) {
+    throw std::runtime_error(std::string(kTag) + " short host_read for block_id " +
+                             std::to_string(block_id) + ": got " + std::to_string(got) +
+                             " expected " + std::to_string(block_size));
+  }
+  if (block_offset > block_size) {
+    throw std::runtime_error(std::string(kTag) + " block_offset (" + std::to_string(block_offset) +
+                             ") exceeds block size (" + std::to_string(block_size) + ")");
+  }
+  out.host_ptr = out.owned_bytes.data() + block_offset;
+  out.bytes    = block_size - block_offset;
+  return out;
+}
+
+pinned_segment_bytes read_blocks_with_additional_via_io(
+  ::sirius::io::sirius_ioctx& ctx,
+  ::sirius::io::sirius_io_object& obj,
+  duckdb::BlockManager const& bm,
+  duckdb::block_id_t main_block_id,
+  std::size_t block_offset,
+  std::vector<duckdb::block_id_t> const& additional_block_ids)
+{
+  const std::size_t block_size = bm.GetBlockSize();
+  const std::size_t main_payload_size =
+    block_size > block_offset ? block_size - block_offset : std::size_t{0};
+
+  std::vector<uint8_t> concat;
+  concat.resize(main_payload_size + additional_block_ids.size() * block_size);
+
+  // Main block: read full payload then memcpy starting at block_offset.
+  {
+    std::vector<uint8_t> main_buf(block_size);
+    const std::size_t got = ctx.host_read(
+      obj, duckdb_block_payload_offset(bm, main_block_id), block_size, main_buf.data());
+    if (got != block_size) {
+      throw std::runtime_error(std::string(kTag) + " short host_read for main block_id " +
+                               std::to_string(main_block_id));
+    }
+    if (main_payload_size > 0) {
+      std::memcpy(concat.data(), main_buf.data() + block_offset, main_payload_size);
+    }
+  }
+
+  // Additional blocks: read each full-payload directly into the concat buffer.
+  std::size_t dst_off = main_payload_size;
+  for (auto add_id : additional_block_ids) {
+    const std::size_t got = ctx.host_read(
+      obj, duckdb_block_payload_offset(bm, add_id), block_size, concat.data() + dst_off);
+    if (got != block_size) {
+      throw std::runtime_error(std::string(kTag) + " short host_read for additional block_id " +
+                               std::to_string(add_id));
+    }
+    dst_off += block_size;
+  }
+
+  pinned_segment_bytes out;
+  out.owned_bytes = std::move(concat);
+  out.host_ptr    = out.owned_bytes.data();
+  out.bytes       = out.owned_bytes.size();
+  return out;
+}
+
+//===----------------------------------------------------------------------===//
+// CONSTANT extraction.
+//
+// CONSTANT segments have block_id == -1; the constant value lives in
+// per-(rg, col) statistics. We pull stats from PartitionRowGroup at scan
+// time and copy the value into an owned buffer the kernel can read.
 //===----------------------------------------------------------------------===//
 
 template <typename T>
