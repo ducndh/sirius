@@ -375,6 +375,96 @@ pinned_segment_bytes decode_roaring_validity(duckdb::DatabaseInstance& db,
   return out;
 }
 
+<<<<<<< HEAD
+=======
+//===----------------------------------------------------------------------===//
+// Per-split staging
+//===----------------------------------------------------------------------===//
+
+struct staged_segment {
+  std::size_t device_offset    = 0;
+  std::size_t bytes            = 0;
+  uint32_t row_offset          = 0;
+  uint32_t row_count           = 0;
+  uint32_t max_string_length   = 0;
+  duckdb::CompressionType compression{duckdb::CompressionType::COMPRESSION_AUTO};
+};
+
+struct staged_column {
+  std::vector<staged_segment> data;
+  std::vector<staged_segment> validity;
+  bool has_nulls         = false;
+  std::size_t total_rows = 0;
+  bool is_varchar        = false;
+};
+
+struct staging_state {
+  std::vector<pinned_segment_bytes> pinned;
+  std::vector<uint8_t const*> src_ptrs;
+  std::vector<std::size_t> src_sizes;
+  std::vector<std::size_t> dst_offsets;
+  std::size_t running_offset = 0;
+};
+
+void record_staged(staging_state& s, pinned_segment_bytes p, staged_segment& out)
+{
+  // Align each segment's device destination to 16 bytes. Several decode
+  // kernels cast `seg.d_bytes + internal_offset` to T*/uint32_t* (e.g. RLE
+  // values, dictionary indices), and back-to-back packing made later segments
+  // start at arbitrary offsets whenever an earlier segment's bytes_size was
+  // not a multiple of the consumer type's alignof. 16 bytes covers every
+  // integer width we read up to uint128. Padding bytes are uninitialized but
+  // unreferenced — kernels only read inside [device_offset, device_offset +
+  // bytes_size). See gpu_decode_rle.cu:467 (uint64) where misaligned d_values
+  // raised cudaErrorMisalignedAddress on q40.
+  constexpr std::size_t SEGMENT_ALIGN = 16;
+  s.running_offset = (s.running_offset + SEGMENT_ALIGN - 1) & ~(SEGMENT_ALIGN - 1);
+  out.bytes         = p.bytes;
+  out.device_offset = s.running_offset;
+  s.src_ptrs.push_back(p.host_ptr);
+  s.src_sizes.push_back(p.bytes);
+  s.dst_offsets.push_back(s.running_offset);
+  s.running_offset += p.bytes;
+  s.pinned.push_back(std::move(p));
+}
+
+duckdb::BaseStatistics const& constant_stats_for(
+  std::vector<duckdb::PartitionStatistics> const& partition_stats,
+  duckdb::idx_t rg_idx,
+  duckdb::idx_t storage_idx,
+  std::vector<std::unique_ptr<duckdb::BaseStatistics>>& owned_stats_cache)
+{
+  if (rg_idx >= partition_stats.size() || !partition_stats[rg_idx].partition_row_group) {
+    throw std::runtime_error(std::string(kTag) +
+                             " no PartitionRowGroup for CONSTANT lookup on rg " +
+                             std::to_string(rg_idx));
+  }
+  auto stats = partition_stats[rg_idx].partition_row_group->GetColumnStatistics(
+    duckdb::StorageIndex(storage_idx));
+  if (!stats) {
+    throw std::runtime_error(std::string(kTag) +
+                             " PartitionRowGroup returned null stats for CONSTANT lookup");
+  }
+  owned_stats_cache.push_back(std::move(stats));
+  return *owned_stats_cache.back();
+}
+
+// Read a single block payload via the io substrate when both ctx + obj are
+// non-null, otherwise fall back to DuckDB's BufferManager. Output shape
+// matches pin_block: payload pointer + remaining bytes from block_offset.
+pinned_segment_bytes read_block_payload(::sirius::io::sirius_ioctx* io_ctx,
+                                        ::sirius::io::sirius_io_object* io_obj,
+                                        duckdb::BlockManager& bm,
+                                        duckdb::BufferManager& buffer_manager,
+                                        duckdb::block_id_t block_id,
+                                        std::size_t block_offset,
+                                        std::vector<duckdb::block_id_t> const& additional_block_ids)
+{
+  const bool via_io = (io_ctx != nullptr && io_obj != nullptr);
+  if (via_io) {
+    if (additional_block_ids.empty()) {
+      return read_block_via_io(*io_ctx, *io_obj, bm, block_id, block_offset);
+>>>>>>> 9e9bda03 (fix(native-scan): pad staging dst_offset to 16B per segment)
     }
     staged_cols.push_back(stage_one_column(pinned,
                                            src_ptrs,
