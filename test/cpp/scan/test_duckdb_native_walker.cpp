@@ -262,6 +262,35 @@ TEST_CASE("walker walks VARCHAR (Uncompressed) table without max-length stat nee
   }
 }
 
+TEST_CASE("walker accepts varchar segment with max_string_length=0",
+          "[scan][duckdb_native_walker]")
+{
+  // An all-empty-string row group is legal data — the MaxStringLength stat is
+  // present but zero, distinct from a row group with no stat at all. The
+  // walker must accept DICT/FSST/DICT_FSST segments in this case; only truly
+  // absent stats should refuse.
+  auto [db_owner, con] = sirius::make_test_db_and_connection();
+  exec_ok(con, "CREATE TABLE t(s VARCHAR)");
+  // Many duplicate empty strings → low-cardinality varchar segment with
+  // max_string_length=0; DuckDB picks DICT/FSST encoding.
+  exec_ok(con, "INSERT INTO t SELECT '' FROM range(0, 100000)");
+  exec_ok(con, "CHECKPOINT");
+  auto& storage = get_storage(con, "t");
+
+  std::vector<projected_column> cols   = {real_col(0)};
+  std::vector<sirius::logical_type> ts = {sirius::logical_type::make(sirius::type_id::VARCHAR)};
+  auto md = walk_duckdb_native_metadata(storage, *con.context, cols, ts);
+
+  // If non-viable for some other reason, allow it — but the reason must not
+  // mention max_string_length.
+  if (!md.viable) {
+    INFO("viability_failure_reason: " << md.viability_failure_reason);
+    REQUIRE(md.viability_failure_reason.find("max_string_length") == std::string::npos);
+  } else {
+    REQUIRE_FALSE(md.row_groups.empty());
+  }
+}
+
 TEST_CASE("walker refuses DECIMAL128 (precision > 18)", "[scan][duckdb_native_walker]")
 {
   auto [db_owner, con] = sirius::make_test_db_and_connection();
