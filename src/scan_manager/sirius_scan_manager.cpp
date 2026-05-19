@@ -127,8 +127,8 @@ void sirius_scan_manager::prepare_for_query(const sirius::planner::query& query)
       SIRIUS_LOG_DEBUG("[sirius_scan_manager::prepare_for_query] registered parquet op_id={}",
                        op->get_operator_id());
     } else if (source->type == ::sirius::op::SiriusPhysicalOperatorType::GPU_DUCKDB_NATIVE_SCAN) {
-      // Interim dispatch — replace with polymorphic make_provider when Kevin's
-      // PR-F lands. See scan_manager_hpp for the parallel map declarations.
+      // Folds into the polymorphic `info->make_provider(*this)` dispatch once
+      // the operator stores `unique_ptr<scan_info>` instead of by-value.
       auto* op = &source->Cast<op::scan::sirius_gpu_duckdb_native_scan_operator>();
       if (_duckdb_native_providers_by_op.find(op) != _duckdb_native_providers_by_op.end()) {
         continue;
@@ -154,59 +154,316 @@ std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
 {
   auto info = op->take_scan_info();
   if (!info) { return nullptr; }
+  return std::make_unique<duckdb_native_split_provider>(std::move(*info), _io_ctx);
+}
 
-  // Pinned-entry lookup. Match by (db_path, table_name): pinned entry's file_paths
-  // must be exactly [db_path] AND its name must equal table_name. Only GPU tier is
-  // wired here; HOST tier falls through to the regular decode path.
-  if (!info->db_path.empty() && !info->table_name.empty()) {
+std::unique_ptr<split_provider> sirius_scan_manager::create_provider_for(
+  op::scan::sirius_gpu_parquet_scan_operator* op)
+{
+  auto info = op->take_scan_info();
+  if (!info) { return nullptr; }
+
+  // Pinned-cache short-circuit lives on the manager because it uses only the
+  // common scan_info fields (file_paths, column_ids, names, returned_types,
+  // projection_ids, partition_indices, table_filters) — format-agnostic. If
+  // it misses, dispatch through scan_info::make_provider() to the format's
+  // own split_provider construction.
+  if (auto cached = try_cached_for(*info, op->get_operator_id())) { return cached; }
+  return info->make_provider(*this);
+}
+
+std::unique_ptr<split_provider> sirius_scan_manager::try_cached_for(op::scan::scan_info const& info,
+                                                                    std::size_t op_id)
+{
+  // If a pinned entry's file paths match this scan_info, build the same
+  // scan_plan the parquet path would build and serve the scan from cache.
+  auto matches_scan_info = [&info](const pinned_entry& entry) {
+    if (entry.file_paths.size() != info.file_paths.size()) { return false; }
+    auto sorted_a = entry.file_paths;
+    auto sorted_b = info.file_paths;
+    std::sort(sorted_a.begin(), sorted_a.end());
+    std::sort(sorted_b.begin(), sorted_b.end());
+    return sorted_a == sorted_b;
+  };
+  try {
     for (auto const& [pinned_name, entry] : _pinned_entries) {
-      if (entry.tier != cucascade::memory::Tier::GPU) { continue; }
-      if (entry.file_paths.size() != 1) { continue; }
-      if (entry.file_paths[0] != info->db_path) { continue; }
-      if (pinned_name != info->table_name) { continue; }
-      if (entry.memory_space == nullptr) { continue; }
-
-      // Resolve shared columns in projected_cols order. Names were captured by the
-      // converter into scan_info->projected_names so we don't need to re-query the
-      // catalog here. Cache miss on rowid columns or any name not in the pin.
-      std::vector<std::shared_ptr<cudf::column>> resolved;
-      resolved.reserve(info->projected_cols.size());
-      bool all_resolved = info->projected_names.size() == info->projected_cols.size();
-      for (std::size_t i = 0; all_resolved && i < info->projected_cols.size(); ++i) {
-        if (info->projected_cols[i].is_rowid) {
-          all_resolved = false;
-          break;
-        }
-        auto const& col_name = info->projected_names[i];
-        auto col_it          = entry.data_batches_by_column.find(col_name);
-        if (col_it == entry.data_batches_by_column.end() || col_it->second.empty()) {
-          all_resolved = false;
-          break;
-        }
-        // Single-chunk only (which is what .duckdb pin emits today). Multi-chunk would
-        // need concatenation here.
-        if (col_it->second.size() != 1) {
-          all_resolved = false;
-          break;
-        }
-        resolved.push_back(col_it->second.front());
+      if (!matches_scan_info(entry)) { continue; }
+      if (entry.memory_space == nullptr) {
+        throw std::runtime_error("[sirius_scan_manager::try_cached_for] pinned entry '" +
+                                 pinned_name + "' has no memory_space");
       }
-      if (!all_resolved) { continue; }
 
-      SIRIUS_LOG_INFO(
-        "[sirius_scan_manager::create_provider_for] duckdb-native cache hit: pinned='{}' "
-        "db_path='{}'",
+      // Build the canonical scan_plan once. Everything downstream — cached column
+      // layout, filter pushdown indices, post-read assembly — reads from this.
+      // Held by shared_ptr<const> so each emitted scan_cached_operator_data can
+      // carry it to the GPU scan operator's per-task assembly check without copying.
+      auto plan_shared = std::make_shared<op::scan::scan_plan const>(
+        op::scan::build_scan_plan(info.column_ids,
+                                  info.projection_ids,
+                                  info.names,
+                                  info.returned_types,
+                                  info.scan_output_arity,
+                                  info.partition_indices));
+      auto const& plan = *plan_shared;
+
+      // Hive partitions on a cached scan would require per-chunk file_path metadata
+      // that pinned entries don't carry today. Fall through to the per-format path,
+      // which extracts partition values per file at read time.
+      if (plan.has_partitions()) {
+        SIRIUS_LOG_DEBUG(
+          "[sirius_scan_manager::try_cached_for] pinned entry '{}' matches op_id={} but "
+          "scan has hive partitions; falling through to per-format split_provider",
+          pinned_name,
+          op_id);
+        break;
+      }
+
+      // Filter expression: BoundReferences are in D-space, via plan.batch_position_by_column_id.
+      // Same recipe parquet_split_provider uses, so the filter evaluates correctly against
+      // the cached batch (which is in D-order by construction above). Built before the
+      // tier-specific assembly so both branches share the same filter.
+      std::shared_ptr<duckdb::Expression> filter_expression;
+      if (info.table_filters && !info.table_filters->filters.empty()) {
+        auto duckdb_expression =
+          op::convert_table_filters_to_expression(*info.table_filters,
+                                                  info.column_ids,
+                                                  info.returned_types,
+                                                  plan.batch_position_by_column_id,
+                                                  plan.partition_primary_indices);
+        if (duckdb_expression) {
+          filter_expression = std::shared_ptr<duckdb::Expression>(std::move(duckdb_expression));
+        }
+      }
+
+      if (entry.tier == cucascade::memory::Tier::HOST) {
+        // Map each D-position to its index inside the captured host chunk. column_names
+        // is in capture order, so we look up the requested data column by name. A missing
+        // column means the user pinned a subset that doesn't cover this scan — fall back
+        // to the parquet path so the query still succeeds.
+        std::vector<std::size_t> column_indices;
+        column_indices.reserve(plan.data_columns.size());
+        for (auto const& dc : plan.data_columns) {
+          auto it = std::find(entry.column_names.begin(), entry.column_names.end(), dc.name);
+          if (it == entry.column_names.end()) {
+            throw std::runtime_error("[sirius_scan_manager::create_provider_for] pinned entry '" +
+                                     pinned_name + "' missing column '" + dc.name +
+                                     "' required by scan op");
+          }
+          column_indices.push_back(
+            static_cast<std::size_t>(std::distance(entry.column_names.begin(), it)));
+        }
+
+        SIRIUS_LOG_DEBUG(
+          "[sirius_scan_manager::create_provider_for] using host cached_split_provider for "
+          "op_id={} (pinned='{}' data_cols={} chunks={} needs_assembly={})",
+          op_id,
+          pinned_name,
+          column_indices.size(),
+          entry.host_chunks.size(),
+          op::scan::needs_output_assembly(plan));
+
+        return std::make_unique<cached_split_provider>(entry.host_chunks,
+                                                       std::move(column_indices),
+                                                       *entry.memory_space,
+                                                       std::move(filter_expression),
+                                                       std::move(plan_shared));
+      }
+
+      // Look up the pinned chunks for each D-position by name. data_columns is in
+      // D-order, so columns_per_request[d] is the chunk vector for D-position d.
+      std::vector<std::vector<std::shared_ptr<cudf::column>>> columns_per_request;
+      columns_per_request.reserve(plan.data_columns.size());
+      for (auto const& dc : plan.data_columns) {
+        auto it = entry.data_batches_by_column.find(dc.name);
+        if (it == entry.data_batches_by_column.end()) {
+          throw std::runtime_error("[sirius_scan_manager::try_cached_for] pinned entry '" +
+                                   pinned_name + "' missing column '" + dc.name +
+                                   "' required by scan op");
+        }
+        columns_per_request.push_back(it->second);
+      }
+
+      SIRIUS_LOG_DEBUG(
+        "[sirius_scan_manager::try_cached_for] using cached_split_provider for op_id={} "
+        "(pinned='{}' data_cols={} needs_assembly={})",
+        op_id,
         pinned_name,
-        info->db_path);
-      auto info_shared = std::shared_ptr<op::scan::duckdb_native_scan_info const>(std::move(info));
-      return std::make_unique<duckdb_native_cached_split_provider>(
-        std::move(info_shared), std::move(resolved), *entry.memory_space);
+        columns_per_request.size(),
+        op::scan::needs_output_assembly(plan));
+
+      return std::make_unique<cached_split_provider>(std::move(columns_per_request),
+                                                     *entry.memory_space,
+                                                     std::move(filter_expression),
+                                                     std::move(plan_shared));
+    }
+  } catch (...) {
+    SIRIUS_LOG_TRACE("not all the columns are pinned for this query");
+  }
+  return nullptr;
+}
+
+void sirius_scan_manager::start_metadata_processing()
+{
+  for (auto* op : _scan_op_order) {
+    auto it = _providers_by_op.find(op);
+    if (it == _providers_by_op.end()) { continue; }
+    auto* connector = op->get_split_connector();
+    if (connector == nullptr) { continue; }
+
+    try {
+      // run() is fire-and-forget: it enqueues workers and returns immediately.
+      // Worker exceptions ride on connector.close(exception_ptr) and surface
+      // when the consumer drains via get_next_split().
+      it->second->run(*_dispatcher, *connector);
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: provider failed to start: {}", e.what());
+      // Synchronous failure inside run() (e.g. scheduler.enqueue throwing)
+      // bypasses the worker error path, so forward it through the connector
+      // here. close() is idempotent and keeps the first stored exception.
+      connector->close(std::current_exception());
+    }
+  }
+  for (auto* op : _duckdb_native_scan_op_order) {
+    auto it = _duckdb_native_providers_by_op.find(op);
+    if (it == _duckdb_native_providers_by_op.end()) { continue; }
+    auto* connector = op->get_split_connector();
+    if (connector == nullptr) { continue; }
+    try {
+      it->second->run(*_dispatcher, *connector);
+    } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR("[sirius_scan_manager] driver: duckdb-native provider failed to start: {}",
+                       e.what());
+      connector->close(std::current_exception());
+    }
+  }
+}
+
+void sirius_scan_manager::reset()
+{
+  _dispatcher->request_stop();
+  _dispatcher->wait_for_all();
+  _scan_op_order.clear();
+  _providers_by_op.clear();
+  _duckdb_native_scan_op_order.clear();
+  _duckdb_native_providers_by_op.clear();
+  _dispatcher =
+    std::make_unique<exec::scoped_dispatcher>(_thread_pool, _config.thread_pool.num_threads);
+}
+
+void sirius_scan_manager::start() {}
+
+void sirius_scan_manager::stop()
+{
+  reset();
+  _thread_pool.stop();
+}
+
+void sirius_scan_manager::insert_pinned_entry(const std::string& name,
+                                              std::vector<std::string> column_names,
+                                              std::vector<std::string> file_paths,
+                                              std::vector<std::unique_ptr<cudf::table>> data_tables,
+                                              cucascade::memory::memory_space& memory_space)
+{
+  // Compute the total row count of the incoming tables before releasing them
+  // (release() empties the table; num_rows() would then return 0).
+  std::size_t new_num_rows = 0;
+  for (auto const& table : data_tables) {
+    if (table) { new_num_rows += static_cast<std::size_t>(table->num_rows()); }
+  }
+
+  auto existing_it = _pinned_entries.find(name);
+  if (existing_it != _pinned_entries.end()) {
+    if (existing_it->second.num_rows == new_num_rows) {
+      // Same row count → merge unique columns into the existing entry.
+      auto& entry = existing_it->second;
+      for (auto& table : data_tables) {
+        if (!table) { continue; }
+        auto cols = table->release();
+        if (cols.size() != column_names.size()) {
+          throw std::runtime_error(
+            "[sirius_scan_manager::insert_pinned_entry] table column count " +
+            std::to_string(cols.size()) + " does not match column_names size " +
+            std::to_string(column_names.size()));
+        }
+        for (std::size_t i = 0; i < cols.size(); ++i) {
+          auto const& col_name = column_names[i];
+          if (entry.data_batches_by_column.contains(col_name)) {
+            // Already cached — drop the duplicate column.
+            continue;
+          }
+          entry.data_batches_by_column[col_name].emplace_back(std::move(cols[i]));
+        }
+      }
+      // Append any new column names to the entry's column_names list so its
+      // metadata reflects the union of pinned columns.
+      for (auto& cn : column_names) {
+        if (std::find(entry.column_names.begin(), entry.column_names.end(), cn) ==
+            entry.column_names.end()) {
+          entry.column_names.push_back(std::move(cn));
+        }
+      }
+      return;
+    }
+    // Row count differs → drop the stale entry and rebuild below.
+    _pinned_entries.erase(existing_it);
+  }
+
+  pinned_entry entry;
+  entry.column_names = std::move(column_names);
+  entry.file_paths   = std::move(file_paths);
+  entry.tier         = cucascade::memory::Tier::GPU;
+  entry.memory_space = &memory_space;
+  entry.num_rows     = new_num_rows;
+
+  for (auto& table : data_tables) {
+    if (!table) { continue; }
+    auto cols = table->release();
+    if (cols.size() != entry.column_names.size()) {
+      throw std::runtime_error("[sirius_scan_manager::insert_pinned_entry] table column count " +
+                               std::to_string(cols.size()) + " does not match column_names size " +
+                               std::to_string(entry.column_names.size()));
+    }
+    for (std::size_t i = 0; i < cols.size(); ++i) {
+      entry.data_batches_by_column[entry.column_names[i]].emplace_back(std::move(cols[i]));
     }
   }
 
-  return std::make_unique<duckdb_native_split_provider>(std::move(*info), _io_ctx);
-  {
-    _pinned_entries.erase(name);
+  _pinned_entries[name] = std::move(entry);
+}
+
+void sirius_scan_manager::insert_pinned_entry_host(
+  const std::string& name,
+  std::vector<std::string> column_names,
+  std::vector<std::string> file_paths,
+  std::vector<std::shared_ptr<cucascade::host_data_representation>> host_chunks,
+  cucascade::memory::memory_space& memory_space)
+{
+  // The host-tier path captures one chunk per emitted batch; each chunk holds every
+  // pinned column. Re-insert always replaces — there is no per-column merge analog
+  // to the GPU path because the chunk-vs-column dimensions are flipped.
+  std::size_t new_num_rows = 0;
+  for (auto const& chunk : host_chunks) {
+    if (!chunk) { continue; }
+    auto const& host_table = chunk->get_host_table();
+    if (host_table && !host_table->columns.empty()) {
+      new_num_rows += static_cast<std::size_t>(host_table->columns.front().num_rows);
+    }
   }
+
+  pinned_entry entry;
+  entry.column_names = std::move(column_names);
+  entry.file_paths   = std::move(file_paths);
+  entry.tier         = cucascade::memory::Tier::HOST;
+  entry.memory_space = &memory_space;
+  entry.num_rows     = new_num_rows;
+  entry.host_chunks  = std::move(host_chunks);
+
+  _pinned_entries[name] = std::move(entry);
+}
+
+void sirius_scan_manager::remove_pinned_entry(const std::string& name)
+{
+  _pinned_entries.erase(name);
+}
 
 }  // namespace sirius::scan_manager
