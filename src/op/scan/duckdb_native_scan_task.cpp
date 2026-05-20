@@ -580,7 +580,7 @@ staged_column stage_one_varchar_column(staging_state& s,
       ss.row_offset        = row_cursor + static_cast<uint32_t>(seg.segment_start);
       ss.row_count         = static_cast<uint32_t>(seg.segment_count);
       ss.compression       = seg.compression;
-      ss.max_string_length = seg.max_string_length;
+      ss.max_string_length = *seg.max_string_length;  // walker invariant
 
       auto p =
         !seg.additional_blocks.empty()

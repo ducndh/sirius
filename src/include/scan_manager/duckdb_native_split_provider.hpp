@@ -72,6 +72,9 @@ class duckdb_native_split_provider : public split_provider {
   op::scan::duckdb_native_metadata _metadata;
   std::vector<row_group_batch> _batches;
   std::atomic<std::size_t> _next_batch_idx{0};
+  /// Parked for the downstream scan task to read .db blocks via
+  /// sirius_ioctx::host_read. Null when the scan_manager runs without
+  /// sirius_datasource.
   std::shared_ptr<sirius::io::sirius_ioctx> _io_ctx;
   std::shared_ptr<sirius::io::sirius_io_object> _db_io_object;
 };

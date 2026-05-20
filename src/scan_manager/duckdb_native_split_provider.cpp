@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -29,21 +30,20 @@ namespace sirius::scan_manager {
 
 namespace {
 
-// cudf strings columns use int32 offsets, so the per-column decoded byte budget
-// for a single scan output must stay under INT32_MAX. 64 MB headroom covers
-// max_string_length being an upper bound + offsets/validity allocations.
+// cudf strings columns use int32 chars-offsets; one column's bytes per
+// scan output must stay <= INT32_MAX.
 constexpr std::size_t VARCHAR_BYTE_CAP =
-  (static_cast<std::size_t>(1) << 31) - (static_cast<std::size_t>(64) << 20);
+  static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
 
+// Per-segment exact: bound = Σ(seg.segment_count × *seg.max_string_length).
+// Walker refuses on absent stat so every segment is Some(...) here.
 std::size_t rg_varchar_bytes_for_col(const op::scan::duckdb_row_group_metadata& rg,
                                      std::size_t col_idx)
 {
   std::size_t total = 0;
   for (const auto& seg : rg.columns[col_idx].data_segments) {
-    std::uint32_t per_row = seg.max_string_length == 0
-                              ? op::scan::VARCHAR_UNKNOWN_LENGTH_FALLBACK_BYTES
-                              : seg.max_string_length;
-    total += static_cast<std::size_t>(seg.segment_count) * static_cast<std::size_t>(per_row);
+    total +=
+      static_cast<std::size_t>(seg.segment_count) * static_cast<std::size_t>(*seg.max_string_length);
   }
   return total;
 }
@@ -64,7 +64,7 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
   const bool any_varchar =
     std::any_of(is_varchar.begin(), is_varchar.end(), [](bool b) { return b; });
 
-  // Fast path: no batch-bytes cap AND no varchar columns → single batch.
+  // No caps in play → single batch.
   if (approximate_batch_size == 0 && !any_varchar) {
     batches.push_back({0, row_groups.size()});
     return batches;
@@ -83,9 +83,8 @@ std::vector<duckdb_native_split_provider::row_group_batch> partition_row_groups_
       }
     }
 
-    // Decide whether to close the in-progress batch before adding this RG.
-    // Cap (c): only fire when the batch is non-empty, so a single oversized RG
-    // still makes forward progress as its own singleton batch.
+    // Only close a non-empty batch; an over-cap row group always lands in
+    // the current batch as its first member (singleton if it's alone).
     if (i > batch_first) {
       const bool would_exceed_total =
         (approximate_batch_size > 0) && (batch_bytes + this_rg_bytes > approximate_batch_size);
@@ -143,12 +142,9 @@ duckdb_native_split_provider::duckdb_native_split_provider(
                                                     _scan_info->projected_cols,
                                                     _scan_info->projected_types);
   if (!_metadata.viable) {
-    // Throw rather than registering with zero batches: empty-splits leaves the
-    // downstream pipeline waiting forever on the FULL barrier. The throw
-    // surfaces as a query error and sirius_extension's transparent fallback
-    // (sirius_extension.cpp:520) routes to DuckDB CPU, the right home for
-    // queries our native scan can't handle. The legacy DUCKDB_SCAN GPU path
-    // is being sunsetted, so we don't try to re-route there.
+    // Empty splits would hang the pipeline on the FULL barrier. The throw
+    // surfaces as a query error and the extension's transparent fallback
+    // routes to DuckDB CPU.
     SPDLOG_DEBUG("[duckdb_native_split_provider] non-viable: {}",
                  _metadata.viability_failure_reason);
     throw std::runtime_error("duckdb-native scan rejected query: " +
