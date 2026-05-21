@@ -161,29 +161,31 @@ struct pinned_segment_bytes {
   std::size_t bytes       = 0;
 };
 
-// Pin a single block and return its host pointer + remaining bytes from
-// `block_offset` to end-of-block.
+// Pin a single block and return its host pointer + the descriptor's exact
+// `bytes_size` (derived by the walker from sorted block_offsets within the
+// block).
 pinned_segment_bytes pin_block(duckdb::BlockManager& block_manager,
                                duckdb::BufferManager& buffer_manager,
-                               duckdb::block_id_t block_id,
-                               std::size_t block_offset)
+                               duckdb_segment_descriptor const& seg)
 {
-  if (block_id < 0) {
+  if (seg.block_id < 0) {
     throw std::runtime_error(std::string(kTag) +
                              " pin_block called with block_id<0 (CONSTANT segment?)");
   }
-  auto handle = block_manager.RegisterBlock(block_id);
-  auto pinned = buffer_manager.Pin(handle);
-  auto* base  = pinned.Ptr();
-  auto bytes  = block_manager.GetBlockSize();
-  if (block_offset > bytes) {
-    throw std::runtime_error(std::string(kTag) + " block_offset (" + std::to_string(block_offset) +
-                             ") exceeds block size (" + std::to_string(bytes) + ")");
+  auto handle           = block_manager.RegisterBlock(seg.block_id);
+  auto pinned           = buffer_manager.Pin(handle);
+  auto* base            = pinned.Ptr();
+  auto const block_size = block_manager.GetBlockSize();
+  if (static_cast<std::size_t>(seg.block_offset) + seg.bytes_size > block_size) {
+    throw std::runtime_error(std::string(kTag) + " segment exceeds block: block_offset=" +
+                             std::to_string(seg.block_offset) +
+                             " bytes_size=" + std::to_string(seg.bytes_size) +
+                             " block_size=" + std::to_string(block_size));
   }
   pinned_segment_bytes out;
   out.handles.push_back(std::move(pinned));
-  out.host_ptr = base + block_offset;
-  out.bytes    = bytes - block_offset;
+  out.host_ptr = base + seg.block_offset;
+  out.bytes    = seg.bytes_size;
   return out;
 }
 
@@ -196,25 +198,28 @@ pinned_segment_bytes pin_block(duckdb::BlockManager& block_manager,
 // readable as one contiguous slab is codec-dependent. For FSST/DICT_FSST
 // inline-symbol-table segments the main block alone is enough; the concat
 // is here for codecs that visit_block_ids.
-pinned_segment_bytes pin_block_with_additional(
-  duckdb::BlockManager& block_manager,
-  duckdb::BufferManager& buffer_manager,
-  duckdb::block_id_t main_block_id,
-  std::size_t block_offset,
-  std::vector<duckdb::block_id_t> const& additional_block_ids)
+pinned_segment_bytes pin_block_with_additional(duckdb::BlockManager& block_manager,
+                                               duckdb::BufferManager& buffer_manager,
+                                               duckdb_segment_descriptor const& seg)
 {
-  auto main_pinned       = block_manager.RegisterBlock(main_block_id);
-  auto main_handle       = buffer_manager.Pin(main_pinned);
-  auto block_size        = block_manager.GetBlockSize();
-  auto main_payload_size = block_size > block_offset ? block_size - block_offset : std::size_t{0};
+  auto main_pinned      = block_manager.RegisterBlock(seg.block_id);
+  auto main_handle      = buffer_manager.Pin(main_pinned);
+  auto const block_size = block_manager.GetBlockSize();
+  if (static_cast<std::size_t>(seg.block_offset) + seg.bytes_size > block_size) {
+    throw std::runtime_error(std::string(kTag) + " segment exceeds block: block_offset=" +
+                             std::to_string(seg.block_offset) +
+                             " bytes_size=" + std::to_string(seg.bytes_size) +
+                             " block_size=" + std::to_string(block_size));
+  }
+  auto const main_payload_size = seg.bytes_size;
 
   std::vector<duckdb::BufferHandle> handles;
   handles.push_back(std::move(main_handle));
   std::vector<uint8_t> concat;
   concat.resize(main_payload_size);
-  std::memcpy(concat.data(), handles.front().Ptr() + block_offset, main_payload_size);
+  std::memcpy(concat.data(), handles.front().Ptr() + seg.block_offset, main_payload_size);
 
-  for (auto add_id : additional_block_ids) {
+  for (auto add_id : seg.additional_blocks) {
     auto add_handle = block_manager.RegisterBlock(add_id);
     auto h          = buffer_manager.Pin(add_handle);
     auto offset     = concat.size();
@@ -244,60 +249,63 @@ pinned_segment_bytes pin_block_with_additional(
 pinned_segment_bytes read_block_via_io(::sirius::io::sirius_ioctx& ctx,
                                        ::sirius::io::sirius_io_object& obj,
                                        duckdb::BlockManager const& bm,
-                                       duckdb::block_id_t block_id,
-                                       std::size_t block_offset)
+                                       duckdb_segment_descriptor const& seg)
 {
   const std::size_t block_size  = bm.GetBlockSize();
-  const std::size_t payload_off = duckdb_block_payload_offset(bm, block_id);
+  const std::size_t payload_off = duckdb_block_payload_offset(bm, seg.block_id);
+  if (static_cast<std::size_t>(seg.block_offset) + seg.bytes_size > block_size) {
+    throw std::runtime_error(std::string(kTag) + " segment exceeds block: block_offset=" +
+                             std::to_string(seg.block_offset) +
+                             " bytes_size=" + std::to_string(seg.bytes_size) +
+                             " block_size=" + std::to_string(block_size));
+  }
   pinned_segment_bytes out;
   out.owned_bytes.resize(block_size);
   const std::size_t got = ctx.host_read(obj, payload_off, block_size, out.owned_bytes.data());
   if (got != block_size) {
     throw std::runtime_error(std::string(kTag) + " short host_read for block_id " +
-                             std::to_string(block_id) + ": got " + std::to_string(got) +
+                             std::to_string(seg.block_id) + ": got " + std::to_string(got) +
                              " expected " + std::to_string(block_size));
   }
-  if (block_offset > block_size) {
-    throw std::runtime_error(std::string(kTag) + " block_offset (" + std::to_string(block_offset) +
-                             ") exceeds block size (" + std::to_string(block_size) + ")");
-  }
-  out.host_ptr = out.owned_bytes.data() + block_offset;
-  out.bytes    = block_size - block_offset;
+  out.host_ptr = out.owned_bytes.data() + seg.block_offset;
+  out.bytes    = seg.bytes_size;
   return out;
 }
 
-pinned_segment_bytes read_blocks_with_additional_via_io(
-  ::sirius::io::sirius_ioctx& ctx,
-  ::sirius::io::sirius_io_object& obj,
-  duckdb::BlockManager const& bm,
-  duckdb::block_id_t main_block_id,
-  std::size_t block_offset,
-  std::vector<duckdb::block_id_t> const& additional_block_ids)
+pinned_segment_bytes read_blocks_with_additional_via_io(::sirius::io::sirius_ioctx& ctx,
+                                                        ::sirius::io::sirius_io_object& obj,
+                                                        duckdb::BlockManager const& bm,
+                                                        duckdb_segment_descriptor const& seg)
 {
   const std::size_t block_size = bm.GetBlockSize();
-  const std::size_t main_payload_size =
-    block_size > block_offset ? block_size - block_offset : std::size_t{0};
+  if (static_cast<std::size_t>(seg.block_offset) + seg.bytes_size > block_size) {
+    throw std::runtime_error(std::string(kTag) + " segment exceeds block: block_offset=" +
+                             std::to_string(seg.block_offset) +
+                             " bytes_size=" + std::to_string(seg.bytes_size) +
+                             " block_size=" + std::to_string(block_size));
+  }
+  const std::size_t main_payload_size = seg.bytes_size;
 
   std::vector<uint8_t> concat;
-  concat.resize(main_payload_size + additional_block_ids.size() * block_size);
+  concat.resize(main_payload_size + seg.additional_blocks.size() * block_size);
 
   // Main block: read full payload then memcpy starting at block_offset.
   {
     std::vector<uint8_t> main_buf(block_size);
     const std::size_t got = ctx.host_read(
-      obj, duckdb_block_payload_offset(bm, main_block_id), block_size, main_buf.data());
+      obj, duckdb_block_payload_offset(bm, seg.block_id), block_size, main_buf.data());
     if (got != block_size) {
       throw std::runtime_error(std::string(kTag) + " short host_read for main block_id " +
-                               std::to_string(main_block_id));
+                               std::to_string(seg.block_id));
     }
     if (main_payload_size > 0) {
-      std::memcpy(concat.data(), main_buf.data() + block_offset, main_payload_size);
+      std::memcpy(concat.data(), main_buf.data() + seg.block_offset, main_payload_size);
     }
   }
 
   // Additional blocks: read each full-payload directly into the concat buffer.
   std::size_t dst_off = main_payload_size;
-  for (auto add_id : additional_block_ids) {
+  for (auto add_id : seg.additional_blocks) {
     const std::size_t got = ctx.host_read(
       obj, duckdb_block_payload_offset(bm, add_id), block_size, concat.data() + dst_off);
     if (got != block_size) {
@@ -506,10 +514,9 @@ staged_column stage_one_fixed_width_column(
           partition_stats, rg.row_group_index, col_md.column_id, owned_stats_cache);
         p = extract_constant_bytes(stats, projected_type);
       } else if (!seg.additional_blocks.empty()) {
-        p = pin_block_with_additional(
-          block_manager, buffer_manager, seg.block_id, seg.block_offset, seg.additional_blocks);
+        p = pin_block_with_additional(block_manager, buffer_manager, seg);
       } else {
-        p = pin_block(block_manager, buffer_manager, seg.block_id, seg.block_offset);
+        p = pin_block(block_manager, buffer_manager, seg);
       }
       record_staged(s, std::move(p), ss);
       out.data.push_back(ss);
@@ -530,13 +537,9 @@ staged_column stage_one_fixed_width_column(
         p = decode_roaring_validity(db, block_manager, vseg);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
         if (!vseg.additional_blocks.empty()) {
-          p = pin_block_with_additional(block_manager,
-                                        buffer_manager,
-                                        vseg.block_id,
-                                        vseg.block_offset,
-                                        vseg.additional_blocks);
+          p = pin_block_with_additional(block_manager, buffer_manager, vseg);
         } else {
-          p = pin_block(block_manager, buffer_manager, vseg.block_id, vseg.block_offset);
+          p = pin_block(block_manager, buffer_manager, vseg);
         }
       } else {
         throw_unsupported("validity codec " + std::to_string(static_cast<int>(vseg.compression)) +
@@ -582,11 +585,9 @@ staged_column stage_one_varchar_column(staging_state& s,
       ss.compression       = seg.compression;
       ss.max_string_length = *seg.max_string_length;  // walker invariant
 
-      auto p =
-        !seg.additional_blocks.empty()
-          ? pin_block_with_additional(
-              block_manager, buffer_manager, seg.block_id, seg.block_offset, seg.additional_blocks)
-          : pin_block(block_manager, buffer_manager, seg.block_id, seg.block_offset);
+      auto p = !seg.additional_blocks.empty()
+                 ? pin_block_with_additional(block_manager, buffer_manager, seg)
+                 : pin_block(block_manager, buffer_manager, seg);
       record_staged(s, std::move(p), ss);
       out.data.push_back(ss);
     }
@@ -604,13 +605,9 @@ staged_column stage_one_varchar_column(staging_state& s,
         p = decode_roaring_validity(db, block_manager, vseg);
       } else if (vseg.compression == duckdb::CompressionType::COMPRESSION_UNCOMPRESSED) {
         if (!vseg.additional_blocks.empty()) {
-          p = pin_block_with_additional(block_manager,
-                                        buffer_manager,
-                                        vseg.block_id,
-                                        vseg.block_offset,
-                                        vseg.additional_blocks);
+          p = pin_block_with_additional(block_manager, buffer_manager, vseg);
         } else {
-          p = pin_block(block_manager, buffer_manager, vseg.block_id, vseg.block_offset);
+          p = pin_block(block_manager, buffer_manager, vseg);
         }
       } else {
         throw_unsupported("validity codec " + std::to_string(static_cast<int>(vseg.compression)) +

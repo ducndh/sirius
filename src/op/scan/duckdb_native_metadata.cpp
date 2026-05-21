@@ -19,8 +19,11 @@
 #include "log/logging.hpp"
 
 #include <duckdb/function/partition_stats.hpp>
+#include <duckdb/main/attached_database.hpp>
+#include <duckdb/storage/block_manager.hpp>
 #include <duckdb/storage/statistics/base_statistics.hpp>
 #include <duckdb/storage/statistics/string_stats.hpp>
+#include <duckdb/storage/storage_manager.hpp>
 #include <duckdb/storage/table_storage_info.hpp>
 
 #include <algorithm>
@@ -220,6 +223,47 @@ void compute_decoded_byte_budgets(duckdb_native_metadata& md,
       }
     }
     rg_md.decoded_bytes_budget = budget;
+  }
+}
+
+// Per-segment exact byte size: DuckDB's PartialBlockManager packs many
+// segments back-to-back into one 256 KiB block, but ColumnSegmentInfo
+// only exposes block_id + block_offset (no segment_size). We compute
+// each segment's exact byte size by sorting all segments by (block_id,
+// block_offset) and subtracting consecutive offsets within the same
+// block. The last segment per block falls back to `block_size -
+// block_offset` and carries up to ~50 KiB of partial-block tail slack;
+// codec parsers handle that via the values-region bound. Without this,
+// every segment's `bytes_size` is the block-tail upper bound and non-
+// last-in-block segments include the next segment's bytes — kernels
+// would over-read structured neighboring data, relying on
+// match-vs-malformed reordering to discard it.
+void compute_segment_bytes_size(duckdb_native_metadata& md, std::size_t block_size)
+{
+  std::vector<duckdb_segment_descriptor*> refs;
+  for (auto& rg : md.row_groups) {
+    for (auto& col : rg.columns) {
+      for (auto& s : col.data_segments)
+        if (s.block_id >= 0) refs.push_back(&s);
+      for (auto& s : col.validity_segments)
+        if (s.block_id >= 0) refs.push_back(&s);
+    }
+  }
+  std::sort(refs.begin(), refs.end(), [](const auto* a, const auto* b) {
+    if (a->block_id != b->block_id) return a->block_id < b->block_id;
+    return a->block_offset < b->block_offset;
+  });
+  for (std::size_t i = 0; i < refs.size(); ++i) {
+    auto& seg = *refs[i];
+    if (i + 1 < refs.size() && refs[i + 1]->block_id == seg.block_id) {
+      // Not last in this block — exact size is the offset delta.
+      seg.bytes_size = static_cast<std::size_t>(refs[i + 1]->block_offset - seg.block_offset);
+    } else {
+      // Last segment in this block — falls back to the block tail.
+      seg.bytes_size = block_size > static_cast<std::size_t>(seg.block_offset)
+                         ? block_size - static_cast<std::size_t>(seg.block_offset)
+                         : 0;
+    }
   }
 }
 
@@ -440,6 +484,13 @@ duckdb_native_metadata walk_duckdb_native_metadata(
       std::sort(col_md.validity_segments.begin(), col_md.validity_segments.end(), seg_less);
     }
   }
+
+  // Derive exact per-segment bytes_size before downstream consumers (scan
+  // task staging) need it. Done after the per-rg segment sort so adjacent
+  // segments inside the same block are reliably consecutive in the global
+  // sort by (block_id, block_offset).
+  const std::size_t block_size = storage.GetAttached().GetStorageManager().GetBlockManager().GetBlockSize();
+  compute_segment_bytes_size(md, block_size);
 
   compute_row_counts(md, partition_stats);
   compute_decoded_byte_budgets(md, projected_types);

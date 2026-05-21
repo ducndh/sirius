@@ -58,6 +58,14 @@ struct duckdb_segment_descriptor {
   /// chars-region sizing and short/long-string routing, and the
   /// partitioner's per-column varchar-byte cap.
   std::optional<std::uint32_t> max_string_length;
+  /// Exact byte size of this segment's main-block payload, derived from
+  /// the next segment sharing the same `block_id` (block_offset delta).
+  /// Last-in-block segments fall back to `block_size - block_offset` and
+  /// carry up to `RegisterPartialBlock`'s trailing zero-fill slack —
+  /// codec parsers handle that via the values-region bound. Zero for
+  /// segments with `block_id == -1` (CONSTANT, ROARING-only validity).
+  /// Excludes `additional_blocks`; stage those separately.
+  std::size_t bytes_size = 0;
 };
 
 struct duckdb_column_metadata {
