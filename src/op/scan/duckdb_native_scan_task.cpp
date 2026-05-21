@@ -161,9 +161,6 @@ struct pinned_segment_bytes {
   std::size_t bytes       = 0;
 };
 
-// Pin a single block and return its host pointer + the descriptor's exact
-// `bytes_size` (derived by the walker from sorted block_offsets within the
-// block).
 pinned_segment_bytes pin_block(duckdb::BlockManager& block_manager,
                                duckdb::BufferManager& buffer_manager,
                                duckdb_segment_descriptor const& seg)
@@ -172,20 +169,12 @@ pinned_segment_bytes pin_block(duckdb::BlockManager& block_manager,
     throw std::runtime_error(std::string(kTag) +
                              " pin_block called with block_id<0 (CONSTANT segment?)");
   }
-  auto handle           = block_manager.RegisterBlock(seg.block_id);
-  auto pinned           = buffer_manager.Pin(handle);
-  auto* base            = pinned.Ptr();
-  auto const block_size = block_manager.GetBlockSize();
-  if (static_cast<std::size_t>(seg.block_offset) + seg.bytes_size > block_size) {
-    throw std::runtime_error(std::string(kTag) + " segment exceeds block: block_offset=" +
-                             std::to_string(seg.block_offset) +
-                             " bytes_size=" + std::to_string(seg.bytes_size) +
-                             " block_size=" + std::to_string(block_size));
-  }
+  auto handle = block_manager.RegisterBlock(seg.block_id);
+  auto pinned = buffer_manager.Pin(handle);
   pinned_segment_bytes out;
-  out.handles.push_back(std::move(pinned));
-  out.host_ptr = base + seg.block_offset;
+  out.host_ptr = pinned.Ptr() + seg.block_offset;
   out.bytes    = seg.bytes_size;
+  out.handles.push_back(std::move(pinned));
   return out;
 }
 
@@ -205,19 +194,12 @@ pinned_segment_bytes pin_block_with_additional(duckdb::BlockManager& block_manag
   auto main_pinned      = block_manager.RegisterBlock(seg.block_id);
   auto main_handle      = buffer_manager.Pin(main_pinned);
   auto const block_size = block_manager.GetBlockSize();
-  if (static_cast<std::size_t>(seg.block_offset) + seg.bytes_size > block_size) {
-    throw std::runtime_error(std::string(kTag) + " segment exceeds block: block_offset=" +
-                             std::to_string(seg.block_offset) +
-                             " bytes_size=" + std::to_string(seg.bytes_size) +
-                             " block_size=" + std::to_string(block_size));
-  }
-  auto const main_payload_size = seg.bytes_size;
 
   std::vector<duckdb::BufferHandle> handles;
   handles.push_back(std::move(main_handle));
   std::vector<uint8_t> concat;
-  concat.resize(main_payload_size);
-  std::memcpy(concat.data(), handles.front().Ptr() + seg.block_offset, main_payload_size);
+  concat.resize(seg.bytes_size);
+  std::memcpy(concat.data(), handles.front().Ptr() + seg.block_offset, seg.bytes_size);
 
   for (auto add_id : seg.additional_blocks) {
     auto add_handle = block_manager.RegisterBlock(add_id);
@@ -236,14 +218,11 @@ pinned_segment_bytes pin_block_with_additional(duckdb::BlockManager& block_manag
   return out;
 }
 
-// sirius_io variant: read .db block payloads via sirius_ioctx::host_read.
-//
-// Equivalent to pin_block / pin_block_with_additional but bypasses DuckDB's
-// BufferManager. Used when the scan_manager is configured with
-// use_sirius_datasource=true so the duckdb-native scan path goes through the
-// same I/O substrate as parquet. Output shape matches BufferManager.Pin: a
-// payload-only host pointer with `block_size - block_offset` bytes for the
-// main block, plus full-block payloads concatenated for additional blocks.
+// sirius_io variants of pin_block / pin_block_with_additional: read .db
+// block payloads via sirius_ioctx::host_read, bypassing DuckDB's
+// BufferManager. Used when scan_manager is configured with
+// use_sirius_datasource=true. Output shape matches the BufferManager
+// variants.
 //===----------------------------------------------------------------------===//
 
 pinned_segment_bytes read_block_via_io(::sirius::io::sirius_ioctx& ctx,
@@ -251,17 +230,11 @@ pinned_segment_bytes read_block_via_io(::sirius::io::sirius_ioctx& ctx,
                                        duckdb::BlockManager const& bm,
                                        duckdb_segment_descriptor const& seg)
 {
-  const std::size_t block_size  = bm.GetBlockSize();
-  const std::size_t payload_off = duckdb_block_payload_offset(bm, seg.block_id);
-  if (static_cast<std::size_t>(seg.block_offset) + seg.bytes_size > block_size) {
-    throw std::runtime_error(std::string(kTag) + " segment exceeds block: block_offset=" +
-                             std::to_string(seg.block_offset) +
-                             " bytes_size=" + std::to_string(seg.bytes_size) +
-                             " block_size=" + std::to_string(block_size));
-  }
+  const std::size_t block_size = bm.GetBlockSize();
   pinned_segment_bytes out;
   out.owned_bytes.resize(block_size);
-  const std::size_t got = ctx.host_read(obj, payload_off, block_size, out.owned_bytes.data());
+  const std::size_t got = ctx.host_read(
+    obj, duckdb_block_payload_offset(bm, seg.block_id), block_size, out.owned_bytes.data());
   if (got != block_size) {
     throw std::runtime_error(std::string(kTag) + " short host_read for block_id " +
                              std::to_string(seg.block_id) + ": got " + std::to_string(got) +
@@ -277,13 +250,7 @@ pinned_segment_bytes read_blocks_with_additional_via_io(::sirius::io::sirius_ioc
                                                         duckdb::BlockManager const& bm,
                                                         duckdb_segment_descriptor const& seg)
 {
-  const std::size_t block_size = bm.GetBlockSize();
-  if (static_cast<std::size_t>(seg.block_offset) + seg.bytes_size > block_size) {
-    throw std::runtime_error(std::string(kTag) + " segment exceeds block: block_offset=" +
-                             std::to_string(seg.block_offset) +
-                             " bytes_size=" + std::to_string(seg.bytes_size) +
-                             " block_size=" + std::to_string(block_size));
-  }
+  const std::size_t block_size        = bm.GetBlockSize();
   const std::size_t main_payload_size = seg.bytes_size;
 
   std::vector<uint8_t> concat;
