@@ -19,7 +19,12 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/dictionary/dictionary_factories.hpp>
+#include <cudf/dictionary/encode.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/detail/error.hpp>
@@ -30,7 +35,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -1907,6 +1915,295 @@ void overlay_validity_run(gpu_codec_run const& run, uint8_t* d_mask, rmm::cuda_s
   }
 }
 
+//===----------------------------------------------------------------------===//
+// DICTIONARY32 producer (late materialization)
+//
+// When a varchar column is *uniformly* DICTIONARY-coded, emit a cuDF
+// DICTIONARY32 column (sorted-unique keys + INT32 codes) instead of decoding to
+// full strings, so the operators downstream can carry the column compressed.
+//
+// Each DuckDB segment carries its own local dictionary. We (1) decode every
+// segment's D_k keys into one concatenated strings column (D = sum D_k entries;
+// only the keys, never the N rows), (2) `cudf::dictionary::encode` over those D
+// entries to obtain the sorted-unique GLOBAL keys plus a LUT mapping each
+// segment-local key to its global id, and (3) remap the N per-row codes through
+// the LUT. Only D keys are hashed — never the N rows.
+//===----------------------------------------------------------------------===//
+
+/// Per-segment descriptor for the dictionary producer. Carries the same row
+/// geometry as `string_chunk_desc` plus the segment's base offset into the
+/// concatenated global key space (`seg_keybase`). `expand_chunks` slices it for
+/// the per-row code kernel; `seg_keybase` is segment-level and copies verbatim.
+struct alignas(8) dict_emit_desc {
+  uint8_t const* d_bytes;
+  uint32_t bytes_size;
+  uint32_t row_count;
+  uint32_t global_row_start;  ///< output row position
+  uint32_t seg_row_start;     ///< rows skipped at segment head when chunked
+  uint32_t seg_keybase;       ///< base into the concatenated key space
+};
+
+/// One thread per segment: read each segment's real key count (index_buffer_count
+/// minus the reserved NULL slot at index 0). Malformed → 0.
+__global__ void kernel_dict_key_counts(dict_emit_desc const* __restrict__ descs,
+                                       uint32_t* __restrict__ out_counts,
+                                       uint32_t num_segs)
+{
+  auto const sid = blockIdx.x;
+  if (sid >= num_segs || threadIdx.x != 0) return;
+  dict_header_t hdr;
+  bool const ok    = parse_dict_header(descs[sid].d_bytes, descs[sid].bytes_size, &hdr);
+  out_counts[sid]  = (ok && hdr.index_buffer_count > 0u) ? (hdr.index_buffer_count - 1u) : 0u;
+}
+
+/// Decoded length of each segment key, written into the global key-length array.
+__global__ void kernel_dict_key_lengths(dict_emit_desc const* __restrict__ descs,
+                                        uint32_t* __restrict__ d_key_lengths,
+                                        uint32_t num_segs)
+{
+  auto const sid = blockIdx.x;
+  if (sid >= num_segs) return;
+  auto const desc = descs[sid];
+
+  __shared__ bool sm_ok;
+  __shared__ dict_header_t sm_hdr;
+  if (threadIdx.x == 0) { sm_ok = parse_dict_header(desc.d_bytes, desc.bytes_size, &sm_hdr); }
+  __syncthreads();
+  if (!sm_ok) return;
+
+  auto const* d_idx = reinterpret_cast<uint32_t const*>(desc.d_bytes + sm_hdr.index_buffer_offset);
+  for (uint32_t j = threadIdx.x + 1u; j < sm_hdr.index_buffer_count; j += blockDim.x) {
+    d_key_lengths[desc.seg_keybase + (j - 1u)] = d_idx[j] - d_idx[j - 1u];
+  }
+}
+
+/// Gather each segment's key bytes into the concatenated key chars buffer.
+__global__ void kernel_dict_key_gather(dict_emit_desc const* __restrict__ descs,
+                                       int32_t const* __restrict__ d_key_offsets,
+                                       uint8_t* __restrict__ d_key_chars,
+                                       uint32_t num_segs)
+{
+  auto const sid = blockIdx.x;
+  if (sid >= num_segs) return;
+  auto const desc = descs[sid];
+
+  __shared__ bool sm_ok;
+  __shared__ dict_header_t sm_hdr;
+  if (threadIdx.x == 0) { sm_ok = parse_dict_header(desc.d_bytes, desc.bytes_size, &sm_hdr); }
+  __syncthreads();
+  if (!sm_ok) return;
+
+  auto const* d_idx    = reinterpret_cast<uint32_t const*>(desc.d_bytes + sm_hdr.index_buffer_offset);
+  auto const* dict_end = desc.d_bytes + sm_hdr.dict_end;
+  for (uint32_t j = threadIdx.x + 1u; j < sm_hdr.index_buffer_count; j += blockDim.x) {
+    auto const end_off = d_idx[j];
+    auto const len     = end_off - d_idx[j - 1u];
+    auto const out_pos = d_key_offsets[desc.seg_keybase + (j - 1u)];
+    memcpy(d_key_chars + out_pos, dict_end - end_off, len);
+  }
+}
+
+/// Per-row code into the concatenated key space. NULL/malformed rows get code 0
+/// (their NULL-ness is carried by the validity mask, exactly as the strings path).
+__global__ void kernel_dict_row_codes(dict_emit_desc const* __restrict__ descs,
+                                      int32_t* __restrict__ d_raw_codes,
+                                      uint32_t num_chunks)
+{
+  auto const cid = blockIdx.x;
+  if (cid >= num_chunks) return;
+  auto const desc = descs[cid];
+
+  __shared__ bool sm_ok;
+  __shared__ dict_header_t sm_hdr;
+  if (threadIdx.x == 0) { sm_ok = parse_dict_header(desc.d_bytes, desc.bytes_size, &sm_hdr); }
+  __syncthreads();
+  if (!sm_ok) {
+    for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+      d_raw_codes[desc.global_row_start + i] = 0;
+    }
+    return;
+  }
+
+  auto const* d_sel = reinterpret_cast<uint32_t const*>(desc.d_bytes + sizeof(dict_header_t));
+  for (uint32_t i = threadIdx.x; i < desc.row_count; i += blockDim.x) {
+    auto const seg_i = desc.seg_row_start + i;
+    auto const sel   = unpack_value<uint32_t>(d_sel, seg_i, sm_hdr.bitpacking_width);
+    int32_t raw      = 0;
+    if (sel != 0u && sel < sm_hdr.index_buffer_count) {
+      raw = static_cast<int32_t>(desc.seg_keybase + (sel - 1u));
+    }
+    d_raw_codes[desc.global_row_start + i] = raw;
+  }
+}
+
+/// Build a DICTIONARY32 column for a uniformly-DICTIONARY varchar column.
+/// Returns nullptr (caller falls back to the strings path) when the column has
+/// no real keys (all-null/malformed) or exceeds int32 offset limits.
+std::unique_ptr<cudf::column> gpu_emit_dictionary_column(gpu_string_column_decode_input const& col,
+                                                         rmm::cuda_stream_view stream,
+                                                         rmm::device_async_resource_ref mr)
+{
+  uint32_t const total_rows = col.total_rows;
+  constexpr auto INT32_MAX_SIZE = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+
+  std::vector<dict_emit_desc> segs;
+  for (auto const& run : col.data) {
+    for (auto const& seg : run.segments) {
+      if (seg.row_count == 0) continue;
+      segs.push_back(dict_emit_desc{
+        seg.d_bytes, seg.bytes_size, seg.row_count, seg.row_offset, seg.seg_row_start, 0u});
+    }
+  }
+  if (segs.empty()) return nullptr;
+  uint32_t const num_segs = static_cast<uint32_t>(segs.size());
+
+  // Per-phase wall timing behind SIRIUS_EMIT_DICT_PROFILE (adds a sync per phase
+  // — only when profiling). Reveals where producer time goes (syncs vs encode vs
+  // gather), so it's not perturbed in normal runs.
+  char const* prof_env = std::getenv("SIRIUS_EMIT_DICT_PROFILE");
+  bool const prof      = prof_env != nullptr && std::string(prof_env) != "0";
+  auto prof_t          = std::chrono::steady_clock::now();
+  auto mark            = [&](char const* label) {
+    if (!prof) return;
+    RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+    auto now      = std::chrono::steady_clock::now();
+    double ms     = std::chrono::duration<double, std::milli>(now - prof_t).count();
+    std::fprintf(stderr, "[emit-prof] %-26s %.4f ms\n", label, ms);
+    prof_t = now;
+  };
+
+  auto upload_bytes = [&](void const* src, size_t bytes) {
+    rmm::device_buffer buf(bytes > 0 ? bytes : 1u, stream, mr);
+    if (bytes > 0) {
+      RMM_CUDA_TRY(
+        cudaMemcpyAsync(buf.data(), src, bytes, cudaMemcpyHostToDevice, stream.value()));
+    }
+    return buf;
+  };
+
+  // Pass 0: per-segment key counts → host prefix sum → seg_keybase.
+  rmm::device_buffer d_segs0 = upload_bytes(segs.data(), num_segs * sizeof(dict_emit_desc));
+  rmm::device_uvector<uint32_t> d_counts(num_segs, stream, mr);
+  kernel_dict_key_counts<<<num_segs, WARP_THREADS, 0, stream.value()>>>(
+    static_cast<dict_emit_desc const*>(d_segs0.data()), d_counts.data(), num_segs);
+  std::vector<uint32_t> h_counts(num_segs);
+  RMM_CUDA_TRY(cudaMemcpyAsync(h_counts.data(),
+                               d_counts.data(),
+                               num_segs * sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost,
+                               stream.value()));
+  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));  // d_segs0 (pageable src) + read counts
+  size_t total_keys = 0;
+  for (uint32_t s = 0; s < num_segs; ++s) {
+    segs[s].seg_keybase = static_cast<uint32_t>(total_keys);
+    total_keys += h_counts[s];
+  }
+  if (total_keys == 0 || total_keys > INT32_MAX_SIZE) return nullptr;
+  auto const D = static_cast<uint32_t>(total_keys);
+  mark("P0 counts+keybase(sync1)");
+
+  rmm::device_buffer d_segs = upload_bytes(segs.data(), num_segs * sizeof(dict_emit_desc));
+  auto const* d_segs_p      = static_cast<dict_emit_desc const*>(d_segs.data());
+
+  // Pass 1: key lengths → exclusive-sum offsets → key chars (all_keys, D entries).
+  rmm::device_uvector<uint32_t> d_key_lengths(D + 1u, stream, mr);
+  RMM_CUDA_TRY(
+    cudaMemsetAsync(d_key_lengths.data(), 0, (D + 1u) * sizeof(uint32_t), stream.value()));
+  kernel_dict_key_lengths<<<num_segs, BLOCK_DIM, 0, stream.value()>>>(
+    d_segs_p, d_key_lengths.data(), num_segs);
+
+  rmm::device_buffer d_key_offsets((D + 1u) * sizeof(int32_t), stream, mr);
+  auto* d_key_offsets_u = reinterpret_cast<uint32_t*>(d_key_offsets.data());
+  size_t cub_bytes      = 0;
+  cub::DeviceScan::ExclusiveSum(
+    nullptr, cub_bytes, d_key_lengths.data(), d_key_offsets_u, static_cast<int>(D) + 1, stream.value());
+  rmm::device_buffer cub_temp(cub_bytes, stream, mr);
+  cub::DeviceScan::ExclusiveSum(cub_temp.data(),
+                                cub_bytes,
+                                d_key_lengths.data(),
+                                d_key_offsets_u,
+                                static_cast<int>(D) + 1,
+                                stream.value());
+
+  uint32_t total_key_chars = 0;
+  RMM_CUDA_TRY(cudaMemcpyAsync(
+    &total_key_chars, d_key_offsets_u + D, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream.value()));
+  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));
+  if (total_key_chars > static_cast<uint32_t>(INT32_MAX_SIZE)) return nullptr;
+
+  rmm::device_buffer d_key_chars(total_key_chars > 0 ? total_key_chars : 1u, stream, mr);
+  kernel_dict_key_gather<<<num_segs, BLOCK_DIM, 0, stream.value()>>>(
+    d_segs_p,
+    static_cast<int32_t const*>(d_key_offsets.data()),
+    static_cast<uint8_t*>(d_key_chars.data()),
+    num_segs);
+
+  auto key_offsets_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+                                                        static_cast<cudf::size_type>(D + 1u),
+                                                        std::move(d_key_offsets),
+                                                        rmm::device_buffer{0, stream, mr},
+                                                        0);
+  auto all_keys = cudf::make_strings_column(static_cast<cudf::size_type>(D),
+                                            std::move(key_offsets_col),
+                                            std::move(d_key_chars),
+                                            0,
+                                            rmm::device_buffer{});
+  mark("P1 keys decode(sync2)");
+
+  // Pass 2: per-row raw codes into the concatenated key space.
+  rmm::device_uvector<int32_t> d_raw_codes(total_rows, stream, mr);
+  auto const row_chunks      = expand_chunks(segs, get_target_ctas());
+  rmm::device_buffer d_row_descs =
+    upload_bytes(row_chunks.data(), row_chunks.size() * sizeof(dict_emit_desc));
+  RMM_CUDA_TRY(cudaStreamSynchronize(stream.value()));  // row_chunks pageable src
+  kernel_dict_row_codes<<<static_cast<uint32_t>(row_chunks.size()), BLOCK_DIM, 0, stream.value()>>>(
+    static_cast<dict_emit_desc const*>(d_row_descs.data()),
+    d_raw_codes.data(),
+    static_cast<uint32_t>(row_chunks.size()));
+
+  // Validity mask — same semantics/source as the strings path.
+  rmm::device_buffer null_mask{};
+  cudf::size_type null_count = 0;
+  if (col.has_nulls) {
+    null_mask = cudf::create_null_mask(
+      static_cast<cudf::size_type>(total_rows), cudf::mask_state::ALL_VALID, stream, mr);
+    for (auto const& run : col.validity) {
+      overlay_validity_run(run, static_cast<uint8_t*>(null_mask.data()), stream);
+    }
+    null_count = cudf::null_count(static_cast<cudf::bitmask_type const*>(null_mask.data()),
+                                  0,
+                                  static_cast<cudf::size_type>(total_rows),
+                                  stream);
+  }
+  mark("P2 rowcodes+mask");
+
+  // Pass 3: encode the D keys → sorted-unique global keys + LUT; remap N codes.
+  auto enc = cudf::dictionary::encode(all_keys->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr);
+  cudf::dictionary_column_view const dcv(enc->view());
+  auto const lut_view = dcv.indices();  // INT32, D entries: local key → global id
+  auto const gkeys    = dcv.keys();     // sorted-unique global keys
+  mark("P3 cudf::encode");
+
+  cudf::column_view const raw_codes_col(cudf::data_type{cudf::type_id::INT32},
+                                        static_cast<cudf::size_type>(total_rows),
+                                        d_raw_codes.data(),
+                                        nullptr,
+                                        0);
+  auto gathered     = cudf::gather(cudf::table_view{{lut_view}},
+                               raw_codes_col,
+                               cudf::out_of_bounds_policy::DONT_CHECK,
+                               stream,
+                               mr);
+  auto global_codes = std::move(gathered->release()[0]);  // INT32, N, no nulls
+  mark("P4 gather remap");
+
+  auto keys_owned = std::make_unique<cudf::column>(gkeys, stream, mr);
+  auto result     = cudf::make_dictionary_column(
+    std::move(keys_owned), std::move(global_codes), std::move(null_mask), null_count);
+  mark("P5 build dict col");
+  return result;
+}
+
 }  // namespace
 
 std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode_input const& col,
@@ -1918,6 +2215,25 @@ std::unique_ptr<cudf::column> gpu_decode_strings_column(gpu_string_column_decode
   if (total_rows > static_cast<uint32_t>(std::numeric_limits<cudf::size_type>::max())) {
     throw std::runtime_error("gpu_decode_strings_column: total_rows (" +
                              std::to_string(total_rows) + ") > cudf::size_type max");
+  }
+
+  // Late-materialization path: emit a DICTIONARY32 column (carry compressed)
+  // when the whole column is uniformly DICTIONARY-coded. Behind SIRIUS_EMIT_DICT
+  // (read per-call — once per column per batch, so the cost is negligible and the
+  // flag stays runtime-togglable for A/B).
+  char const* emit_dict_env = std::getenv("SIRIUS_EMIT_DICT");
+  bool const emit_dict_flag = emit_dict_env != nullptr && std::string(emit_dict_env) != "0";
+  if (emit_dict_flag && !col.data.empty()) {
+    bool all_dict = true;
+    for (auto const& run : col.data) {
+      if (run.codec != duckdb::CompressionType::COMPRESSION_DICTIONARY) {
+        all_dict = false;
+        break;
+      }
+    }
+    if (all_dict) {
+      if (auto dict_col = gpu_emit_dictionary_column(col, stream, mr)) { return dict_col; }
+    }
   }
 
   prepared_uncomp prep_uncomp;

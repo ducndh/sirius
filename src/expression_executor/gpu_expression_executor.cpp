@@ -44,7 +44,10 @@
 
 // cudf
 #include <cudf/column/column_factories.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/dictionary/encode.hpp>
 #include <cudf/stream_compaction.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
@@ -289,8 +292,36 @@ std::unique_ptr<cudf::table> gpu_expression_executor::execute(cudf::table_view i
   _temp_scalars.clear();
   _temp_columns.clear();
 
-  // Get the table_view from the input_batch
-  _input_table = std::move(input);
+  // Get the table_view from the input_batch. Decode-on-receipt: if the input
+  // carries scan-emitted DICTIONARY32 columns, materialize them to their real
+  // types here, because cuDF's AST / binaryop cannot evaluate a predicate that
+  // mixes a DICTIONARY32 column with a STRING scalar (e.g. l_shipmode IN (...)).
+  // Filters still keep the column compressed downstream: select() applies the
+  // resulting mask to the ORIGINAL input batch, not to this decoded copy.
+  bool has_dict = false;
+  for (auto const& c : input) {
+    if (c.type().id() == cudf::type_id::DICTIONARY32) {
+      has_dict = true;
+      break;
+    }
+  }
+  if (has_dict) {
+    std::vector<std::unique_ptr<cudf::column>> decoded_cols;
+    decoded_cols.reserve(input.num_columns());
+    for (auto const& c : input) {
+      if (c.type().id() == cudf::type_id::DICTIONARY32) {
+        decoded_cols.push_back(
+          cudf::dictionary::decode(cudf::dictionary_column_view(c), _stream, _mr));
+      } else {
+        decoded_cols.push_back(std::make_unique<cudf::column>(c, _stream, _mr));
+      }
+    }
+    _decoded_input = std::make_unique<cudf::table>(std::move(decoded_cols));
+    _input_table   = _decoded_input->view();
+  } else {
+    _decoded_input.reset();
+    _input_table = std::move(input);
+  }
 
   // Per-result column post-processing — shared between the DuckDB and the
   // AST branches below. The DuckDB-typed expression is the parity reference;

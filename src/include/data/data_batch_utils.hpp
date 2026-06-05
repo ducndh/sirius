@@ -16,9 +16,14 @@
 
 #pragma once
 
+#include <cudf/column/column.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/dictionary/encode.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
@@ -129,6 +134,47 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(
     std::move(table), memory_space, writer_stream);
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
+}
+
+/**
+ * @brief True if any column in @p t is a cuDF DICTIONARY32 column.
+ *
+ * Used by decode-on-receipt guards to cheaply skip the decode path when the
+ * batch carries no scan-emitted dictionary columns (the common case).
+ */
+inline bool table_has_dictionary(cudf::table_view const& t)
+{
+  for (auto const& c : t) {
+    if (c.type().id() == cudf::type_id::DICTIONARY32) return true;
+  }
+  return false;
+}
+
+/**
+ * @brief Decode any DICTIONARY32 columns in @p t to their materialized form
+ * (STRING for the scan's string dicts); deep-copy the rest. Returns a
+ * fully-owned table.
+ *
+ * This is the decode-on-receipt primitive: operators and the result boundary
+ * that are not (yet) dictionary-aware call this before consuming a batch that
+ * may carry scan-emitted DICTIONARY32 columns, so they only ever see the
+ * materialized types they already handle. Callers should gate on
+ * table_has_dictionary() first to avoid the deep-copy when there's nothing to
+ * decode.
+ */
+inline std::unique_ptr<cudf::table> decode_dictionary_columns(
+  cudf::table_view const& t, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.reserve(t.num_columns());
+  for (auto const& c : t) {
+    if (c.type().id() == cudf::type_id::DICTIONARY32) {
+      cols.push_back(cudf::dictionary::decode(cudf::dictionary_column_view(c), stream, mr));
+    } else {
+      cols.push_back(std::make_unique<cudf::column>(c, stream, mr));
+    }
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
 }
 
 }  // namespace sirius

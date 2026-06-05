@@ -18,6 +18,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <helper/type_conversions.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
@@ -138,13 +139,33 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     std::optional<cucascade::read_only_data_batch> result_ro_opt;
 
     if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
+      // Decode-on-receipt: if the GPU result carries scan-emitted DICTIONARY32
+      // columns, materialize them to their real types (STRING) on-GPU before the
+      // host clone — otherwise the host reader would copy the raw int32 codes as
+      // data. Done here (not per output chunk) so it runs once, and so the host
+      // reservation below is sized for the decoded table.
+      auto src_tv = data->cast<cucascade::gpu_table_representation>().get_table_view();
+      std::shared_ptr<cucascade::data_batch> decoded_batch;
+      std::optional<cucascade::read_only_data_batch> decoded_ro;
+      cucascade::read_only_data_batch* clone_src = &ro;
+      auto* clone_data                           = data;
+      if (auto* gpu_ms = ro.get_memory_space();
+          gpu_ms != nullptr && sirius::table_has_dictionary(src_tv)) {
+        auto decoded =
+          sirius::decode_dictionary_columns(src_tv, stream, gpu_ms->get_default_allocator());
+        decoded_batch = sirius::make_data_batch(std::move(decoded), *gpu_ms, stream);
+        decoded_ro    = decoded_batch->to_read_only();
+        clone_src     = &*decoded_ro;
+        clone_data    = decoded_ro->get_data();
+      }
+
       // Use clone_to to clone directly into HOST representation
       auto sirius_ctx  = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
       auto& memory_mgr = sirius_ctx->get_memory_manager();
       /// TODO: Find the closest memory space, not just any memory space, in HOST tier
       auto reservation = memory_mgr.request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
-        data->get_size_in_bytes());
+        clone_data->get_size_in_bytes());
       if (!reservation) {
         throw internal_exception(
           "[GPUPhysicalMaterializedCollector] Failed to reserve host memory for result collection");
@@ -156,7 +177,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
 
       // clone_to: creates new batch with data converted to host_data_representation
-      auto result_batch = ro.clone_to<cucascade::host_data_representation>(
+      auto result_batch = clone_src->clone_to<cucascade::host_data_representation>(
         registry, next_batch_id, &mem_space, stream);
 
       // Access the result batch's data. Declared outside the if-block so result_ro outlives

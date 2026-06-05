@@ -22,6 +22,8 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/dictionary/encode.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -313,6 +315,93 @@ TEST_CASE("gpu_decode_strings DICTIONARY - bitpacking_width > 32 zero-fills",
   auto out = decode_invalid_with_canary(bytes, CompressionType::COMPRESSION_DICTIONARY, 4);
   for (auto& s : out)
     REQUIRE(s.empty());
+}
+
+// --- DICTIONARY32 emit (late-materialization producer) ---
+
+namespace {
+
+/// Build a uniformly-DICTIONARY column from one-or-more (dict, selections)
+/// segments, run it through the SIRIUS_EMIT_DICT producer path, assert the
+/// result is a DICTIONARY32 column, and decode it back to host strings via
+/// cudf so callers can compare against the expected logical values.
+std::vector<std::string> emit_dict_roundtrip(
+  std::vector<std::pair<std::vector<std::string>, std::vector<uint32_t>>> const& segs_in,
+  uint32_t max_string_length)
+{
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+
+  std::vector<rmm::device_buffer> d_segs;  // keep segment bytes alive on device
+  std::vector<gpu_string_segment_desc> descs;
+  uint32_t row_off = 0;
+  for (auto const& [dict, sel] : segs_in) {
+    auto bytes = make_dict_segment(dict, sel);
+    d_segs.emplace_back(bytes.data(), bytes.size(), stream.view());
+    descs.push_back(gpu_string_segment_desc{static_cast<uint8_t const*>(d_segs.back().data()),
+                                            static_cast<uint32_t>(d_segs.back().size()),
+                                            row_off,
+                                            static_cast<uint32_t>(sel.size()),
+                                            0u,
+                                            max_string_length});
+    row_off += static_cast<uint32_t>(sel.size());
+  }
+
+  gpu_string_column_decode_input col;
+  col.total_rows = row_off;
+  col.has_nulls  = false;
+  col.data.push_back({CompressionType::COMPRESSION_DICTIONARY, descs});
+
+  setenv("SIRIUS_EMIT_DICT", "1", 1);
+  auto column = gpu_decode_strings_column(col, stream.view(), mr);
+  unsetenv("SIRIUS_EMIT_DICT");
+
+  REQUIRE(column->type().id() == cudf::type_id::DICTIONARY32);
+
+  cudf::dictionary_column_view const dcv(column->view());
+  auto strs = cudf::dictionary::decode(dcv, stream.view(), mr);
+  cudf::strings_column_view scv(strs->view());
+
+  uint32_t const n = col.total_rows;
+  std::vector<int32_t> offsets =
+    download<int32_t>(scv.offsets().data<int32_t>(), n + 1, stream.value());
+  std::vector<std::string> out(n);
+  if (scv.chars_size(stream) > 0) {
+    std::vector<uint8_t> chars =
+      download<uint8_t>(scv.chars_begin(stream), scv.chars_size(stream), stream.value());
+    for (uint32_t i = 0; i < n; ++i) {
+      int32_t s = offsets[i];
+      int32_t e = offsets[i + 1];
+      out[i].assign(reinterpret_cast<char const*>(chars.data() + s), static_cast<size_t>(e - s));
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("gpu_decode_strings DICTIONARY emit - single segment round-trip",
+          "[scan][decode][strings][dictionary][emit]")
+{
+  // dict index 0 is the reserved NULL slot (see make_dict_segment); sel is 1-based.
+  auto out = emit_dict_roundtrip({{{"", "alpha", "beta", "gamma"}, {1, 2, 3, 1, 2, 3, 1}}}, 8u);
+  std::vector<std::string> const expect = {
+    "alpha", "beta", "gamma", "alpha", "beta", "gamma", "alpha"};
+  REQUIRE(out == expect);
+}
+
+TEST_CASE("gpu_decode_strings DICTIONARY emit - multi-segment global key unify",
+          "[scan][decode][strings][dictionary][emit]")
+{
+  // seg0 local dict {alpha,beta,gamma}; seg1 local dict {gamma,delta}. The two
+  // dicts overlap (gamma) and differ — exercises the global dedup+remap. Index 0
+  // is the reserved NULL slot; sel is 1-based.
+  auto out = emit_dict_roundtrip({{{"", "alpha", "beta", "gamma"}, {1, 2, 3, 1, 2}},
+                                  {{"", "gamma", "delta"}, {1, 2, 2, 1}}},
+                                 8u);
+  std::vector<std::string> const expect = {
+    "alpha", "beta", "gamma", "alpha", "beta", "gamma", "delta", "delta", "gamma"};
+  REQUIRE(out == expect);
 }
 
 TEST_CASE("gpu_decode_strings FSST - corrupt dict_end > segment_size zero-fills",

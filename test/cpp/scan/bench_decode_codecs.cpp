@@ -27,6 +27,8 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/dictionary/encode.hpp>             // cudf::dictionary::encode / decode
+#include <cudf/dictionary/dictionary_column_view.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
@@ -809,6 +811,72 @@ double bench_strings_seconds(rmm::cuda_stream& stream,
   return (ms / 1000.0) / iters;
 }
 
+/// Time the REAL DICTIONARY32 producer (gpu_emit_dictionary_column, via the
+/// SIRIUS_EMIT_DICT gate) on the same input bench_strings_seconds decodes to
+/// strings. This is the fair scan-stage cost: dict-emit vs string-decode, same
+/// segments in / a column out. (Distinct from bench_cudf_dict_ab's encode_s,
+/// which is the WRONG-WAY cudf::encode that re-hashes all N rows.)
+double bench_emit_seconds(rmm::cuda_stream& stream,
+                          sirius::cuda::scan::gpu_string_column_decode_input const& col,
+                          rmm::mr::cuda_async_memory_resource& mr,
+                          int iters  = 10,
+                          int warmup = 3)
+{
+  setenv("SIRIUS_EMIT_DICT", "1", 1);
+  for (int i = 0; i < warmup; ++i)
+    (void)sirius::cuda::scan::gpu_decode_strings_column(col, stream.view(), mr);
+  cudaStreamSynchronize(stream.value());
+
+  cudaEvent_t s, e;
+  cudaEventCreate(&s);
+  cudaEventCreate(&e);
+  cudaEventRecord(s, stream.value());
+  for (int i = 0; i < iters; ++i)
+    (void)sirius::cuda::scan::gpu_decode_strings_column(col, stream.view(), mr);
+  cudaEventRecord(e, stream.value());
+  cudaEventSynchronize(e);
+  float ms = 0.0f;
+  cudaEventElapsedTime(&ms, s, e);
+  cudaEventDestroy(s);
+  cudaEventDestroy(e);
+  unsetenv("SIRIUS_EMIT_DICT");
+  return (ms / 1000.0) / iters;
+}
+
+/// A/B for the "carry as cuDF dict" design: from the SAME segment, time the
+/// cuDF route (encode = producer, decode = gather) against Sirius's fused kernel.
+/// encode_s = strings->DICTIONARY32 (the scan producer cost); decode_s =
+/// DICTIONARY32->strings (cuDF gather). Same input / process / MR / harness.
+struct cudf_dict_ab {
+  double encode_s;
+  double decode_s;
+};
+cudf_dict_ab bench_cudf_dict_ab(rmm::cuda_stream& stream,
+                                sirius::cuda::scan::gpu_string_column_decode_input const& col,
+                                rmm::mr::cuda_async_memory_resource& mr,
+                                int iters  = 10,
+                                int warmup = 3)
+{
+  auto strs = sirius::cuda::scan::gpu_decode_strings_column(col, stream.view(), mr);  // source of truth
+  auto i32  = cudf::data_type{cudf::type_id::INT32};
+  auto time = [&](auto&& fn) {
+    for (int i = 0; i < warmup; ++i) (void)fn();
+    cudaStreamSynchronize(stream.value());
+    cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
+    cudaEventRecord(s, stream.value());
+    for (int i = 0; i < iters; ++i) (void)fn();
+    cudaEventRecord(e, stream.value()); cudaEventSynchronize(e);
+    float ms = 0.0f; cudaEventElapsedTime(&ms, s, e);
+    cudaEventDestroy(s); cudaEventDestroy(e);
+    return (ms / 1000.0) / iters;
+  };
+  double enc = time([&] { return cudf::dictionary::encode(strs->view(), i32, stream.view(), mr); });
+  auto dict  = cudf::dictionary::encode(strs->view(), i32, stream.view(), mr);
+  cudf::dictionary_column_view dv(dict->view());
+  double dec = time([&] { return cudf::dictionary::decode(dv, stream.view(), mr); });
+  return {enc, dec};
+}
+
 /// Load raw segment bytes from a path in env var `var_name`. Returns empty
 /// vector if the var is unset or the file isn't readable.
 std::vector<uint8_t> load_fixture_bytes(char const* var_name)
@@ -864,6 +932,16 @@ TEST_CASE("bench DICTIONARY 1M rows / 1024 dict / 16-byte avg",
     sec,
     double(ROWS) / sec / 1e6,
     bytes_decoded / sec / GIB);
+  auto ab = bench_cudf_dict_ab(stream, col, mr);
+  std::printf(
+    "[bench]   A/B 1M/1024d/16B: Sirius kernel=%.6fs | cuDF encode(produce)=%.6fs decode=%.6fs"
+    "  | decode vs kernel %.2fx\n",
+    sec, ab.encode_s, ab.decode_s, sec / ab.decode_s);
+  double emit_s = bench_emit_seconds(stream, col, mr);
+  std::printf(
+    "[bench]   EMIT 1M/1024d/16B: producer(dict32)=%.6fs | string-decode=%.6fs -> emit %.2fx "
+    "string-decode | emit+full-decode=%.6fs (%.2fx string-decode)\n",
+    emit_s, sec, sec / emit_s, emit_s + ab.decode_s, sec / (emit_s + ab.decode_s));
 }
 
 TEST_CASE("bench DICTIONARY low-cardinality / 2 entries × 2000B",
@@ -910,6 +988,16 @@ TEST_CASE("bench DICTIONARY low-cardinality / 2 entries × 2000B",
     sec,
     double(ROWS) / sec / 1e6,
     bytes_decoded / sec / GIB);
+  auto ab = bench_cudf_dict_ab(stream, col, mr);
+  std::printf(
+    "[bench]   A/B 128K/2d/2000B: Sirius kernel=%.6fs | cuDF encode(produce)=%.6fs decode=%.6fs"
+    "  | decode vs kernel %.2fx\n",
+    sec, ab.encode_s, ab.decode_s, sec / ab.decode_s);
+  double emit_s = bench_emit_seconds(stream, col, mr);
+  std::printf(
+    "[bench]   EMIT 128K/2d/2000B: producer(dict32)=%.6fs | string-decode=%.6fs -> emit %.2fx "
+    "string-decode | emit+full-decode=%.6fs (%.2fx string-decode)\n",
+    emit_s, sec, sec / emit_s, emit_s + ab.decode_s, sec / (emit_s + ab.decode_s));
 }
 
 TEST_CASE("bench FSST 1M rows / TPC-H-like comments", "[!benchmark][scan][decode][strings]")
