@@ -29,7 +29,9 @@ def main():
     # read latency per (rho, arm, tick): mean over queries
     lat = defaultdict(list)
     for r in recs:
-        if r.get("event") == "read" and r.get("wall_s") is not None and r.get("tick", -1) >= 0:
+        if (r.get("event") == "read" and r.get("wall_s") is not None
+                and r.get("tick", -1) >= 0 and r.get("event_tag") is None):
+            # event_tag warm/rewarm = refresh cost, plotted via refresh records
             lat[(r["rho"], r["arm"], r["tick"])].append(r["wall_s"])
     rhos = sorted({k[0] for k in lat})
     arms = sorted({k[1] for k in lat})

@@ -43,7 +43,8 @@ python3 gate0_driver.py --config config.a100.json --phase setup    # ~minutes, o
 python3 gate0_driver.py --config config.a100.json --phase probe    # current-dev semantics
 python3 gate0_driver.py --config config.a100.json --phase sweep    # full grid (hours)
 # single cells:
-python3 gate0_driver.py --config config.a100.json --phase arm_b --rho 0.01 --ticks 10
+python3 gate0_driver.py --config config.a100.json --phase arm_b --rho 0.01 --ticks 10   # single cell
+python3 gate0_driver.py --config config.a100.synth.json --phase sweep            # clustering instrument
 python3 plot_gate0.py results/sweep.jsonl                          # figures
 ```
 
@@ -52,16 +53,30 @@ fresh / error) at the three stages: un-checkpointed writes, after CHECKPOINT
 without restart, after restart. Run it first and read the verdicts — they are
 finding #1 of the paper and they pin down what the `table_gpu` cache keys on.
 
-## Data
+## Datasets
 
-Synthetic 8-column table (`churn`), default 20M rows (~1.2 GB), generated
-deterministically via `hash(range)` — no external datasets needed (the box's
-benchmark data is on ephemeral storage and gets wiped). An `incoming`
-reservoir (60% of N) feeds inserts. Churn shapes: `fifo` (sliding window —
-clustered deletes + appends, matches append-heavy workloads and the NeurIPS'23
-streaming-runbook structure) and `uniform` (scattered deletes — adversarial
-for granular invalidation; the dirty-granule fraction follows
-`1-(1-1/G)^U`). Scale via `scale.n_rows`.
+**`tpch` (default, config.a100.json):** TPC-H base tables + the OFFICIAL
+refresh streams. The repo-bundled `test_datasets/tpch-dbgen.zip` ships a
+working `dbgen` that generates RF1/RF2 update sets (`dbgen -U N`:
+`lineitem.tbl.uN`/`orders.tbl.uN` inserts + `delete.N` orderkey lists). One
+refresh pair churns SF*1500 orders = 0.1% of the orders table, so rho maps to
+`round(rho/0.001)` pairs per tick. RF2 deletes cluster at the low-orderkey
+end (oldest data) — the spec's sliding-window intent. An UPDATE stream
+(`update_rows_per_tick` sampled `l_quantity`/`l_extendedprice` changes) is
+added on top, modeled as delete(old)+insert(new) — exactly how HANA models
+updates internally; TPC-H itself has no update in RF1/RF2. Reads: Q1 and Q6
+(lineitem-linear, decomposable -> mergeable) + count(*). Join queries (Q3
+etc.) merge correctly too when only lineitem churns, but RF1/RF2 churn
+orders as well, so they're excluded from arm_b for now (run them in
+arm_a/cpu later as supplementary).
+
+**`synth` (config.a100.synth.json):** deterministic 8-column table, default
+20M rows — the *controlled-clustering instrument*. Churn shapes: `fifo`
+(clustered sliding window) and `uniform` (scattered deletes — adversarial for
+granular invalidation; dirty-granule fraction follows `1-(1-1/G)^U`). TPC-H
+refresh is inherently clustered, so the uniform-scatter axis only exists
+here. No external data needed either way (the box's benchmark data lives on
+ephemeral storage and gets wiped).
 
 ## Output
 
@@ -105,6 +120,6 @@ mkdir -p /tmp/sirius-build-gate0 && ln -s /tmp/sirius-build-gate0 build
 - Engine restart is the cache-invalidation mechanism for arm_a/arm_c (the
   cache is in-process and has no SQL-level drop). `restart_s` is logged
   separately so the re-upload cost can be isolated from process startup.
-- Decomposable aggregates only; no UPDATE stream yet (#819 scopes it out too;
-  add as delete+insert later).
+- Decomposable aggregates only (mergeable set). The UPDATE stream exists in
+  tpch mode (delete+insert model); #819 itself scopes UPDATE out.
 - Single GPU, single writer session.

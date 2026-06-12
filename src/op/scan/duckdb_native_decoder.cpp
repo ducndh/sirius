@@ -97,7 +97,14 @@ bool is_supported_fixed_width_codec(duckdb::CompressionType c)
     case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
     case duckdb::CompressionType::COMPRESSION_CONSTANT:
     case duckdb::CompressionType::COMPRESSION_RLE:
-    case duckdb::CompressionType::COMPRESSION_BITPACKING: return true;
+    case duckdb::CompressionType::COMPRESSION_BITPACKING:
+    // ALP/ALPRD float codecs ARE decodable on GPU (dispatch_data_run →
+    // decode_alp_data / decode_alprd_data) and are listed in
+    // is_supported_data_compression(); this fixed-width staging gate was just
+    // never updated to admit them, so ALP/ALPRD float columns silently fell
+    // back to CPU. Admit them so the existing kernels are actually reached.
+    case duckdb::CompressionType::COMPRESSION_ALP:
+    case duckdb::CompressionType::COMPRESSION_ALPRD: return true;
     default: return false;
   }
 }
