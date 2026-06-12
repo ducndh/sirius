@@ -1,0 +1,2 @@
+{"box": "a100-dnguyen56", "interconnect": "pcie4", "dataset": "tpch", "churn_shape": "rf", "phase": "arm_d", "ts": "2026-06-12T23:03:29", "event": "engine_start", "arm": "arm_d", "rho": 0.01, "wall_s": 4.831698880996555}
+{"box": "a100-dnguyen56", "interconnect": "pcie4", "dataset": "tpch", "churn_shape": "rf", "phase": "arm_d", "ts": "2026-06-12T23:03:29", "event": "pin_epoch", "arm": "arm_d", "rho": 0.01, "tick": -1, "export_s": 1.7574603098910302, "pin_s": 1.7339208230841905}

@@ -55,6 +55,7 @@ import argparse
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -97,28 +98,46 @@ class SiriusEngine:
         t0 = time.monotonic()
         # stdbuf: the CLI block-buffers stdout on a pipe; without line
         # buffering the sentinel never arrives and the driver deadlocks.
+        # binary pipes + select-based reads: a hung query that emits NOTHING
+        # must still hit the deadline (blocking readline() never would —
+        # observed with the 16-file glob pin hang, 2026-06-12).
         self.proc = subprocess.Popen(
             ["stdbuf", "-oL", "-eL", binary, "-unsigned", "-init", "/dev/null",
              self.db_path],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
             env=env,
         )
+        self._buf = b""
         setup = [".headers off", ".mode list", ".separator |", ".timer on"]
-        for line in setup:
-            self.proc.stdin.write(line + "\n")
+        self.proc.stdin.write(("\n".join(setup) + "\n").encode())
         self.proc.stdin.flush()
         for stmt in init_sql or []:
             self.sql(stmt, timeout=timeout)
         return time.monotonic() - t0
 
+    def _readline(self, deadline):
+        """Line read with a hard deadline. None = timeout, "" = EOF."""
+        while b"\n" not in self._buf:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            r, _, _ = select.select([self.proc.stdout], [], [], min(remaining, 5.0))
+            if not r:
+                continue
+            chunk = os.read(self.proc.stdout.fileno(), 1 << 16)
+            if chunk == b"":
+                return ""
+            self._buf += chunk
+        raw, self._buf = self._buf.split(b"\n", 1)
+        return raw.decode(errors="replace") + "\n"
+
     def stop(self):
         if self.proc is None:
             return
         try:
-            self.proc.stdin.write(".quit\n")
+            self.proc.stdin.write(b".quit\n")
             self.proc.stdin.flush()
             self.proc.wait(timeout=15)
         except Exception:
@@ -138,19 +157,18 @@ class SiriusEngine:
         self.last_engine_times = []
         self.last_fallback = False
         t0 = time.monotonic()
-        self.proc.stdin.write(q + ";\n")
         # NB: .print, not SELECT '...': on current dev, constant SELECTs
         # (no FROM) return 0 rows through this CLI, so a SELECT sentinel
         # never prints and the driver would hang (observed 2026-06-12).
-        self.proc.stdin.write(f".print {SENTINEL}\n")
+        self.proc.stdin.write((q + ";\n" + f".print {SENTINEL}\n").encode())
         self.proc.stdin.flush()
         rows, errors = [], []
         deadline = t0 + timeout
         while True:
-            if time.monotonic() > deadline:
+            line = self._readline(deadline)
+            if line is None:
                 self.proc.kill()
                 raise EngineCrash(f"timeout after {timeout}s on: {q[:120]}")
-            line = self.proc.stdout.readline()
             if line == "":  # EOF: process died (segfault etc.)
                 raise EngineCrash(f"engine died during: {q[:120]}")
             line = line.rstrip("\n")
@@ -282,7 +300,7 @@ class SynthDataset:
     def queries(self):
         kmax = int(1000000 * self.cfg["dataset"].get("filter_selectivity", 0.1))
         return {
-            "q_count": {"sql": "SELECT count(*) FROM {t}", "key_cols": 0},
+            "q_count": {"sql": "SELECT count(id) FROM {t}", "key_cols": 0},
             "q_sum_filter": {
                 "sql": f"SELECT sum(price * (1 - disc)), count(*) FROM {{t}} WHERE k < {kmax}",
                 "key_cols": 0,
@@ -337,7 +355,7 @@ class SynthDataset:
     granule_scale = 1
     # content-sensitive: sum(id) shifts under equal-size FIFO churn where
     # count(*) cannot distinguish stale from fresh.
-    probe_query = "SELECT count(*), sum(id) FROM churn"
+    probe_query = "SELECT count(id), sum(id) FROM churn"
     # columns the query set touches — the pin exports/pins only these
     pin_cols = ["id", "grp", "k", "qty", "price", "disc"]
 
@@ -375,7 +393,11 @@ class TpchDataset:
 
     def queries(self):
         return {
-            "q_count": {"sql": "SELECT count(*) FROM {t}", "key_cols": 0},
+            # count(l_orderkey), NOT count(*): zero-column-projection scans
+            # over a MULTI-FILE pinned entry deadlock on current dev
+            # (FINDINGS.md #6); count(col) is semantically identical here
+            # (NOT NULL key) and keeps the query set uniform across arms.
+            "q_count": {"sql": "SELECT count(l_orderkey) FROM {t}", "key_cols": 0},
             "q1": {
                 "sql": ("SELECT l_returnflag, l_linestatus, sum(l_quantity), "
                         "sum(l_extendedprice), sum(l_extendedprice * (1 - l_discount)), "
@@ -513,7 +535,7 @@ class TpchDataset:
     # approximates row position for dirty-granule estimation.
     granule_expr = "l_orderkey"
     granule_scale = 4
-    probe_query = "SELECT count(*), sum(l_orderkey) FROM lineitem"
+    probe_query = "SELECT count(l_orderkey), sum(l_orderkey) FROM lineitem"
     pin_cols = ["l_orderkey", "l_quantity", "l_extendedprice", "l_discount",
                 "l_returnflag", "l_linestatus", "l_shipdate"]
 
@@ -702,7 +724,7 @@ def run_arm(cfg, arm, rho, log):
     ds = make_dataset(cfg)
     ds.reset_state()
     ticks = cfg["workload"]["ticks"]
-    track_delta = arm in ("arm_b", "arm_c")
+    track_delta = arm in ("arm_b", "arm_c", "arm_d")  # arm_d: write log only
     recompact_every = cfg.get("recompact_every", 5)
     cell = f"{arm}_rho{rho}"
     db = fresh_cell_db(cfg, cell)
@@ -722,6 +744,66 @@ def run_arm(cfg, arm, rho, log):
     # pages); pin_s + the rewarm read = the true re-upload/decode cost.
     gpu_table = "pin_v" if arm != "cpu" else ds.table
     pin_epoch = {"n": 0}
+
+    # arm_d: granular invalidation. The pin is P chunk files partitioned by
+    # the dataset's monotone key; refresh rewrites ONLY dirty chunks (tracked
+    # via the delta tables used as a write log) then re-pins the glob.
+    # CONSTRAINT measured on current dev: pin_table re-uploads the WHOLE glob
+    # regardless of which files changed (no per-file re-pin primitive), so
+    # arm_d's realized saving is export-side only; projected_pin_s =
+    # pin_s * dirty_fraction is logged as what an engine-level partial
+    # re-pin would buy — the engine-headroom number.
+    P = cfg.get("pin_chunks", 16)
+    chunk_dir = os.path.join(cfg["data_dir"], f"pinchunks_{cell}")
+    kb = {}  # key bounds, fixed at pin epoch
+
+    def chunk_pred(i):
+        span = kb["kmax"] - kb["kmin"] + 1
+        lo = kb["kmin"] + (span * i) // P
+        hi = kb["kmin"] + (span * (i + 1)) // P
+        if i == 0:
+            return f"{ds.granule_expr} < {hi}"  # open: catch keys below kmin
+        if i == P - 1:
+            return f"{ds.granule_expr} >= {lo}"  # open: catch keys above kmax
+        return f"{ds.granule_expr} >= {lo} AND {ds.granule_expr} < {hi}"
+
+    def make_pin_chunked(dirty=None):
+        """dirty=None -> full epoch pin; else iterable of chunk ids."""
+        cols = ", ".join(ds.pin_cols)
+        if dirty is None:
+            os.makedirs(chunk_dir, exist_ok=True)
+            rows, _ = eng.sql(
+                f"SELECT min({ds.granule_expr}), max({ds.granule_expr}) FROM {ds.table}")
+            kb["kmin"], kb["kmax"] = (int(x) for x in rows[0].split("|"))
+            todo = range(P)
+        else:
+            todo = sorted(set(dirty))
+        t0 = time.monotonic()
+        for i in todo:
+            eng.sql(f"COPY (SELECT {cols} FROM {ds.table} WHERE {chunk_pred(i)}) "
+                    f"TO '{chunk_dir}/c{i:04d}.parquet' (FORMAT parquet)", timeout=3600)
+        t1 = time.monotonic()
+        if pin_epoch["n"] > 0:
+            try:
+                eng.sql("CALL unpin_table('pin_v')", timeout=600)
+            except RuntimeError:
+                pass
+        pin_epoch["n"] += 1
+        eng.sql("CREATE OR REPLACE VIEW pin_v AS SELECT * FROM "
+                f"read_parquet('{chunk_dir}/*.parquet')", timeout=600)
+        eng.sql(f"CALL pin_table('{chunk_dir}/*.parquet', tier='gpu', name='pin_v')",
+                timeout=1800)
+        t2 = time.monotonic()
+        return t1 - t0, t2 - t1, len(list(todo))  # export_s, pin_s, n_chunks
+
+    def dirty_chunks():
+        e = ds.granule_expr
+        span = kb["kmax"] - kb["kmin"] + 1
+        cexpr = f"least({P - 1}, greatest(0, (({e} - {kb['kmin']}) * {P}) // {span}))"
+        rows, _ = eng.sql(
+            f"SELECT DISTINCT {cexpr} FROM (SELECT {e} FROM delta_del "
+            f"UNION ALL SELECT {e} FROM delta_ins)", timeout=600)
+        return [int(float(r)) for r in rows]
 
     def make_pin():
         pin_epoch["n"] += 1
@@ -747,7 +829,10 @@ def run_arm(cfg, arm, rho, log):
         return t1 - t0, t2 - t1  # export_s (artifact), pin_s
 
     if read_mode == "gpu":
-        export_s, pin_s = make_pin()
+        if arm == "arm_d":
+            export_s, pin_s, _ = make_pin_chunked(None)
+        else:
+            export_s, pin_s = make_pin()
         log.rec(event="pin_epoch", arm=arm, rho=rho, tick=-1,
                 export_s=export_s, pin_s=pin_s)
         # warm read = pin materialization + decode (the true upload cost)
@@ -772,6 +857,27 @@ def run_arm(cfg, arm, rho, log):
                       arm=arm, rho=rho, tick=tick)
             log.rec(event="refresh", arm=arm, rho=rho, tick=tick,
                     export_s=export_s, pin_s=pin_s)
+        elif arm == "arm_d":
+            # granular: rewrite only dirty chunks, re-pin, clear the write log
+            dirty = dirty_chunks()
+            export_s, pin_s, n = make_pin_chunked(dirty)
+            eng.sql("DELETE FROM delta_ins", timeout=600)
+            eng.sql("DELETE FROM delta_del", timeout=600)
+            run_reads(eng, ds, "gpu", log, table=gpu_table, event_tag="rewarm",
+                      arm=arm, rho=rho, tick=tick)
+            log.rec(event="refresh", arm=arm, rho=rho, tick=tick,
+                    export_s=export_s, pin_s=pin_s,
+                    dirty_chunks=n, total_chunks=P,
+                    projected_pin_s=pin_s * n / P)
+            # freshness check: pin must now equal the live table
+            try:
+                gp, _ = eng.gpu_sql(ds.probe_query.replace(ds.table, "pin_v"))
+                cp, _ = eng.sql(ds.probe_query)
+                log.rec(event="verify", query="probe", arm=arm, rho=rho,
+                        tick=tick, ok=(gp == cp),
+                        detail=None if gp == cp else {"pin": gp, "cpu": cp})
+            except (RuntimeError, EngineCrash):
+                pass
         elif arm == "arm_c" and tick > 0 and tick % recompact_every == 0:
             t0 = time.monotonic()
             eng.sql("DELETE FROM delta_ins", timeout=600)
@@ -828,7 +934,7 @@ def run_arm(cfg, arm, rho, log):
             eng.stop()
             eng.start(init_sql=init_settings(cfg, arm))
 
-        if track_delta:
+        if arm in ("arm_b", "arm_c"):  # arm_d truncates deltas at refresh
             try:
                 log.rec(event="granules", arm=arm, rho=rho, tick=tick,
                         **granule_stats(eng, ds))
@@ -842,6 +948,8 @@ def run_arm(cfg, arm, rho, log):
               os.path.join(cfg["data_dir"], f"pin_{cell}_{pin_epoch['n']}.parquet")):
         if os.path.exists(p):
             os.remove(p)
+    if os.path.isdir(chunk_dir):
+        shutil.rmtree(chunk_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -853,7 +961,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", required=True)
     ap.add_argument("--phase", required=True,
-                    choices=["setup", "probe", "arm_a", "arm_b", "arm_c", "cpu", "sweep"])
+                    choices=["setup", "probe", "arm_a", "arm_b", "arm_c", "arm_d", "cpu", "sweep"])
     ap.add_argument("--rho", type=float, default=None)
     ap.add_argument("--ticks", type=int, default=None)
     ap.add_argument("--out", default=None)
@@ -888,7 +996,7 @@ def main():
 
     if args.phase == "probe":
         phase_probe(cfg, log)
-    elif args.phase in ("arm_a", "arm_b", "arm_c", "cpu"):
+    elif args.phase in ("arm_a", "arm_b", "arm_c", "arm_d", "cpu"):
         rho = args.rho if args.rho is not None else cfg["churn"]["rhos"][0]
         run_arm(cfg, args.phase, rho, log)
     elif args.phase == "sweep":

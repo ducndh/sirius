@@ -62,3 +62,18 @@ decode kernels exist, are dispatched, and are unit-tested → every
 FLOAT/DOUBLE column silently fell back to CPU on native scan. Bit the
 harness within minutes (TPC-H `l_quantity`/`l_extendedprice` predicates).
 Extract as its own upstream PR with a float-column e2e regression test.
+
+## 6. count(*) over a MULTI-FILE pinned entry hangs (deadlock, file-worthy)
+
+`CALL pin_table('<dir>/*.parquet', tier='gpu', name=v)` over N>=4 chunk files
+(any partitioning — range and modulo both reproduce), then
+`gpu_execution('SELECT count(*) FROM v')` **never returns** (process blocks,
+GPU memory held; needed kill -9, one corpse went uninterruptible-state).
+Isolation on the same pinned entry: `sum(col) WHERE ...` works (0.09s),
+`count(col)` works (0.05s), `count(*)` hangs. Single-FILE pins run count(*)
+fine (all iter-1/2 sweeps did). So the trigger is the zero-column-projection
+scan against a multi-file pinned entry — same degenerate-projection family
+as the parquet path's 105-column COUNT(*) SIGSEGV (Project 6,
+`_post_filter_projection_ids`). Harness dodges it by using count(key)
+(semantically identical, NOT NULL). Repro recipe in git history
+(`/tmp/bisect_pin*.py` pattern, 2026-06-12 session).

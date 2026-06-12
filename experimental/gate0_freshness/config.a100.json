@@ -37,5 +37,6 @@
     "cuda_arch": "80-real",
     "interconnect": "pcie4",
     "gpu_mem_gb": 40
-  }
+  },
+  "pin_chunks": 16
 }
