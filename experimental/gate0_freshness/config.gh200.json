@@ -1,0 +1,32 @@
+{
+  "repo_root": "auto",
+  "duckdb_binary": "build/release/duckdb",
+  "ld_library_path": ".pixi/envs/default/lib",
+  "data_dir": "/tmp/gate0_data",
+  "scale": {
+    "n_rows": 20000000,
+    "incoming_frac": 0.6
+  },
+  "workload": {
+    "ticks": 15,
+    "queries": ["q_count", "q_sum_filter", "q_group"],
+    "filter_selectivity": 0.1,
+    "verify_every": 3
+  },
+  "churn": {
+    "mode": "fifo",
+    "rhos": [0.0001, 0.001, 0.01, 0.03]
+  },
+  "recompact_every": 5,
+  "sweep_arms": ["cpu", "arm_a", "arm_b", "arm_c"],
+  "engine_settings": [
+    "SET scan_cache_level='table_gpu'"
+  ],
+  "box": {
+    "name": "gh200",
+    "gpu": "GH200-480GB (H100 96GB HBM3)",
+    "cuda_arch": "90a-real",
+    "interconnect": "nvlink-c2c",
+    "gpu_mem_gb": 96
+  }
+}
