@@ -5,7 +5,7 @@
   "data_dir": "/tmp/gate0_data",
   "dataset": {
     "kind": "tpch",
-    "sf": 5,
+    "sf": 20,
     "refresh_sets": 450,
     "update_rows_per_tick": 5000
   },
@@ -14,10 +14,20 @@
     "verify_every": 3
   },
   "churn": {
-    "rhos": [0.001, 0.005, 0.01, 0.03]
+    "rhos": [
+      0.001,
+      0.005,
+      0.01,
+      0.03
+    ]
   },
   "recompact_every": 5,
-  "sweep_arms": ["cpu", "arm_a", "arm_b", "arm_c"],
+  "sweep_arms": [
+    "cpu",
+    "arm_a",
+    "arm_b",
+    "arm_c"
+  ],
   "engine_settings": [
     "SET scan_cache_level='table_gpu'"
   ],

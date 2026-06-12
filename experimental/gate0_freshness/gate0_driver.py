@@ -338,6 +338,8 @@ class SynthDataset:
     # content-sensitive: sum(id) shifts under equal-size FIFO churn where
     # count(*) cannot distinguish stale from fresh.
     probe_query = "SELECT count(*), sum(id) FROM churn"
+    # columns the query set touches — the pin exports/pins only these
+    pin_cols = ["id", "grp", "k", "qty", "price", "disc"]
 
 
 class TpchDataset:
@@ -512,6 +514,8 @@ class TpchDataset:
     granule_expr = "l_orderkey"
     granule_scale = 4
     probe_query = "SELECT count(*), sum(l_orderkey) FROM lineitem"
+    pin_cols = ["l_orderkey", "l_quantity", "l_extendedprice", "l_discount",
+                "l_returnflag", "l_linestatus", "l_shipdate"]
 
 
 def make_dataset(cfg):
@@ -539,15 +543,13 @@ def init_settings(cfg, arm=None):
     re-reads through DuckDB's MVCC-merging scan -> always fresh -> the merge
     would double-count (observed in smoke: verify failures).
     """
-    s = ["SET gpu_execution=false"] + list(cfg["engine_settings"])
-    if arm in ("arm_b", "arm_c"):
-        if not any("enable_gpu_duckdb_native_scan" in x for x in s):
-            s.append("SET enable_gpu_duckdb_native_scan=true")
-        # DuckDB auto-checkpoints at ~16MB of WAL, which would silently fold
-        # the deltas into the file mid-cell and break the stale-snapshot
-        # premise. Folding must happen ONLY at the arm's own fold points.
-        s.append("SET checkpoint_threshold='1TB'")
-    return s
+    # iteration 2: the pin is a parquet export + CALL pin_table (the only
+    # route with real GPU residency — measured 25x warm/steady gap; the
+    # table_gpu view route gave none). Native-scan + checkpoint-threshold
+    # workarounds from iteration 1 are no longer needed: the pin file is
+    # immutable by construction and auto-checkpoint of the live WAL is
+    # harmless (deltas live in tables, not WAL state).
+    return ["SET gpu_execution=false"] + list(cfg["engine_settings"])
 
 
 # ---------------------------------------------------------------------------
@@ -572,8 +574,9 @@ class Log:
 
 
 def master_path(cfg):
-    kind = cfg["dataset"]["kind"]
-    return os.path.join(cfg["data_dir"], f"gate0_master_{kind}.duckdb")
+    d = cfg["dataset"]
+    tag = d["kind"] + (f"_sf{d['sf']}" if d["kind"] == "tpch" else "")
+    return os.path.join(cfg["data_dir"], f"gate0_master_{tag}.duckdb")
 
 
 def fresh_cell_db(cfg, cell_tag):
@@ -708,27 +711,46 @@ def run_arm(cfg, arm, rho, log):
     log.rec(event="engine_start", arm=arm, rho=rho, wall_s=start_s)
     read_mode = "cpu" if arm == "cpu" else "gpu"
 
-    # arm_b/arm_c pin model: a frozen copy of the table at pin epoch.
-    # No scan route serves a consistent stale snapshot under concurrent DML
-    # (observed: native scan sees un-checkpointed INSERTS but not DELETES —
-    # an inconsistent state, which is precisely what #819 exists to fix), so
-    # the pinned GPU copy is modeled as an immutable table: any route then
-    # returns exactly the epoch state and the delta merge is sound.
-    gpu_table = ds.table
+    # Pin model (iteration 2): the pinned GPU copy = a column-pruned parquet
+    # export of the table at pin epoch, pinned via CALL pin_table(tier='gpu')
+    # — the only route with real GPU residency (measured 25x warm/steady
+    # gap). Immutable by construction, so the delta merge is sound regardless
+    # of scan-route semantics (iteration 1 showed no route serves a
+    # consistent stale snapshot under concurrent DML). All GPU arms share
+    # this read mechanism; they differ only in WHEN they re-pin.
+    # export_s is a harness artifact (a real system re-uploads from table
+    # pages); pin_s + the rewarm read = the true re-upload/decode cost.
+    gpu_table = "pin_v" if arm != "cpu" else ds.table
+    pin_epoch = {"n": 0}
 
-    def make_pin_snap():
+    def make_pin():
+        pin_epoch["n"] += 1
+        e = pin_epoch["n"]
+        path = os.path.join(cfg["data_dir"], f"pin_{cell}_{e}.parquet")
+        cols = ", ".join(ds.pin_cols)
         t0 = time.monotonic()
-        eng.sql("DROP TABLE IF EXISTS pin_snap", timeout=600)
-        eng.sql(f"CREATE TABLE pin_snap AS SELECT * FROM {ds.table}", timeout=3600)
-        eng.sql("CHECKPOINT", timeout=3600)
-        return time.monotonic() - t0
+        eng.sql(f"COPY (SELECT {cols} FROM {ds.table}) TO '{path}' (FORMAT parquet)",
+                timeout=3600)
+        t1 = time.monotonic()
+        if e > 1:
+            try:
+                eng.sql("CALL unpin_table('pin_v')", timeout=600)
+            except RuntimeError:
+                pass
+        eng.sql("CREATE OR REPLACE VIEW pin_v AS SELECT * FROM "
+                f"read_parquet('{path}')", timeout=600)
+        eng.sql(f"CALL pin_table('{path}', tier='gpu', name='pin_v')", timeout=1800)
+        t2 = time.monotonic()
+        old = os.path.join(cfg["data_dir"], f"pin_{cell}_{e - 1}.parquet")
+        if os.path.exists(old):
+            os.remove(old)
+        return t1 - t0, t2 - t1  # export_s (artifact), pin_s
 
-    if arm in ("arm_b", "arm_c"):
-        snap_s = make_pin_snap()
-        log.rec(event="pin_epoch", arm=arm, rho=rho, tick=-1, wall_s=snap_s)
-        gpu_table = "pin_snap"
-
-    if read_mode == "gpu":  # pin epoch: timed upload+decode cost
+    if read_mode == "gpu":
+        export_s, pin_s = make_pin()
+        log.rec(event="pin_epoch", arm=arm, rho=rho, tick=-1,
+                export_s=export_s, pin_s=pin_s)
+        # warm read = pin materialization + decode (the true upload cost)
         run_reads(eng, ds, "gpu", log, table=gpu_table, event_tag="warm",
                   arm=arm, rho=rho, tick=-1)
         log.rec(event="gpu_mem", arm=arm, rho=rho, tick=-1, mib=gpu_mem_used_mib())
@@ -742,27 +764,24 @@ def run_arm(cfg, arm, rho, log):
                 wall_s=time.monotonic() - t0)
 
         if arm == "arm_a":
-            t0 = time.monotonic()
-            eng.sql("CHECKPOINT", timeout=1800)
-            ckpt_s = time.monotonic() - t0
-            eng.stop()
-            restart_s = eng.start(init_sql=init_settings(cfg, arm))
-            run_reads(eng, ds, "gpu", log, event_tag="rewarm",
+            # invalidate + re-upload after every write batch: unpin -> re-pin
+            # (no engine restart needed; iteration 1's 4.3s restart was an
+            # artifact of having no invalidation primitive on that route)
+            export_s, pin_s = make_pin()
+            run_reads(eng, ds, "gpu", log, table=gpu_table, event_tag="rewarm",
                       arm=arm, rho=rho, tick=tick)
             log.rec(event="refresh", arm=arm, rho=rho, tick=tick,
-                    checkpoint_s=ckpt_s, restart_s=restart_s)
+                    export_s=export_s, pin_s=pin_s)
         elif arm == "arm_c" and tick > 0 and tick % recompact_every == 0:
             t0 = time.monotonic()
             eng.sql("DELETE FROM delta_ins", timeout=600)
             eng.sql("DELETE FROM delta_del", timeout=600)
-            fold_s = make_pin_snap()  # rebuild the pin at the new epoch
-            ckpt_s = time.monotonic() - t0
-            eng.stop()
-            restart_s = eng.start(init_sql=init_settings(cfg, arm))
+            trunc_s = time.monotonic() - t0
+            export_s, pin_s = make_pin()  # re-pin at the new epoch
             run_reads(eng, ds, "gpu", log, table=gpu_table, event_tag="rewarm",
                       arm=arm, rho=rho, tick=tick)
             log.rec(event="recompact", arm=arm, rho=rho, tick=tick,
-                    fold_s=fold_s, checkpoint_s=ckpt_s, restart_s=restart_s)
+                    trunc_s=trunc_s, export_s=export_s, pin_s=pin_s)
 
         try:
             if arm in ("arm_b", "arm_c"):
@@ -801,7 +820,8 @@ def run_arm(cfg, arm, rho, log):
                         if not ok:
                             print(f"[{cell}] VERIFY FAIL {qname} tick={tick}", flush=True)
             else:
-                run_reads(eng, ds, read_mode, log, arm=arm, rho=rho, tick=tick)
+                run_reads(eng, ds, read_mode, log, table=gpu_table,
+                          arm=arm, rho=rho, tick=tick)
         except EngineCrash as e:
             log.rec(event="crash", arm=arm, rho=rho, tick=tick, error=str(e)[:300])
             print(f"[{cell}] ENGINE CRASH tick={tick}: {e}", flush=True)
@@ -818,7 +838,8 @@ def run_arm(cfg, arm, rho, log):
         print(f"[{cell}] tick {tick + 1}/{ticks} done", flush=True)
 
     eng.stop()
-    for p in (db, db + ".wal"):
+    for p in (db, db + ".wal",
+              os.path.join(cfg["data_dir"], f"pin_{cell}_{pin_epoch['n']}.parquet")):
         if os.path.exists(p):
             os.remove(p)
 

@@ -5,7 +5,7 @@
   "data_dir": "/tmp/gate0_data",
   "dataset": {
     "kind": "tpch",
-    "sf": 5,
+    "sf": 20,
     "refresh_sets": 450,
     "update_rows_per_tick": 5000
   },
