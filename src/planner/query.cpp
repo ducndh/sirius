@@ -47,7 +47,8 @@ void query::build_indices()
       // must be included: task_scheduler::start_query() schedules the first
       // scan operator, which is the only kickoff a VALUES-only plan gets.
       if (source->type == op::SiriusPhysicalOperatorType::GPU_SCAN ||
-          source->type == op::SiriusPhysicalOperatorType::GPU_VALUES) {
+          source->type == op::SiriusPhysicalOperatorType::GPU_VALUES ||
+          source->type == op::SiriusPhysicalOperatorType::VECTOR_JOIN) {
         _scan_operators.push_back(source.get());
       }
     }
