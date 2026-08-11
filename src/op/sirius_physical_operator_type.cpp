@@ -115,7 +115,9 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::GPU_SCAN: return "GPU_SCAN";
     case SiriusPhysicalOperatorType::DYNAMIC_FILTER: return "DYNAMIC_FILTER";
     case SiriusPhysicalOperatorType::STREAMING_SOURCE: return "STREAMING_SOURCE";
-    case SiriusPhysicalOperatorType::VECTOR_JOIN: return "VECTOR_JOIN";
+    case SiriusPhysicalOperatorType::VECTOR_JOIN_SELECTION: return "VECTOR_JOIN_SELECTION";
+    case SiriusPhysicalOperatorType::VECTOR_JOIN_LOCAL_MERGE: return "VECTOR_JOIN_LOCAL_MERGE";
+    case SiriusPhysicalOperatorType::VECTOR_JOIN_MATERIALIZE: return "VECTOR_JOIN_MATERIALIZE";
     case SiriusPhysicalOperatorType::INVALID: break;
   }
   return "INVALID";
