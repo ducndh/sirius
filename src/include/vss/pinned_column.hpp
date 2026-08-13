@@ -30,12 +30,45 @@ class column_view;
 }  // namespace cudf
 namespace cucascade::memory {
 class memory_space;
+class reservation;
 }  // namespace cucascade::memory
 namespace sirius::scan_manager {
 struct pinned_entry;
 }  // namespace sirius::scan_manager
+namespace cucascade {
+class data_batch;
+}  // namespace cucascade
+namespace sirius::telemetry {
+struct batch_telemetry_info;
+}  // namespace sirius::telemetry
 
 namespace sirius::vss {
+
+/**
+ * @brief Device-resident views over a pinned column, whatever tier the pin lives on.
+ *
+ * For a GPU-tier pin the views alias the pinned chunks and @c owners is empty. For a
+ * HOST-tier pin each chunk is copied device-side and @c owners / @c reservations keep those
+ * copies alive; dropping this struct releases them.
+ */
+struct staged_pinned_column {
+  std::vector<cudf::column_view> views;
+  std::vector<std::shared_ptr<::cucascade::data_batch>> owners;
+  std::vector<std::shared_ptr<::cucascade::memory::reservation>> reservations;
+};
+
+/**
+ * @brief Tier-agnostic replacement for @ref pinned_column_chunk_views.
+ *
+ * GPU-tier pins are aliased zero-copy as before; HOST-tier pins are staged to @p gpu_space.
+ * Callers that must work against a corpus larger than device memory should stage a chunk at
+ * a time instead of calling this, which stages every chunk at once.
+ */
+staged_pinned_column stage_pinned_column(const scan_manager::pinned_entry& pin,
+                                         const std::string& column_name,
+                                         ::cucascade::memory::memory_space& gpu_space,
+                                         rmm::cuda_stream_view stream,
+                                         const telemetry::batch_telemetry_info& telemetry_info);
 
 /// Return the pinned column's GPU chunks as column_views in pin order, without
 /// concatenating them. Every chunk must live on @p space's device. The views

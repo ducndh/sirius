@@ -25,6 +25,14 @@
 #include "vss/knn_merge.hpp"
 #include "vss/pinned_column.hpp"
 
+#include "data/sirius_converter_registry.hpp"
+
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+
+#include <array>
+
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
 #include <cudf/concatenate.hpp>
@@ -46,6 +54,120 @@
 #include <vector>
 
 namespace sirius::op {
+
+namespace {
+
+/// GPU-tier pin: every chunk is already device-resident, so staging hands back a view.
+class gpu_pinned_corpus_source : public corpus_source {
+ public:
+  gpu_pinned_corpus_source(const scan_manager::pinned_entry& pin,
+                           const std::string& column,
+                           cucascade::memory::memory_space& space)
+    : _views(vss::pinned_column_chunk_views(pin, column, space))
+  {
+  }
+
+  [[nodiscard]] std::size_t num_chunks() const override { return _views.size(); }
+  [[nodiscard]] bool is_streaming() const override { return false; }
+
+  staged_corpus_chunk stage(std::size_t i,
+                            cucascade::memory::memory_space& /*space*/,
+                            rmm::cuda_stream_view /*stream*/) override
+  {
+    return staged_corpus_chunk{_views.at(i), nullptr, nullptr};
+  }
+
+ private:
+  std::vector<cudf::column_view> _views;
+};
+
+/// HOST-tier pin: each chunk is copied device-side on demand through the same converter
+/// the scan path uses, and freed when the caller drops the returned owner. Peak device
+/// memory is therefore set by the chunks in flight, not by the corpus size.
+class host_pinned_corpus_source : public corpus_source {
+ public:
+  host_pinned_corpus_source(const scan_manager::pinned_entry& pin,
+                            const std::string& column,
+                            const telemetry::batch_telemetry_info& telemetry_info)
+    : _pin(pin), _telemetry_info(telemetry_info)
+  {
+    auto const& names = _pin.cache_info.column_names();
+    auto const it     = std::find(names.begin(), names.end(), column);
+    if (it == names.end()) {
+      throw std::runtime_error("[sirius_physical_vector_join_stream] host-tier pin is missing "
+                               "column '" +
+                               column + "'");
+    }
+    _column_index = static_cast<std::size_t>(std::distance(names.begin(), it));
+  }
+
+  [[nodiscard]] std::size_t num_chunks() const override { return _pin.host_chunks.size(); }
+  [[nodiscard]] bool is_streaming() const override { return true; }
+
+  staged_corpus_chunk stage(std::size_t i,
+                            cucascade::memory::memory_space& space,
+                            rmm::cuda_stream_view stream) override
+  {
+    auto const& chunk = _pin.host_chunks.at(i);
+    if (!chunk) {
+      throw std::runtime_error("[sirius_physical_vector_join_stream] host chunk " +
+                               std::to_string(i) + " is null");
+    }
+    // Slice to the vector column alone: the rest of the pinned table is dead weight on
+    // the wire and this copy is the operator's bandwidth budget.
+    std::array<std::size_t, 1> const cols{_column_index};
+    auto data_rep    = chunk->slice(cols);
+    auto const bytes = data_rep->get_size_in_bytes();
+
+    // Draw the staged copy from the task's budget. A null reservation means the chunk does
+    // not fit what this task was granted, which is a sizing problem to surface, not to
+    // silently exceed.
+    std::shared_ptr<cucascade::memory::reservation> reservation{
+      space.make_reservation_or_null(bytes)};
+    if (!reservation) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(i) + " needs " +
+        std::to_string(bytes) + " bytes device-side, which exceeds this task's budget");
+    }
+
+    auto const batch_id = sirius::get_next_batch_id();
+    auto batch          = cucascade::data_batch::make(
+      batch_id,
+      std::move(data_rep),
+      telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
+
+    {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(
+        sirius::converter_registry::get(), *reservation, stream);
+    }
+    auto const table = sirius::get_cudf_table_view(*batch);
+    return staged_corpus_chunk{table.column(0), std::move(batch), std::move(reservation)};
+  }
+
+ private:
+  const scan_manager::pinned_entry& _pin;
+  telemetry::batch_telemetry_info _telemetry_info;
+  std::size_t _column_index{0};
+};
+
+}  // namespace
+
+std::unique_ptr<corpus_source> make_gpu_pinned_corpus_source(
+  const sirius::scan_manager::pinned_entry& pin,
+  const std::string& column,
+  cucascade::memory::memory_space& space)
+{
+  return std::make_unique<gpu_pinned_corpus_source>(pin, column, space);
+}
+
+std::unique_ptr<corpus_source> make_host_pinned_corpus_source(
+  const sirius::scan_manager::pinned_entry& pin,
+  const std::string& column,
+  const telemetry::batch_telemetry_info& telemetry_info)
+{
+  return std::make_unique<host_pinned_corpus_source>(pin, column, telemetry_info);
+}
 
 sirius_physical_vector_join_stream::sirius_physical_vector_join_stream(
   duckdb::vector<sirius::logical_type> types,
@@ -81,18 +203,21 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
       "[sirius_physical_vector_join_stream] left or right table is no longer pinned");
   }
 
+  // The probe side stays resident: it is the [M x d] build side and it is small. Only the
+  // corpus streams, so only the corpus goes behind the tier-agnostic seam.
   _left_views =
     vss::pinned_column_chunk_views(*left_pin, left.column, vss::pinned_entry_gpu_space(*left_pin));
-  _right_views = vss::pinned_column_chunk_views(
-    *right_pin, right.column, vss::pinned_entry_gpu_space(*right_pin));
 
-  _right_offsets.resize(_right_views.size());
-  std::int64_t acc = 0;
-  for (std::size_t j = 0; j < _right_views.size(); ++j) {
-    _right_offsets[j] = acc;
-    acc += static_cast<std::int64_t>(_right_views[j].size());
+  if (right_pin->tier == cucascade::memory::Tier::HOST) {
+    _corpus = make_host_pinned_corpus_source(*right_pin, right.column, batch_telemetry());
+  } else {
+    _corpus = make_gpu_pinned_corpus_source(
+      *right_pin, right.column, vss::pinned_entry_gpu_space(*right_pin));
   }
-  _right_total_rows = acc;
+
+  // Row counts per chunk are not known until a chunk is staged, so the neighbor-id base is
+  // accumulated while streaming rather than pre-summed. The total comes from the pin.
+  _right_total_rows = static_cast<std::int64_t>(right_pin->num_rows);
 
   _num_left    = _left_views.size();
   _initialized = true;
@@ -167,15 +292,22 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   std::unique_ptr<cudf::column> acc_neighbors;
   std::unique_ptr<cudf::column> acc_distances;
 
-  for (std::size_t j = 0; j < _right_views.size(); ++j) {
-    auto const dataset    = vss::list_column_as_dataset_view(_right_views[j], dim);
+  auto const n_chunks = _corpus->num_chunks();
+  std::int64_t offset = 0;  // running base of the current chunk in right-table row space
+
+  for (std::size_t j = 0; j < n_chunks; ++j) {
+    // Staged for this iteration only. For a host-tier corpus this is the H2D copy, and
+    // `staged.owner` releases the device copy at the end of the iteration -- which is what
+    // keeps device memory bounded by the chunk in flight rather than the corpus.
+    auto staged           = _corpus->stage(j, *mem_space, stream);
+    auto const dataset    = vss::list_column_as_dataset_view(staged.view, dim);
     auto const batch_rows = static_cast<std::int64_t>(dataset.extent(0));
     if (batch_rows == 0) { continue; }
 
     // knn_merge_parts requires a uniform k across the parts it merges. Every batch
     // therefore has to supply k_join candidates; a batch shorter than k_join cannot,
     // and padding it row-major is not expressible without a dedicated kernel.
-    if (_right_views.size() > 1 && batch_rows < k_join) {
+    if (n_chunks > 1 && batch_rows < k_join) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_stream] right batch " + std::to_string(j) + " has " +
         std::to_string(batch_rows) + " rows, fewer than k=" + std::to_string(k_join) +
@@ -186,9 +318,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
 
     std::unique_ptr<cudf::column> neighbors = std::move(knn.neighbors);
-    auto const offset                       = _right_offsets[j];
-    if (offset != 0) {
-      cudf::numeric_scalar<std::int64_t> const off_scalar(offset, true, stream);
+    auto const chunk_base                   = offset;
+    offset += batch_rows;
+    if (chunk_base != 0) {
+      cudf::numeric_scalar<std::int64_t> const off_scalar(chunk_base, true, stream);
       neighbors = cudf::binary_operation(neighbors->view(),
                                          off_scalar,
                                          cudf::binary_operator::ADD,

@@ -76,14 +76,15 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
     throw std::runtime_error(
       "[sirius_physical_vector_join_materialize] left/right table is no longer pinned");
   }
-  auto& left_space  = vss::pinned_entry_gpu_space(*left_pin);
-  auto& right_space = vss::pinned_entry_gpu_space(*right_pin);
-
-  // Left output columns as zero-copy per-batch views: _left_output_cols[col][batch].
+  // Staged rather than aliased so a HOST-tier pin works: output columns are the small
+  // non-vector columns, and the right side is concatenated on device below regardless, so
+  // staging does not change the memory profile for a GPU-tier pin (where it is zero-copy).
   _left_output_cols.resize(left.output_columns.size());
   for (std::size_t c = 0; c < left.output_columns.size(); ++c) {
-    _left_output_cols[c] =
-      vss::pinned_column_chunk_views(*left_pin, left.output_columns[c], left_space);
+    auto staged = vss::stage_pinned_column(
+      *left_pin, left.output_columns[c], space, stream, batch_telemetry());
+    _left_output_cols[c] = staged.views;
+    _staged_left.push_back(std::move(staged));
   }
 
   // Right output columns concatenated once across batches, so a global right id
@@ -92,8 +93,8 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
   std::vector<std::unique_ptr<cudf::column>> right_cols;
   right_cols.reserve(right.output_columns.size());
   for (auto const& name : right.output_columns) {
-    auto views = vss::pinned_column_chunk_views(*right_pin, name, right_space);
-    right_cols.push_back(cudf::concatenate(views, stream, mr));
+    auto staged = vss::stage_pinned_column(*right_pin, name, space, stream, batch_telemetry());
+    right_cols.push_back(cudf::concatenate(staged.views, stream, mr));
   }
   _right_output_concat = std::make_unique<cudf::table>(std::move(right_cols));
 

@@ -283,8 +283,18 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
       // reached indirectly (e.g. through a view) to the CPU plan.
       std::optional<duckdb::SiriusContext::CpuFallbackGuard> fallback_guard;
       if (state.sirius_context) { fallback_guard.emplace(*state.sirius_context); }
-      state.result =
-        run_cpu_fallback_plan(context.client, *cpu_fallback_prepared_, state.cpu_executor);
+      try {
+        state.result =
+          run_cpu_fallback_plan(context.client, *cpu_fallback_prepared_, state.cpu_executor);
+      } catch (const std::exception& fallback_error) {
+        // The fallback's own failure says nothing about why the GPU failed, and for
+        // GPU-only rewrite targets (sirius_knn_join) it is actively misleading -- the
+        // user sees "cannot run on the CPU" when the real cause was, say, an OOM. Report
+        // the GPU error, which is the actionable one, with the fallback failure attached.
+        throw duckdb::ExecutorException("Sirius GPU execution failed: " + gpu_msg +
+                                        " (CPU fallback also failed: " +
+                                        std::string(fallback_error.what()) + ")");
+      }
     }
 
     SIRIUS_LOG_INFO("Transparent GPU execution: query completed");

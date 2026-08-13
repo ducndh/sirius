@@ -358,3 +358,45 @@ TEST_CASE_METHOD(VectorJoinFixture,
 
   run_ok("SELECT * FROM unpin_table('rej');");
 }
+
+// -----------------------------------------------------------------------------
+// Out-of-core: a HOST-tier corpus is streamed chunk-by-chunk through the fused
+// operator's running top-k instead of being GPU-resident, and must produce exactly
+// what the GPU-resident corpus produces. Multiple right batches, so the fold is the
+// thing under test. Streaming-path only -- the split operators require GPU residency.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - host-tier corpus matches a GPU-tier corpus",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  setenv("SIRIUS_VECTOR_JOIN_STREAMING", "1", 1);
+
+  run_ok("CREATE TABLE oc_corpus (id INTEGER, vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO oc_corpus SELECT i, "
+    "[sin(i)::float, cos(i*1.3)::float, sin(i*0.7)::float] FROM range(60000) t(i);");
+  run_ok("CREATE TABLE oc_probe (id INTEGER, vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO oc_probe SELECT i, "
+    "[sin(i*2.1)::float, cos(i*0.9)::float, sin(i*1.7)::float] FROM range(64) t(i);");
+  run_ok("CHECKPOINT;");
+
+  const std::string join_sql =
+    "SELECT left_id, right_id FROM sirius_knn_join("
+    "'oc_probe','vec','oc_corpus','vec', search_mode => 'exact', metric => 'l2', k => 8);";
+
+  run_ok("SELECT * FROM pin_table(name => 'oc_probe',  tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'oc_corpus', tier => 'gpu', format => 'duckdb');");
+  auto const gpu_tier_rows = ok_rows(*con, join_sql);
+  REQUIRE(gpu_tier_rows.size() == 64 * 8);
+  run_ok("SELECT * FROM unpin_table('oc_corpus');");
+
+  run_ok("SELECT * FROM pin_table(name => 'oc_corpus', tier => 'host', format => 'duckdb');");
+  auto const host_tier_rows = ok_rows(*con, join_sql);
+
+  REQUIRE(host_tier_rows == gpu_tier_rows);
+
+  run_ok("SELECT * FROM unpin_table('oc_corpus');");
+  run_ok("SELECT * FROM unpin_table('oc_probe');");
+  unsetenv("SIRIUS_VECTOR_JOIN_STREAMING");
+}

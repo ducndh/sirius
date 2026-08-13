@@ -17,6 +17,7 @@
 #pragma once
 
 #include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "vss/pinned_column.hpp"
 #include "vss/vector_join.hpp"
 
 #include <cudf/column/column.hpp>
@@ -93,6 +94,8 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
   bool _initialized{false};
   //! Left output columns as zero-copy views, indexed [output_col][batch].
   std::vector<std::vector<cudf::column_view>> _left_output_cols;
+  //! Keeps staged left copies alive when the pin is HOST-tier; empty for GPU-tier pins.
+  std::vector<vss::staged_pinned_column> _staged_left;
   //! Right output columns concatenated across batches; row i == global right id i.
   std::unique_ptr<cudf::table> _right_output_concat;
 };

@@ -16,7 +16,19 @@
 
 #include "vss/pinned_column.hpp"
 
+#include "data/data_batch_utils.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+
+#include <cudf/table/table_view.hpp>
+
+#include <algorithm>
+#include <array>
 #include "sirius/exception.hpp"
 
 #include <cudf/column/column.hpp>
@@ -58,6 +70,59 @@ cucascade::memory::memory_space& pinned_entry_gpu_space(const scan_manager::pinn
     if (space != nullptr) { return *space; }
   }
   throw internal_exception("VSS: pinned table has no GPU-resident chunk (host-tier pin?)");
+}
+
+staged_pinned_column stage_pinned_column(const scan_manager::pinned_entry& pin,
+                                         const std::string& column_name,
+                                         cucascade::memory::memory_space& gpu_space,
+                                         rmm::cuda_stream_view stream,
+                                         const telemetry::batch_telemetry_info& telemetry_info)
+{
+  staged_pinned_column out;
+  if (pin.tier != cucascade::memory::Tier::HOST) {
+    out.views = pinned_column_chunk_views(pin, column_name, gpu_space);
+    return out;
+  }
+
+  auto const& names = pin.cache_info.column_names();
+  auto const it     = std::find(names.begin(), names.end(), column_name);
+  if (it == names.end()) {
+    throw internal_exception("VSS: host-tier pinned table missing column '" + column_name + "'");
+  }
+  std::array<std::size_t, 1> const cols{static_cast<std::size_t>(std::distance(names.begin(), it))};
+
+  out.views.reserve(pin.host_chunks.size());
+  out.owners.reserve(pin.host_chunks.size());
+  out.reservations.reserve(pin.host_chunks.size());
+  for (std::size_t c = 0; c < pin.host_chunks.size(); ++c) {
+    auto const& chunk = pin.host_chunks[c];
+    if (!chunk) { throw internal_exception("VSS: host-tier pinned chunk is null"); }
+
+    auto data_rep    = chunk->slice(cols);
+    auto const bytes = data_rep->get_size_in_bytes();
+    std::shared_ptr<cucascade::memory::reservation> reservation{
+      gpu_space.make_reservation_or_null(bytes)};
+    if (!reservation) {
+      throw internal_exception("VSS: staging host-tier column '" + column_name + "' chunk " +
+                               std::to_string(c) + " needs " + std::to_string(bytes) +
+                               " device bytes, which exceeds the available budget");
+    }
+
+    auto const batch_id = sirius::get_next_batch_id();
+    auto batch          = cucascade::data_batch::make(
+      batch_id,
+      std::move(data_rep),
+      telemetry::quent_data_batch_probe::create(telemetry_info, batch_id));
+    {
+      auto mut = batch->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(
+        sirius::converter_registry::get(), *reservation, stream);
+    }
+    out.views.push_back(sirius::get_cudf_table_view(*batch).column(0));
+    out.owners.push_back(std::move(batch));
+    out.reservations.push_back(std::move(reservation));
+  }
+  return out;
 }
 
 }  // namespace sirius::vss
