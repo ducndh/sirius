@@ -50,7 +50,7 @@ namespace sirius::op {
  * holds the staged copy alive and releases it when the fold step drops it, which is what
  * bounds device memory to the chunks in flight rather than the whole corpus.
  */
-struct staged_corpus_chunk {
+struct staged_vector_chunk {
   cudf::column_view view;
   std::shared_ptr<::cucascade::data_batch> owner;
   /// Draws the staged copy from the task's device budget instead of committing fresh
@@ -65,35 +65,41 @@ struct staged_corpus_chunk {
  * done". Isolating that behind this interface is what lets the corpus live on the GPU, in
  * host memory, or -- later -- behind an ordinary child scan, without the fold changing.
  */
-class corpus_source {
+class vector_chunk_source {
  public:
-  corpus_source()                                = default;
-  corpus_source(const corpus_source&)            = delete;
-  corpus_source& operator=(const corpus_source&) = delete;
-  virtual ~corpus_source()                       = default;
+  vector_chunk_source()                                = default;
+  vector_chunk_source(const vector_chunk_source&)            = delete;
+  vector_chunk_source& operator=(const vector_chunk_source&) = delete;
+  virtual ~vector_chunk_source()                       = default;
 
   [[nodiscard]] virtual std::size_t num_chunks() const = 0;
 
   /// Make chunk @p i device-resident in @p space. Called once per chunk per left batch.
-  virtual staged_corpus_chunk stage(std::size_t i,
+  virtual staged_vector_chunk stage(std::size_t i,
                                     ::cucascade::memory::memory_space& space,
                                     rmm::cuda_stream_view stream) = 0;
 
-  /// True when staging performs a host-to-device copy, i.e. the corpus is not resident.
+  /// True when staging performs a host-to-device copy, i.e. the data is not resident.
   [[nodiscard]] virtual bool is_streaming() const = 0;
+
+  /// Rows in chunk @p i, and its device footprint, both without staging it. The memory
+  /// estimate has to size a task before any copy happens.
+  [[nodiscard]] virtual std::size_t chunk_rows(std::size_t i) const = 0;
+  [[nodiscard]] virtual std::size_t chunk_bytes(std::size_t i) const = 0;
 };
 
 /// GPU-tier pin: chunks are already device-resident, so staging is a no-op view.
-std::unique_ptr<corpus_source> make_gpu_pinned_corpus_source(
+std::unique_ptr<vector_chunk_source> make_gpu_pinned_chunk_source(
   const sirius::scan_manager::pinned_entry& pin,
   const std::string& column,
   ::cucascade::memory::memory_space& space);
 
 /// HOST-tier pin: each chunk is copied device-side on demand and released after the fold
 /// step, which is what makes the corpus side out-of-core.
-std::unique_ptr<corpus_source> make_host_pinned_corpus_source(
+std::unique_ptr<vector_chunk_source> make_host_pinned_chunk_source(
   const sirius::scan_manager::pinned_entry& pin,
   const std::string& column,
+  std::int64_t dim,
   const telemetry::batch_telemetry_info& telemetry_info);
 
 /**
@@ -214,13 +220,14 @@ class sirius_physical_vector_join_stream : public sirius_physical_operator {
   std::mutex _op_mutex;
   bool _initialized{false};
   bool _hint_returned{false};
-  std::vector<cudf::column_view> _left_views;
+  std::unique_ptr<vector_chunk_source> _probe;
   //! Streamed side, behind the tier-agnostic seam.
-  std::unique_ptr<corpus_source> _corpus;
+  std::unique_ptr<vector_chunk_source> _corpus;
   //! Total right-table rows, used to clamp k the way the plan already does.
   std::int64_t _right_total_rows{0};
   //! Largest corpus chunk in bytes; reserved per task when the corpus is streamed.
   std::size_t _max_chunk_bytes{0};
+  std::size_t _max_probe_chunk_bytes{0};
   std::size_t _num_left{0};
   std::size_t _next_left{0};
 };

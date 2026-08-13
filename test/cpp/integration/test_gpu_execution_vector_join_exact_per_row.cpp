@@ -507,3 +507,47 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM unpin_table('tt_corpus');");
   run_ok("SELECT * FROM unpin_table('tt_probe');");
 }
+
+// -----------------------------------------------------------------------------
+// Query-side partitioning: the probe side no longer has to be device-resident either.
+// A task owns one probe chunk and searches the whole corpus against it, so both sides
+// can exceed VRAM at once -- the shape every rec-sys candidate-generation join has.
+// Answers must not depend on where either side was pinned.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - host-tier probe side matches a GPU-tier probe side",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE qp_corpus (id INTEGER, vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO qp_corpus SELECT i, "
+    "[sin(i)::float, cos(i*1.3)::float, sin(i*0.7)::float] FROM range(60000) t(i);");
+  run_ok("CREATE TABLE qp_probe (id INTEGER, vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO qp_probe SELECT i, "
+    "[sin(i*2.1)::float, cos(i*0.9)::float, sin(i*1.7)::float] FROM range(50000) t(i);");
+  run_ok("CHECKPOINT;");
+
+  const std::string join_sql =
+    "SELECT left_id, right_id FROM sirius_knn_join("
+    "'qp_probe','vec','qp_corpus','vec', search_mode => 'exact', metric => 'l2', k => 8, "
+    "left_output_columns => ['id'], right_output_columns => ['id']);";
+
+  run_ok("SELECT * FROM pin_table(name => 'qp_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'qp_probe',  tier => 'gpu', format => 'duckdb');");
+  auto const gpu_probe_rows = ok_rows(*con, join_sql);
+  REQUIRE(gpu_probe_rows.size() == 50000 * 8);
+  run_ok("SELECT * FROM unpin_table('qp_probe');");
+
+  // Probe streamed, corpus resident.
+  run_ok("SELECT * FROM pin_table(name => 'qp_probe', tier => 'host', format => 'duckdb');");
+  REQUIRE(ok_rows(*con, join_sql) == gpu_probe_rows);
+  run_ok("SELECT * FROM unpin_table('qp_corpus');");
+
+  // Both sides streamed: neither has to fit device memory.
+  run_ok("SELECT * FROM pin_table(name => 'qp_corpus', tier => 'host', format => 'duckdb');");
+  REQUIRE(ok_rows(*con, join_sql) == gpu_probe_rows);
+
+  run_ok("SELECT * FROM unpin_table('qp_corpus');");
+  run_ok("SELECT * FROM unpin_table('qp_probe');");
+}

@@ -63,9 +63,9 @@ namespace sirius::op {
 namespace {
 
 /// GPU-tier pin: every chunk is already device-resident, so staging hands back a view.
-class gpu_pinned_corpus_source : public corpus_source {
+class gpu_pinned_chunk_source : public vector_chunk_source {
  public:
-  gpu_pinned_corpus_source(const scan_manager::pinned_entry& pin,
+  gpu_pinned_chunk_source(const scan_manager::pinned_entry& pin,
                            const std::string& column,
                            cucascade::memory::memory_space& space)
     : _views(vss::pinned_column_chunk_views(pin, column, space))
@@ -74,12 +74,17 @@ class gpu_pinned_corpus_source : public corpus_source {
 
   [[nodiscard]] std::size_t num_chunks() const override { return _views.size(); }
   [[nodiscard]] bool is_streaming() const override { return false; }
+  [[nodiscard]] std::size_t chunk_rows(std::size_t i) const override
+  {
+    return static_cast<std::size_t>(_views.at(i).size());
+  }
+  [[nodiscard]] std::size_t chunk_bytes(std::size_t /*i*/) const override { return 0; }
 
-  staged_corpus_chunk stage(std::size_t i,
+  staged_vector_chunk stage(std::size_t i,
                             cucascade::memory::memory_space& /*space*/,
                             rmm::cuda_stream_view /*stream*/) override
   {
-    return staged_corpus_chunk{_views.at(i), nullptr, nullptr};
+    return staged_vector_chunk{_views.at(i), nullptr, nullptr};
   }
 
  private:
@@ -89,12 +94,13 @@ class gpu_pinned_corpus_source : public corpus_source {
 /// HOST-tier pin: each chunk is copied device-side on demand through the same converter
 /// the scan path uses, and freed when the caller drops the returned owner. Peak device
 /// memory is therefore set by the chunks in flight, not by the corpus size.
-class host_pinned_corpus_source : public corpus_source {
+class host_pinned_chunk_source : public vector_chunk_source {
  public:
-  host_pinned_corpus_source(const scan_manager::pinned_entry& pin,
+  host_pinned_chunk_source(const scan_manager::pinned_entry& pin,
                             const std::string& column,
+                            std::int64_t dim,
                             const telemetry::batch_telemetry_info& telemetry_info)
-    : _pin(pin), _telemetry_info(telemetry_info)
+    : _pin(pin), _telemetry_info(telemetry_info), _dim(dim)
   {
     auto const& names = _pin.cache_info.column_names();
     auto const it     = std::find(names.begin(), names.end(), column);
@@ -109,7 +115,20 @@ class host_pinned_corpus_source : public corpus_source {
   [[nodiscard]] std::size_t num_chunks() const override { return _pin.host_chunks.size(); }
   [[nodiscard]] bool is_streaming() const override { return true; }
 
-  staged_corpus_chunk stage(std::size_t i,
+  // Row and byte counts without staging, so the memory estimate can size a task before any
+  // copy happens. A host chunk reports bytes; rows follow from the fixed vector width.
+  [[nodiscard]] std::size_t chunk_bytes(std::size_t i) const override
+  {
+    auto const& chunk = _pin.host_chunks.at(i);
+    return chunk ? chunk->column_size(_column_index) : 0;
+  }
+  [[nodiscard]] std::size_t chunk_rows(std::size_t i) const override
+  {
+    auto const width = static_cast<std::size_t>(_dim) * sizeof(float);
+    return width == 0 ? 0 : chunk_bytes(i) / width;
+  }
+
+  staged_vector_chunk stage(std::size_t i,
                             cucascade::memory::memory_space& space,
                             rmm::cuda_stream_view stream) override
   {
@@ -147,31 +166,33 @@ class host_pinned_corpus_source : public corpus_source {
         sirius::converter_registry::get(), *reservation, stream);
     }
     auto const table = sirius::get_cudf_table_view(*batch);
-    return staged_corpus_chunk{table.column(0), std::move(batch), std::move(reservation)};
+    return staged_vector_chunk{table.column(0), std::move(batch), std::move(reservation)};
   }
 
  private:
   const scan_manager::pinned_entry& _pin;
   telemetry::batch_telemetry_info _telemetry_info;
   std::size_t _column_index{0};
+  std::int64_t _dim{0};
 };
 
 }  // namespace
 
-std::unique_ptr<corpus_source> make_gpu_pinned_corpus_source(
+std::unique_ptr<vector_chunk_source> make_gpu_pinned_chunk_source(
   const sirius::scan_manager::pinned_entry& pin,
   const std::string& column,
   cucascade::memory::memory_space& space)
 {
-  return std::make_unique<gpu_pinned_corpus_source>(pin, column, space);
+  return std::make_unique<gpu_pinned_chunk_source>(pin, column, space);
 }
 
-std::unique_ptr<corpus_source> make_host_pinned_corpus_source(
+std::unique_ptr<vector_chunk_source> make_host_pinned_chunk_source(
   const sirius::scan_manager::pinned_entry& pin,
   const std::string& column,
+  std::int64_t dim,
   const telemetry::batch_telemetry_info& telemetry_info)
 {
-  return std::make_unique<host_pinned_corpus_source>(pin, column, telemetry_info);
+  return std::make_unique<host_pinned_chunk_source>(pin, column, dim, telemetry_info);
 }
 
 sirius_physical_vector_join_stream::sirius_physical_vector_join_stream(
@@ -208,13 +229,21 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
       "[sirius_physical_vector_join_stream] left or right table is no longer pinned");
   }
 
-  // The probe side stays resident: it is the [M x d] build side and it is small. Only the
-  // corpus streams, so only the corpus goes behind the tier-agnostic seam.
-  _left_views =
-    vss::pinned_column_chunk_views(*left_pin, left.column, vss::pinned_entry_gpu_space(*left_pin));
+  // Both sides go behind the same seam. The probe side used to be required GPU-resident on
+  // the argument that it is the small one; that is false for any join where both sides are
+  // large (rec-sys candidate generation is the motivating case). One task already handles one
+  // probe chunk, so streaming the probe is the same change staging the corpus was: stage the
+  // chunk this task owns, search the whole corpus against it, release.
+  if (left_pin->tier == cucascade::memory::Tier::HOST) {
+    _probe = make_host_pinned_chunk_source(*left_pin, left.column, _request.dim, batch_telemetry());
+  } else {
+    _probe = make_gpu_pinned_chunk_source(
+      *left_pin, left.column, vss::pinned_entry_gpu_space(*left_pin));
+  }
 
   if (right_pin->tier == cucascade::memory::Tier::HOST) {
-    _corpus = make_host_pinned_corpus_source(*right_pin, right.column, batch_telemetry());
+    _corpus =
+      make_host_pinned_chunk_source(*right_pin, right.column, _request.dim, batch_telemetry());
     // Sized from the widest chunk, since any one of them may be the one in flight when
     // the reservation is granted.
     auto const& names = right_pin->cache_info.column_names();
@@ -228,7 +257,7 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
       }
     }
   } else {
-    _corpus = make_gpu_pinned_corpus_source(
+    _corpus = make_gpu_pinned_chunk_source(
       *right_pin, right.column, vss::pinned_entry_gpu_space(*right_pin));
   }
 
@@ -236,7 +265,12 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
   // accumulated while streaming rather than pre-summed. The total comes from the pin.
   _right_total_rows = static_cast<std::int64_t>(right_pin->num_rows);
 
-  _num_left    = _left_views.size();
+  _num_left = _probe->num_chunks();
+  if (_probe->is_streaming()) {
+    for (std::size_t i = 0; i < _num_left; ++i) {
+      _max_probe_chunk_bytes = std::max(_max_probe_chunk_bytes, _probe->chunk_bytes(i));
+    }
+  }
   _initialized = true;
 }
 
@@ -294,8 +328,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   auto const dim      = _request.dim;
   auto const mr       = mem_space->get_default_allocator();
 
-  auto const queries  = vss::list_column_as_dataset_view(_left_views[left_idx], dim);
-  auto const n_left   = static_cast<std::int64_t>(queries.extent(0));
+  // Held for the whole task: every corpus chunk is searched against this probe chunk. Staged
+  // on the compute stream, so its eventual free is already ordered behind the searches that
+  // read it and needs no rebind, unlike the corpus chunks below.
+  auto staged_probe  = _probe->stage(left_idx, *mem_space, stream);
+  auto const queries = vss::list_column_as_dataset_view(staged_probe.view, dim);
+  auto const n_left  = static_cast<std::int64_t>(queries.extent(0));
 
   // Every mode is served by searching each left row to some depth and then deciding which
   // of those candidates survive. The depth differs: global top-k needs k_global per left
@@ -326,23 +364,23 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   if (_corpus->is_streaming()) { staging_stream.emplace(); }
   auto const stage_on = staging_stream ? staging_stream->view() : stream;
 
-  auto prefetched = n_chunks > 0 ? _corpus->stage(0, *mem_space, stage_on) : staged_corpus_chunk{};
+  auto prefetched = n_chunks > 0 ? _corpus->stage(0, *mem_space, stage_on) : staged_vector_chunk{};
 
   auto advance = [&](std::size_t next) {
     prefetched =
-      next < n_chunks ? _corpus->stage(next, *mem_space, stage_on) : staged_corpus_chunk{};
+      next < n_chunks ? _corpus->stage(next, *mem_space, stage_on) : staged_vector_chunk{};
   };
 
   // The staged copy is read by kernels that are still pending on the compute stream, but it
   // was allocated on the staging stream, so dropping it here would hand the buffer back to
   // RMM's free list for that other stream while a kernel is still reading it. Rebinding
   // moves the deallocation onto the compute stream, where it is ordered behind that kernel.
-  auto release_staged = [&](staged_corpus_chunk& chunk) {
+  auto release_staged = [&](staged_vector_chunk& chunk) {
     if (chunk.owner) {
       auto mut = chunk.owner->to_mutable();
       mut.rebind_stream(stream);
     }
-    chunk = staged_corpus_chunk{};
+    chunk = staged_vector_chunk{};
   };
 
   for (std::size_t j = 0; j < n_chunks; ++j) {
@@ -515,7 +553,7 @@ std::size_t sirius_physical_vector_join_stream::per_left_batch_estimate(std::siz
   // merge reads (2x), plus the merge output. Six [n_left x k] blocks covers it, with
   // the same 1 MiB floor the split design used. Notably independent of the right
   // batch count -- the split design's merge stage scaled with it.
-  auto const n_left = static_cast<std::size_t>(_left_views[left_idx].size());
+  auto const n_left = _probe->chunk_rows(left_idx);
   auto const k      = static_cast<std::size_t>(std::max<std::int64_t>(_request.k, 1));
   auto const block  = n_left * k * (sizeof(std::int64_t) + sizeof(float));
 
@@ -533,6 +571,11 @@ std::size_t sirius_physical_vector_join_stream::per_left_batch_estimate(std::siz
   std::size_t staged_chunk = 0;
   if (_corpus && _corpus->is_streaming()) {
     staged_chunk = _max_chunk_bytes;
+  }
+  // A streamed probe side holds its chunk for the whole task, so it is live alongside the
+  // corpus chunk rather than instead of it.
+  if (_probe && _probe->is_streaming()) {
+    staged_chunk += _max_probe_chunk_bytes;
   }
 
   return (block * 6) + cuvs_scratch + staged_chunk + (std::size_t{1} << 20);
