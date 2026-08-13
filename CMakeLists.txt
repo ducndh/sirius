@@ -294,6 +294,7 @@ set(EXTENSION_SOURCES
     src/op/sirius_physical_delim_join.cpp
     src/op/sirius_physical_dummy_scan.cpp
     src/op/sirius_physical_vector_join_select.cpp
+    src/op/sirius_physical_vector_join_stream.cpp
     src/op/sirius_physical_vector_join_reduce_local.cpp
     src/op/sirius_physical_vector_join_materialize.cpp
     src/op/sirius_physical_empty_result.cpp

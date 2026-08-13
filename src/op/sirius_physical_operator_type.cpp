@@ -116,6 +116,7 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::DYNAMIC_FILTER: return "DYNAMIC_FILTER";
     case SiriusPhysicalOperatorType::STREAMING_SOURCE: return "STREAMING_SOURCE";
     case SiriusPhysicalOperatorType::VECTOR_JOIN_SELECT: return "VECTOR_JOIN_SELECT";
+    case SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM: return "VECTOR_JOIN_STREAM";
     case SiriusPhysicalOperatorType::VECTOR_JOIN_REDUCE_LOCAL: return "VECTOR_JOIN_REDUCE_LOCAL";
     case SiriusPhysicalOperatorType::VECTOR_JOIN_MATERIALIZE: return "VECTOR_JOIN_MATERIALIZE";
     case SiriusPhysicalOperatorType::INVALID: break;

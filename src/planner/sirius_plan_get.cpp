@@ -42,7 +42,12 @@
 #include "vss/sirius_physical_vector_join_materialize.hpp"
 #include "vss/sirius_physical_vector_join_reduce_local.hpp"
 #include "vss/sirius_physical_vector_join_select.hpp"
+#include "vss/sirius_physical_vector_join_stream.hpp"
 #include "vss/vector_join.hpp"
+
+#include <string_view>
+
+#include <cstdlib>
 
 #include <memory>
 #include <unordered_set>
@@ -533,18 +538,34 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
     return t;
   };
 
-  auto selection = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_select>(
-    intermediate_types(), op.estimated_cardinality, req, &scan_manager);
+  // SIRIUS_VECTOR_JOIN_STREAMING selects the fused streaming operator, which folds
+  // each right batch into a running top-k instead of emitting a partial per
+  // (left, right) pair for a separate reduce stage. Both paths emit the same
+  // [neighbor_id, distance] schema partitioned by left batch, so materialize is
+  // shared and the two can be compared directly on the same query.
+  const char* streaming_env = std::getenv("SIRIUS_VECTOR_JOIN_STREAMING");
+  bool const use_streaming =
+    streaming_env != nullptr && std::string_view{streaming_env} != "0";
 
-  auto reduce_local = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_reduce_local>(
-    intermediate_types(), op.estimated_cardinality, req.k);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> join_stage;
+  if (use_streaming) {
+    join_stage = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_stream>(
+      intermediate_types(), op.estimated_cardinality, req, &scan_manager);
+  } else {
+    auto selection = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_select>(
+      intermediate_types(), op.estimated_cardinality, req, &scan_manager);
 
-  reduce_local->children.push_back(std::move(selection));
+    auto reduce_local = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_reduce_local>(
+      intermediate_types(), op.estimated_cardinality, req.k);
+
+    reduce_local->children.push_back(std::move(selection));
+    join_stage = std::move(reduce_local);
+  }
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> node =
     duckdb::make_uniq<sirius::op::sirius_physical_vector_join_materialize>(
       sirius::from_duckdb_vec(op.returned_types), op.estimated_cardinality, req, &scan_manager);
-  node->children.push_back(std::move(reduce_local));
+  node->children.push_back(std::move(join_stage));
 
   auto column_ids  = op.GetColumnIds();
   bool is_identity = column_ids.size() == op.returned_types.size();
