@@ -219,6 +219,8 @@ class sirius_physical_vector_join_stream : public sirius_physical_operator {
   std::unique_ptr<corpus_source> _corpus;
   //! Total right-table rows, used to clamp k the way the plan already does.
   std::int64_t _right_total_rows{0};
+  //! Largest corpus chunk in bytes; reserved per task when the corpus is streamed.
+  std::size_t _max_chunk_bytes{0};
   std::size_t _num_left{0};
   std::size_t _next_left{0};
 };

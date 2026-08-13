@@ -28,6 +28,7 @@
 #include "data/sirius_converter_registry.hpp"
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 
@@ -210,6 +211,18 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
 
   if (right_pin->tier == cucascade::memory::Tier::HOST) {
     _corpus = make_host_pinned_corpus_source(*right_pin, right.column, batch_telemetry());
+    // Sized from the widest chunk, since any one of them may be the one in flight when
+    // the reservation is granted.
+    auto const& names = right_pin->cache_info.column_names();
+    auto const it     = std::find(names.begin(), names.end(), right.column);
+    if (it != names.end()) {
+      auto const col = static_cast<std::size_t>(std::distance(names.begin(), it));
+      for (auto const& chunk : right_pin->host_chunks) {
+        if (chunk) {
+          _max_chunk_bytes = std::max(_max_chunk_bytes, chunk->column_size(col));
+        }
+      }
+    }
   } else {
     _corpus = make_gpu_pinned_corpus_source(
       *right_pin, right.column, vss::pinned_entry_gpu_space(*right_pin));
@@ -411,7 +424,24 @@ std::size_t sirius_physical_vector_join_stream::per_left_batch_estimate(std::siz
   auto const n_left = static_cast<std::size_t>(_left_views[left_idx].size());
   auto const k      = static_cast<std::size_t>(std::max<std::int64_t>(_request.k, 1));
   auto const block  = n_left * k * (sizeof(std::int64_t) + sizeof(float));
-  return (block * 6) + (std::size_t{1} << 20);
+
+  // cuVS tiles the pairwise distances against a bounded internal workspace, so its
+  // scratch does not scale with the search shape -- the two figures recorded on the
+  // split path (~35 MB L2, ~209 MB cosine, both at 50k x 50k) are workspace sizes, not
+  // a function of n. Modelled as a metric-dependent constant on that basis. Leaving it
+  // out entirely is what let tasks reserve far less than they used; these figures are
+  // observations from one shape, so treat them as a floor to refine, not a derivation.
+  auto const cuvs_scratch =
+    (_request.metric == "cosine") ? (std::size_t{220} << 20) : (std::size_t{40} << 20);
+
+  // A streamed corpus also holds the staged chunk itself; it is drawn from this task's
+  // budget, so it has to be reserved here too.
+  std::size_t staged_chunk = 0;
+  if (_corpus && _corpus->is_streaming()) {
+    staged_chunk = _max_chunk_bytes;
+  }
+
+  return (block * 6) + cuvs_scratch + staged_chunk + (std::size_t{1} << 20);
 }
 
 std::size_t sirius_physical_vector_join_stream::no_history_peak_memory_estimate(
