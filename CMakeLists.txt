@@ -373,6 +373,7 @@ set(EXTENSION_SOURCES
     src/vss/distance_metric.cpp
     src/vss/enn_top_k.cpp
     src/vss/join_result_shaping.cpp
+    $<$<BOOL:${SIRIUS_ENABLE_FAISS_KERNEL}>:src/vss/brute_force_search_faiss.cpp>
     src/vss/pinned_column.cpp
     src/vss/vector_join_binding.cpp
     src/vss/vector_search.cpp
@@ -510,6 +511,16 @@ foreach(_target sirius_extension sirius_loadable_extension)
     cuCascade::cucascade_cudf
     yaml-cpp::yaml-cpp
     telemetry_bridge)
+
+  # Optional FAISS-GPU brute-force kernel behind the same seam as the cuVS one, for
+  # measuring the kernel gap under a single query (SIRIUS_VSS_KERNEL=faiss selects it).
+  # Off by default: FAISS is not a Sirius dependency, and its GpuResources allocates
+  # scratch outside cucascade's accounting.
+  if(SIRIUS_ENABLE_FAISS_KERNEL)
+    target_compile_definitions(${_target} PRIVATE SIRIUS_ENABLE_FAISS_KERNEL)
+    target_include_directories(${_target} PRIVATE ${FAISS_INCLUDE_DIR})
+    target_link_libraries(${_target} ${FAISS_LIBRARY})
+  endif()
 
   add_dependencies(${_target} duckdb_static)
 endforeach()

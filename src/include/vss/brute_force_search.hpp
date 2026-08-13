@@ -82,4 +82,22 @@ knn_result brute_force_knn(
   cuvs::distance::DistanceType metric = cuvs::distance::DistanceType::L2SqrtUnexpanded,
   rmm::device_async_resource_ref mr   = cudf::get_current_device_resource_ref());
 
+#ifdef SIRIUS_ENABLE_FAISS_KERNEL
+/**
+ * @brief The same search, run by FAISS-GPU instead of cuVS.
+ *
+ * Same contract as @ref brute_force_knn -- same layout, same unsquared L2 distances -- so the
+ * two are interchangeable under one query and the difference measured is the kernel's.
+ * Selected by SIRIUS_VSS_KERNEL=faiss. L2 only; FAISS has no cosine metric and this refuses
+ * rather than quietly normalizing on the caller's behalf.
+ */
+knn_result brute_force_knn_faiss(
+  raft::device_resources const& res,
+  dataset_matrix_view dataset,
+  dataset_matrix_view queries,
+  int64_t k,
+  cuvs::distance::DistanceType metric = cuvs::distance::DistanceType::L2SqrtUnexpanded,
+  rmm::device_async_resource_ref mr   = cudf::get_current_device_resource_ref());
+#endif
+
 }  // namespace sirius::vss

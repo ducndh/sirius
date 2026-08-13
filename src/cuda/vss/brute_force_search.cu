@@ -16,6 +16,9 @@
 
 #include "vss/brute_force_search.hpp"
 
+#include <cstdlib>
+#include <string_view>
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
@@ -37,6 +40,15 @@ knn_result brute_force_knn(raft::device_resources const& res,
                            rmm::device_async_resource_ref mr)
 {
   namespace bf = cuvs::neighbors::brute_force;
+
+#ifdef SIRIUS_ENABLE_FAISS_KERNEL
+  // Read once: this is on the per-corpus-chunk path, so a getenv per call would show up.
+  static bool const use_faiss = [] {
+    const char* k = std::getenv("SIRIUS_VSS_KERNEL");
+    return k != nullptr && std::string_view{k} == "faiss";
+  }();
+  if (use_faiss) { return brute_force_knn_faiss(res, dataset, queries, k, metric, mr); }
+#endif
 
   auto const n_rows    = dataset.extent(0);
   auto const n_queries = queries.extent(0);
