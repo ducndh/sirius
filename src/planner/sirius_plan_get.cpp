@@ -35,6 +35,7 @@
 #include "op/scan/duckdb_mvcc_visibility.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "op/sirius_physical_top_n.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -531,32 +532,53 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   // reduction) → materialize (gather output columns + score into the TVF rows).
   // The select/reduce stages carry a [neighbor_id BIGINT, distance FLOAT] schema;
   // only materialize emits the TVF's declared columns.
-  auto intermediate_types = []() {
+  // Per-pair partials, before any left row is resolved: [neighbor_id, distance].
+  auto partial_types = []() {
     duckdb::vector<sirius::logical_type> t;
     t.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
     t.push_back(sirius::logical_type::make(sirius::type_id::FLOAT));
     return t;
   };
 
-  // SIRIUS_VECTOR_JOIN_STREAMING selects the fused streaming operator, which folds
-  // each right batch into a running top-k instead of emitting a partial per
-  // (left, right) pair for a separate reduce stage. Both paths emit the same
-  // [neighbor_id, distance] schema partitioned by left batch, so materialize is
-  // shared and the two can be compared directly on the same query.
+  // What the join stage hands to materialize: [left_row, neighbor_id, distance].
+  //
+  // left_row is carried explicitly rather than implied by position. Under per-row top-k the
+  // result is exactly k rows per left row and the left index can be recovered as row/k, which
+  // is what materialize used to do. Threshold and global top-k break that: their output is
+  // ragged by construction, so position carries no information and the left row has to travel
+  // with the pair. Making it explicit for every mode is what keeps one materialize.
+  auto joined_types = []() {
+    duckdb::vector<sirius::logical_type> t;
+    t.push_back(sirius::logical_type::make(sirius::type_id::INTEGER));
+    t.push_back(sirius::logical_type::make(sirius::type_id::BIGINT));
+    t.push_back(sirius::logical_type::make(sirius::type_id::FLOAT));
+    return t;
+  };
+
+  // The fused streaming operator folds each right batch into a running top-k instead
+  // of emitting a partial per (left, right) pair for a separate reduce stage. Both
+  // paths emit the same [neighbor_id, distance] schema partitioned by left batch, so
+  // materialize is shared and the two can be compared directly on the same query.
+  //
+  // Streaming is the default. The split path is kept for A/B comparison only and is
+  // known to be wrong whenever the right table pins to more than one chunk: reduce_local
+  // merges each partial on its own instead of folding the partition, and materialize's
+  // fixed-k slicing then attributes neighbours to the wrong left rows. Select it with
+  // SIRIUS_VECTOR_JOIN_STREAMING=0, and only on a single-chunk right table.
   const char* streaming_env = std::getenv("SIRIUS_VECTOR_JOIN_STREAMING");
   bool const use_streaming =
-    streaming_env != nullptr && std::string_view{streaming_env} != "0";
+    streaming_env == nullptr || std::string_view{streaming_env} != "0";
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> join_stage;
   if (use_streaming) {
     join_stage = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_stream>(
-      intermediate_types(), op.estimated_cardinality, req, &scan_manager);
+      joined_types(), op.estimated_cardinality, req, &scan_manager);
   } else {
     auto selection = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_select>(
-      intermediate_types(), op.estimated_cardinality, req, &scan_manager);
+      partial_types(), op.estimated_cardinality, req, &scan_manager);
 
     auto reduce_local = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_reduce_local>(
-      intermediate_types(), op.estimated_cardinality, req.k);
+      joined_types(), op.estimated_cardinality, req.k);
 
     reduce_local->children.push_back(std::move(selection));
     join_stage = std::move(reduce_local);
@@ -566,6 +588,34 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
     duckdb::make_uniq<sirius::op::sirius_physical_vector_join_materialize>(
       sirius::from_duckdb_vec(op.returned_types), op.estimated_cardinality, req, &scan_manager);
   node->children.push_back(std::move(join_stage));
+
+  // Global top-k finishes above materialize rather than inside the join. The join stage
+  // searches every left row to depth k, which bounds the candidates correctly (one left row
+  // can own at most k of the global winners) but leaves one top-k per left batch. Ranking the
+  // materialized rows by score with an ordinary TOP_N collapses those into a single answer,
+  // and the plan generator's post-pass wraps any TOP_N with MERGE_TOP_N, which is exactly the
+  // cross-partition merge this needs — so left-side partitioning is not a restriction here.
+  if (req.mode == sirius::vss::vector_join_mode::global_top_k) {
+    auto const score_idx = op.returned_types.size() - 1;  // materialize emits score last
+    auto const ascending =
+      req.output_type == sirius::vss::vector_join_output_type::similarity ? false : true;
+
+    duckdb::vector<duckdb::BoundOrderByNode> orders;
+    orders.emplace_back(ascending ? duckdb::OrderType::ASCENDING : duckdb::OrderType::DESCENDING,
+                        duckdb::OrderByNullType::NULLS_LAST,
+                        duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+                          op.returned_types[score_idx], score_idx));
+
+    auto top_n = duckdb::make_uniq<sirius::op::sirius_physical_top_n>(
+      sirius::from_duckdb_vec(op.returned_types),
+      std::move(orders),
+      static_cast<std::size_t>(req.k),
+      /*offset=*/std::size_t{0},
+      /*dynamic_filter=*/nullptr,
+      op.estimated_cardinality);
+    top_n->children.push_back(std::move(node));
+    node = std::move(top_n);
+  }
 
   auto column_ids  = op.GetColumnIds();
   bool is_identity = column_ids.size() == op.returned_types.size();

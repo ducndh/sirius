@@ -1896,6 +1896,33 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   }
   req.dim = left_dim;
 
+  // The split path (SIRIUS_VECTOR_JOIN_STREAMING=0) merges each right chunk's partial on
+  // its own instead of folding the whole partition, and materialize's fixed-k slicing then
+  // attributes neighbours to the wrong left rows. The result passes every downstream check,
+  // so refuse it here rather than return scrambled rows. Bind time, not plan time: the plan
+  // generator's exceptions are caught and turned into a CPU fallback, where this table
+  // function refuses again with an unrelated message.
+  auto pinned_chunk_count = [&](const sirius::vss::vector_join_side& side) -> std::size_t {
+    const auto* pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
+      side.catalog, side.schema, side.table);
+    if (pin == nullptr) { return 0; }
+    return pin->tier == cucascade::memory::Tier::HOST ? pin->host_chunks.size()
+                                                      : pin->chunk_memory_spaces.size();
+  };
+
+  const char* streaming_env = std::getenv("SIRIUS_VECTOR_JOIN_STREAMING");
+  if (streaming_env != nullptr && std::string_view{streaming_env} == "0") {
+    auto const right_chunks = pinned_chunk_count(req.right);
+    if (right_chunks > 1) {
+      throw BinderException(
+        "sirius_knn_join: SIRIUS_VECTOR_JOIN_STREAMING=0 selects the split path, which does "
+        "not merge across right batches; table '" +
+        req.right.table + "' is pinned in " + std::to_string(right_chunks) +
+        " chunks. Unset the variable to use the streaming operator.");
+    }
+  }
+
+
   return_types.push_back(LogicalType::FLOAT);
   names.push_back(req.output_type == vector_join_output_type::similarity ? "similarity"
                                                                          : "distance");

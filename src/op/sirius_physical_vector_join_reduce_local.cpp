@@ -17,6 +17,7 @@
 #include "vss/sirius_physical_vector_join_reduce_local.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "vss/join_result_shaping.hpp"
 #include "vss/knn_merge.hpp"
 
 #include <cudf/column/column.hpp>
@@ -125,10 +126,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
   auto merged = vss::knn_merge_parts_topk(
     res, stacked_distances->view(), stacked_neighbors->view(), n_samples, n_parts, _k, stream, mr);
 
-  // Preserve the [neighbor_id, distance] layout and the partition (left batch)
-  // so the materialize stage can gather each left row's output columns.
+  // Emit [left_row, neighbor_id, distance] and the partition (left batch) so materialize can
+  // gather each pair's left row. This path only ever produces per-row top-k, so left_row is
+  // just the row-major identity; it is carried anyway because materialize is shared with the
+  // streaming operator, whose threshold and global modes have no such identity.
   std::vector<std::unique_ptr<cudf::column>> out_cols;
-  out_cols.reserve(2);
+  out_cols.reserve(3);
+  out_cols.push_back(vss::make_left_row_index(n_samples, _k, stream, mr));
   out_cols.push_back(std::move(merged.neighbors));
   out_cols.push_back(std::move(merged.distances));
   auto out_table = std::make_unique<cudf::table>(std::move(out_cols));

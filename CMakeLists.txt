@@ -372,6 +372,7 @@ set(EXTENSION_SOURCES
     src/vss/cuvs_index_cache.cpp
     src/vss/distance_metric.cpp
     src/vss/enn_top_k.cpp
+    src/vss/join_result_shaping.cpp
     src/vss/pinned_column.cpp
     src/vss/vector_join_binding.cpp
     src/vss/vector_search.cpp

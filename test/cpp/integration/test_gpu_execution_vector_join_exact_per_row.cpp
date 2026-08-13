@@ -400,3 +400,110 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM unpin_table('oc_probe');");
   unsetenv("SIRIUS_VECTOR_JOIN_STREAMING");
 }
+
+// -----------------------------------------------------------------------------
+// Global top-k: the k closest pairs over the whole join, not k per left row. The CPU
+// reference is an exhaustive cross join ordered by distance, which is the definition.
+// The corpus spans several right batches so the fold, the per-batch depth bound and
+// the TOP_N above materialize are all exercised together.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - global top-k matches an exhaustive CPU ranking",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE g_corpus (id INTEGER, vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO g_corpus SELECT i, "
+    "[sin(i)::float, cos(i*1.3)::float, sin(i*0.7)::float] FROM range(60000) t(i);");
+  run_ok("CREATE TABLE g_probe (id INTEGER, vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO g_probe SELECT i, "
+    "[sin(i*2.1)::float, cos(i*0.9)::float, sin(i*1.7)::float] FROM range(32) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'g_probe',  tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'g_corpus', tier => 'gpu', format => 'duckdb');");
+
+  con->Query("SET gpu_execution = false;");
+  auto const reference = ok_rows(*con,
+                                 "SELECT p.id, c.id FROM g_probe p, g_corpus c "
+                                 "ORDER BY array_distance(p.vec, c.vec) LIMIT 12;");
+  con->Query("SET gpu_execution = true;");
+
+  auto const joined = ok_rows(*con,
+                              "SELECT left_id, right_id FROM sirius_knn_join("
+                              "'g_probe','vec','g_corpus','vec', search_mode => 'exact', "
+                              "metric => 'l2', k => 12, join_mode => 'global', "
+                              "left_output_columns => ['id'], right_output_columns => ['id']);");
+  REQUIRE(joined.size() == 12);
+  REQUIRE(joined == reference);
+
+  run_ok("SELECT * FROM unpin_table('g_corpus');");
+  run_ok("SELECT * FROM unpin_table('g_probe');");
+}
+
+// -----------------------------------------------------------------------------
+// Threshold (range) join: every pair within eps, which is ragged by construction --
+// left rows contribute anywhere from zero to many pairs. This is the case the old
+// fixed-k output contract could not represent at all, so it is also the regression
+// test for materialize gathering by an explicit left row instead of repeating.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - threshold join matches an exhaustive CPU range query",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE t_corpus (id INTEGER, vec FLOAT[2]);");
+  run_ok("INSERT INTO t_corpus SELECT i, [(i%100)::float, (i/100)::float] FROM range(10000) t(i);");
+  run_ok("CREATE TABLE t_probe (id INTEGER, vec FLOAT[2]);");
+  run_ok("INSERT INTO t_probe VALUES (0,[10.0,10.0]),(1,[50.5,50.5]),(2,[99.0,99.0]);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 't_probe',  tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 't_corpus', tier => 'gpu', format => 'duckdb');");
+
+  con->Query("SET gpu_execution = false;");
+  auto const reference = ok_rows(*con,
+                                 "SELECT p.id, c.id FROM t_probe p, t_corpus c "
+                                 "WHERE array_distance(p.vec, c.vec) <= 2.0;");
+  con->Query("SET gpu_execution = true;");
+
+  auto const joined = ok_rows(*con,
+                              "SELECT left_id, right_id FROM sirius_knn_join("
+                              "'t_probe','vec','t_corpus','vec', search_mode => 'exact', "
+                              "metric => 'l2', k => 64, join_mode => 'threshold', eps => 2.0, "
+                              "left_output_columns => ['id'], right_output_columns => ['id']);");
+  REQUIRE(joined == reference);
+  // Ragged by construction: this is not a whole multiple of the probe row count.
+  REQUIRE(joined.size() % 3 != 0);
+
+  run_ok("SELECT * FROM unpin_table('t_corpus');");
+  run_ok("SELECT * FROM unpin_table('t_probe');");
+}
+
+// -----------------------------------------------------------------------------
+// A threshold join searches each left row only to depth k, so an eps loose enough to
+// admit more than k neighbours cannot be answered completely. It must say so rather
+// than return a silently truncated result set.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - threshold join refuses to truncate",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE tt_corpus (id INTEGER, vec FLOAT[2]);");
+  run_ok(
+    "INSERT INTO tt_corpus SELECT i, [(i%100)::float, (i/100)::float] FROM range(10000) t(i);");
+  run_ok("CREATE TABLE tt_probe (id INTEGER, vec FLOAT[2]);");
+  run_ok("INSERT INTO tt_probe VALUES (0,[50.0,50.0]);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'tt_probe',  tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'tt_corpus', tier => 'gpu', format => 'duckdb');");
+
+  // eps => 50 admits thousands of pairs; k => 4 cannot represent them.
+  expect_error(*con,
+               "SELECT left_id, right_id FROM sirius_knn_join("
+               "'tt_probe','vec','tt_corpus','vec', search_mode => 'exact', metric => 'l2', "
+               "k => 4, join_mode => 'threshold', eps => 50.0, "
+               "left_output_columns => ['id'], right_output_columns => ['id']);",
+               "truncated");
+
+  run_ok("SELECT * FROM unpin_table('tt_corpus');");
+  run_ok("SELECT * FROM unpin_table('tt_probe');");
+}

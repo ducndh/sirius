@@ -142,37 +142,41 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
   auto const mr = space->get_default_allocator();
 
   // Merge emits one result batch per partition; concatenate defensively if more.
+  std::vector<cudf::column_view> left_row_views;
   std::vector<cudf::column_view> neighbor_views;
   std::vector<cudf::column_view> distance_views;
   for (auto const& ro : input_batches) {
     auto const tv = sirius::get_cudf_table_view(ro);
-    neighbor_views.push_back(tv.column(0));  // INT64 global right id
-    distance_views.push_back(tv.column(1));  // FLOAT32 distance
+    left_row_views.push_back(tv.column(0));  // INT32 row index into the left batch
+    neighbor_views.push_back(tv.column(1));  // INT64 global right id
+    distance_views.push_back(tv.column(2));  // FLOAT32 distance
   }
+  std::unique_ptr<cudf::column> left_row_owned;
   std::unique_ptr<cudf::column> neighbor_owned;
   std::unique_ptr<cudf::column> distance_owned;
+  cudf::column_view left_row_view = left_row_views.front();
   cudf::column_view neighbor_view = neighbor_views.front();
   cudf::column_view distance_view = distance_views.front();
   if (input_batches.size() > 1) {
+    left_row_owned = cudf::concatenate(left_row_views, stream, mr);
     neighbor_owned = cudf::concatenate(neighbor_views, stream, mr);
     distance_owned = cudf::concatenate(distance_views, stream, mr);
+    left_row_view  = left_row_owned->view();
     neighbor_view  = neighbor_owned->view();
     distance_view  = distance_owned->view();
   }
 
-  // Left columns of batch `partition_idx`, each row repeated for its k neighbors.
+  // Left columns gathered by the left row each pair belongs to. This used to repeat every
+  // left row k times, which assumed a fixed k per row; threshold and global top-k are ragged
+  // by construction, so the join stage now names the left row for each pair instead.
   std::vector<cudf::column_view> left_batch_cols;
   left_batch_cols.reserve(_left_output_cols.size());
   for (auto const& per_batch : _left_output_cols) {
     left_batch_cols.push_back(per_batch[partition_idx]);
   }
   auto const left_table = cudf::table_view(left_batch_cols);
-  auto const total_rows = static_cast<int64_t>(neighbor_view.size());
-  auto const left_rows  = static_cast<int64_t>(left_table.num_rows());
-  CUDF_EXPECTS(left_rows > 0 && total_rows % left_rows == 0,
-               "VSS materialize: result rows are not a whole multiple of the left batch rows");
-  auto const k_eff   = static_cast<cudf::size_type>(total_rows / left_rows);
-  auto left_repeated = cudf::repeat(left_table, k_eff, stream, mr);
+  auto left_repeated    = cudf::gather(
+    left_table, left_row_view, cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
 
   // Right columns gathered by the global neighbor id.
   auto right_gathered = cudf::gather(_right_output_concat->view(),

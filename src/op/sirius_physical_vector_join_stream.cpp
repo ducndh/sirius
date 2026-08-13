@@ -22,6 +22,7 @@
 #include "vss/brute_force_search.hpp"
 #include "vss/cudf_raft_interop.hpp"
 #include "vss/distance_metric.hpp"
+#include "vss/join_result_shaping.hpp"
 #include "vss/knn_merge.hpp"
 #include "vss/pinned_column.hpp"
 
@@ -295,7 +296,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
 
   auto const queries  = vss::list_column_as_dataset_view(_left_views[left_idx], dim);
   auto const n_left   = static_cast<std::int64_t>(queries.extent(0));
-  auto const k_join   = std::min<std::int64_t>(_request.k, _right_total_rows);
+
+  // Every mode is served by searching each left row to some depth and then deciding which
+  // of those candidates survive. The depth differs: global top-k needs k_global per left
+  // row (a single left row may own the entire global answer), and threshold needs a cap on
+  // how many in-range neighbours one left row may have, which is what k supplies there.
+  auto const k_join = std::min<std::int64_t>(_request.k, _right_total_rows);
 
   raft::device_resources res{stream};
   auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact;
@@ -417,10 +423,59 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       "[sirius_physical_vector_join_stream] right table produced no rows to join against");
   }
 
+  // The fold is mode-independent; only which of its candidates survive is not.
+  vss::shaped_join_result shaped;
+  switch (_request.mode) {
+    case vss::vector_join_mode::global_top_k: {
+      shaped = vss::shape_global_top_k(acc_neighbors->view(),
+                                       acc_distances->view(),
+                                       n_left,
+                                       k_join,
+                                       k_join,
+                                       stream,
+                                       mr);
+      break;
+    }
+    case vss::vector_join_mode::threshold: {
+      // The kernel works in distance space. For cosine with a similarity threshold the
+      // user's "score >= eps" is the same set as "distance <= 1 - eps"; for a distance
+      // threshold it is eps directly.
+      auto const max_distance =
+        _request.output_type == vss::vector_join_output_type::similarity
+          ? static_cast<float>(1.0 - _request.eps)
+          : static_cast<float>(_request.eps);
+      bool truncated = false;
+      shaped         = vss::shape_threshold(acc_neighbors->view(),
+                                    acc_distances->view(),
+                                    n_left,
+                                    k_join,
+                                    max_distance,
+                                    truncated,
+                                    stream,
+                                    mr);
+      if (truncated) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_stream] threshold join truncated: at least one left row "
+          "has k=" +
+          std::to_string(k_join) +
+          " neighbours inside the threshold, so pairs beyond k were never searched for. Raise k "
+          "or tighten eps.");
+      }
+      break;
+    }
+    case vss::vector_join_mode::per_row_top_k:
+    default: {
+      shaped = vss::shape_per_row_top_k(
+        std::move(acc_neighbors), std::move(acc_distances), n_left, k_join, stream, mr);
+      break;
+    }
+  }
+
   std::vector<std::unique_ptr<cudf::column>> out_cols;
-  out_cols.reserve(2);
-  out_cols.push_back(std::move(acc_neighbors));
-  out_cols.push_back(std::move(acc_distances));
+  out_cols.reserve(3);
+  out_cols.push_back(std::move(shaped.left_rows));
+  out_cols.push_back(std::move(shaped.neighbors));
+  out_cols.push_back(std::move(shaped.distances));
   auto out_table = std::make_unique<cudf::table>(std::move(out_cols));
 
   auto batch = sirius::make_data_batch(std::move(out_table), *mem_space, stream, batch_telemetry());
