@@ -43,11 +43,14 @@
 
 #include <raft/core/device_resources.hpp>
 
+#include <rmm/cuda_stream.hpp>
+
 #include <nvtx3/nvtx3.hpp>
 
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <typeinfo>
@@ -308,14 +311,44 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   auto const n_chunks = _corpus->num_chunks();
   std::int64_t offset = 0;  // running base of the current chunk in right-table row space
 
+  // Staging runs on its own stream so chunk j+1's H2D overlaps chunk j's compute. The
+  // converter host-synchronizes at the end of its copy, so what is actually overlapped is
+  // "host blocked on the copy" against "GPU busy with the previous chunk" -- the compute
+  // below is issued asynchronously and does not block the host. Only worth a stream when
+  // the corpus actually streams; a GPU-tier pin stages nothing.
+  std::optional<rmm::cuda_stream> staging_stream;
+  if (_corpus->is_streaming()) { staging_stream.emplace(); }
+  auto const stage_on = staging_stream ? staging_stream->view() : stream;
+
+  auto prefetched = n_chunks > 0 ? _corpus->stage(0, *mem_space, stage_on) : staged_corpus_chunk{};
+
+  auto advance = [&](std::size_t next) {
+    prefetched =
+      next < n_chunks ? _corpus->stage(next, *mem_space, stage_on) : staged_corpus_chunk{};
+  };
+
+  // The staged copy is read by kernels that are still pending on the compute stream, but it
+  // was allocated on the staging stream, so dropping it here would hand the buffer back to
+  // RMM's free list for that other stream while a kernel is still reading it. Rebinding
+  // moves the deallocation onto the compute stream, where it is ordered behind that kernel.
+  auto release_staged = [&](staged_corpus_chunk& chunk) {
+    if (chunk.owner) {
+      auto mut = chunk.owner->to_mutable();
+      mut.rebind_stream(stream);
+    }
+    chunk = staged_corpus_chunk{};
+  };
+
   for (std::size_t j = 0; j < n_chunks; ++j) {
-    // Staged for this iteration only. For a host-tier corpus this is the H2D copy, and
-    // `staged.owner` releases the device copy at the end of the iteration -- which is what
-    // keeps device memory bounded by the chunk in flight rather than the corpus.
-    auto staged           = _corpus->stage(j, *mem_space, stream);
+    // Held for this iteration only; released at the bottom once its compute is ordered,
+    // which is what keeps device memory bounded by the chunks in flight, not the corpus.
+    auto staged           = std::move(prefetched);
     auto const dataset    = vss::list_column_as_dataset_view(staged.view, dim);
     auto const batch_rows = static_cast<std::int64_t>(dataset.extent(0));
-    if (batch_rows == 0) { continue; }
+    if (batch_rows == 0) {
+      advance(j + 1);
+      continue;
+    }
 
     // knn_merge_parts requires a uniform k across the parts it merges. Every batch
     // therefore has to supply k_join candidates; a batch shorter than k_join cannot,
@@ -329,6 +362,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto const k_eff = std::min<std::int64_t>(k_join, batch_rows);
 
     auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
+
+    // The search above is issued, not finished. Staging the next chunk now runs its H2D
+    // while the GPU works on this one; the host blocks inside the converter, the device
+    // does not.
+    advance(j + 1);
+    release_staged(staged);
 
     std::unique_ptr<cudf::column> neighbors = std::move(knn.neighbors);
     auto const chunk_base                   = offset;
