@@ -70,6 +70,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 // #include "from_substrait.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
@@ -2006,6 +2007,63 @@ static unique_ptr<NodeStatistics> SiriusVectorJoinCardinality(ClientContext&,
   return make_uniq<NodeStatistics>(rows, rows);
 }
 
+//! Stamp the vector join's real output cardinality onto its LogicalGet.
+//!
+//! `LogicalGet::EstimateCardinality` consults the function's cardinality callback, which is
+//! handed only the bind data. That is enough for the name-taking form, whose row counts are
+//! known at bind. It is not enough for `sirius_knn_join_rel`, whose probe is a subquery: the
+//! bind cannot see the child's estimate, so the callback declines and DuckDB falls back to
+//! `children[0]->EstimateCardinality()` -- the join's INPUT count, when the join emits k rows
+//! per input row. Everything planned above the operator is then sized an order of magnitude
+//! low at k=10.
+//!
+//! Stamping it here fixes that, because `has_estimated_cardinality` takes precedence over both
+//! the callback and the child fallback.
+static void stamp_vector_join_cardinality(ClientContext& context, LogicalOperator& op)
+{
+  for (auto& child : op.children) {
+    stamp_vector_join_cardinality(context, *child);
+  }
+  if (op.type != LogicalOperatorType::LOGICAL_GET) { return; }
+  auto& get = op.Cast<LogicalGet>();
+  if (get.function.name != "sirius_knn_join_rel" || get.children.empty() || !get.bind_data) {
+    return;
+  }
+  auto const* bind = dynamic_cast<SiriusVectorJoinBindData const*>(get.bind_data.get());
+  if (bind == nullptr) { return; }
+
+  auto const k = static_cast<idx_t>(std::max<std::int64_t>(bind->req.k, 0));
+  if (bind->req.mode == vector_join_mode::global_top_k) {
+    get.SetEstimatedCardinality(k);
+    return;
+  }
+  auto const child_rows = get.children[0]->EstimateCardinality(context);
+  if (k != 0 && child_rows > NumericLimits<idx_t>::Maximum() / k) {
+    get.SetEstimatedCardinality(NumericLimits<idx_t>::Maximum());
+    return;
+  }
+  get.SetEstimatedCardinality(child_rows * k);
+}
+
+//! Runs before every built-in optimizer, so JOIN_ORDER sees the stamped value. The child has
+//! not been optimized yet at this point -- a probe-side predicate is still a LogicalFilter
+//! above the scan rather than pushed into it -- so the count feeding this is rougher than the
+//! final one. It is still the k factor that dominates the error, which is what this fixes.
+static void SiriusPreOptimizeVectorJoin(OptimizerExtensionInput& input,
+                                        unique_ptr<LogicalOperator>& plan)
+{
+  if (plan) { stamp_vector_join_cardinality(input.context, *plan); }
+}
+
+//! Runs after them, when the child's estimate reflects the pushed-down filter. Too late to
+//! change a join order, but it is what EXPLAIN and the physical planner read, and it overwrites
+//! the rougher pre-pass value.
+static void SiriusPostOptimizeVectorJoin(OptimizerExtensionInput& input,
+                                         unique_ptr<LogicalOperator>& plan)
+{
+  if (plan) { stamp_vector_join_cardinality(input.context, *plan); }
+}
+
 static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
                                                      TableFunctionBindInput& input,
                                                      vector<LogicalType>& return_types,
@@ -2774,6 +2832,11 @@ static void LoadInternal(ExtensionLoader& loader)
   auto callback      = make_shared_ptr<duckdb::SiriusContextExtensionCallback>();
   auto* callback_ptr = callback.get();
   config.GetCallbackManager().Register(std::move(callback));
+
+  duckdb::OptimizerExtension vector_join_cardinality;
+  vector_join_cardinality.pre_optimize_function = duckdb::SiriusPreOptimizeVectorJoin;
+  vector_join_cardinality.optimize_function     = duckdb::SiriusPostOptimizeVectorJoin;
+  config.GetCallbackManager().Register(std::move(vector_join_cardinality));
 
   // The ctor already installed the db-independent backend; reinstall now that the
   // DatabaseInstance exists so the duckdb backend (which needs it) is built and an
