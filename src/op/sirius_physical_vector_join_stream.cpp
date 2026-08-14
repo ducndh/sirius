@@ -186,7 +186,7 @@ class host_pinned_chunk_source : public vector_chunk_source {
 /// staging time rather than per query at planning time.
 class materialized_chunk_source : public vector_chunk_source {
  public:
-  materialized_chunk_source(vss::build_side_buffer& buffer,
+  materialized_chunk_source(vss::materialized_side_buffer& buffer,
                             std::size_t column_index,
                             std::int64_t dim,
                             const telemetry::batch_telemetry_info& telemetry_info)
@@ -313,7 +313,7 @@ class materialized_chunk_source : public vector_chunk_source {
 }  // namespace
 
 std::unique_ptr<vector_chunk_source> make_materialized_chunk_source(
-  sirius::vss::build_side_buffer& buffer,
+  sirius::vss::materialized_side_buffer& buffer,
   std::size_t column_index,
   std::int64_t dim,
   const telemetry::batch_telemetry_info& telemetry_info)
@@ -343,10 +343,12 @@ sirius_physical_vector_join_stream::sirius_physical_vector_join_stream(
   duckdb::idx_t estimated_cardinality,
   sirius::vss::vector_join_request request,
   sirius::scan_manager::sirius_scan_manager* scan_manager,
-  std::shared_ptr<sirius::vss::build_side_buffer> build_side)
+  std::shared_ptr<sirius::vss::materialized_side_buffer> build_side,
+  std::shared_ptr<sirius::vss::materialized_side_buffer> probe_side)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM, std::move(types), estimated_cardinality),
     _build_side(std::move(build_side)),
+    _probe_side(std::move(probe_side)),
     _request(std::move(request)),
     _scan_manager(scan_manager)
 {
@@ -375,22 +377,29 @@ void sirius_physical_vector_join_stream::build_pipelines(
     host_current = &current;
   }
 
-  D_ASSERT(children.size() == 1);
-  auto& build_child = *children[0];
-  D_ASSERT(build_child.is_sink());
-  D_ASSERT(!build_child.children.empty());
-  auto& build_meta = host_meta->create_child_meta_pipeline(*host_current, build_child);
-  build_meta.build(*build_child.children[0]);
+  // One child meta pipeline per fed side; each child is the wrap chain's CONCAT, whose own
+  // child is the PARTITION that materializes that side's scan into this operator's port.
+  for (auto& child_slot : children) {
+    auto& child = *child_slot;
+    D_ASSERT(child.is_sink());
+    D_ASSERT(!child.children.empty());
+    auto& child_meta = host_meta->create_child_meta_pipeline(*host_current, child);
+    child_meta.build(*child.children[0]);
+  }
 }
 
 bool sirius_physical_vector_join_stream::build_side_ready_locked()
 {
-  if (!_build_side) { return true; }
-  auto* port = get_port("build");
-  if (port == nullptr || port->repo == nullptr) { return false; }
-  // The corpus is not complete -- and so its row order is not yet fixed -- until the build
-  // pipeline has finished. Snapshotting before that would silently join against a prefix.
-  return !port->src_pipeline || port->src_pipeline->is_pipeline_finished();
+  // A side is not complete -- and so its row order is not yet fixed -- until the pipeline
+  // feeding it has finished. Snapshotting before that would silently join against a prefix.
+  auto ready = [&](const char* port_id) {
+    auto* port = get_port(port_id);
+    if (port == nullptr || port->repo == nullptr) { return false; }
+    return !port->src_pipeline || port->src_pipeline->is_pipeline_finished();
+  };
+  if (_build_side && !ready("build")) { return false; }
+  if (_probe_side && !ready("default")) { return false; }
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -408,14 +417,16 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
   auto const& right = _request.right;
 
   const auto* left_pin =
-    _scan_manager->find_pinned_entry_for_duckdb_table(left.catalog, left.schema, left.table);
+    _probe_side ? nullptr
+                : _scan_manager->find_pinned_entry_for_duckdb_table(
+                    left.catalog, left.schema, left.table);
   // The corpus comes from the build port on the build path, so only the probe side has to be
   // pinned there.
   const auto* right_pin =
     _build_side ? nullptr
                 : _scan_manager->find_pinned_entry_for_duckdb_table(
                     right.catalog, right.schema, right.table);
-  if (left_pin == nullptr || (!_build_side && right_pin == nullptr)) {
+  if ((!_probe_side && left_pin == nullptr) || (!_build_side && right_pin == nullptr)) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_stream] left or right table is no longer pinned");
   }
@@ -425,7 +436,12 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
   // large (rec-sys candidate generation is the motivating case). One task already handles one
   // probe chunk, so streaming the probe is the same change staging the corpus was: stage the
   // chunk this task owns, search the whole corpus against it, release.
-  if (left_pin->tier == cucascade::memory::Tier::HOST) {
+  if (_probe_side) {
+    auto* port = get_port("default");
+    _probe_side->ensure_snapshot(*port->repo);
+    _probe = make_materialized_chunk_source(
+      *_probe_side, /*column_index=*/0, _request.dim, batch_telemetry());
+  } else if (left_pin->tier == cucascade::memory::Tier::HOST) {
     _probe = make_host_pinned_chunk_source(*left_pin, left.column, _request.dim, batch_telemetry());
   } else {
     _probe = make_gpu_pinned_chunk_source(

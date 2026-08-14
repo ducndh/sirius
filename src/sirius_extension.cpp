@@ -1832,6 +1832,13 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
         throw BinderException("sirius_knn_join: output_type must be 'similarity' or 'distance'");
       }
       output_type_is_set = true;
+    } else if (key == "probe_source") {
+      auto const src = StringUtil::Lower(kv.second.ToString());
+      if (src == "scan") {
+        req.probe_from_scan = true;
+      } else if (src != "pin") {
+        throw BinderException("sirius_knn_join: probe_source must be 'pin' or 'scan'");
+      }
     } else if (key == "build_source") {
       auto const src = StringUtil::Lower(kv.second.ToString());
       if (src == "scan") {
@@ -1892,7 +1899,6 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
     throw InvalidInputException("sirius_knn_join requires the Sirius context to be initialized");
   }
 
-  // The probe side is still read from its pin; only the corpus has a build phase.
   auto const left_dim  = resolve_vector_join_side(context,
                                                  *sirius_ctx,
                                                  "left",
@@ -1900,7 +1906,7 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
                                                  left_column,
                                                  left_schema,
                                                  left_out_cols,
-                                                 /*require_pin=*/true,
+                                                 /*require_pin=*/!req.probe_from_scan,
                                                  req.left,
                                                  return_types,
                                                  names,
@@ -2114,6 +2120,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join.named_parameters["left_output_columns"]  = LogicalType::LIST(LogicalType::VARCHAR);
   vector_join.named_parameters["right_output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
   vector_join.named_parameters["build_source"]         = LogicalType::VARCHAR;
+  vector_join.named_parameters["probe_source"]         = LogicalType::VARCHAR;
   vector_join.cardinality                              = SiriusVectorJoinCardinality;
   CreateTableFunctionInfo vector_join_info(vector_join);
   catalog.CreateTableFunction(transaction, vector_join_info);

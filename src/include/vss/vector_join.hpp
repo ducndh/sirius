@@ -76,6 +76,9 @@ struct vector_join_request {
   /// phase is verified against the pin path; the SQL surface that replaces it is the
   /// LATERAL-rewrite rule, which will set this unconditionally.
   bool build_from_scan{false};
+  /// Same for the probe side (`probe_source => 'scan'`). Independent of build_from_scan so each
+  /// side can be A/B'd against its pinned path on its own.
+  bool probe_from_scan{false};
 };
 
 struct SiriusVectorJoinBindData : public duckdb::TableFunctionData {

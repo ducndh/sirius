@@ -55,12 +55,14 @@ sirius_physical_vector_join_materialize::sirius_physical_vector_join_materialize
   duckdb::idx_t estimated_cardinality,
   sirius::vss::vector_join_request request,
   sirius::scan_manager::sirius_scan_manager* scan_manager,
-  std::shared_ptr<sirius::vss::build_side_buffer> build_side)
+  std::shared_ptr<sirius::vss::materialized_side_buffer> build_side,
+  std::shared_ptr<sirius::vss::materialized_side_buffer> probe_side)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::VECTOR_JOIN_MATERIALIZE, std::move(types), estimated_cardinality),
     _request(std::move(request)),
     _scan_manager(scan_manager),
-    _build_side(std::move(build_side))
+    _build_side(std::move(build_side)),
+    _probe_side(std::move(probe_side))
 {
 }
 
@@ -162,6 +164,76 @@ sirius_physical_vector_join_materialize::build_side_output_columns(
   return cols;
 }
 
+std::vector<std::vector<cudf::column_view>>
+sirius_physical_vector_join_materialize::probe_side_output_views(
+  std::size_t num_output_columns,
+  rmm::cuda_stream_view stream,
+  ::cucascade::memory::memory_space& space)
+{
+  auto const ids = _probe_side->batch_ids();
+  auto* repo     = _probe_side->repo();
+  if (repo == nullptr) {
+    throw std::runtime_error(
+      "[sirius_physical_vector_join_materialize] probe side has no snapshot; the join stage "
+      "should have taken it before any row reached this operator");
+  }
+
+  // Output columns sit after the vector column, which the probe scan projects first.
+  std::vector<std::size_t> out_cols(num_output_columns);
+  for (std::size_t c = 0; c < num_output_columns; ++c) {
+    out_cols[c] = c + 1;
+  }
+
+  std::vector<std::vector<cudf::column_view>> per_column(num_output_columns);
+  for (auto const id : ids) {
+    auto batch = repo->get_data_batch_by_id(id, /*partition_idx=*/0);
+    if (!batch) {
+      throw std::runtime_error("[sirius_physical_vector_join_materialize] probe-side batch " +
+                               std::to_string(id) + " is no longer in the repository");
+    }
+    auto ro = batch->to_read_only();
+    cudf::table_view table;
+    cudf::size_type first = 0;
+    if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
+      table = sirius::get_cudf_table_view(ro);
+      first = 1;
+    } else {
+      const auto* data = ro.get_data();
+      if (data == nullptr) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_materialize] probe-side batch has no data representation");
+      }
+      auto data_rep    = data->cast<cucascade::host_data_representation>().slice(out_cols);
+      auto const bytes = data_rep->get_size_in_bytes();
+      std::shared_ptr<cucascade::memory::reservation> reservation{
+        space.make_reservation_or_null(bytes)};
+      if (!reservation) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_materialize] probe-side output columns need " +
+          std::to_string(bytes) + " bytes device-side, which exceeds the available budget");
+      }
+      auto const batch_id = sirius::get_next_batch_id();
+      auto staged         = cucascade::data_batch::make(
+        batch_id,
+        std::move(data_rep),
+        telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
+      {
+        auto mut = staged->to_mutable();
+        mut.convert_to<cucascade::gpu_table_representation>(
+          sirius::converter_registry::get(), *reservation, stream);
+      }
+      table = sirius::get_cudf_table_view(*staged);
+      _probe_restaged.push_back(std::move(staged));
+      _probe_reservations.push_back(std::move(reservation));
+    }
+    for (std::size_t c = 0; c < num_output_columns; ++c) {
+      per_column[c].push_back(table.column(first + static_cast<cudf::size_type>(c)));
+    }
+    _probe_readers.push_back(std::move(ro));
+  }
+  return per_column;
+}
+
 void sirius_physical_vector_join_materialize::ensure_initialized(
   rmm::cuda_stream_view stream, ::cucascade::memory::memory_space& space)
 {
@@ -175,24 +247,30 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
   auto const& right = _request.right;
 
   const auto* left_pin =
-    _scan_manager->find_pinned_entry_for_duckdb_table(left.catalog, left.schema, left.table);
+    _probe_side ? nullptr
+                : _scan_manager->find_pinned_entry_for_duckdb_table(
+                    left.catalog, left.schema, left.table);
   const auto* right_pin =
     _build_side ? nullptr
                 : _scan_manager->find_pinned_entry_for_duckdb_table(
                     right.catalog, right.schema, right.table);
-  if (left_pin == nullptr || (!_build_side && right_pin == nullptr)) {
+  if ((!_probe_side && left_pin == nullptr) || (!_build_side && right_pin == nullptr)) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_materialize] left/right table is no longer pinned");
   }
   // Staged rather than aliased so a HOST-tier pin works: output columns are the small
   // non-vector columns, and the right side is concatenated on device below regardless, so
   // staging does not change the memory profile for a GPU-tier pin (where it is zero-copy).
-  _left_output_cols.resize(left.output_columns.size());
-  for (std::size_t c = 0; c < left.output_columns.size(); ++c) {
-    auto staged = vss::stage_pinned_column(
-      *left_pin, left.output_columns[c], space, stream, batch_telemetry());
-    _left_output_cols[c] = staged.views;
-    _staged_left.push_back(std::move(staged));
+  if (_probe_side) {
+    _left_output_cols = probe_side_output_views(left.output_columns.size(), stream, space);
+  } else {
+    _left_output_cols.resize(left.output_columns.size());
+    for (std::size_t c = 0; c < left.output_columns.size(); ++c) {
+      auto staged = vss::stage_pinned_column(
+        *left_pin, left.output_columns[c], space, stream, batch_telemetry());
+      _left_output_cols[c] = staged.views;
+      _staged_left.push_back(std::move(staged));
+    }
   }
 
   // Right output columns concatenated once across batches, so a global right id

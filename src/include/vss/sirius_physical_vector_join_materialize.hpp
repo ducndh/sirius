@@ -19,7 +19,10 @@
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_join.hpp"
-#include "vss/vector_join_build_side.hpp"
+#include "vss/vector_join_materialized_side.hpp"
+
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
@@ -67,7 +70,8 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
     duckdb::idx_t estimated_cardinality,
     sirius::vss::vector_join_request request,
     sirius::scan_manager::sirius_scan_manager* scan_manager,
-    std::shared_ptr<sirius::vss::build_side_buffer> build_side = nullptr);
+    std::shared_ptr<sirius::vss::materialized_side_buffer> build_side = nullptr,
+    std::shared_ptr<sirius::vss::materialized_side_buffer> probe_side = nullptr);
 
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
@@ -98,10 +102,19 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
     rmm::cuda_stream_view stream,
     ::cucascade::memory::memory_space& space);
 
+  /// The probe output columns as per-batch views in the probe side's snapshot order, which is
+  /// the order the join stage numbered its output partitions by. Probe-scan path only.
+  std::vector<std::vector<cudf::column_view>> probe_side_output_views(
+    std::size_t num_output_columns,
+    rmm::cuda_stream_view stream,
+    ::cucascade::memory::memory_space& space);
+
   sirius::vss::vector_join_request _request;
   sirius::scan_manager::sirius_scan_manager* _scan_manager;
   /// Shared corpus row order; null on the pinned path, where the pinned entry plays that role.
-  std::shared_ptr<sirius::vss::build_side_buffer> _build_side;
+  std::shared_ptr<sirius::vss::materialized_side_buffer> _build_side;
+  /// Shared probe row order; null on the pinned path.
+  std::shared_ptr<sirius::vss::materialized_side_buffer> _probe_side;
 
   std::mutex _drain_mutex;                  // guards get_next_task_input_data()
   std::size_t _current_partition_index{0};  // next partition (left batch) to drain
@@ -112,6 +125,12 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
   std::vector<std::vector<cudf::column_view>> _left_output_cols;
   //! Keeps staged left copies alive when the pin is HOST-tier; empty for GPU-tier pins.
   std::vector<vss::staged_pinned_column> _staged_left;
+  //! Probe-scan path: the borrows and re-staged copies backing _left_output_cols. Unlike the
+  //! corpus columns, which are concatenated once and then owned outright, the left views point
+  //! into these for the operator's whole life, so they are held rather than released per call.
+  std::vector<::cucascade::read_only_data_batch> _probe_readers;
+  std::vector<std::shared_ptr<::cucascade::data_batch>> _probe_restaged;
+  std::vector<std::shared_ptr<::cucascade::memory::reservation>> _probe_reservations;
   //! Right output columns concatenated across batches; row i == global right id i.
   std::unique_ptr<cudf::table> _right_output_concat;
 };

@@ -28,7 +28,7 @@
 namespace sirius::vss {
 
 /**
- * @brief The corpus as one ordered list of batches, agreed on by every stage that reads it.
+ * @brief One join side, materialized as an ordered list of batches that every stage agrees on.
  *
  * A neighbour id is a position in the corpus row order, and two operators in two different
  * pipelines resolve it: the fold writes ids, materialize turns them back into rows. Against a
@@ -43,7 +43,7 @@ namespace sirius::vss {
  * dynamic filters, where one channel object is handed to the producing join and the consuming
  * scan rather than letting each rediscover it.
  */
-class build_side_buffer {
+class materialized_side_buffer {
  public:
   /// Take the snapshot if it has not been taken, and return it. The first caller wins; later
   /// callers get that same list even if the repository has changed underneath.

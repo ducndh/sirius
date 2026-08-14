@@ -19,7 +19,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "vss/vector_join.hpp"
-#include "vss/vector_join_build_side.hpp"
+#include "vss/vector_join_materialized_side.hpp"
 
 #include "telemetry/data_batch_probe.hpp"
 
@@ -116,7 +116,7 @@ std::unique_ptr<vector_chunk_source> make_host_pinned_chunk_source(
 /// device-side for the fold step and released after it, exactly as a HOST-tier pin chunk is;
 /// one still resident is viewed in place.
 std::unique_ptr<vector_chunk_source> make_materialized_chunk_source(
-  sirius::vss::build_side_buffer& buffer,
+  sirius::vss::materialized_side_buffer& buffer,
   std::size_t column_index,
   std::int64_t dim,
   const telemetry::batch_telemetry_info& telemetry_info);
@@ -200,7 +200,8 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
     duckdb::idx_t estimated_cardinality,
     sirius::vss::vector_join_request request,
     sirius::scan_manager::sirius_scan_manager* scan_manager,
-    std::shared_ptr<sirius::vss::build_side_buffer> build_side = nullptr);
+    std::shared_ptr<sirius::vss::materialized_side_buffer> build_side = nullptr,
+    std::shared_ptr<sirius::vss::materialized_side_buffer> probe_side = nullptr);
 
   [[nodiscard]] const sirius::vss::vector_join_request& request() const { return _request; }
 
@@ -252,7 +253,11 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
 
   /// The corpus row order, shared with materialize. Null on the pinned path, where the
   /// pinned_entry plays the same role.
-  std::shared_ptr<sirius::vss::build_side_buffer> _build_side;
+  std::shared_ptr<sirius::vss::materialized_side_buffer> _build_side;
+  /// The probe row order, shared with materialize the same way. A probe chunk is read once, so
+  /// this side needs no re-reads -- but its batch order still names the output partitions that
+  /// materialize gathers left columns by, so the two must agree on it just the same.
+  std::shared_ptr<sirius::vss::materialized_side_buffer> _probe_side;
 
   sirius::vss::vector_join_request _request;
   sirius::scan_manager::sirius_scan_manager* _scan_manager;

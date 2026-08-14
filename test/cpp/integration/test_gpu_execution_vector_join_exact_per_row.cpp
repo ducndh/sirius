@@ -723,3 +723,63 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM unpin_table('up_corpus');");
   run_ok("SELECT * FROM unpin_table('up_probe');");
 }
+
+// -----------------------------------------------------------------------------
+// Probe side from a scan too, and then both sides at once with nothing pinned.
+//
+// The probe is read once per task, so unlike the corpus it needs no re-reads --
+// but its batch order still names the output partitions materialize gathers left
+// columns by, so the two stages have to agree on it exactly as they do for the
+// corpus. Answers must be identical to the all-pinned path either way.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - probe side from a scan matches the pinned probe",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE ps_corpus (id INTEGER, vec FLOAT[8]);");
+  run_ok(
+    "INSERT INTO ps_corpus SELECT i, "
+    "list_transform(range(0, 8), j -> ((hash(i * 8 + j) % 100000) / 100000.0)::FLOAT)::FLOAT[8] "
+    "FROM range(30000) t(i);");
+  run_ok("CREATE TABLE ps_probe (id INTEGER, vec FLOAT[8], region INTEGER);");
+  run_ok(
+    "INSERT INTO ps_probe SELECT i, "
+    "list_transform(range(0, 8), j -> ((hash(i * 41 + j * 3 + 11) % 100000) / 100000.0)::FLOAT)"
+    "::FLOAT[8], (i % 5) FROM range(300) t(i);");
+  run_ok("CHECKPOINT;");
+
+  const std::string cols =
+    "search_mode => 'exact', metric => 'l2', k => 4, left_output_columns => ['id','region'], "
+    "right_output_columns => ['id']";
+
+  run_ok("SELECT * FROM pin_table(name => 'ps_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'ps_probe', tier => 'gpu', format => 'duckdb');");
+  auto const pinned = ok_rows(*con,
+                              "SELECT left_id, left_region, right_id, distance FROM "
+                              "sirius_knn_join('ps_probe','vec','ps_corpus','vec', " + cols + ");");
+  REQUIRE(pinned.size() == 300 * 4);
+  run_ok("SELECT * FROM unpin_table('ps_probe');");
+
+  // Probe from a scan, corpus still pinned.
+  REQUIRE(ok_rows(*con,
+                  "SELECT left_id, left_region, right_id, distance FROM "
+                  "sirius_knn_join('ps_probe','vec','ps_corpus','vec', " + cols +
+                  ", probe_source => 'scan');") == pinned);
+
+  // Both sides from scans, nothing pinned at all.
+  run_ok("SELECT * FROM unpin_table('ps_corpus');");
+  REQUIRE(ok_rows(*con,
+                  "SELECT left_id, left_region, right_id, distance FROM "
+                  "sirius_knn_join('ps_probe','vec','ps_corpus','vec', " + cols +
+                  ", probe_source => 'scan', build_source => 'scan');") == pinned);
+
+  // Reversing both snapshots must not move a single row: any order is correct as long as every
+  // stage uses the same one.
+  setenv("SIRIUS_VECTOR_JOIN_REVERSE_BUILD_ORDER", "1", 1);
+  auto const reversed = ok_rows(*con,
+                                "SELECT left_id, left_region, right_id, distance FROM "
+                                "sirius_knn_join('ps_probe','vec','ps_corpus','vec', " + cols +
+                                ", build_source => 'scan', probe_source => 'scan');");
+  unsetenv("SIRIUS_VECTOR_JOIN_REVERSE_BUILD_ORDER");
+  REQUIRE(reversed == pinned);
+}

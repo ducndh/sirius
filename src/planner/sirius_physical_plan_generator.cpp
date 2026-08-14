@@ -15,6 +15,7 @@
  */
 
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "vss/sirius_physical_vector_join_stream.hpp"
 
 #include "config.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -492,14 +493,21 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
     });
 }
 
-//! Wrap the vector join's single child -- the corpus -- as a build side. The probe side still
-//! comes from a pin, so there is no children[0] probe to wrap; when it does, this collapses
-//! into wrap_join.
+//! Wrap whichever of the vector join's sides are fed by a scan. create_plan_knn_join pushes
+//! the probe first and the corpus second, so the children follow wrap_join's probe / build
+//! order; a side still read from its pin contributes no child.
 void wrap_vector_join(sirius::op::sirius_physical_operator& join_op,
                       const sirius::operator_params& op_params)
 {
-  if (join_op.children.empty()) { return; }
-  wrap_join_child(join_op, /*child_idx=*/0, /*is_build=*/true, op_params);
+  auto const& req =
+    join_op.Cast<sirius::op::sirius_physical_vector_join_stream>().request();
+  std::size_t child_idx = 0;
+  if (req.probe_from_scan) {
+    wrap_join_child(join_op, child_idx++, /*is_build=*/false, op_params);
+  }
+  if (req.build_from_scan) {
+    wrap_join_child(join_op, child_idx++, /*is_build=*/true, op_params);
+  }
 }
 
 //! Wrap both children of a HASH_JOIN / NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
