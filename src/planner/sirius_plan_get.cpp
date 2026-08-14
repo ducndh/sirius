@@ -661,6 +661,11 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       score_read = true;
     }
   }
+  SIRIUS_LOG_DEBUG(
+    "[vector_join] output columns: declared left={} right={}, read {} -> keeping left={} "
+    "right={} score={}",
+    declared_left, declared_right, op.GetColumnIds().size(), kept_left.size(),
+    kept_right.size(), score_read);
   req.left.output_columns  = std::move(kept_left);
   req.right.output_columns = std::move(kept_right);
   // The score is always produced -- it is one column of the output rows, not of the corpus --

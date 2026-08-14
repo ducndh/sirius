@@ -17,6 +17,7 @@
 #include "vss/sirius_physical_vector_join_materialize.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "log/logging.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "vss/pinned_column.hpp"
@@ -42,6 +43,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -287,6 +289,29 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
     }
   }
   _right_output_concat = std::make_unique<cudf::table>(std::move(right_cols));
+  {
+    std::function<std::size_t(cudf::column_view const&)> col_bytes =
+      [&](cudf::column_view const& c) -> std::size_t {
+      if (c.num_children() > 0) {
+        std::size_t total = 0;
+        for (cudf::size_type i = 0; i < c.num_children(); ++i) {
+          total += col_bytes(c.child(i));
+        }
+        return total;
+      }
+      return static_cast<std::size_t>(c.size()) * cudf::size_of(c.type());
+    };
+    std::size_t concat_bytes = 0;
+    for (auto const& c : _right_output_concat->view()) {
+      concat_bytes += col_bytes(c);
+    }
+    // The quantity projection pushdown exists to shrink: this is resident for the whole query
+    // and scales with the corpus, not with the result.
+    SIRIUS_LOG_DEBUG("[vector_join] corpus output concat: {} columns, {} rows, ~{} bytes",
+                    _right_output_concat->num_columns(),
+                    _right_output_concat->num_rows(),
+                    concat_bytes);
+  }
 
   _initialized = true;
 }
