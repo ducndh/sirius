@@ -125,7 +125,12 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         }
       }
     }
-  } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+  } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN ||
+             op->type == SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM) {
+    // Neither has an equality key to partition on. For the vector join that is not an
+    // implementation gap: no partitioning of vectors can guarantee a probe's nearest
+    // neighbour lands in its own partition, which is why every probe row must see the whole
+    // corpus. One partition, and the corpus is streamed past the probe instead.
     _partition_type = PartitionType::NONE;
     _num_partitions = 1;
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {

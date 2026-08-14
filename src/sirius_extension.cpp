@@ -1832,6 +1832,13 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
         throw BinderException("sirius_knn_join: output_type must be 'similarity' or 'distance'");
       }
       output_type_is_set = true;
+    } else if (key == "build_source") {
+      auto const src = StringUtil::Lower(kv.second.ToString());
+      if (src == "scan") {
+        req.build_from_scan = true;
+      } else if (src != "pin") {
+        throw BinderException("sirius_knn_join: build_source must be 'pin' or 'scan'");
+      }
     } else if (key == "left_schema_name") {
       left_schema = kv.second.ToString();
     } else if (key == "right_schema_name") {
@@ -2092,6 +2099,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join.named_parameters["right_schema_name"]    = LogicalType::VARCHAR;
   vector_join.named_parameters["left_output_columns"]  = LogicalType::LIST(LogicalType::VARCHAR);
   vector_join.named_parameters["right_output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
+  vector_join.named_parameters["build_source"]         = LogicalType::VARCHAR;
   vector_join.cardinality                              = SiriusVectorJoinCardinality;
   CreateTableFunctionInfo vector_join_info(vector_join);
   catalog.CreateTableFunction(transaction, vector_join_info);

@@ -18,6 +18,8 @@
 
 #include "data/data_batch_utils.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "vss/brute_force_search.hpp"
 #include "vss/cudf_raft_interop.hpp"
@@ -176,7 +178,148 @@ class host_pinned_chunk_source : public vector_chunk_source {
   std::int64_t _dim{0};
 };
 
+/// Build phase: the corpus is whatever the child scan deposited in the build port, walked in
+/// the shared snapshot's order. A batch still device-resident is borrowed in place under a
+/// read lock; one the downgrade executor has spilled is copied back device-side for the fold
+/// step and released after it, exactly as a HOST-tier pin chunk is. So the same source serves
+/// a corpus that fits and one that does not, and which case applies is decided per chunk at
+/// staging time rather than per query at planning time.
+class materialized_chunk_source : public vector_chunk_source {
+ public:
+  materialized_chunk_source(vss::build_side_buffer& buffer,
+                            std::size_t column_index,
+                            std::int64_t dim,
+                            const telemetry::batch_telemetry_info& telemetry_info)
+    : _repo(buffer.repo()),
+      _batch_ids(buffer.batch_ids()),
+      _telemetry_info(telemetry_info),
+      _column_index(column_index),
+      _dim(dim)
+  {
+    if (_repo == nullptr) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] build side has no snapshot; the build pipeline "
+        "has not finished");
+    }
+    // Sizes up front: the task estimate and the neighbour-id base both need per-chunk rows
+    // before anything is staged.
+    _rows.reserve(_batch_ids.size());
+    _bytes.reserve(_batch_ids.size());
+    for (auto const id : _batch_ids) {
+      auto batch = fetch(id);
+      auto ro    = batch->to_read_only();
+      if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
+        auto const table = sirius::get_cudf_table_view(ro);
+        auto const col   = table.column(static_cast<cudf::size_type>(_column_index));
+        _rows.push_back(static_cast<std::size_t>(col.size()));
+        _bytes.push_back(row_bytes() * _rows.back());
+      } else {
+        auto const bytes = host_repr(ro).column_size(_column_index);
+        _bytes.push_back(bytes);
+        _rows.push_back(row_bytes() == 0 ? 0 : bytes / row_bytes());
+      }
+    }
+  }
+
+  [[nodiscard]] std::size_t num_chunks() const override { return _batch_ids.size(); }
+  /// Reported as streaming: any chunk may have been spilled by the time it is staged, so a
+  /// task must be sized as though it will have to copy one back.
+  [[nodiscard]] bool is_streaming() const override { return true; }
+  [[nodiscard]] std::size_t chunk_rows(std::size_t i) const override { return _rows.at(i); }
+  [[nodiscard]] std::size_t chunk_bytes(std::size_t i) const override { return _bytes.at(i); }
+
+  staged_vector_chunk stage(std::size_t i,
+                            cucascade::memory::memory_space& space,
+                            rmm::cuda_stream_view stream) override
+  {
+    auto batch = fetch(_batch_ids.at(i));
+    auto ro    = batch->to_read_only();
+    if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
+      auto const table = sirius::get_cudf_table_view(ro);
+      auto const view  = table.column(static_cast<cudf::size_type>(_column_index));
+      // Borrowed, not owned: the reader holds the batch alive as well as locked, and `owner`
+      // stays null so the fold does not try to rebind a stream on memory it did not allocate.
+      return staged_vector_chunk{view, nullptr, nullptr, std::move(ro)};
+    }
+
+    // Spilled: copy just the vector column back, the rest of the batch is dead weight on the
+    // wire. Mirrors the HOST-tier pin path, including drawing from the task's own budget so a
+    // chunk that does not fit surfaces as a sizing error instead of silently overcommitting.
+    // The slice references the batch's host allocation, so the borrow is held across the copy.
+    std::array<std::size_t, 1> const cols{_column_index};
+    auto data_rep    = host_repr(ro).slice(cols);
+    auto const bytes = data_rep->get_size_in_bytes();
+
+    std::shared_ptr<cucascade::memory::reservation> reservation{
+      space.make_reservation_or_null(bytes)};
+    if (!reservation) {
+      throw std::runtime_error("[sirius_physical_vector_join_stream] corpus chunk " +
+                               std::to_string(i) + " needs " + std::to_string(bytes) +
+                               " bytes device-side, which exceeds this task's budget");
+    }
+
+    auto const batch_id = sirius::get_next_batch_id();
+    auto staged         = cucascade::data_batch::make(
+      batch_id,
+      std::move(data_rep),
+      telemetry::quent_data_batch_probe::create(_telemetry_info, batch_id));
+    {
+      auto mut = staged->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(
+        sirius::converter_registry::get(), *reservation, stream);
+    }
+    auto const table = sirius::get_cudf_table_view(*staged);
+    return staged_vector_chunk{
+      table.column(0), std::move(staged), std::move(reservation), std::move(ro)};
+  }
+
+ private:
+  [[nodiscard]] std::size_t row_bytes() const
+  {
+    return static_cast<std::size_t>(_dim) * sizeof(float);
+  }
+
+  [[nodiscard]] std::shared_ptr<cucascade::data_batch> fetch(std::uint64_t id) const
+  {
+    auto batch = _repo->get_data_batch_by_id(id, /*partition_idx=*/0);
+    if (!batch) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] build-side batch " + std::to_string(id) +
+        " is no longer in the repository; the corpus must outlive every probe chunk");
+    }
+    return batch;
+  }
+
+  static const cucascade::host_data_representation& host_repr(
+    const cucascade::read_only_data_batch& ro)
+  {
+    const auto* data = ro.get_data();
+    if (data == nullptr) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] build-side batch has no data representation");
+    }
+    return data->cast<cucascade::host_data_representation>();
+  }
+
+  cucascade::shared_data_repository* _repo;
+  std::vector<std::uint64_t> _batch_ids;
+  std::vector<std::size_t> _rows;
+  std::vector<std::size_t> _bytes;
+  telemetry::batch_telemetry_info _telemetry_info;
+  std::size_t _column_index{0};
+  std::int64_t _dim{0};
+};
+
 }  // namespace
+
+std::unique_ptr<vector_chunk_source> make_materialized_chunk_source(
+  sirius::vss::build_side_buffer& buffer,
+  std::size_t column_index,
+  std::int64_t dim,
+  const telemetry::batch_telemetry_info& telemetry_info)
+{
+  return std::make_unique<materialized_chunk_source>(buffer, column_index, dim, telemetry_info);
+}
 
 std::unique_ptr<vector_chunk_source> make_gpu_pinned_chunk_source(
   const sirius::scan_manager::pinned_entry& pin,
@@ -199,12 +342,55 @@ sirius_physical_vector_join_stream::sirius_physical_vector_join_stream(
   duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   sirius::vss::vector_join_request request,
-  sirius::scan_manager::sirius_scan_manager* scan_manager)
-  : sirius_physical_operator(
+  sirius::scan_manager::sirius_scan_manager* scan_manager,
+  std::shared_ptr<sirius::vss::build_side_buffer> build_side)
+  : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM, std::move(types), estimated_cardinality),
+    _build_side(std::move(build_side)),
     _request(std::move(request)),
     _scan_manager(scan_manager)
 {
+}
+
+void sirius_physical_vector_join_stream::build_pipelines(
+  pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
+{
+  if (children.empty()) {
+    sirius_physical_operator::build_pipelines(current, meta_pipeline);
+    return;
+  }
+
+  // Mirrors sirius_physical_nested_loop_join::build_pipelines, with one child: the corpus.
+  // The child is the wrap chain's CONCAT, whose own child is the PARTITION that materializes
+  // the scan into this operator's build port.
+  pipeline::sirius_meta_pipeline* host_meta;
+  pipeline::sirius_pipeline* host_current;
+  if (is_sink()) {
+    auto& sink_meta = meta_pipeline.create_child_meta_pipeline(current, *this);
+    host_meta       = &sink_meta;
+    host_current    = sink_meta.get_base_pipeline().get();
+  } else {
+    meta_pipeline.get_state().add_pipeline_operator(current, *this);
+    host_meta    = &meta_pipeline;
+    host_current = &current;
+  }
+
+  D_ASSERT(children.size() == 1);
+  auto& build_child = *children[0];
+  D_ASSERT(build_child.is_sink());
+  D_ASSERT(!build_child.children.empty());
+  auto& build_meta = host_meta->create_child_meta_pipeline(*host_current, build_child);
+  build_meta.build(*build_child.children[0]);
+}
+
+bool sirius_physical_vector_join_stream::build_side_ready_locked()
+{
+  if (!_build_side) { return true; }
+  auto* port = get_port("build");
+  if (port == nullptr || port->repo == nullptr) { return false; }
+  // The corpus is not complete -- and so its row order is not yet fixed -- until the build
+  // pipeline has finished. Snapshotting before that would silently join against a prefix.
+  return !port->src_pipeline || port->src_pipeline->is_pipeline_finished();
 }
 
 //===----------------------------------------------------------------------===//
@@ -213,6 +399,7 @@ sirius_physical_vector_join_stream::sirius_physical_vector_join_stream(
 void sirius_physical_vector_join_stream::ensure_initialized_locked()
 {
   if (_initialized) { return; }
+  if (!build_side_ready_locked()) { return; }
   if (_scan_manager == nullptr) {
     throw std::runtime_error("[sirius_physical_vector_join_stream] no scan manager set");
   }
@@ -222,9 +409,13 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
 
   const auto* left_pin =
     _scan_manager->find_pinned_entry_for_duckdb_table(left.catalog, left.schema, left.table);
+  // The corpus comes from the build port on the build path, so only the probe side has to be
+  // pinned there.
   const auto* right_pin =
-    _scan_manager->find_pinned_entry_for_duckdb_table(right.catalog, right.schema, right.table);
-  if (left_pin == nullptr || right_pin == nullptr) {
+    _build_side ? nullptr
+                : _scan_manager->find_pinned_entry_for_duckdb_table(
+                    right.catalog, right.schema, right.table);
+  if (left_pin == nullptr || (!_build_side && right_pin == nullptr)) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_stream] left or right table is no longer pinned");
   }
@@ -241,7 +432,17 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
       *left_pin, left.column, vss::pinned_entry_gpu_space(*left_pin));
   }
 
-  if (right_pin->tier == cucascade::memory::Tier::HOST) {
+  if (_build_side) {
+    // Column 0 of every build batch is the vector column: the plan generator projects the
+    // corpus scan that way precisely so the fold needs no name lookup here.
+    auto* port = get_port("build");
+    _build_side->ensure_snapshot(*port->repo);
+    _corpus = make_materialized_chunk_source(
+      *_build_side, /*column_index=*/0, _request.dim, batch_telemetry());
+    for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
+      _max_chunk_bytes = std::max(_max_chunk_bytes, _corpus->chunk_bytes(i));
+    }
+  } else if (right_pin->tier == cucascade::memory::Tier::HOST) {
     _corpus =
       make_host_pinned_chunk_source(*right_pin, right.column, _request.dim, batch_telemetry());
     // Sized from the widest chunk, since any one of them may be the one in flight when
@@ -262,8 +463,16 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
   }
 
   // Row counts per chunk are not known until a chunk is staged, so the neighbor-id base is
-  // accumulated while streaming rather than pre-summed. The total comes from the pin.
-  _right_total_rows = static_cast<std::int64_t>(right_pin->num_rows);
+  // accumulated while streaming rather than pre-summed. The total comes from the pin, or on
+  // the build path from the materialized batches, which report rows without being staged.
+  if (_build_side) {
+    _right_total_rows = 0;
+    for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
+      _right_total_rows += static_cast<std::int64_t>(_corpus->chunk_rows(i));
+    }
+  } else {
+    _right_total_rows = static_cast<std::int64_t>(right_pin->num_rows);
+  }
 
   _num_left = _probe->num_chunks();
   if (_probe->is_streaming()) {
@@ -280,6 +489,9 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
 std::optional<task_creation_hint> sirius_physical_vector_join_stream::get_next_task_hint()
 {
   std::lock_guard<std::mutex> lg(_op_mutex);
+  // Before the corpus is complete the base rule names the build pipeline as the producer to
+  // wait on; the per-probe-chunk schedule below only starts once it says READY.
+  if (!build_side_ready_locked()) { return sirius_physical_operator::get_next_task_hint(); }
   ensure_initialized_locked();
   if (_num_left == 0 || _next_left >= _num_left || _hint_returned) { return std::nullopt; }
   _hint_returned = true;
@@ -289,6 +501,8 @@ std::optional<task_creation_hint> sirius_physical_vector_join_stream::get_next_t
 bool sirius_physical_vector_join_stream::all_ports_empty()
 {
   std::lock_guard<std::mutex> lg(_op_mutex);
+  // Work is still to come, it just cannot be scheduled yet.
+  if (!build_side_ready_locked()) { return false; }
   ensure_initialized_locked();
   return _next_left >= _num_left;
 }
@@ -296,6 +510,7 @@ bool sirius_physical_vector_join_stream::all_ports_empty()
 std::unique_ptr<operator_data> sirius_physical_vector_join_stream::get_next_task_input_data()
 {
   std::lock_guard<std::mutex> lg(_op_mutex);
+  if (!build_side_ready_locked()) { return nullptr; }
   ensure_initialized_locked();
   if (_next_left >= _num_left) { return nullptr; }
 
@@ -371,15 +586,24 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       next < n_chunks ? _corpus->stage(next, *mem_space, stage_on) : staged_vector_chunk{};
   };
 
+  // Borrowed build-side batches whose read locks have to outlive the searches reading them.
+  // A borrow costs no device memory -- the batch was already resident, which is why it was
+  // borrowed rather than copied -- so holding it to the end of the task only means the
+  // downgrade executor cannot spill that batch while this task is still reading it.
+  std::vector<cucascade::read_only_data_batch> borrowed;
+
   // The staged copy is read by kernels that are still pending on the compute stream, but it
   // was allocated on the staging stream, so dropping it here would hand the buffer back to
   // RMM's free list for that other stream while a kernel is still reading it. Rebinding
   // moves the deallocation onto the compute stream, where it is ordered behind that kernel.
+  // Only ever applied to a copy this task made: `owner` is null for a borrow, and upgrading a
+  // borrowed batch to mutable while its own read lock is held would deadlock against itself.
   auto release_staged = [&](staged_vector_chunk& chunk) {
     if (chunk.owner) {
       auto mut = chunk.owner->to_mutable();
       mut.rebind_stream(stream);
     }
+    if (chunk.reader) { borrowed.push_back(std::move(*chunk.reader)); }
     chunk = staged_vector_chunk{};
   };
 

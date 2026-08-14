@@ -19,6 +19,7 @@
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_join.hpp"
+#include "vss/vector_join_build_side.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
@@ -57,10 +58,16 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::VECTOR_JOIN_MATERIALIZE;
 
-  sirius_physical_vector_join_materialize(duckdb::vector<sirius::logical_type> types,
-                                          duckdb::idx_t estimated_cardinality,
-                                          sirius::vss::vector_join_request request,
-                                          sirius::scan_manager::sirius_scan_manager* scan_manager);
+  /// @param build_side  The corpus row order the fold numbered its neighbour ids against.
+  ///                    Non-null exactly when the join runs a build phase; this operator
+  ///                    resolves ids against that same list rather than re-deriving one, which
+  ///                    is what keeps position i meaning the same row to both stages.
+  sirius_physical_vector_join_materialize(
+    duckdb::vector<sirius::logical_type> types,
+    duckdb::idx_t estimated_cardinality,
+    sirius::vss::vector_join_request request,
+    sirius::scan_manager::sirius_scan_manager* scan_manager,
+    std::shared_ptr<sirius::vss::build_side_buffer> build_side = nullptr);
 
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
@@ -84,8 +91,17 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
   /// Idempotent; needs a stream + memory space, so it runs on first execute().
   void ensure_initialized(rmm::cuda_stream_view stream, ::cucascade::memory::memory_space& space);
 
+  /// The corpus output columns concatenated across the build side's snapshot, in the order the
+  /// fold numbered against. Build path only.
+  std::vector<std::unique_ptr<cudf::column>> build_side_output_columns(
+    std::size_t num_output_columns,
+    rmm::cuda_stream_view stream,
+    ::cucascade::memory::memory_space& space);
+
   sirius::vss::vector_join_request _request;
   sirius::scan_manager::sirius_scan_manager* _scan_manager;
+  /// Shared corpus row order; null on the pinned path, where the pinned entry plays that role.
+  std::shared_ptr<sirius::vss::build_side_buffer> _build_side;
 
   std::mutex _drain_mutex;                  // guards get_next_task_input_data()
   std::size_t _current_partition_index{0};  // next partition (left batch) to drain

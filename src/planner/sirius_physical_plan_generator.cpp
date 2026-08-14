@@ -465,7 +465,8 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
                      const sirius::operator_params& op_params)
 {
   D_ASSERT(join_op.type == sirius::op::SiriusPhysicalOperatorType::HASH_JOIN ||
-           join_op.type == sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN);
+           join_op.type == sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN ||
+           join_op.type == sirius::op::SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM);
   auto* join_op_ptr = &join_op;
   wrap_child(
     join_op, child_idx, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child_orig) {
@@ -489,6 +490,16 @@ void wrap_join_child(sirius::op::sirius_physical_operator& join_op,
       concat->children.push_back(std::move(partition));
       return concat;
     });
+}
+
+//! Wrap the vector join's single child -- the corpus -- as a build side. The probe side still
+//! comes from a pin, so there is no children[0] probe to wrap; when it does, this collapses
+//! into wrap_join.
+void wrap_vector_join(sirius::op::sirius_physical_operator& join_op,
+                      const sirius::operator_params& op_params)
+{
+  if (join_op.children.empty()) { return; }
+  wrap_join_child(join_op, /*child_idx=*/0, /*is_build=*/true, op_params);
 }
 
 //! Wrap both children of a HASH_JOIN / NESTED_LOOP_JOIN with the CONCAT/PARTITION feeder
@@ -634,6 +645,9 @@ void insert_gpu_pipeline_operators_recursive(
     case sirius::op::SiriusPhysicalOperatorType::HASH_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN:
       wrap_join(*slot, op_params);
+      break;
+    case sirius::op::SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM:
+      wrap_vector_join(*slot, op_params);
       break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:

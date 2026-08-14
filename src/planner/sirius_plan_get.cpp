@@ -72,6 +72,65 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
   return out;
 }
 
+//! A scan of the corpus table projected to its vector column, built the way DuckDB builds a
+//! base-table scan (`GetScanFunction` mints the same bind data its binder would) rather than
+//! bound from SQL. The vector join's LogicalGet has no children -- it is a table function, and
+//! a table-in-out surface is a separate piece of work -- so the build phase's input is
+//! constructed here instead. The projection is the vector column alone, which is why the fold
+//! can take column 0 without a name lookup.
+duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_corpus_scan(
+  duckdb::ClientContext& context, const sirius::vss::vector_join_request& req)
+{
+  auto& entry_base = duckdb::Catalog::GetEntry(
+    context, duckdb::CatalogType::TABLE_ENTRY, req.right.catalog, req.right.schema, req.right.table);
+  auto& table_entry = entry_base.Cast<duckdb::DuckTableEntry>();
+
+  auto const& columns = table_entry.GetColumns();
+  auto const names    = columns.GetColumnNames();
+  auto const types    = columns.GetColumnTypes();
+
+  auto const it = std::find(names.begin(), names.end(), req.right.column);
+  if (it == names.end()) {
+    throw duckdb::InternalException("sirius_knn_join: corpus column '" + req.right.column +
+                                    "' vanished between bind and plan");
+  }
+  auto const vec_idx = static_cast<duckdb::idx_t>(std::distance(names.begin(), it));
+
+  duckdb::unique_ptr<duckdb::FunctionData> bind_data;
+  auto scan_function = table_entry.GetScanFunction(context, bind_data);
+
+  // Vector column first, then the columns the join emits. Materialize concatenates those in
+  // this same batch order to resolve neighbour ids, so they have to travel in the same batches
+  // the fold numbered -- not be re-read from the table afterwards.
+  duckdb::vector<duckdb::ColumnIndex> column_ids;
+  column_ids.emplace_back(vec_idx);
+  duckdb::vector<duckdb::LogicalType> projected_types{types[vec_idx]};
+  for (auto const& out_col : req.right.output_columns) {
+    auto const out_it = std::find(names.begin(), names.end(), out_col);
+    if (out_it == names.end()) {
+      throw duckdb::InternalException("sirius_knn_join: corpus output column '" + out_col +
+                                      "' vanished between bind and plan");
+    }
+    auto const idx = static_cast<duckdb::idx_t>(std::distance(names.begin(), out_it));
+    column_ids.emplace_back(idx);
+    projected_types.push_back(types[idx]);
+  }
+
+  return duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(
+    sirius::from_duckdb_vec(projected_types),
+    scan_function,
+    std::move(bind_data),
+    sirius::from_duckdb_vec(types),
+    std::move(column_ids),
+    duckdb::vector<std::size_t>{},
+    names,
+    /*table_filters=*/nullptr,
+    table_entry.GetStorage().GetTotalRows(),
+    duckdb::ExtraOperatorInfo{},
+    duckdb::vector<duckdb::Value>{},
+    table_entry.GetVirtualColumns());
+}
+
 }  // namespace
 
 duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
@@ -569,10 +628,25 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   bool const use_streaming =
     streaming_env == nullptr || std::string_view{streaming_env} != "0";
 
+  // The build phase's corpus row order, minted here so the fold and materialize resolve
+  // neighbour ids against one list rather than each deriving one of their own.
+  std::shared_ptr<sirius::vss::build_side_buffer> build_side =
+    req.build_from_scan ? std::make_shared<sirius::vss::build_side_buffer>() : nullptr;
+
+  if (build_side && !use_streaming) {
+    throw duckdb::NotImplementedException(
+      "sirius_knn_join: build_source => 'scan' needs the streaming operator; the split path "
+      "(SIRIUS_VECTOR_JOIN_STREAMING=0) reads the corpus from a pin only");
+  }
+
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> join_stage;
   if (use_streaming) {
-    join_stage = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_stream>(
-      joined_types(), op.estimated_cardinality, req, &scan_manager);
+    auto stream_op = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_stream>(
+      joined_types(), op.estimated_cardinality, req, &scan_manager, build_side);
+    if (req.build_from_scan) {
+      stream_op->children.push_back(make_corpus_scan(context, req));
+    }
+    join_stage = std::move(stream_op);
   } else {
     auto selection = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_select>(
       partial_types(), op.estimated_cardinality, req, &scan_manager);
@@ -586,7 +660,11 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> node =
     duckdb::make_uniq<sirius::op::sirius_physical_vector_join_materialize>(
-      sirius::from_duckdb_vec(op.returned_types), op.estimated_cardinality, req, &scan_manager);
+      sirius::from_duckdb_vec(op.returned_types),
+      op.estimated_cardinality,
+      req,
+      &scan_manager,
+      build_side);
   node->children.push_back(std::move(join_stage));
 
   // Global top-k finishes above materialize rather than inside the join. The join stage

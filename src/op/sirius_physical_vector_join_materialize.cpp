@@ -17,8 +17,14 @@
 #include "vss/sirius_physical_vector_join_materialize.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "vss/pinned_column.hpp"
+
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
@@ -48,12 +54,112 @@ sirius_physical_vector_join_materialize::sirius_physical_vector_join_materialize
   duckdb::vector<sirius::logical_type> types,
   duckdb::idx_t estimated_cardinality,
   sirius::vss::vector_join_request request,
-  sirius::scan_manager::sirius_scan_manager* scan_manager)
+  sirius::scan_manager::sirius_scan_manager* scan_manager,
+  std::shared_ptr<sirius::vss::build_side_buffer> build_side)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::VECTOR_JOIN_MATERIALIZE, std::move(types), estimated_cardinality),
     _request(std::move(request)),
-    _scan_manager(scan_manager)
+    _scan_manager(scan_manager),
+    _build_side(std::move(build_side))
 {
+}
+
+std::vector<std::unique_ptr<cudf::column>>
+sirius_physical_vector_join_materialize::build_side_output_columns(
+  std::size_t num_output_columns,
+  rmm::cuda_stream_view stream,
+  ::cucascade::memory::memory_space& space)
+{
+  // The fold numbered neighbour ids by walking this snapshot, so concatenating in the same
+  // order is what makes id i address row i. Re-deriving the order here -- from the pin, or by
+  // asking the repository again -- is the bug this shares a handle to avoid: the batches
+  // arrive in scan-completion order, which is not the table's row order.
+  auto const ids = _build_side->batch_ids();
+  auto* repo     = _build_side->repo();
+  if (repo == nullptr) {
+    throw std::runtime_error(
+      "[sirius_physical_vector_join_materialize] build side has no snapshot; the join stage "
+      "should have taken it before any row reached this operator");
+  }
+
+  // Held until every concatenate below has copied out of them.
+  std::vector<cucascade::read_only_data_batch> readers;
+  std::vector<std::shared_ptr<cucascade::data_batch>> restaged;
+  std::vector<std::shared_ptr<cucascade::memory::reservation>> reservations;
+  std::vector<cudf::table_view> tables;
+  //! Index of the first output column in the matching entry of `tables`: a borrowed batch is
+  //! the whole scan batch, whose column 0 is the vector; a re-staged one holds the output
+  //! columns alone.
+  std::vector<cudf::size_type> first_output_col;
+  readers.reserve(ids.size());
+  tables.reserve(ids.size());
+  first_output_col.reserve(ids.size());
+
+  // Output columns sit after the vector column, which the corpus scan projects first.
+  std::vector<std::size_t> out_cols(num_output_columns);
+  for (std::size_t c = 0; c < num_output_columns; ++c) {
+    out_cols[c] = c + 1;
+  }
+
+  for (auto const id : ids) {
+    auto batch = repo->get_data_batch_by_id(id, /*partition_idx=*/0);
+    if (!batch) {
+      throw std::runtime_error("[sirius_physical_vector_join_materialize] build-side batch " +
+                               std::to_string(id) + " is no longer in the repository");
+    }
+    auto ro = batch->to_read_only();
+    if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
+      tables.push_back(sirius::get_cudf_table_view(ro));
+      first_output_col.push_back(1);
+      readers.push_back(std::move(ro));
+      continue;
+    }
+
+    // Spilled: bring back the output columns alone. The vector column is the bulk of the
+    // batch and nothing here reads it.
+    const auto* data = ro.get_data();
+    if (data == nullptr) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_materialize] build-side batch has no data representation");
+    }
+    auto data_rep    = data->cast<cucascade::host_data_representation>().slice(out_cols);
+    auto const bytes = data_rep->get_size_in_bytes();
+    std::shared_ptr<cucascade::memory::reservation> reservation{
+      space.make_reservation_or_null(bytes)};
+    if (!reservation) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_materialize] build-side output columns need " +
+        std::to_string(bytes) + " bytes device-side, which exceeds the available budget");
+    }
+    auto const batch_id = sirius::get_next_batch_id();
+    auto staged         = cucascade::data_batch::make(
+      batch_id,
+      std::move(data_rep),
+      telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
+    {
+      auto mut = staged->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(
+        sirius::converter_registry::get(), *reservation, stream);
+    }
+    tables.push_back(sirius::get_cudf_table_view(*staged));
+    first_output_col.push_back(0);
+    restaged.push_back(std::move(staged));
+    reservations.push_back(std::move(reservation));
+    readers.push_back(std::move(ro));
+  }
+
+  auto const mr = space.get_default_allocator();
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.reserve(num_output_columns);
+  for (std::size_t c = 0; c < num_output_columns; ++c) {
+    std::vector<cudf::column_view> views;
+    views.reserve(tables.size());
+    for (std::size_t b = 0; b < tables.size(); ++b) {
+      views.push_back(tables[b].column(first_output_col[b] + static_cast<cudf::size_type>(c)));
+    }
+    cols.push_back(cudf::concatenate(views, stream, mr));
+  }
+  return cols;
 }
 
 void sirius_physical_vector_join_materialize::ensure_initialized(
@@ -71,8 +177,10 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
   const auto* left_pin =
     _scan_manager->find_pinned_entry_for_duckdb_table(left.catalog, left.schema, left.table);
   const auto* right_pin =
-    _scan_manager->find_pinned_entry_for_duckdb_table(right.catalog, right.schema, right.table);
-  if (left_pin == nullptr || right_pin == nullptr) {
+    _build_side ? nullptr
+                : _scan_manager->find_pinned_entry_for_duckdb_table(
+                    right.catalog, right.schema, right.table);
+  if (left_pin == nullptr || (!_build_side && right_pin == nullptr)) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_materialize] left/right table is no longer pinned");
   }
@@ -92,9 +200,13 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
   auto const mr = space.get_default_allocator();
   std::vector<std::unique_ptr<cudf::column>> right_cols;
   right_cols.reserve(right.output_columns.size());
-  for (auto const& name : right.output_columns) {
-    auto staged = vss::stage_pinned_column(*right_pin, name, space, stream, batch_telemetry());
-    right_cols.push_back(cudf::concatenate(staged.views, stream, mr));
+  if (_build_side) {
+    right_cols = build_side_output_columns(right.output_columns.size(), stream, space);
+  } else {
+    for (auto const& name : right.output_columns) {
+      auto staged = vss::stage_pinned_column(*right_pin, name, space, stream, batch_telemetry());
+      right_cols.push_back(cudf::concatenate(staged.views, stream, mr));
+    }
   }
   _right_output_concat = std::make_unique<cudf::table>(std::move(right_cols));
 

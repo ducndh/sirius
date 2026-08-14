@@ -17,15 +17,20 @@
 #pragma once
 
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "vss/vector_join.hpp"
+#include "vss/vector_join_build_side.hpp"
 
 #include "telemetry/data_batch_probe.hpp"
+
+#include <cucascade/data/data_batch.hpp>
 
 #include <cudf/column/column_view.hpp>
 
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -56,6 +61,10 @@ struct staged_vector_chunk {
   /// Draws the staged copy from the task's device budget instead of committing fresh
   /// capacity; must outlive @c owner, so it is released alongside it.
   std::shared_ptr<::cucascade::memory::reservation> reservation;
+  /// Held only when @c view points into a batch this chunk does not own -- a build-side batch
+  /// that was already device-resident. The shared lock is what stops the downgrade executor
+  /// spilling that batch out from under the fold; dropping it ends the borrow.
+  std::optional<::cucascade::read_only_data_batch> reader;
 };
 
 /**
@@ -99,6 +108,16 @@ std::unique_ptr<vector_chunk_source> make_gpu_pinned_chunk_source(
 std::unique_ptr<vector_chunk_source> make_host_pinned_chunk_source(
   const sirius::scan_manager::pinned_entry& pin,
   const std::string& column,
+  std::int64_t dim,
+  const telemetry::batch_telemetry_info& telemetry_info);
+
+/// Build phase: chunks are the batches a child scan deposited in the join's build port, taken
+/// in the buffer's snapshot order. A batch the downgrade executor has spilled is brought back
+/// device-side for the fold step and released after it, exactly as a HOST-tier pin chunk is;
+/// one still resident is viewed in place.
+std::unique_ptr<vector_chunk_source> make_materialized_chunk_source(
+  sirius::vss::build_side_buffer& buffer,
+  std::size_t column_index,
   std::int64_t dim,
   const telemetry::batch_telemetry_info& telemetry_info);
 
@@ -167,17 +186,29 @@ class vector_join_stream_input : public operator_data {
  * distance FLOAT32]` flattened `[n_left * k]`, partitioned by left batch index -- so
  * the materialize stage is unchanged.
  */
-class sirius_physical_vector_join_stream : public sirius_physical_operator {
+class sirius_physical_vector_join_stream : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM;
 
-  sirius_physical_vector_join_stream(duckdb::vector<sirius::logical_type> types,
-                                     duckdb::idx_t estimated_cardinality,
-                                     sirius::vss::vector_join_request request,
-                                     sirius::scan_manager::sirius_scan_manager* scan_manager);
+  /// @param build_side  When non-null the corpus comes from this operator's build port -- a
+  ///                    child scan materialized by the build phase -- instead of a pinned
+  ///                    catalog table, and the buffer is the row order both this operator and
+  ///                    materialize resolve neighbour ids against.
+  sirius_physical_vector_join_stream(
+    duckdb::vector<sirius::logical_type> types,
+    duckdb::idx_t estimated_cardinality,
+    sirius::vss::vector_join_request request,
+    sirius::scan_manager::sirius_scan_manager* scan_manager,
+    std::shared_ptr<sirius::vss::build_side_buffer> build_side = nullptr);
 
   [[nodiscard]] const sirius::vss::vector_join_request& request() const { return _request; }
+
+  /// True when the corpus is fed by a child scan rather than resolved from a pin.
+  [[nodiscard]] bool has_build_phase() const { return _build_side != nullptr; }
+
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
   // -----------------------------
   // Source interface
@@ -206,13 +237,22 @@ class sirius_physical_vector_join_stream : public sirius_physical_operator {
 
  private:
   /// Resolve both pinned tables and snapshot per-batch views plus right-batch row
-  /// offsets. Idempotent; caller holds _op_mutex.
+  /// offsets. Idempotent; caller holds _op_mutex. On the build path this is a no-op until
+  /// @ref build_side_ready_locked, so callers must check that first.
   void ensure_initialized_locked();
+
+  /// Whether the build port is wired and its producing pipeline has finished. Always true on
+  /// the pinned path. Caller holds _op_mutex.
+  bool build_side_ready_locked();
 
   /// Peak bytes for one left batch's task: the accumulator, the partial being folded
   /// in, and the stacked pair the merge reads. Independent of the right batch count,
   /// which is the point of the fold.
   [[nodiscard]] std::size_t per_left_batch_estimate(std::size_t left_idx) const;
+
+  /// The corpus row order, shared with materialize. Null on the pinned path, where the
+  /// pinned_entry plays the same role.
+  std::shared_ptr<sirius::vss::build_side_buffer> _build_side;
 
   sirius::vss::vector_join_request _request;
   sirius::scan_manager::sirius_scan_manager* _scan_manager;
