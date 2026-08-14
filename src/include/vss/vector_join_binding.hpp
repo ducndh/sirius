@@ -29,7 +29,13 @@ class SiriusContext;
 
 namespace sirius::vss {
 
-/// Resolve one join side (left or right) at bind time.
+/// Resolve one join side (left or right) at bind time, returning its vector dimensionality
+/// and, through @p out_num_rows, its row count.
+///
+/// @param require_pin  True for a side the operator reads out of a pinned table, where the pin
+///                     also decides which columns can be emitted. False for a side fed by the
+///                     build phase: its scan reads the table whether or not a pin happens to be
+///                     caching it, so columns come from the catalog and no pin is required.
 std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
                                       duckdb::SiriusContext& sirius_ctx,
                                       const std::string& label,
@@ -37,9 +43,11 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
                                       const std::string& column_arg,
                                       const std::string& schema_name,
                                       const std::vector<std::string>& out_cols,
+                                      bool require_pin,
                                       vector_join_side& side,
                                       duckdb::vector<duckdb::LogicalType>& out_types,
-                                      duckdb::vector<duckdb::string>& out_names);
+                                      duckdb::vector<duckdb::string>& out_names,
+                                      std::uint64_t& out_num_rows);
 
 /// Pull a LIST(VARCHAR) named parameter into a string vector; throws if empty.
 std::vector<std::string> parse_output_columns(const duckdb::Value& v, const std::string& key);

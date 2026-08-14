@@ -670,3 +670,56 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM unpin_table('bp_probe');");
   run_ok("SELECT * FROM unpin_table('bp_corpus');");
 }
+
+// -----------------------------------------------------------------------------
+// What the build phase is for: the corpus does not have to be pinned, and the
+// columns it emits are not confined to whatever a pin happens to hold.
+//
+// Pinning a column subset used to make the rest of that table unusable in the
+// same query -- `items` pinned on ['id','vec'] meant nothing could read
+// `items.category` -- which is why the join benchmark has to split attributes
+// into a side table. The corpus scan reads the base table, so a pin is a cache
+// in front of it rather than the source.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - build phase does not require a pinned corpus",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE up_corpus (id INTEGER, vec FLOAT[8], category INTEGER);");
+  run_ok(
+    "INSERT INTO up_corpus SELECT i, "
+    "list_transform(range(0, 8), j -> ((hash(i * 8 + j) % 100000) / 100000.0)::FLOAT)::FLOAT[8], "
+    "(i % 7) FROM range(20000) t(i);");
+  run_ok("CREATE TABLE up_probe (id INTEGER, vec FLOAT[8]);");
+  run_ok(
+    "INSERT INTO up_probe SELECT i, "
+    "list_transform(range(0, 8), j -> ((hash(i * 31 + j * 7 + 3) % 100000) / 100000.0)::FLOAT)"
+    "::FLOAT[8] FROM range(100) t(i);");
+  run_ok("CHECKPOINT;");
+
+  // Only the probe is pinned. The corpus is never pinned at all.
+  run_ok("SELECT * FROM pin_table(name => 'up_probe', tier => 'gpu', format => 'duckdb');");
+
+  const std::string join_sql =
+    "SELECT left_id, right_id, right_category FROM sirius_knn_join("
+    "'up_probe','vec','up_corpus','vec', search_mode => 'exact', metric => 'l2', k => 4, "
+    "left_output_columns => ['id'], right_output_columns => ['id','category'], "
+    "build_source => 'scan');";
+  auto const unpinned = ok_rows(*con, join_sql);
+  REQUIRE(unpinned.size() == 100 * 4);
+
+  // category is a real value from the corpus row the id names, not a placeholder.
+  for (auto const& row : unpinned) {
+    REQUIRE(std::stoi(row[2]) == std::stoi(row[1]) % 7);
+  }
+
+  // Pinning a strict column subset must not change the answer, and must not make
+  // `category` -- absent from the pin -- unavailable.
+  run_ok(
+    "SELECT * FROM pin_table(name => 'up_corpus', tier => 'gpu', format => 'duckdb', "
+    "cols => ['id','vec']);");
+  REQUIRE(ok_rows(*con, join_sql) == unpinned);
+
+  run_ok("SELECT * FROM unpin_table('up_corpus');");
+  run_ok("SELECT * FROM unpin_table('up_probe');");
+}

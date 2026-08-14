@@ -1892,6 +1892,7 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
     throw InvalidInputException("sirius_knn_join requires the Sirius context to be initialized");
   }
 
+  // The probe side is still read from its pin; only the corpus has a build phase.
   auto const left_dim  = resolve_vector_join_side(context,
                                                  *sirius_ctx,
                                                  "left",
@@ -1899,9 +1900,11 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
                                                  left_column,
                                                  left_schema,
                                                  left_out_cols,
+                                                 /*require_pin=*/true,
                                                  req.left,
                                                  return_types,
-                                                 names);
+                                                 names,
+                                                 result->left_rows);
   auto const right_dim = resolve_vector_join_side(context,
                                                   *sirius_ctx,
                                                   "right",
@@ -1909,9 +1912,11 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
                                                   right_column,
                                                   right_schema,
                                                   right_out_cols,
+                                                  /*require_pin=*/!req.build_from_scan,
                                                   req.right,
                                                   return_types,
-                                                  names);
+                                                  names,
+                                                  result->right_rows);
   if (left_dim != right_dim) {
     throw BinderException("sirius_knn_join: left is FLOAT[" + std::to_string(left_dim) +
                           "] but right is FLOAT[" + std::to_string(right_dim) +
@@ -1935,13 +1940,6 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
     return pin->tier == cucascade::memory::Tier::HOST ? pin->host_chunks.size()
                                                       : pin->chunk_memory_spaces.size();
   };
-
-  if (const auto* left_pin = pinned_entry_for(req.left)) {
-    result->left_rows = left_pin->num_rows;
-  }
-  if (const auto* right_pin = pinned_entry_for(req.right)) {
-    result->right_rows = right_pin->num_rows;
-  }
 
   const char* streaming_env = std::getenv("SIRIUS_VECTOR_JOIN_STREAMING");
   if (streaming_env != nullptr && std::string_view{streaming_env} == "0") {

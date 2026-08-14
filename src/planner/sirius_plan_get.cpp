@@ -577,15 +577,11 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   auto& scan_manager = sirius_state->get_scan_manager();
 
   // If k is larger than the number of rows in the right table, lower it to that row count.
-  auto req = bind_data.req;
-  {
-    const auto* right_pin = scan_manager.find_pinned_entry_for_duckdb_table(
-      req.right.catalog, req.right.schema, req.right.table);
-    if (right_pin != nullptr) {
-      auto const right_rows = static_cast<std::int64_t>(right_pin->num_rows);
-      if (req.k > right_rows) { req.k = right_rows; }
-    }
-  }
+  // The count comes from the bind, which reads it from the pin or from the table itself
+  // depending on where this join's corpus is coming from.
+  auto req              = bind_data.req;
+  auto const right_rows = static_cast<std::int64_t>(bind_data.right_rows);
+  if (right_rows > 0 && req.k > right_rows) { req.k = right_rows; }
 
   // Three-stage pipeline: select (per-pair top-k) → reduce_local (per-left-batch
   // reduction) → materialize (gather output columns + score into the TVF rows).

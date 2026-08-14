@@ -20,6 +20,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
@@ -35,9 +36,11 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
                                       const std::string& column_arg,
                                       const std::string& schema_name,
                                       const std::vector<std::string>& out_cols,
+                                      bool require_pin,
                                       vector_join_side& side,
                                       duckdb::vector<duckdb::LogicalType>& out_types,
-                                      duckdb::vector<duckdb::string>& out_names)
+                                      duckdb::vector<duckdb::string>& out_names,
+                                      std::uint64_t& out_num_rows)
 {
   side.column = column_arg;
 
@@ -72,22 +75,26 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   }
   auto const dim = static_cast<std::int64_t>(duckdb::ArrayType::GetSize(vec_type));
 
-  // Tables must be pinned for now; output columns must be a subset of the pin.
+  // A side the operator reads straight out of a pin can only emit what the pin holds. A side
+  // fed by the build phase is read by an ordinary scan, which serves the table pinned or not --
+  // the pin is a cache in front of it, not the source -- so the catalog decides the columns and
+  // an absent pin is not an error. That is what stops a column-subset pin from making the rest
+  // of the table unusable in the same query.
   const auto* pin = sirius_ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
     side.catalog, side.schema, side.table);
-  if (pin == nullptr) {
+  if (pin == nullptr && require_pin) {
     throw duckdb::BinderException("sirius_knn_join: " + label + " table '" + side.table +
                                   "' must be pinned");
   }
-  auto const& pinned_names = pin->cache_info.column_names();
-  auto is_pinned           = [&](const std::string& col) {
+  auto const emittable = [&](const std::string& col) {
+    if (pin == nullptr || !require_pin) { return true; }
+    auto const& pinned_names = pin->cache_info.column_names();
     return std::ranges::find(pinned_names.begin(), pinned_names.end(), col) != pinned_names.end();
   };
 
   if (out_cols.empty()) {
-    // Default to all pinned columns in catalog schema order
     for (auto const& name : schema_names) {
-      if (is_pinned(name)) { side.output_columns.push_back(name); }
+      if (emittable(name)) { side.output_columns.push_back(name); }
     }
   } else {
     for (auto const& col : out_cols) {
@@ -97,7 +104,7 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
         throw duckdb::BinderException("sirius_knn_join: " + label + " column '" + col +
                                       "' not found in table '" + side.table + "'");
       }
-      if (!is_pinned(col)) {
+      if (!emittable(col)) {
         throw duckdb::BinderException(
           "sirius_knn_join: " + label + " output column '" + col + "' is not pinned on table '" +
           side.table + "'; pin it (pin_table cols => [...]) or omit the output_columns list");
@@ -105,6 +112,12 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
       side.output_columns.push_back(col);
     }
   }
+
+  // Row count for the cardinality estimate and the plan's k clamp. The pin's count is the
+  // authority when the operator reads the pin; otherwise the table's own.
+  out_num_rows = (pin != nullptr && require_pin)
+                   ? static_cast<std::uint64_t>(pin->num_rows)
+                   : static_cast<std::uint64_t>(entry.GetStorage().GetTotalRows());
 
   for (auto const& col : side.output_columns) {
     out_types.push_back(type_of(col));
