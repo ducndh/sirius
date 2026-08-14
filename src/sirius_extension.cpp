@@ -2178,6 +2178,9 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join.named_parameters["build_source"]         = LogicalType::VARCHAR;
   vector_join.named_parameters["probe_source"]         = LogicalType::VARCHAR;
   vector_join.cardinality                              = SiriusVectorJoinCardinality;
+  // Lets DuckDB narrow column_ids to what the query reads. create_plan_knn_join drops the rest
+  // before the corpus's output columns are concatenated, which is where the cost is.
+  vector_join.projection_pushdown                      = true;
   CreateTableFunctionInfo vector_join_info(vector_join);
   catalog.CreateTableFunction(transaction, vector_join_info);
 
@@ -2193,7 +2196,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     SiriusVectorJoinFunction,
     SiriusVectorJoinRelBind);
   vector_join_rel.named_parameters = vector_join.named_parameters;
-  vector_join_rel.cardinality      = SiriusVectorJoinCardinality;
+  vector_join_rel.cardinality          = SiriusVectorJoinCardinality;
+  vector_join_rel.projection_pushdown  = true;
   vector_join_rel.in_out_function  = SiriusVectorJoinInOutFunction;
   CreateTableFunctionInfo vector_join_rel_info(vector_join_rel);
   catalog.CreateTableFunction(transaction, vector_join_rel_info);

@@ -853,3 +853,67 @@ TEST_CASE_METHOD(VectorJoinFixture,
                "probe_source => 'pin');",
                "does not apply");
 }
+
+// -----------------------------------------------------------------------------
+// Projection pushdown narrows the declared output to what the query reads, which
+// changes the shape materialize assembles: either side can end up contributing
+// no columns at all. Correctness of the surviving columns is the thing to pin
+// down -- the saving itself is structural (an unread corpus column is one fewer
+// column concatenated across the whole corpus) and not visible from SQL.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - reading a subset of the declared output columns",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE pp_corpus (id INTEGER, vec FLOAT[8], category INTEGER);");
+  run_ok(
+    "INSERT INTO pp_corpus SELECT i, "
+    "list_transform(range(0, 8), j -> ((hash(i * 8 + j) % 100000) / 100000.0)::FLOAT)::FLOAT[8], "
+    "(i % 7) FROM range(20000) t(i);");
+  run_ok("CREATE TABLE pp_probe (id INTEGER, vec FLOAT[8], region INTEGER);");
+  run_ok(
+    "INSERT INTO pp_probe SELECT i, "
+    "list_transform(range(0, 8), j -> ((hash(i * 61 + j * 9 + 4) % 100000) / 100000.0)::FLOAT)"
+    "::FLOAT[8], (i % 5) FROM range(200) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'pp_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'pp_probe', tier => 'gpu', format => 'duckdb');");
+
+  const std::string args =
+    "'pp_probe','vec','pp_corpus','vec', search_mode => 'exact', metric => 'l2', k => 4, "
+    "left_output_columns => ['id','region'], right_output_columns => ['id','category']";
+
+  auto const everything =
+    ok_rows(*con, "SELECT left_id, left_region, right_id, right_category, distance FROM "
+                  "sirius_knn_join(" + args + ");");
+  REQUIRE(everything.size() == 200 * 4);
+
+  // One column from each side, and the score dropped: the narrowed layout must still name the
+  // same rows as the full one.
+  auto const narrowed =
+    ok_rows(*con, "SELECT left_id, right_category FROM sirius_knn_join(" + args + ");");
+  std::vector<std::vector<std::string>> expected;
+  for (auto const& row : everything) {
+    expected.push_back({row[0], row[3]});
+  }
+  std::sort(expected.begin(), expected.end());
+  REQUIRE(narrowed == expected);
+
+  // Nothing from the corpus at all -- the right-side gather has no columns to work on.
+  auto const left_only =
+    ok_rows(*con, "SELECT left_region FROM sirius_knn_join(" + args + ");");
+  REQUIRE(left_only.size() == 200 * 4);
+
+  // Nothing from either side: only the score survives.
+  auto const score_only =
+    ok_rows(*con, "SELECT distance FROM sirius_knn_join(" + args + ");");
+  REQUIRE(score_only.size() == 200 * 4);
+
+  // And no output columns whatsoever.
+  auto const counted = ok_rows(*con, "SELECT count(*) FROM sirius_knn_join(" + args + ");");
+  REQUIRE(counted.size() == 1);
+  REQUIRE(counted[0][0] == std::to_string(200 * 4));
+
+  run_ok("SELECT * FROM unpin_table('pp_probe');");
+  run_ok("SELECT * FROM unpin_table('pp_corpus');");
+}

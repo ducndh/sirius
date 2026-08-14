@@ -632,6 +632,41 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   bool const use_streaming =
     streaming_env == nullptr || std::string_view{streaming_env} != "0";
 
+  // Projection pushdown. The declared output is
+  // [left_output_columns..., right_output_columns..., score]; column_ids names the subset the
+  // query reads, narrowed by DuckDB because the function sets projection_pushdown. Dropping the
+  // rest here is not a cosmetic saving: materialize concatenates the corpus's output columns
+  // across the WHOLE corpus to gather by neighbour id, so an unread column costs O(corpus)
+  // device memory on the path whose premise is that the corpus need not fit.
+  auto const declared_left  = req.left.output_columns.size();
+  auto const declared_right = req.right.output_columns.size();
+  auto const score_idx_orig = declared_left + declared_right;
+
+  std::vector<std::string> kept_left;
+  std::vector<std::string> kept_right;
+  duckdb::vector<duckdb::LogicalType> kept_types;
+  bool score_read = false;
+  for (auto const& column_id : op.GetColumnIds()) {
+    if (!column_id.HasPrimaryIndex()) {
+      throw duckdb::NotImplementedException("sirius_knn_join: virtual/rowid columns unsupported");
+    }
+    auto const idx = column_id.GetPrimaryIndex();
+    if (idx < declared_left) {
+      kept_left.push_back(req.left.output_columns[idx]);
+      kept_types.push_back(op.returned_types[idx]);
+    } else if (idx < score_idx_orig) {
+      kept_right.push_back(req.right.output_columns[idx - declared_left]);
+      kept_types.push_back(op.returned_types[idx]);
+    } else {
+      score_read = true;
+    }
+  }
+  req.left.output_columns  = std::move(kept_left);
+  req.right.output_columns = std::move(kept_right);
+  // The score is always produced -- it is one column of the output rows, not of the corpus --
+  // and projected away below when unread.
+  kept_types.push_back(op.returned_types[score_idx_orig]);
+
   // Row orders for the fed sides, minted here so the fold and materialize resolve positions
   // against one list per side rather than each deriving one of their own.
   std::shared_ptr<sirius::vss::materialized_side_buffer> build_side =
@@ -720,7 +755,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> node =
     duckdb::make_uniq<sirius::op::sirius_physical_vector_join_materialize>(
-      sirius::from_duckdb_vec(op.returned_types),
+      sirius::from_duckdb_vec(kept_types),
       op.estimated_cardinality,
       req,
       &scan_manager,
@@ -756,25 +791,16 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
     node = std::move(top_n);
   }
 
-  auto column_ids  = op.GetColumnIds();
-  bool is_identity = column_ids.size() == op.returned_types.size();
-  for (std::size_t i = 0; is_identity && i < column_ids.size(); ++i) {
-    if (!column_ids[i].HasPrimaryIndex() || column_ids[i].GetPrimaryIndex() != i) {
-      is_identity = false;
-    }
-  }
-  if (is_identity) { return node; }
+  // column_ids is ascending, and left columns precede right ones which precede the score, so
+  // the narrowed layout above is already in the order the query expects. The only mismatch
+  // left is the trailing score when nothing reads it.
+  if (score_read) { return node; }
 
   duckdb::vector<duckdb::LogicalType> types;
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
-  for (auto const& column_id : column_ids) {
-    if (!column_id.HasPrimaryIndex()) {
-      throw duckdb::NotImplementedException("sirius_knn_join: virtual/rowid columns unsupported");
-    }
-    auto const col_id = column_id.GetPrimaryIndex();
-    auto const type   = op.returned_types[col_id];
-    types.push_back(type);
-    expressions.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, col_id));
+  for (std::size_t i = 0; i + 1 < kept_types.size(); ++i) {
+    types.push_back(kept_types[i]);
+    expressions.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(kept_types[i], i));
   }
   return push_projection(std::move(node),
                          sirius::from_duckdb_vec(types),

@@ -359,21 +359,32 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
   // Left columns gathered by the left row each pair belongs to. This used to repeat every
   // left row k times, which assumed a fixed k per row; threshold and global top-k are ragged
   // by construction, so the join stage now names the left row for each pair instead.
+  // Either side can contribute no columns once projection pushdown has narrowed the output --
+  // `SELECT count(*)`, or a query reading only the score -- and gathering a table of no columns
+  // is not something cudf defines, so the gather is skipped rather than fed an empty table.
   std::vector<cudf::column_view> left_batch_cols;
   left_batch_cols.reserve(_left_output_cols.size());
   for (auto const& per_batch : _left_output_cols) {
     left_batch_cols.push_back(per_batch[partition_idx]);
   }
-  auto const left_table = cudf::table_view(left_batch_cols);
-  auto left_repeated    = cudf::gather(
-    left_table, left_row_view, cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+  std::unique_ptr<cudf::table> left_repeated;
+  if (!left_batch_cols.empty()) {
+    left_repeated = cudf::gather(cudf::table_view(left_batch_cols),
+                                 left_row_view,
+                                 cudf::out_of_bounds_policy::DONT_CHECK,
+                                 stream,
+                                 mr);
+  }
 
   // Right columns gathered by the global neighbor id.
-  auto right_gathered = cudf::gather(_right_output_concat->view(),
-                                     neighbor_view,
-                                     cudf::out_of_bounds_policy::DONT_CHECK,
-                                     stream,
-                                     mr);
+  std::unique_ptr<cudf::table> right_gathered;
+  if (_right_output_concat->num_columns() > 0) {
+    right_gathered = cudf::gather(_right_output_concat->view(),
+                                  neighbor_view,
+                                  cudf::out_of_bounds_policy::DONT_CHECK,
+                                  stream,
+                                  mr);
+  }
 
   // Score: distance, or cosine similarity = max(0, 1 - distance).
   std::unique_ptr<cudf::column> score;
@@ -398,14 +409,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
 
   // Assemble [left cols..., right cols..., score] — the TVF schema.
   std::vector<std::unique_ptr<cudf::column>> out_cols;
-  auto left_cols  = left_repeated->release();
-  auto right_cols = right_gathered->release();
-  out_cols.reserve(left_cols.size() + right_cols.size() + 1);
-  for (auto& c : left_cols) {
-    out_cols.push_back(std::move(c));
+  if (left_repeated) {
+    for (auto& c : left_repeated->release()) {
+      out_cols.push_back(std::move(c));
+    }
   }
-  for (auto& c : right_cols) {
-    out_cols.push_back(std::move(c));
+  if (right_gathered) {
+    for (auto& c : right_gathered->release()) {
+      out_cols.push_back(std::move(c));
+    }
   }
   out_cols.push_back(std::move(score));
   auto out_table = std::make_unique<cudf::table>(std::move(out_cols));
