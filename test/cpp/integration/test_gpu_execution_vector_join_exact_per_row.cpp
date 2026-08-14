@@ -25,6 +25,7 @@
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -550,4 +551,122 @@ TEST_CASE_METHOD(VectorJoinFixture,
 
   run_ok("SELECT * FROM unpin_table('qp_corpus');");
   run_ok("SELECT * FROM unpin_table('qp_probe');");
+}
+
+// -----------------------------------------------------------------------------
+// Knobs that describe an approximate search must be refused while none exists.
+// Accepting them ran an exhaustive search under a query that claimed otherwise,
+// which is indistinguishable in the results from an approximate run that got
+// lucky -- the one failure mode a user cannot detect.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - approximate knobs are refused, not ignored",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE ap_corpus (id INTEGER, vec FLOAT[3]);");
+  run_ok("INSERT INTO ap_corpus SELECT i, [i::float, (i+1)::float, (i+2)::float] FROM range(64) t(i);");
+  run_ok("CREATE TABLE ap_probe (id INTEGER, vec FLOAT[3]);");
+  run_ok("INSERT INTO ap_probe VALUES (0, [1.0, 2.0, 3.0]);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'ap_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'ap_probe', tier => 'gpu', format => 'duckdb');");
+
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('ap_probe','vec','ap_corpus','vec', "
+               "search_mode => 'approx', k => 4);",
+               "not implemented");
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('ap_probe','vec','ap_corpus','vec', "
+               "n_clusters => 8, k => 4);",
+               "approximate search");
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('ap_probe','vec','ap_corpus','vec', "
+               "n_probes => 4, k => 4);",
+               "approximate search");
+
+  // The defaults these guard must keep working.
+  REQUIRE(ok_rows(*con,
+                  "SELECT left_id, right_id FROM sirius_knn_join("
+                  "'ap_probe','vec','ap_corpus','vec', search_mode => 'exact', k => 4);")
+            .size() == 4);
+
+  run_ok("SELECT * FROM unpin_table('ap_probe');");
+  run_ok("SELECT * FROM unpin_table('ap_corpus');");
+}
+
+// -----------------------------------------------------------------------------
+// Build phase: the corpus taken from a child scan must answer identically to the
+// corpus taken from the pin.
+//
+// The corpus must span several batches or this test proves almost nothing: a
+// neighbour id is a position in the corpus row order, and the fold and materialize
+// derive that order independently unless they share the build side's snapshot. One
+// batch cannot be ordered wrongly, so a small corpus passes even when the orders
+// disagree -- which is exactly how the first cut of this path returned a million
+// wrong ids against correct distances.
+//
+// Batching follows DuckDB row groups (122,880 rows), not the byte target, so the
+// row count below is what makes this multi-batch; the vectors stay narrow and the
+// whole table is a few MB. Keep it above ~3 row groups.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - build phase matches the pinned corpus",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  // Wide vectors and enough of them to exceed concat_batch_bytes (100 MB in integration.yaml):
+  // the build side is coalesced by BYTES, so a narrow-vector corpus of any row count arrives as
+  // a single batch and cannot exercise the ordering contract at all. 600k x FLOAT[64] is ~154 MB
+  // and lands as several batches.
+  run_ok("CREATE TABLE bp_corpus (id INTEGER, vec FLOAT[64]);");
+  // Hashed, not periodic: a smooth generator like sin(i*c + j) repeats every 2*pi/c rows, which
+  // at this row count gives every point ~95 near-identical twins and makes the k-th neighbour a
+  // coin toss between tied rows. Comparing ids then fails for reasons that have nothing to do
+  // with the build phase.
+  run_ok(
+    "INSERT INTO bp_corpus SELECT i, "
+    "list_transform(range(0, 64), j -> ((hash(i * 64 + j) % 100000) / 100000.0)::FLOAT)"
+    "::FLOAT[64] FROM range(600000) t(i);");
+  run_ok("CREATE TABLE bp_probe (id INTEGER, vec FLOAT[64]);");
+  run_ok(
+    "INSERT INTO bp_probe SELECT i, "
+    "list_transform(range(0, 64), j -> ((hash(i * 977 + j * 13 + 7) % 100000) / 100000.0)::FLOAT)"
+    "::FLOAT[64] FROM range(200) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'bp_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'bp_probe', tier => 'gpu', format => 'duckdb');");
+
+  auto const pinned = ok_rows(*con,
+                              "SELECT left_id, right_id, distance FROM sirius_knn_join("
+                              "'bp_probe','vec','bp_corpus','vec', search_mode => 'exact', "
+                              "metric => 'l2', k => 5, left_output_columns => ['id'], "
+                              "right_output_columns => ['id']);");
+  REQUIRE(pinned.size() == 200 * 5);
+
+  auto const built = ok_rows(*con,
+                             "SELECT left_id, right_id, distance FROM sirius_knn_join("
+                             "'bp_probe','vec','bp_corpus','vec', search_mode => 'exact', "
+                             "metric => 'l2', k => 5, left_output_columns => ['id'], "
+                             "right_output_columns => ['id'], build_source => 'scan');");
+  REQUIRE(built == pinned);
+
+  // Agreeing with the pin path is necessary but not sufficient, and waiting for the two to
+  // disagree on their own does not work: whether the corpus batches arrive in the table's
+  // order is a race, and on most runs they do, so the bug this guards against stays dormant.
+  // Reversing the snapshot forces the disagreement instead. Any order is a correct corpus
+  // order as long as every stage uses the same one, so a reversed run must return exactly the
+  // same rows -- and does not if some stage derived an order of its own.
+  // Compared against the pinned result, not against `built`: the two build-phase queries would
+  // otherwise be the same SQL text, and the second reuses the first's plan -- and with it the
+  // snapshot already taken -- so the reversal never happens and the check passes vacuously.
+  setenv("SIRIUS_VECTOR_JOIN_REVERSE_BUILD_ORDER", "1", 1);
+  auto const reversed = ok_rows(*con,
+                                "SELECT left_id, right_id, distance FROM sirius_knn_join("
+                                "'bp_probe','vec','bp_corpus','vec', search_mode => 'exact', "
+                                "metric => 'l2', k => 5, right_output_columns => ['id'], "
+                                "left_output_columns => ['id'], build_source => 'scan');");
+  unsetenv("SIRIUS_VECTOR_JOIN_REVERSE_BUILD_ORDER");
+  REQUIRE(reversed == pinned);
+
+  run_ok("SELECT * FROM unpin_table('bp_probe');");
+  run_ok("SELECT * FROM unpin_table('bp_corpus');");
 }

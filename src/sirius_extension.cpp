@@ -1852,6 +1852,22 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   if (req.k < 0) { throw BinderException("sirius_knn_join: k must be >= 0"); }
   if (req.n_clusters < 0) { throw BinderException("sirius_knn_join: n_clusters must be >= 0"); }
   if (req.n_probes < 1) { throw BinderException("sirius_knn_join: n_probes must be >= 1"); }
+  // Approximate search is unimplemented: nothing downstream reads search_mode beyond the
+  // exact/exact-gemm distinction, nor n_clusters/n_probes at all, so accepting them ran an
+  // exhaustive search while the query said otherwise -- results indistinguishable from an
+  // approximate run that happened to be perfect. Refusing is the only honest answer until
+  // there is a real approximate path.
+  if (req.search_mode == vector_join_search_mode::approx) {
+    throw BinderException(
+      "sirius_knn_join: search_mode => 'approx' is not implemented; it would run an exhaustive "
+      "search and report itself as approximate. Use 'exact' or 'exact-gemm'");
+  }
+  if (req.n_clusters > 0 || req.n_probes > 1) {
+    throw BinderException(
+      "sirius_knn_join: n_clusters and n_probes only mean anything under an approximate search, "
+      "which is not implemented; they are ignored, so setting them is refused rather than "
+      "silently disregarded");
+  }
   if (req.eps < 0.0) { throw BinderException("sirius_knn_join: eps must be >= 0"); }
   if (req.metric != "l2" && req.metric != "cosine") {
     throw BinderException("sirius_knn_join: metric must be one of 'l2', 'cosine', got '" +

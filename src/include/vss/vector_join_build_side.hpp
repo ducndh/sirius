@@ -18,8 +18,11 @@
 
 #include <cucascade/data/data_repository.hpp>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
+#include <string_view>
 #include <vector>
 
 namespace sirius::vss {
@@ -50,7 +53,16 @@ class build_side_buffer {
     if (!_taken) {
       _repo      = &repo;
       _batch_ids = repo.get_batch_ids(/*partition_idx=*/0);
-      _taken     = true;
+      // Any order is a correct corpus order -- what matters is that every stage uses the same
+      // one -- so reversing it must not change a single output row. That makes this switch a
+      // deterministic test for the property: whether the batches arrive in the table's order
+      // is a race, so a test that waits for them to disagree passes for the wrong reason on
+      // most runs. Reversing forces the disagreement that the race only sometimes produces.
+      const char* reverse = std::getenv("SIRIUS_VECTOR_JOIN_REVERSE_BUILD_ORDER");
+      if (reverse != nullptr && std::string_view{reverse} == "1") {
+        std::reverse(_batch_ids.begin(), _batch_ids.end());
+      }
+      _taken = true;
     }
     return _batch_ids;
   }
