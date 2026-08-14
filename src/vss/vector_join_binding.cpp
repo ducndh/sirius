@@ -24,6 +24,7 @@
 #include "sirius_context.hpp"
 
 #include <algorithm>
+#include <limits>
 
 namespace sirius::vss {
 
@@ -110,6 +111,26 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
     out_names.push_back(label + "_" + col);
   }
   return dim;
+}
+
+std::uint64_t estimate_vector_join_cardinality(const vector_join_request& req,
+                                               std::uint64_t left_rows,
+                                               std::uint64_t right_rows)
+{
+  // create_plan_knn_join lowers k to the right-table row count; asking for more
+  // neighbours than the corpus holds cannot produce more pairs than exist.
+  auto const k = std::min(static_cast<std::uint64_t>(std::max<std::int64_t>(req.k, 0)), right_rows);
+
+  // Global top-k finishes in a TOP_N above materialize, which cuts the whole
+  // result to k rows regardless of how many left rows fed it.
+  if (req.mode == vector_join_mode::global_top_k) { return k; }
+
+  // Per-row emits exactly k rows per left row. Threshold searches to the same
+  // depth and then drops pairs outside eps, so this is its ceiling, not its
+  // expectation — no selectivity is knowable at bind time.
+  constexpr auto max_rows = std::numeric_limits<std::uint64_t>::max();
+  if (k != 0 && left_rows > max_rows / k) { return max_rows; }
+  return left_rows * k;
 }
 
 std::vector<std::string> parse_output_columns(const duckdb::Value& v, const std::string& key)

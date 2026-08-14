@@ -1902,13 +1902,23 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   // so refuse it here rather than return scrambled rows. Bind time, not plan time: the plan
   // generator's exceptions are caught and turned into a CPU fallback, where this table
   // function refuses again with an unrelated message.
-  auto pinned_chunk_count = [&](const sirius::vss::vector_join_side& side) -> std::size_t {
-    const auto* pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
+  auto pinned_entry_for = [&](const sirius::vss::vector_join_side& side) {
+    return sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
       side.catalog, side.schema, side.table);
+  };
+  auto pinned_chunk_count = [&](const sirius::vss::vector_join_side& side) -> std::size_t {
+    const auto* pin = pinned_entry_for(side);
     if (pin == nullptr) { return 0; }
     return pin->tier == cucascade::memory::Tier::HOST ? pin->host_chunks.size()
                                                       : pin->chunk_memory_spaces.size();
   };
+
+  if (const auto* left_pin = pinned_entry_for(req.left)) {
+    result->left_rows = left_pin->num_rows;
+  }
+  if (const auto* right_pin = pinned_entry_for(req.right)) {
+    result->right_rows = right_pin->num_rows;
+  }
 
   const char* streaming_env = std::getenv("SIRIUS_VECTOR_JOIN_STREAMING");
   if (streaming_env != nullptr && std::string_view{streaming_env} == "0") {
@@ -1927,6 +1937,18 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
   names.push_back(req.output_type == vector_join_output_type::similarity ? "similarity"
                                                                          : "distance");
   return std::move(result);
+}
+
+static unique_ptr<NodeStatistics> SiriusVectorJoinCardinality(ClientContext&,
+                                                              FunctionData const* bind_data_p)
+{
+  auto const* typed = dynamic_cast<SiriusVectorJoinBindData const*>(bind_data_p);
+  if (typed == nullptr) { return nullptr; }
+  auto const rows = sirius::vss::estimate_vector_join_cardinality(
+    typed->req, typed->left_rows, typed->right_rows);
+  // Sound as a maximum in every mode: threshold only ever drops pairs from the
+  // same per-row top-k candidate set the other modes emit in full.
+  return make_uniq<NodeStatistics>(rows, rows);
 }
 
 // Execute callback
@@ -2070,6 +2092,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join.named_parameters["right_schema_name"]    = LogicalType::VARCHAR;
   vector_join.named_parameters["left_output_columns"]  = LogicalType::LIST(LogicalType::VARCHAR);
   vector_join.named_parameters["right_output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
+  vector_join.cardinality                              = SiriusVectorJoinCardinality;
   CreateTableFunctionInfo vector_join_info(vector_join);
   catalog.CreateTableFunction(transaction, vector_join_info);
 }

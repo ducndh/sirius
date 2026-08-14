@@ -75,6 +75,10 @@ struct vector_join_request {
 
 struct SiriusVectorJoinBindData : public duckdb::TableFunctionData {
   vector_join_request req;
+  /// Pinned row counts of both sides, captured at bind time so the cardinality
+  /// callback needs no catalog access. Zero if the side resolved to no pin.
+  std::uint64_t left_rows{0};
+  std::uint64_t right_rows{0};
 };
 
 }  // namespace sirius::vss

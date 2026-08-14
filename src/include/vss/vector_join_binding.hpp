@@ -44,4 +44,11 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
 /// Pull a LIST(VARCHAR) named parameter into a string vector; throws if empty.
 std::vector<std::string> parse_output_columns(const duckdb::Value& v, const std::string& key);
 
+/// Rows the join emits, from the two pinned row counts and the request. Exact for
+/// per-row and global top-k; an upper bound for threshold mode, whose selectivity
+/// is data-dependent.
+std::uint64_t estimate_vector_join_cardinality(const vector_join_request& req,
+                                               std::uint64_t left_rows,
+                                               std::uint64_t right_rows);
+
 }  // namespace sirius::vss
