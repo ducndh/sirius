@@ -1749,22 +1749,31 @@ using sirius::vss::SiriusVectorJoinBindData;
 using sirius::vss::vector_join_mode;
 using sirius::vss::vector_join_output_type;
 using sirius::vss::vector_join_search_mode;
-static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
-                                                     TableFunctionBindInput& input,
-                                                     vector<LogicalType>& return_types,
-                                                     vector<string>& names)
+//! Shared bind for both surfaces. `relational` selects the one whose probe side is a bound
+//! subquery rather than a table name: its vector column and output columns are resolved against
+//! the input relation's schema, and it needs no pin on that side at all.
+static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
+                                                   TableFunctionBindInput& input,
+                                                   vector<LogicalType>& return_types,
+                                                   vector<string>& names,
+                                                   bool relational)
 {
   auto result = make_uniq<SiriusVectorJoinBindData>();
   auto& req   = result->req;
+  // The relational form's probe is the child relation, so it always runs the scan path on that
+  // side; the caller has no say and there is no `probe_source` to set.
+  req.probe_from_scan   = relational;
+  result->probe_is_relation = relational;
 
-  // Required positional params
-  if (input.inputs.size() < 4 || input.inputs[0].IsNull() || input.inputs[1].IsNull() ||
-      input.inputs[2].IsNull() || input.inputs[3].IsNull()) {
+  // Required positional params. The relational form's first argument is the subquery, which
+  // reaches the bind as an empty placeholder with the relation's schema in input_table_*.
+  if (input.inputs.size() < 4 || (!relational && input.inputs[0].IsNull()) ||
+      input.inputs[1].IsNull() || input.inputs[2].IsNull() || input.inputs[3].IsNull()) {
     throw BinderException(
       "sirius_knn_join requires four non-NULL positional arguments: "
       "left_table, left_column, right_table, right_column");
   }
-  auto const left_table   = input.inputs[0].ToString();
+  auto const left_table   = relational ? std::string{} : input.inputs[0].ToString();
   auto const left_column  = input.inputs[1].ToString();
   auto const right_table  = input.inputs[2].ToString();
   auto const right_column = input.inputs[3].ToString();
@@ -1833,6 +1842,11 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
       }
       output_type_is_set = true;
     } else if (key == "probe_source") {
+      if (relational) {
+        throw BinderException(
+          "sirius_knn_join_rel: probe_source does not apply; the probe side is the relation "
+          "passed as the first argument");
+      }
       auto const src = StringUtil::Lower(kv.second.ToString());
       if (src == "scan") {
         req.probe_from_scan = true;
@@ -1899,18 +1913,26 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
     throw InvalidInputException("sirius_knn_join requires the Sirius context to be initialized");
   }
 
-  auto const left_dim  = resolve_vector_join_side(context,
-                                                 *sirius_ctx,
-                                                 "left",
-                                                 left_table,
-                                                 left_column,
-                                                 left_schema,
-                                                 left_out_cols,
-                                                 /*require_pin=*/!req.probe_from_scan,
-                                                 req.left,
-                                                 return_types,
-                                                 names,
-                                                 result->left_rows);
+  auto const left_dim =
+    relational ? sirius::vss::resolve_relational_probe_side(input.input_table_types,
+                                                            input.input_table_names,
+                                                            left_column,
+                                                            left_out_cols,
+                                                            req.left,
+                                                            return_types,
+                                                            names)
+               : resolve_vector_join_side(context,
+                                          *sirius_ctx,
+                                          "left",
+                                          left_table,
+                                          left_column,
+                                          left_schema,
+                                          left_out_cols,
+                                          /*require_pin=*/!req.probe_from_scan,
+                                          req.left,
+                                          return_types,
+                                          names,
+                                          result->left_rows);
   auto const right_dim = resolve_vector_join_side(context,
                                                   *sirius_ctx,
                                                   "right",
@@ -1971,6 +1993,12 @@ static unique_ptr<NodeStatistics> SiriusVectorJoinCardinality(ClientContext&,
 {
   auto const* typed = dynamic_cast<SiriusVectorJoinBindData const*>(bind_data_p);
   if (typed == nullptr) { return nullptr; }
+  // A relational probe's row count is the child's, which the bind cannot see and this callback
+  // is not given. Declining lets LogicalGet fall back to children[0]'s estimate -- the input
+  // count rather than the output's, so short by k, but derived from the actual filtered
+  // subquery instead of an unfiltered table. create_plan_knn_join applies the k itself, where
+  // the child's estimate is in hand.
+  if (typed->probe_is_relation) { return nullptr; }
   auto const rows = sirius::vss::estimate_vector_join_cardinality(
     typed->req, typed->left_rows, typed->right_rows);
   // Sound as a maximum in every mode: threshold only ever drops pairs from the
@@ -1978,11 +2006,39 @@ static unique_ptr<NodeStatistics> SiriusVectorJoinCardinality(ClientContext&,
   return make_uniq<NodeStatistics>(rows, rows);
 }
 
+static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
+                                                     TableFunctionBindInput& input,
+                                                     vector<LogicalType>& return_types,
+                                                     vector<string>& names)
+{
+  return VectorJoinBindImpl(context, input, return_types, names, /*relational=*/false);
+}
+
+static unique_ptr<FunctionData> SiriusVectorJoinRelBind(ClientContext& context,
+                                                        TableFunctionBindInput& input,
+                                                        vector<LogicalType>& return_types,
+                                                        vector<string>& names)
+{
+  return VectorJoinBindImpl(context, input, return_types, names, /*relational=*/true);
+}
+
 // Execute callback
 static void SiriusVectorJoinFunction(ClientContext&, TableFunctionInput&, DataChunk&)
 {
   throw std::runtime_error(
     "sirius_knn_join is an internal rewrite target executed on the GPU; it cannot run on the CPU");
+}
+
+// Present so the binder treats the relational form as taking a table; the operator never runs
+// on the CPU, so reaching this is the same error as above.
+static OperatorResultType SiriusVectorJoinInOutFunction(ExecutionContext&,
+                                                        TableFunctionInput&,
+                                                        DataChunk&,
+                                                        DataChunk&)
+{
+  throw std::runtime_error(
+    "sirius_knn_join_rel is an internal rewrite target executed on the GPU; it cannot run on "
+    "the CPU");
 }
 
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
@@ -2124,6 +2180,23 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join.cardinality                              = SiriusVectorJoinCardinality;
   CreateTableFunctionInfo vector_join_info(vector_join);
   catalog.CreateTableFunction(transaction, vector_join_info);
+
+  // Relational surface: the probe side is a subquery rather than a table name, so a predicate
+  // on it is DuckDB's to push into the scan before this ever binds, and the probe can be any
+  // relation -- a filtered table, a join, a CTE. Registered under its own name because a
+  // function with a TABLE parameter cannot have overloads.
+  //   sirius_knn_join_rel(TABLE (SELECT ... FROM users WHERE region = 3), 'vec',
+  //                       'items', 'vec', k => 10)
+  TableFunction vector_join_rel(
+    "sirius_knn_join_rel",
+    {LogicalType::TABLE, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+    SiriusVectorJoinFunction,
+    SiriusVectorJoinRelBind);
+  vector_join_rel.named_parameters = vector_join.named_parameters;
+  vector_join_rel.cardinality      = SiriusVectorJoinCardinality;
+  vector_join_rel.in_out_function  = SiriusVectorJoinInOutFunction;
+  CreateTableFunctionInfo vector_join_rel_info(vector_join_rel);
+  catalog.CreateTableFunction(transaction, vector_join_rel_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)

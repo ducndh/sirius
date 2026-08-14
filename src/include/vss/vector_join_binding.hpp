@@ -49,6 +49,18 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
                                       duckdb::vector<duckdb::string>& out_names,
                                       std::uint64_t& out_num_rows);
 
+/// Resolve the probe side of the relational surface against the input relation's schema
+/// instead of the catalog. There is no table to pin and no pin to restrict the columns, so the
+/// relation's own columns are what can be emitted.
+std::int64_t resolve_relational_probe_side(
+  const duckdb::vector<duckdb::LogicalType>& input_types,
+  const duckdb::vector<duckdb::string>& input_names,
+  const std::string& column_arg,
+  const std::vector<std::string>& out_cols,
+  vector_join_side& side,
+  duckdb::vector<duckdb::LogicalType>& out_types,
+  duckdb::vector<duckdb::string>& out_names);
+
 /// Pull a LIST(VARCHAR) named parameter into a string vector; throws if empty.
 std::vector<std::string> parse_output_columns(const duckdb::Value& v, const std::string& key);
 

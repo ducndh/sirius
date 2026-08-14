@@ -783,3 +783,73 @@ TEST_CASE_METHOD(VectorJoinFixture,
   unsetenv("SIRIUS_VECTOR_JOIN_REVERSE_BUILD_ORDER");
   REQUIRE(reversed == pinned);
 }
+
+// -----------------------------------------------------------------------------
+// Relational surface: the probe is a subquery, so a predicate on it is DuckDB's
+// to push into the scan before the join ever binds. That is the one thing the
+// name-taking form cannot express -- a filtered probe had to be materialized as
+// its own table first -- and it must give the same answer as doing so.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join_rel - filtered probe matches a pre-filtered table",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE rl_corpus (id INTEGER, vec FLOAT[8]);");
+  run_ok(
+    "INSERT INTO rl_corpus SELECT i, "
+    "list_transform(range(0, 8), j -> ((hash(i * 8 + j) % 100000) / 100000.0)::FLOAT)::FLOAT[8] "
+    "FROM range(20000) t(i);");
+  run_ok("CREATE TABLE rl_probe (id INTEGER, vec FLOAT[8], region INTEGER);");
+  run_ok(
+    "INSERT INTO rl_probe SELECT i, "
+    "list_transform(range(0, 8), j -> ((hash(i * 53 + j * 5 + 2) % 100000) / 100000.0)::FLOAT)"
+    "::FLOAT[8], (i % 10) FROM range(1000) t(i);");
+  // The workaround the relational form removes: the filtered probe as its own table.
+  run_ok("CREATE TABLE rl_probe_r3 AS SELECT id, vec FROM rl_probe WHERE region = 3;");
+  run_ok("CHECKPOINT;");
+
+  run_ok("SELECT * FROM pin_table(name => 'rl_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'rl_probe_r3', tier => 'gpu', format => 'duckdb');");
+  auto const workaround =
+    ok_rows(*con,
+            "SELECT left_id, right_id, distance FROM sirius_knn_join("
+            "'rl_probe_r3','vec','rl_corpus','vec', search_mode => 'exact', metric => 'l2', "
+            "k => 5, left_output_columns => ['id'], right_output_columns => ['id']);");
+  REQUIRE(workaround.size() == 100 * 5);
+  run_ok("SELECT * FROM unpin_table('rl_probe_r3');");
+
+  // Same answer with the filter pushed into the probe scan instead, and rl_probe never pinned.
+  auto const pushed =
+    ok_rows(*con,
+            "SELECT left_id, right_id, distance FROM sirius_knn_join_rel("
+            "(SELECT id, vec FROM rl_probe WHERE region = 3), 'vec', 'rl_corpus', 'vec', "
+            "search_mode => 'exact', metric => 'l2', k => 5, left_output_columns => ['id'], "
+            "right_output_columns => ['id']);");
+  REQUIRE(pushed == workaround);
+
+  // The probe can be any relation, not just a filtered scan.
+  auto const from_cte =
+    ok_rows(*con,
+            "WITH picked AS (SELECT id, vec FROM rl_probe WHERE region = 3) "
+            "SELECT left_id, right_id, distance FROM sirius_knn_join_rel("
+            "(SELECT id, vec FROM picked), 'vec', 'rl_corpus', 'vec', "
+            "search_mode => 'exact', metric => 'l2', k => 5, left_output_columns => ['id'], "
+            "right_output_columns => ['id']);");
+  REQUIRE(from_cte == workaround);
+
+  // Corpus unpinned as well: neither side needs a pin on this surface.
+  run_ok("SELECT * FROM unpin_table('rl_corpus');");
+  REQUIRE(ok_rows(*con,
+                  "SELECT left_id, right_id, distance FROM sirius_knn_join_rel("
+                  "(SELECT id, vec FROM rl_probe WHERE region = 3), 'vec', 'rl_corpus', 'vec', "
+                  "search_mode => 'exact', metric => 'l2', k => 5, "
+                  "left_output_columns => ['id'], right_output_columns => ['id'], "
+                  "build_source => 'scan');") == workaround);
+
+  // probe_source has no meaning here -- the probe is the relation.
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join_rel("
+               "(SELECT id, vec FROM rl_probe), 'vec', 'rl_corpus', 'vec', k => 5, "
+               "probe_source => 'pin');",
+               "does not apply");
+}

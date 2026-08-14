@@ -15,6 +15,7 @@
  */
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -51,6 +52,7 @@
 #include <cstdlib>
 
 #include <memory>
+#include <optional>
 #include <unordered_set>
 
 namespace sirius::planner {
@@ -160,7 +162,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   // sirius_knn_join produces its join result from two pinned tables, so it gets its own leaf
   // builder rather than being routed through the scan path.
-  if (op.function.name == "sirius_knn_join") { return create_plan_knn_join(op); }
+  if (op.function.name == "sirius_knn_join" || op.function.name == "sirius_knn_join_rel") {
+    return create_plan_knn_join(op);
+  }
 
   auto column_ids = op.GetColumnIds();
 
@@ -558,8 +562,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
 {
-  if (!op.children.empty()) {
+  auto const& bind_data_probe = op.bind_data->Cast<sirius::vss::SiriusVectorJoinBindData>();
+  if (!op.children.empty() && !bind_data_probe.probe_is_relation) {
     throw duckdb::NotImplementedException("sirius_knn_join does not take table inputs");
+  }
+  if (op.children.size() > 1) {
+    throw duckdb::NotImplementedException("sirius_knn_join_rel takes at most one input relation");
   }
   op.ResolveOperatorTypes();
 
@@ -637,13 +645,66 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       "split path (SIRIUS_VECTOR_JOIN_STREAMING=0) reads both sides from pins only");
   }
 
+  // The relational surface hands us the probe already bound and optimized -- filters pushed
+  // into its scan, projections trimmed -- so it is planned as-is and only reordered into the
+  // layout the fold expects: vector column first, then the columns the join emits.
+  std::optional<duckdb::unique_ptr<sirius::op::sirius_physical_operator>> probe_child;
+  if (!op.children.empty()) {
+    // ColumnBindingResolver stops at a LOGICAL_GET and does not descend into its children, so
+    // the subquery still carries column bindings rather than positional references when the
+    // main plan's pass is done. DuckDB resolves it separately for exactly this reason -- its
+    // own plan_get calls ResolveAndPlan on the child -- and so must this.
+    duckdb::ColumnBindingResolver child_resolver;
+    child_resolver.VisitOperator(*op.children[0]);
+    duckdb::vector<duckdb::LogicalType> child_types = op.children[0]->types;
+    auto planned = create_plan(*op.children[0]);
+
+    auto index_of = [&](const std::string& col) -> std::size_t {
+      auto const& names = op.input_table_names;
+      for (std::size_t i = 0; i < names.size(); ++i) {
+        if (names[i] == col) { return i; }
+      }
+      throw duckdb::InternalException("sirius_knn_join_rel: probe column '" + col +
+                                      "' vanished between bind and plan");
+    };
+
+    duckdb::vector<duckdb::LogicalType> types;
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
+    auto add = [&](std::size_t idx) {
+      types.push_back(child_types[idx]);
+      exprs.push_back(
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_types[idx], idx));
+    };
+    add(index_of(req.left.column));
+    for (auto const& col : req.left.output_columns) {
+      add(index_of(col));
+    }
+    probe_child = push_projection(std::move(planned),
+                                  sirius::from_duckdb_vec(types),
+                                  translate_expressions(std::move(exprs)),
+                                  op.children[0]->estimated_cardinality);
+  }
+
+  // With a relational probe the bind could not know the row count, so the cardinality callback
+  // declined and DuckDB fell back to the child's estimate -- the join's input, not its output.
+  // The child's estimate is in hand here, so the k is applied where it can be.
+  if (probe_child.has_value()) {
+    auto const child_rows = static_cast<std::size_t>(op.children[0]->estimated_cardinality);
+    auto const k          = static_cast<std::size_t>(std::max<std::int64_t>(req.k, 0));
+    op.estimated_cardinality =
+      req.mode == sirius::vss::vector_join_mode::global_top_k ? k : child_rows * k;
+  }
+
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> join_stage;
   if (use_streaming) {
     auto stream_op = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_stream>(
       joined_types(), op.estimated_cardinality, req, &scan_manager, build_side, probe_side);
     // Probe first, then corpus: wrap_vector_join walks the children in that order to decide
     // which is the build side, matching wrap_join's probe=0 / build=1 convention.
-    if (req.probe_from_scan) { stream_op->children.push_back(make_side_scan(context, req.left)); }
+    if (req.probe_from_scan) {
+      stream_op->children.push_back(
+        probe_child.has_value() ? std::move(*probe_child) : make_side_scan(context, req.left));
+    }
     if (req.build_from_scan) { stream_op->children.push_back(make_side_scan(context, req.right)); }
     join_stage = std::move(stream_op);
   } else {

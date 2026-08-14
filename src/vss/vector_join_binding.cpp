@@ -126,6 +126,51 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   return dim;
 }
 
+std::int64_t resolve_relational_probe_side(
+  const duckdb::vector<duckdb::LogicalType>& input_types,
+  const duckdb::vector<duckdb::string>& input_names,
+  const std::string& column_arg,
+  const std::vector<std::string>& out_cols,
+  vector_join_side& side,
+  duckdb::vector<duckdb::LogicalType>& out_types,
+  duckdb::vector<duckdb::string>& out_names)
+{
+  side.column = column_arg;
+  // catalog/schema/table stay empty: there is no table behind this side, and every path that
+  // would look one up is the pinned path, which this side never takes.
+
+  auto index_of = [&](const std::string& col) -> std::size_t {
+    for (std::size_t i = 0; i < input_names.size(); ++i) {
+      if (input_names[i] == col) { return i; }
+    }
+    throw duckdb::BinderException("sirius_knn_join_rel: column '" + col +
+                                  "' is not produced by the probe relation");
+  };
+
+  auto const& vec_type = input_types[index_of(side.column)];
+  if (vec_type.id() != duckdb::LogicalTypeId::ARRAY ||
+      duckdb::ArrayType::GetChildType(vec_type).id() != duckdb::LogicalTypeId::FLOAT) {
+    throw duckdb::BinderException("sirius_knn_join_rel: probe column '" + side.column +
+                                  "' must be a FLOAT[N] array column");
+  }
+
+  if (out_cols.empty()) {
+    // Everything the relation produces, minus the vector column: it is the join's input, not
+    // usually something the caller wants echoed back, and it is by far the widest column.
+    for (auto const& name : input_names) {
+      if (name != side.column) { side.output_columns.push_back(name); }
+    }
+  } else {
+    side.output_columns = out_cols;
+  }
+
+  for (auto const& col : side.output_columns) {
+    out_types.push_back(input_types[index_of(col)]);
+    out_names.push_back("left_" + col);
+  }
+  return static_cast<std::int64_t>(duckdb::ArrayType::GetSize(vec_type));
+}
+
 std::uint64_t estimate_vector_join_cardinality(const vector_join_request& req,
                                                std::uint64_t left_rows,
                                                std::uint64_t right_rows)

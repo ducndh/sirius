@@ -87,6 +87,9 @@ struct SiriusVectorJoinBindData : public duckdb::TableFunctionData {
   /// callback needs no catalog access. Zero if the side resolved to no pin.
   std::uint64_t left_rows{0};
   std::uint64_t right_rows{0};
+  /// True for the relational surface, whose probe is a bound subquery. Its row count is the
+  /// child's and is unknown here, which is why the cardinality callback declines for it.
+  bool probe_is_relation{false};
 };
 
 }  // namespace sirius::vss
