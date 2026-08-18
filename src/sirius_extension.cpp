@@ -2074,6 +2074,10 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
     }
     if (key == "k") {
       req.k = kv.second.GetValue<int64_t>();
+    } else if (key == "clustering") {
+      req.clustering = kv.second.ToString();
+    } else if (key == "cluster_column") {
+      req.build_cluster_column = kv.second.ToString();
     } else if (key == "n_clusters") {
       req.n_clusters = kv.second.GetValue<int64_t>();
     } else if (key == "n_probes") {
@@ -2154,16 +2158,49 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   // exhaustive search while the query said otherwise -- results indistinguishable from an
   // approximate run that happened to be perfect. Refusing is the only honest answer until
   // there is a real approximate path.
-  if (req.search_mode == vector_join_search_mode::approx) {
+  // An approximate run is only honest when something actually prunes. The clustering is what
+  // does that, so approx without one would again be an exhaustive search calling itself
+  // approximate -- the exact state the refusal below existed to prevent.
+  if (req.search_mode == vector_join_search_mode::approx && req.clustering.empty()) {
     throw BinderException(
-      "sirius_knn_join: search_mode => 'approx' is not implemented; it would run an exhaustive "
-      "search and report itself as approximate. Use 'exact' or 'exact-gemm'");
+      "sirius_knn_join: search_mode => 'approx' needs clustering => '<name>' from "
+      "sirius_kmeans_fit, and cluster_column => '<col>' naming the corpus's cluster id; without "
+      "one it would run an exhaustive search and report itself as approximate");
   }
-  if (req.n_clusters > 0 || req.n_probes > 1) {
+  if (!req.clustering.empty()) {
+    if (req.search_mode != vector_join_search_mode::approx) {
+      throw BinderException(
+        "sirius_knn_join: clustering only applies under search_mode => 'approx'");
+    }
+    if (req.build_cluster_column.empty()) {
+      throw BinderException(
+        "sirius_knn_join: clustering requires cluster_column => '<col>', the corpus column "
+        "holding each row's cluster id");
+    }
+    if (req.build_from_scan) {
+      throw BinderException(
+        "sirius_knn_join: clustering needs the corpus pinned; the build-phase path cannot "
+        "supply per-chunk cluster ranges yet");
+    }
+    // Checked here rather than left to the planner: a throw during planning is caught as a
+    // "this query cannot run on the GPU" signal and turns into a CPU fallback, which then fails
+    // with an unrelated message. At bind it is a plain, accurate error.
+    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (sirius_ctx && sirius::vss::find_clustering_centroids(*sirius_ctx, req.clustering) ==
+                        nullptr) {
+      throw BinderException("sirius_knn_join: no clustering named '" + req.clustering +
+                            "'; run sirius_kmeans_fit first");
+    }
+  }
+  // n_clusters describes a clustering, which sirius_kmeans_fit owns; the join only consumes one.
+  if (req.n_clusters > 0) {
     throw BinderException(
-      "sirius_knn_join: n_clusters and n_probes only mean anything under an approximate search, "
-      "which is not implemented; they are ignored, so setting them is refused rather than "
-      "silently disregarded");
+      "sirius_knn_join: n_clusters belongs to sirius_kmeans_fit, which trains the clustering; "
+      "the join takes clustering => '<name>' and probes it with n_probes");
+  }
+  if (req.n_probes > 1 && req.clustering.empty()) {
+    throw BinderException(
+      "sirius_knn_join: n_probes only means anything with clustering => '<name>'");
   }
   if (req.eps < 0.0) { throw BinderException("sirius_knn_join: eps must be >= 0"); }
   if (req.metric != "l2" && req.metric != "cosine") {
@@ -2536,6 +2573,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
     SiriusVectorJoinFunction,
     SiriusVectorJoinBind);
+  vector_join.named_parameters["clustering"]           = LogicalType::VARCHAR;
+  vector_join.named_parameters["cluster_column"]       = LogicalType::VARCHAR;
   vector_join.named_parameters["k"]                    = LogicalType::BIGINT;
   vector_join.named_parameters["metric"]               = LogicalType::VARCHAR;
   vector_join.named_parameters["search_mode"]          = LogicalType::VARCHAR;

@@ -554,13 +554,14 @@ TEST_CASE_METHOD(VectorJoinFixture,
 }
 
 // -----------------------------------------------------------------------------
-// Knobs that describe an approximate search must be refused while none exists.
-// Accepting them ran an exhaustive search under a query that claimed otherwise,
+// An approximate search must be backed by something that actually prunes. Without
+// a clustering the join would run exhaustively under a query that claimed otherwise,
 // which is indistinguishable in the results from an approximate run that got
-// lucky -- the one failure mode a user cannot detect.
+// lucky -- the one failure mode a user cannot detect. The clustered path that lifts
+// this refusal is covered in test_gpu_execution_kmeans.cpp.
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
-                 "sirius_knn_join - approximate knobs are refused, not ignored",
+                 "sirius_knn_join - approximate knobs are refused without a clustering",
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
   run_ok("CREATE TABLE ap_corpus (id INTEGER, vec FLOAT[3]);");
@@ -574,15 +575,15 @@ TEST_CASE_METHOD(VectorJoinFixture,
   expect_error(*con,
                "SELECT * FROM sirius_knn_join('ap_probe','vec','ap_corpus','vec', "
                "search_mode => 'approx', k => 4);",
-               "not implemented");
+               "needs clustering =>");
   expect_error(*con,
                "SELECT * FROM sirius_knn_join('ap_probe','vec','ap_corpus','vec', "
                "n_clusters => 8, k => 4);",
-               "approximate search");
+               "belongs to sirius_kmeans_fit");
   expect_error(*con,
                "SELECT * FROM sirius_knn_join('ap_probe','vec','ap_corpus','vec', "
                "n_probes => 4, k => 4);",
-               "approximate search");
+               "only means anything with clustering");
 
   // The defaults these guard must keep working.
   REQUIRE(ok_rows(*con,

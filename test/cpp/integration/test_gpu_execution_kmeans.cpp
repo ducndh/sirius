@@ -25,6 +25,7 @@
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,14 @@ std::int64_t scalar_i64(duckdb::Connection& con, const std::string& sql)
 {
   auto r = query_ok(con, sql);
   return r->GetValue(0, 0).GetValue<std::int64_t>();
+}
+
+// Sorted rows from a query that must succeed, so two result sets compare independent of the
+// order rows happen to arrive in.
+std::vector<std::vector<std::string>> ok_rows(duckdb::Connection& con, const std::string& sql)
+{
+  auto r = query_ok(con, sql);
+  return sirius::test::GpuExecutionFixture::collect_rows(*r, /*sort=*/true);
 }
 
 void expect_error(duckdb::Connection& con, const std::string& sql, const std::string& needle)
@@ -272,4 +281,140 @@ TEST_CASE_METHOD(KMeansFixture,
   con->Query("SET gpu_execution = true;");
 
   CHECK(disagreements == 0);
+}
+
+// -----------------------------------------------------------------------------
+// The approximate join. Its first gate is not recall but exactness: probing every
+// cluster skips nothing, so the answer must match the exhaustive join it is built on.
+// -----------------------------------------------------------------------------
+
+namespace {
+
+// A corpus stored in cluster order, plus a probe table, plus a clustering over both.
+void create_clustered_join(KMeansFixture& fixture,
+                           duckdb::Connection& con,
+                           const std::string& prefix,
+                           int n_clusters)
+{
+  auto const corpus = prefix + "_corpus";
+  auto const probe  = prefix + "_probe";
+  auto const clust  = prefix + "_c";
+
+  fixture.run_ok("CREATE TABLE " + prefix + "_raw (id INTEGER, vec FLOAT[3]);");
+  fixture.run_ok("INSERT INTO " + prefix + "_raw SELECT i, "
+                 "[(i % 97)::float, ((i * 7) % 89)::float, ((i * 13) % 83)::float] "
+                 "FROM range(4000) t(i);");
+  fixture.run_ok("CREATE TABLE " + probe + " (id INTEGER, vec FLOAT[3]);");
+  fixture.run_ok("INSERT INTO " + probe + " SELECT i, "
+                 "[((i * 3) % 97)::float, ((i * 11) % 89)::float, ((i * 5) % 83)::float] "
+                 "FROM range(200) t(i);");
+  fixture.run_ok("CHECKPOINT;");
+
+  // Cluster the raw table, then materialize a copy ordered by cluster so each pinned chunk
+  // holds a narrow span of cluster ids -- which is what gives the join anything to skip.
+  fixture.run_ok("SELECT * FROM pin_table(name => '" + prefix +
+                 "_raw', tier => 'gpu', format => 'duckdb');");
+  fixture.run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_raw','vec', name => '" + clust +
+                 "', n_clusters => " + std::to_string(n_clusters) + ");");
+  fixture.run_ok("CREATE TABLE " + prefix + "_asg AS SELECT * FROM sirius_kmeans_assign('" +
+                 prefix + "_raw','vec','" + clust + "', n_probes => 1);");
+  fixture.run_ok("CREATE TABLE " + corpus + " AS SELECT r.id, r.vec, a.cluster_id FROM " + prefix +
+                 "_raw r JOIN " + prefix + "_asg a ON r.rowid = a.row_id ORDER BY a.cluster_id;");
+  fixture.run_ok("CHECKPOINT;");
+  fixture.run_ok("SELECT * FROM pin_table(name => '" + corpus +
+                 "', tier => 'gpu', format => 'duckdb');");
+  fixture.run_ok("SELECT * FROM pin_table(name => '" + probe +
+                 "', tier => 'gpu', format => 'duckdb');");
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_knn_join approx probing every cluster equals the exhaustive join",
+                 "[integration][gpu_execution][array][vss][kmeans][approx]")
+{
+  constexpr int n_clusters = 8;
+  create_clustered_join(*this, *con, "apx", n_clusters);
+
+  auto const exhaustive = ok_rows(*con,
+                                  "SELECT left_id, right_id FROM sirius_knn_join("
+                                  "'apx_probe','vec','apx_corpus','vec', "
+                                  "search_mode => 'exact-gemm', metric => 'l2', k => 5);");
+
+  // n_probes == n_clusters wants every cluster, so no chunk can be skipped and the approximate
+  // path must reproduce the exhaustive answer exactly. This is what catches a mistake in the
+  // neighbour-id base, which pruning would otherwise hide as a plausible-looking wrong answer.
+  auto const probe_all = ok_rows(*con,
+                                 "SELECT left_id, right_id FROM sirius_knn_join("
+                                 "'apx_probe','vec','apx_corpus','vec', "
+                                 "search_mode => 'approx', metric => 'l2', k => 5, "
+                                 "clustering => 'apx_c', cluster_column => 'cluster_id', "
+                                 "n_probes => " + std::to_string(n_clusters) + ");");
+
+  REQUIRE(probe_all == exhaustive);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_knn_join approx returns fewer, still-valid neighbours when pruning",
+                 "[integration][gpu_execution][array][vss][kmeans][approx]")
+{
+  create_clustered_join(*this, *con, "apy", 8);
+
+  // One cluster per probe row prunes hard. Recall is expected to drop -- that is the trade --
+  // but every pair returned must still be a real corpus row, and every probe row must be
+  // answered, which is what separates "approximate" from "broken".
+  auto const pruned = ok_rows(*con,
+                              "SELECT left_id, right_id FROM sirius_knn_join("
+                              "'apy_probe','vec','apy_corpus','vec', "
+                              "search_mode => 'approx', metric => 'l2', k => 5, "
+                              "clustering => 'apy_c', cluster_column => 'cluster_id', "
+                              "n_probes => 1);");
+  CHECK(pruned.size() == 200 * 5);
+
+  // Counted here rather than in SQL: an aggregate directly over the join falls back to the CPU,
+  // which cannot execute the rewrite target at all.
+  std::set<std::string> answered;
+  std::set<std::string> neighbours;
+  for (auto const& row : pruned) {
+    answered.insert(row.at(0));
+    neighbours.insert(row.at(1));
+  }
+  // Every probe row is answered...
+  CHECK(answered.size() == 200);
+
+  // ...and every neighbour is a real corpus row, which is what a mis-based neighbour id would
+  // break: pruning changes which rows come back, never whether they exist.
+  auto const corpus_ids = ok_rows(*con, "SELECT id FROM apy_corpus;");
+  std::set<std::string> valid;
+  for (auto const& row : corpus_ids) {
+    valid.insert(row.at(0));
+  }
+  for (auto const& n : neighbours) {
+    CHECK(valid.count(n) == 1);
+  }
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_knn_join rejects approx without a usable clustering",
+                 "[integration][gpu_execution][array][vss][kmeans][approx]")
+{
+  create_two_group_table(*this, "apz_corpus");
+
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('apz_corpus','vec','apz_corpus','vec', "
+               "search_mode => 'approx', k => 2);",
+               "needs clustering =>");
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('apz_corpus','vec','apz_corpus','vec', "
+               "search_mode => 'approx', k => 2, clustering => 'nope');",
+               "requires cluster_column =>");
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('apz_corpus','vec','apz_corpus','vec', "
+               "k => 2, clustering => 'nope', cluster_column => 'c');",
+               "only applies under search_mode");
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('apz_corpus','vec','apz_corpus','vec', "
+               "search_mode => 'approx', k => 2, clustering => 'nope', "
+               "cluster_column => 'cluster_id');",
+               "no clustering named");
 }

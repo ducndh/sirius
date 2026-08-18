@@ -44,6 +44,7 @@
 #include "vss/sirius_physical_vector_join_materialize.hpp"
 #include "vss/sirius_physical_vector_join_reduce_local.hpp"
 #include "vss/sirius_physical_vector_join_select.hpp"
+#include "vss/kmeans_functions.hpp"
 #include "vss/sirius_physical_vector_join_stream.hpp"
 #include "vss/vector_join.hpp"
 
@@ -737,8 +738,25 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> join_stage;
   if (use_streaming) {
+    // Resolved here rather than inside the operator: the operator holds only a scan manager and
+    // has no route to the session's index cache, while the planner does. The cache owns the
+    // centroids, so the operator borrows them for the life of the query.
+    const cudf::column* centroids = nullptr;
+    if (!req.clustering.empty()) {
+      auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      if (!sirius_ctx) {
+        throw duckdb::InvalidInputException(
+          "sirius_knn_join: clustering requires the Sirius context to be initialized");
+      }
+      centroids = sirius::vss::find_clustering_centroids(*sirius_ctx, req.clustering);
+      if (centroids == nullptr) {
+        throw duckdb::InvalidInputException("sirius_knn_join: no clustering named '" +
+                                            req.clustering + "'; run sirius_kmeans_fit first");
+      }
+    }
     auto stream_op = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_stream>(
-      joined_types(), op.estimated_cardinality, req, &scan_manager, build_side, probe_side);
+      joined_types(), op.estimated_cardinality, req, &scan_manager, build_side, probe_side,
+      centroids);
     // Probe first, then corpus: wrap_vector_join walks the children in that order to decide
     // which is the build side, matching wrap_join's probe=0 / build=1 convention.
     if (req.probe_from_scan) {

@@ -201,7 +201,8 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
     sirius::vss::vector_join_request request,
     sirius::scan_manager::sirius_scan_manager* scan_manager,
     std::shared_ptr<sirius::vss::materialized_side_buffer> build_side = nullptr,
-    std::shared_ptr<sirius::vss::materialized_side_buffer> probe_side = nullptr);
+    std::shared_ptr<sirius::vss::materialized_side_buffer> probe_side = nullptr,
+    const cudf::column* centroids                                     = nullptr);
 
   [[nodiscard]] const sirius::vss::vector_join_request& request() const { return _request; }
 
@@ -242,6 +243,11 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// @ref build_side_ready_locked, so callers must check that first.
   void ensure_initialized_locked();
 
+  /// Fill @c _chunk_cluster_ranges on first use. Deferred out of init because staging a chunk
+  /// needs a memory space, which only a running task supplies.
+  void ensure_cluster_ranges(::cucascade::memory::memory_space& space,
+                             rmm::cuda_stream_view stream);
+
   /// Whether the build port is wired and its producing pipeline has finished. Always true on
   /// the pinned path. Caller holds _op_mutex.
   bool build_side_ready_locked();
@@ -261,6 +267,17 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
 
   sirius::vss::vector_join_request _request;
   sirius::scan_manager::sirius_scan_manager* _scan_manager;
+  /// Centroids of @c _request.clustering, owned by the session's index cache and valid until
+  /// that entry is dropped. Null for an exhaustive join, which is what selects the fold's
+  /// visit-everything path.
+  const cudf::column* _centroids{nullptr};
+  /// Per corpus chunk, the smallest and largest cluster id it holds, computed once at init.
+  /// A chunk is skipped when a probe batch wants no cluster inside its range.
+  ///
+  /// The test is conservative rather than exact: a chunk holding a sparse set of ids still
+  /// reports a contiguous span, so an unsorted corpus simply stops pruning. Correctness never
+  /// depends on the corpus being stored in cluster order -- only the speedup does.
+  std::vector<std::pair<std::int32_t, std::int32_t>> _chunk_cluster_ranges;
 
   std::mutex _op_mutex;
   bool _initialized{false};

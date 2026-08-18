@@ -79,6 +79,14 @@ struct vector_join_request {
   /// Same for the probe side (`probe_source => 'scan'`). Independent of build_from_scan so each
   /// side can be A/B'd against its pinned path on its own.
   bool probe_from_scan{false};
+  /// Name of a clustering trained by `sirius_kmeans_fit`, shared by both sides. Empty means an
+  /// exhaustive join. When set, each probe batch visits only the corpus chunks holding clusters
+  /// its rows were assigned to, which is what makes the join approximate.
+  std::string clustering;
+  /// Column on the corpus table holding each row's cluster id, as emitted by
+  /// `sirius_kmeans_assign`. Pruning is only effective when the corpus is stored in cluster
+  /// order, since a chunk is skipped on its [min, max] cluster range.
+  std::string build_cluster_column;
 };
 
 struct SiriusVectorJoinBindData : public duckdb::TableFunctionData {
