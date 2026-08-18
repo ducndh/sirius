@@ -24,6 +24,8 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <raft/core/device_resources.hpp>
+
 #include <cuvs/distance/distance.hpp>
 
 #include <cstdint>
@@ -162,10 +164,13 @@ struct cluster_assignment {
  * @p vectors and @p centroids must share @p dim. @p metric must be the one the centroids were
  * trained under; a mismatch silently assigns rows to the wrong clusters rather than failing.
  *
- * Enqueued on @p stream and not synchronized: the returned columns are only readable on the
- * host after the caller syncs.
+ * Enqueued on @p res's stream and not synchronized: the returned columns are only readable on
+ * the host after the caller syncs. @p res is the caller's because it must outlive that pending
+ * work -- a handle destroyed here would free its cuVS workspace while kernels still read it --
+ * and because reusing one handle across batches pays its workspace setup once.
  */
-[[nodiscard]] cluster_assignment assign_to_centroids(cudf::column_view const& vectors,
+[[nodiscard]] cluster_assignment assign_to_centroids(raft::device_resources const& res,
+                                                     cudf::column_view const& vectors,
                                                      cudf::column_view const& centroids,
                                                      std::int64_t dim,
                                                      assignment_spec const& spec,

@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -180,7 +181,8 @@ std::unique_ptr<cudf::column> train_centroids(std::vector<cudf::column_view> con
                                  rmm::device_buffer{});
 }
 
-cluster_assignment assign_to_centroids(cudf::column_view const& vectors,
+cluster_assignment assign_to_centroids(raft::device_resources const& res,
+                                       cudf::column_view const& vectors,
                                        cudf::column_view const& centroids,
                                        std::int64_t dim,
                                        assignment_spec const& spec,
@@ -201,10 +203,21 @@ cluster_assignment assign_to_centroids(cudf::column_view const& vectors,
   auto const requested = radius_mode && spec.max_probes > 0 ? spec.max_probes : spec.n_probes;
   auto const depth     = std::clamp<std::int64_t>(requested, 1, n_clusters);
 
-  raft::device_resources res{stream};
+  // A cudf column cannot hold more than 2^31 rows, and the edge list is n_rows * depth long, so
+  // a large enough table times a deep enough probe overflows the column rather than the maths.
+  // Caught here because the truncation is silent: the cast would produce a short, wrong result.
+  auto const edges = n_rows * depth;
+  if (edges > static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max())) {
+    throw std::invalid_argument(
+      "assign_to_centroids: " + std::to_string(n_rows) + " rows x " + std::to_string(depth) +
+      " clusters is " + std::to_string(edges) +
+      " edges, which exceeds what a cudf column can hold; assign in smaller chunks or lower "
+      "n_probes/max_probes");
+  }
+
   auto knn = brute_force_knn(res, centers, queries, depth, metric, mr);
 
-  auto const total = static_cast<cudf::size_type>(n_rows * depth);
+  auto const total = static_cast<cudf::size_type>(edges);
   cudf::numeric_scalar<std::int32_t> const zero(0, true, stream);
   cudf::numeric_scalar<std::int32_t> const one(1, true, stream);
   cudf::numeric_scalar<std::int32_t> const depth32(static_cast<std::int32_t>(depth), true, stream);

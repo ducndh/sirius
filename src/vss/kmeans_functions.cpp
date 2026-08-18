@@ -27,11 +27,16 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/filling.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+
+#include <raft/core/device_resources.hpp>
 
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
@@ -227,6 +232,7 @@ std::unique_ptr<cucascade::host_data_representation> run_kmeans_assign(
   telemetry::batch_telemetry_info const telemetry_info{};
   auto const n_chunks = pinned_column_chunk_count(*c.pin, req.column);
 
+  raft::device_resources res{stream};
   std::vector<std::unique_ptr<cudf::column>> row_ids;
   std::vector<std::unique_ptr<cudf::column>> cluster_ids;
   std::vector<std::unique_ptr<cudf::column>> distances;
@@ -237,7 +243,8 @@ std::unique_ptr<cucascade::host_data_representation> run_kmeans_assign(
     auto const rows = static_cast<std::int64_t>(staged.view.size());
     if (rows == 0) { continue; }
 
-    auto assignment = assign_to_centroids(staged.view,
+    auto assignment = assign_to_centroids(res,
+                                          staged.view,
                                           centroids->view(),
                                           req.dim,
                                           req.spec,
@@ -273,6 +280,66 @@ std::unique_ptr<cucascade::host_data_representation> run_kmeans_assign(
   auto table = std::make_unique<cudf::table>(std::move(columns));
 
   return vss_table_to_host(*c.space, *c.host_space, stream, std::move(table));
+}
+
+std::unique_ptr<cucascade::host_data_representation> run_kmeans_centroids(
+  duckdb::SiriusContext& ctx, const std::string& clustering)
+{
+  static const std::string fn = "sirius_kmeans_centroids";
+
+  auto& memory_manager = ctx.get_memory_manager();
+  auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  auto host_spaces     = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  if (gpu_spaces.empty() || host_spaces.empty()) {
+    throw duckdb::InvalidInputException(fn + ": no GPU or HOST memory space available");
+  }
+  auto* space = const_cast<cucascade::memory::memory_space*>(gpu_spaces.front());
+  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
+  rmm::cuda_stream stream_owner;
+  auto stream   = stream_owner.view();
+  auto const mr = space->get_default_allocator();
+
+  const auto* entry = find_clustering_entry(ctx, clustering);
+  if (entry == nullptr) {
+    throw duckdb::InvalidInputException(fn + ": no clustering named '" + clustering + "'");
+  }
+  const auto* centroids = find_clustering_centroids(ctx, clustering);
+  if (centroids == nullptr) {
+    throw duckdb::InvalidInputException(fn + ": clustering '" + clustering +
+                                        "' holds no centroids");
+  }
+
+  auto const dim    = entry->meta.dim;
+  auto const values = cudf::lists_column_view(centroids->view()).child();
+  auto const total  = values.size();
+
+  cudf::numeric_scalar<std::int32_t> const zero(0, true, stream);
+  cudf::numeric_scalar<std::int32_t> const one(1, true, stream);
+  cudf::numeric_scalar<std::int32_t> const width(static_cast<std::int32_t>(dim), true, stream);
+
+  // Position in the flattened [n_clusters, dim] buffer splits into its two coordinates by
+  // division and remainder, which is what puts the centroids in long form.
+  auto const positions = cudf::sequence(total, zero, one, stream, mr);
+  auto cluster_ids     = cudf::binary_operation(positions->view(),
+                                            width,
+                                            cudf::binary_operator::DIV,
+                                            cudf::data_type{cudf::type_id::INT32},
+                                            stream,
+                                            mr);
+  auto dim_index       = cudf::binary_operation(positions->view(),
+                                          width,
+                                          cudf::binary_operator::MOD,
+                                          cudf::data_type{cudf::type_id::INT32},
+                                          stream,
+                                          mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(cluster_ids));
+  columns.push_back(std::move(dim_index));
+  columns.push_back(std::make_unique<cudf::column>(values, stream, mr));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+
+  return vss_table_to_host(*space, *host_spaces.front(), stream, std::move(table));
 }
 
 }  // namespace sirius::vss

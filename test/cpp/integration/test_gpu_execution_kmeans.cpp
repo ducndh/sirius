@@ -236,3 +236,40 @@ TEST_CASE_METHOD(KMeansFixture,
                "SELECT * FROM sirius_kmeans_assign('kmh_wide','vec','kmh_c');",
                "is over FLOAT[3]");
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_kmeans_assign matches a CPU-computed nearest centroid",
+                 "[integration][gpu_execution][array][vss][kmeans]")
+{
+  create_two_group_table(*this, "kmo_corpus");
+  run_ok("SELECT * FROM sirius_kmeans_fit('kmo_corpus','vec', name => 'kmo_c', n_clusters => 4);");
+  run_ok("CREATE TABLE kmo_cent AS SELECT * FROM sirius_kmeans_centroids('kmo_c');");
+  run_ok(
+    "CREATE TABLE kmo_asg AS SELECT * FROM sirius_kmeans_assign('kmo_corpus','vec','kmo_c', "
+    "n_probes => 1);");
+
+  // The oracle is DuckDB on the CPU: pivot the centroids back to one row each, compute every
+  // (row, centroid) distance in SQL, and keep each row's argmin. Nothing here shares code with
+  // the GPU path, so agreement is evidence the assignment is right rather than self-consistent.
+  con->Query("SET gpu_execution = false;");
+  auto const disagreements = scalar_i64(
+    *con,
+    "WITH cent AS ("
+    "  SELECT cluster_id,"
+    "         max(CASE WHEN dim_index = 0 THEN value END) AS c0,"
+    "         max(CASE WHEN dim_index = 1 THEN value END) AS c1,"
+    "         max(CASE WHEN dim_index = 2 THEN value END) AS c2"
+    "  FROM kmo_cent GROUP BY cluster_id),"
+    "ranked AS ("
+    "  SELECT t.rowid AS row_id, k.cluster_id,"
+    "         row_number() OVER (PARTITION BY t.rowid ORDER BY"
+    "           (t.vec[1]-k.c0)*(t.vec[1]-k.c0) + (t.vec[2]-k.c1)*(t.vec[2]-k.c1)"
+    "         + (t.vec[3]-k.c2)*(t.vec[3]-k.c2), k.cluster_id) AS rn"
+    "  FROM kmo_corpus t CROSS JOIN cent k),"
+    "oracle AS (SELECT row_id, cluster_id FROM ranked WHERE rn = 1)"
+    "SELECT count(*) FROM oracle o JOIN kmo_asg a USING (row_id)"
+    "  WHERE o.cluster_id <> a.cluster_id;");
+  con->Query("SET gpu_execution = true;");
+
+  CHECK(disagreements == 0);
+}

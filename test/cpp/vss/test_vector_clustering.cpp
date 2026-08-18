@@ -20,6 +20,9 @@
 // sirius
 #include <vss/vector_clustering.hpp>
 
+// raft
+#include <raft/core/device_resources.hpp>
+
 // cudf
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -131,6 +134,7 @@ TEST_CASE("train_centroids places one centroid per separated group", "[vss]")
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
   auto const mr                 = cudf::get_current_device_resource_ref();
+  raft::device_resources res{stream};
 
   auto const vectors = make_vectors(two_group_dataset(), dim);
 
@@ -159,6 +163,7 @@ TEST_CASE("train_centroids samples across every chunk", "[vss]")
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
   auto const mr                 = cudf::get_current_device_resource_ref();
+  raft::device_resources res{stream};
 
   // One group per chunk, so a fit that read only the first chunk could not place a centroid
   // on the second group.
@@ -193,6 +198,7 @@ TEST_CASE("assign_to_centroids emits one edge per row at n_probes 1", "[vss]")
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
   auto const mr                 = cudf::get_current_device_resource_ref();
+  raft::device_resources res{stream};
 
   auto const vectors   = make_vectors(two_group_dataset(), dim);
   auto const centroids = make_vectors({0.5f, 0.5f, 10.5f, 10.5f}, dim);
@@ -200,7 +206,7 @@ TEST_CASE("assign_to_centroids emits one edge per row at n_probes 1", "[vss]")
   assignment_spec spec;
   spec.n_probes = 1;
   auto const assignment = assign_to_centroids(
-    vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
+    res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
   stream.synchronize();
 
   REQUIRE(assignment.row_ids->size() == 8);
@@ -217,6 +223,7 @@ TEST_CASE("assign_to_centroids offsets row ids by the chunk base", "[vss]")
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
   auto const mr                 = cudf::get_current_device_resource_ref();
+  raft::device_resources res{stream};
 
   auto const vectors   = make_vectors({0.0f, 0.0f, 10.0f, 10.0f}, dim);
   auto const centroids = make_vectors({0.5f, 0.5f, 10.5f, 10.5f}, dim);
@@ -224,7 +231,7 @@ TEST_CASE("assign_to_centroids offsets row ids by the chunk base", "[vss]")
   assignment_spec spec;
   spec.n_probes = 1;
   auto const assignment = assign_to_centroids(
-    vectors->view(), centroids->view(), dim, spec, 1000, Metric::L2SqrtExpanded, stream, mr);
+    res, vectors->view(), centroids->view(), dim, spec, 1000, Metric::L2SqrtExpanded, stream, mr);
   stream.synchronize();
 
   auto const rows = to_host<std::int64_t>(assignment.row_ids->view());
@@ -238,6 +245,7 @@ TEST_CASE("assign_to_centroids repeats a row once per probe and orders by distan
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
   auto const mr                 = cudf::get_current_device_resource_ref();
+  raft::device_resources res{stream};
 
   auto const vectors   = make_vectors({0.0f, 0.0f}, dim);
   auto const centroids = make_vectors({0.5f, 0.5f, 10.5f, 10.5f, 100.5f, 100.5f}, dim);
@@ -245,7 +253,7 @@ TEST_CASE("assign_to_centroids repeats a row once per probe and orders by distan
   assignment_spec spec;
   spec.n_probes = 3;
   auto const assignment = assign_to_centroids(
-    vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
+    res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
   stream.synchronize();
 
   REQUIRE(assignment.row_ids->size() == 3);
@@ -263,6 +271,7 @@ TEST_CASE("assign_to_centroids caps probes at the centroid count", "[vss]")
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
   auto const mr                 = cudf::get_current_device_resource_ref();
+  raft::device_resources res{stream};
 
   auto const vectors   = make_vectors({0.0f, 0.0f}, dim);
   auto const centroids = make_vectors({0.5f, 0.5f, 10.5f, 10.5f}, dim);
@@ -270,7 +279,7 @@ TEST_CASE("assign_to_centroids caps probes at the centroid count", "[vss]")
   assignment_spec spec;
   spec.n_probes = 10;
   auto const assignment = assign_to_centroids(
-    vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
+    res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
   stream.synchronize();
 
   CHECK(assignment.row_ids->size() == 2);
@@ -281,6 +290,7 @@ TEST_CASE("assign_to_centroids radius mode keeps only near-tied centroids", "[vs
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
   auto const mr                 = cudf::get_current_device_resource_ref();
+  raft::device_resources res{stream};
 
   // The query sits at (0,0): centroid 0 is at distance 1, centroid 1 at 1.1, centroid 2 at 50.
   auto const vectors   = make_vectors({0.0f, 0.0f}, dim);
@@ -290,7 +300,7 @@ TEST_CASE("assign_to_centroids radius mode keeps only near-tied centroids", "[vs
   spec.radius_factor = 0.2;  // keeps everything within 1.2x of the nearest
   spec.max_probes    = 3;
   auto const assignment = assign_to_centroids(
-    vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
+    res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
   stream.synchronize();
 
   REQUIRE(assignment.row_ids->size() == 2);
@@ -303,6 +313,7 @@ TEST_CASE("assign_to_centroids radius mode always keeps the nearest centroid", "
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
   auto const mr                 = cudf::get_current_device_resource_ref();
+  raft::device_resources res{stream};
 
   auto const vectors   = make_vectors({0.0f, 0.0f, 100.0f, 100.0f}, dim);
   auto const centroids = make_vectors({1.0f, 0.0f, 50.0f, 0.0f, 90.0f, 90.0f}, dim);
@@ -313,7 +324,7 @@ TEST_CASE("assign_to_centroids radius mode always keeps the nearest centroid", "
   spec.radius_factor = 0.000001;
   spec.max_probes    = 3;
   auto const assignment = assign_to_centroids(
-    vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
+    res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
   stream.synchronize();
 
   REQUIRE(assignment.row_ids->size() == 2);
@@ -328,6 +339,7 @@ TEST_CASE("assign_to_centroids round-trips centroids trained by train_centroids"
   constexpr cudf::size_type dim = 2;
   auto const stream             = cudf::get_default_stream();
   auto const mr                 = cudf::get_current_device_resource_ref();
+  raft::device_resources res{stream};
 
   auto const vectors = make_vectors(two_group_dataset(), dim);
 
@@ -339,7 +351,7 @@ TEST_CASE("assign_to_centroids round-trips centroids trained by train_centroids"
   assignment_spec assign;
   assign.n_probes       = 1;
   auto const assignment = assign_to_centroids(
-    vectors->view(), centroids->view(), dim, assign, 0, spec.metric, stream, mr);
+    res, vectors->view(), centroids->view(), dim, assign, 0, spec.metric, stream, mr);
   stream.synchronize();
 
   REQUIRE(assignment.cluster_ids->size() == 8);

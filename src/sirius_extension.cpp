@@ -1971,6 +1971,54 @@ static void SiriusKMeansAssignFunction(ClientContext& context,
   state.reader->get_next_chunk(output);
 }
 
+struct KMeansCentroidsBindData : public TableFunctionData {
+  std::string clustering;
+  duckdb::vector<sirius::logical_type> reader_types;
+};
+
+static unique_ptr<FunctionData> SiriusKMeansCentroidsBind(ClientContext& context,
+                                                          TableFunctionBindInput& input,
+                                                          vector<LogicalType>& return_types,
+                                                          vector<string>& names)
+{
+  auto result = make_uniq<KMeansCentroidsBindData>();
+  if (input.inputs.empty() || input.inputs[0].IsNull()) {
+    throw BinderException(
+      "sirius_kmeans_centroids requires one non-NULL positional argument: the clustering name");
+  }
+  result->clustering = input.inputs[0].ToString();
+
+  return_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::FLOAT};
+  names        = {"cluster_id", "dim_index", "value"};
+
+  result->reader_types = sirius::from_duckdb_vec(return_types);
+  return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState> SiriusKMeansCentroidsInit(
+  ClientContext& context, TableFunctionInitInput& input)
+{
+  auto& bind_data = input.bind_data->Cast<KMeansCentroidsBindData>();
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException(
+      "sirius_kmeans_centroids requires the Sirius context to be initialized");
+  }
+  auto state       = make_uniq<KMeansAssignGlobalState>();
+  state->host_repr = sirius::vss::run_kmeans_centroids(*sirius_ctx, bind_data.clustering);
+  state->reader    = std::make_unique<sirius::op::result::host_table_chunk_reader>(
+    context, *state->host_repr, bind_data.reader_types);
+  return std::move(state);
+}
+
+static void SiriusKMeansCentroidsFunction(ClientContext& context,
+                                          TableFunctionInput& data_p,
+                                          DataChunk& output)
+{
+  auto& state = data_p.global_state->Cast<KMeansAssignGlobalState>();
+  state.reader->get_next_chunk(output);
+}
+
 using sirius::vss::parse_output_columns;
 using sirius::vss::resolve_vector_join_side;
 using sirius::vss::SiriusVectorJoinBindData;
@@ -2469,6 +2517,15 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   kmeans_assign.named_parameters["schema_name"]   = LogicalType::VARCHAR;
   CreateTableFunctionInfo kmeans_assign_info(kmeans_assign);
   catalog.CreateTableFunction(transaction, kmeans_assign_info);
+
+  // sirius_kmeans_centroids(clustering)
+  TableFunction kmeans_centroids("sirius_kmeans_centroids",
+                                 {LogicalType::VARCHAR},
+                                 SiriusKMeansCentroidsFunction,
+                                 SiriusKMeansCentroidsBind,
+                                 SiriusKMeansCentroidsInit);
+  CreateTableFunctionInfo kmeans_centroids_info(kmeans_centroids);
+  catalog.CreateTableFunction(transaction, kmeans_centroids_info);
 
   // sirius_knn_join(left_table, left_column, right_table, right_column, k =>, metric =>,
   //   search_mode =>, join_mode =>, n_clusters =>, n_probes =>, eps =>, output_type =>,

@@ -83,6 +83,22 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
 std::unique_ptr<cucascade::host_data_representation> run_kmeans_assign(
   duckdb::SiriusContext& ctx, const kmeans_assign_request& req);
 
+/**
+ * @brief `sirius_kmeans_centroids(clustering)`: read a named clustering's centroids back as rows.
+ *
+ * Emitted in long form -- one row per (centroid, component) rather than one row per centroid --
+ * so the result needs no ARRAY column and can be pivoted in plain SQL.
+ *
+ * This exists to make the clustering checkable against something other than itself. Without it
+ * a test can only confirm that an assignment is internally consistent; with it, a query can
+ * recompute each row's nearest centroid on the CPU and compare, which is what distinguishes
+ * "the code agrees with itself" from "the answer is right".
+ *
+ * Result columns: `cluster_id INT32`, `dim_index INT32`, `value FLOAT32`.
+ */
+std::unique_ptr<cucascade::host_data_representation> run_kmeans_centroids(
+  duckdb::SiriusContext& ctx, const std::string& clustering);
+
 /// The centroid column a named clustering holds, or nullptr when @p name is absent or names an
 /// entry that is not a clustering. Owned by the cache; valid until that entry is dropped.
 [[nodiscard]] const cudf::column* find_clustering_centroids(duckdb::SiriusContext& ctx,
