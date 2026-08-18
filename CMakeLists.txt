@@ -373,6 +373,7 @@ set(EXTENSION_SOURCES
     src/vss/distance_metric.cpp
     src/vss/enn_top_k.cpp
     src/vss/join_result_shaping.cpp
+    src/vss/kmeans_functions.cpp
     $<$<BOOL:${SIRIUS_ENABLE_FAISS_KERNEL}>:src/vss/brute_force_search_faiss.cpp>
     src/vss/pinned_column.cpp
     src/vss/vector_join_binding.cpp
@@ -402,7 +403,8 @@ set(CUDA_SOURCES
     src/cuda/vss/cudf_raft_interop.cu
     src/cuda/vss/brute_force_search.cu
     src/cuda/vss/knn_merge.cu
-    src/cuda/vss/ivf_flat_index.cu)
+    src/cuda/vss/ivf_flat_index.cu
+    src/cuda/vss/vector_clustering.cu)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/CMakeLists.txt")
   add_subdirectory(src/legacy)
   list(APPEND EXTENSION_SOURCES ${SIRIUS_LEGACY_SOURCES}
@@ -632,6 +634,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_multi_format.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
+    test/cpp/integration/test_gpu_execution_kmeans.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_gpu_execution_vector_join_exact_per_row.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
@@ -737,6 +740,7 @@ set(TEST_SOURCES
     test/cpp/vss/test_enn_top_k.cpp
     test/cpp/vss/test_ivf_flat_index.cpp
     test/cpp/vss/test_pinned_column.cpp
+    test/cpp/vss/test_vector_clustering.cpp
     test/cpp/vss/test_vector_search.cpp
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp

@@ -60,14 +60,23 @@ std::unique_ptr<cudf::table> make_empty_vss_output(const scan_manager::pinned_en
   return std::make_unique<cudf::table>(std::move(cols));
 }
 
+std::unique_ptr<cucascade::host_data_representation> vss_table_to_host(
+  cucascade::memory::memory_space& space,
+  const cucascade::memory::memory_space& host_space,
+  rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::table> table)
+{
+  cucascade::gpu_table_representation gpu_repr(std::move(table), space, stream);
+  auto host_repr = converter_registry::get().convert<cucascade::host_data_representation>(
+    gpu_repr, &host_space, stream);
+  stream.synchronize();
+  return host_repr;
+}
+
 std::unique_ptr<cucascade::host_data_representation> vss_result_to_host(
   const vector_search_context& c, std::unique_ptr<cudf::table> table)
 {
-  cucascade::gpu_table_representation gpu_repr(std::move(table), c.space, c.stream);
-  auto host_repr = converter_registry::get().convert<cucascade::host_data_representation>(
-    gpu_repr, &c.host_space, c.stream);
-  c.stream.synchronize();
-  return host_repr;
+  return vss_table_to_host(c.space, c.host_space, c.stream, std::move(table));
 }
 
 std::unique_ptr<cucascade::host_data_representation> run_vector_search(

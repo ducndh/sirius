@@ -71,6 +71,14 @@ std::unique_ptr<cudf::table> make_empty_vss_output(const scan_manager::pinned_en
 std::unique_ptr<cucascade::host_data_representation> vss_result_to_host(
   const vector_search_context& c, std::unique_ptr<cudf::table> table);
 
+/// The same conversion for a caller that has no @ref vector_search_context, i.e. any vss table
+/// function that produces rows rather than searching. Synchronizes @p stream before returning.
+std::unique_ptr<cucascade::host_data_representation> vss_table_to_host(
+  cucascade::memory::memory_space& space,
+  const cucascade::memory::memory_space& host_space,
+  rmm::cuda_stream_view stream,
+  std::unique_ptr<cudf::table> table);
+
 /// ENN search, tiled per pinned chunk and merged.
 std::unique_ptr<cucascade::host_data_representation> run_vector_search_enn(
   const vector_search_context& c);

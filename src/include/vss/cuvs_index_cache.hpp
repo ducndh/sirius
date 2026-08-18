@@ -34,11 +34,14 @@ class reservation;
 
 namespace sirius::vss {
 
-/// Which cuVS index algorithm a pinned entry holds. Drives how a search
-/// operator down-casts the type-erased index back to its concrete cuVS type.
-/// Only @c ivf_flat is built today; the rest are placeholders.
+/// What a pinned entry holds. Drives how a consumer down-casts the type-erased payload back to
+/// its concrete type; a consumer that finds the wrong kind under a name must refuse rather than
+/// cast. @c kmeans_centroids is not a search index at all -- it is the centroid matrix of a
+/// clustering, held here because it wants the same thing an index does: a name, a GPU
+/// reservation, and session lifetime.
 enum class index_kind : std::uint8_t {
   ivf_flat,
+  kmeans_centroids,
   // ivf_pq,  // not supported yet
   // cagra,  // not supported yet
 };
@@ -100,8 +103,12 @@ template <class Index>
 /// releasing the reservation frees the index. Move-only (owns unique resources).
 struct pinned_index_entry {
   index_metadata meta;
-  std::unique_ptr<any_cuvs_index> index;
+  /// Declared before @c index so it is destroyed *after* it. The payload's device buffers were
+  /// allocated through this reservation's memory resource, so freeing them once the reservation
+  /// is gone deallocates through a dead resource -- a segfault at session teardown, not at the
+  /// point of misuse.
   std::unique_ptr<cucascade::memory::reservation> reservation;
+  std::unique_ptr<any_cuvs_index> index;
 
   /// Recover the concrete cuVS index, or nullptr if the held index is not of
   /// type @c Index. The returned pointer is owned by this entry.

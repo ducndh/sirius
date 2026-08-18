@@ -16,6 +16,9 @@
 
 #pragma once
 
+// staged_pinned_chunk holds a column_view by value, which a forward declaration cannot satisfy.
+#include <cudf/column/column_view.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
@@ -56,6 +59,32 @@ struct staged_pinned_column {
   std::vector<std::shared_ptr<::cucascade::data_batch>> owners;
   std::vector<std::shared_ptr<::cucascade::memory::reservation>> reservations;
 };
+
+/// One chunk of @ref staged_pinned_column. @c owner and @c reservation are null for a GPU-tier
+/// pin, where the view aliases the pinned chunk; for a HOST-tier pin they hold the staged copy
+/// and free it when this struct is dropped.
+struct staged_pinned_chunk {
+  cudf::column_view view;
+  std::shared_ptr<::cucascade::data_batch> owner;
+  std::shared_ptr<::cucascade::memory::reservation> reservation;
+};
+
+/// Chunks the pinned column is stored in, on either tier.
+[[nodiscard]] std::size_t pinned_column_chunk_count(const scan_manager::pinned_entry& pin,
+                                                    const std::string& column_name);
+
+/// Stage chunk @p chunk_index of a pinned column, whatever tier the pin lives on.
+///
+/// The per-chunk form of @ref stage_pinned_column: a caller that walks a column larger than
+/// device memory stages one chunk, consumes it, and drops it before staging the next, so peak
+/// device use is one chunk rather than the whole column.
+[[nodiscard]] staged_pinned_chunk stage_pinned_column_chunk(
+  const scan_manager::pinned_entry& pin,
+  const std::string& column_name,
+  std::size_t chunk_index,
+  ::cucascade::memory::memory_space& gpu_space,
+  rmm::cuda_stream_view stream,
+  const telemetry::batch_telemetry_info& telemetry_info);
 
 /**
  * @brief Tier-agnostic replacement for @ref pinned_column_chunk_views.
