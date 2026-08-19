@@ -27,14 +27,17 @@
 #include "vss/join_result_shaping.hpp"
 #include "vss/knn_merge.hpp"
 #include "vss/pinned_column.hpp"
-#include <cudf/aggregation.hpp>
-#include <cudf/reduction.hpp>
-#include <cudf/stream_compaction.hpp>
 #include "vss/vector_clustering.hpp"
-#include "vss/pinned_column.hpp"
+
 #include <cudf/aggregation.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/stream_compaction.hpp>
+
+#include <cstdio>
+#include <cstdlib>
 
 #include "data/sirius_converter_registry.hpp"
 
@@ -547,6 +550,110 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::get_next_task
 //===----------------------------------------------------------------------===//
 // Execution
 //===----------------------------------------------------------------------===//
+void sirius_physical_vector_join_stream::ensure_cluster_index(
+  ::cucascade::memory::memory_space& space,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr,
+  raft::device_resources const& res,
+  cuvs::distance::DistanceType metric)
+{
+  std::lock_guard<std::mutex> const lock(_op_mutex);
+  if (!_cluster_row_ranges.empty()) { return; }
+
+  auto const* pin = _scan_manager->find_pinned_entry_for_duckdb_table(
+    _request.right.catalog, _request.right.schema, _request.right.table);
+  if (pin == nullptr) {
+    throw std::runtime_error(
+      "[sirius_physical_vector_join_stream] clustering needs the corpus table '" +
+      _request.right.table + "' pinned");
+  }
+
+  // The cluster column is read to the host once: it is one INT32 per corpus row, so even a
+  // 100M-row corpus is 400 MB, and having it host-side turns range lookup into arithmetic
+  // instead of a device round-trip on every probe run.
+  std::vector<std::int32_t> labels;
+  labels.reserve(static_cast<std::size_t>(_right_total_rows));
+  auto const n_chunks = vss::pinned_column_chunk_count(*pin, _request.build_cluster_column);
+  for (std::size_t i = 0; i < n_chunks; ++i) {
+    auto staged     = vss::stage_pinned_column_chunk(
+      *pin, _request.build_cluster_column, i, space, stream, batch_telemetry());
+    auto const rows = static_cast<std::size_t>(staged.view.size());
+    if (rows == 0) { continue; }
+    auto const base = labels.size();
+    labels.resize(base + rows);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(labels.data() + base,
+                                  staged.view.data<std::int32_t>(),
+                                  rows * sizeof(std::int32_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    stream.synchronize();
+  }
+  if (labels.empty()) {
+    throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column '" +
+                             _request.build_cluster_column + "' is empty");
+  }
+
+  _n_clusters = static_cast<std::int64_t>(
+    vss::list_column_as_dataset_view(_centroids->view(), _request.dim).extent(0));
+
+  // A cluster is one contiguous run because the corpus is stored in cluster order. A corpus
+  // that is not so ordered yields non-contiguous clusters, which this detects rather than
+  // silently answering from a partial range.
+  _cluster_row_ranges.assign(static_cast<std::size_t>(_n_clusters), {0, 0});
+  std::vector<char> seen(static_cast<std::size_t>(_n_clusters), 0);
+  std::int64_t run_start = 0;
+  for (std::size_t i = 1; i <= labels.size(); ++i) {
+    if (i < labels.size() && labels[i] == labels[run_start]) { continue; }
+    auto const c = labels[run_start];
+    if (c < 0 || c >= _n_clusters) {
+      throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column '" +
+                               _request.build_cluster_column + "' holds id " +
+                               std::to_string(c) + ", outside the clustering's " +
+                               std::to_string(_n_clusters) + " clusters");
+    }
+    if (seen[static_cast<std::size_t>(c)]) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] corpus is not stored in cluster order: cluster " +
+        std::to_string(c) + " appears in more than one run. Materialize the corpus with "
+        "ORDER BY " + _request.build_cluster_column);
+    }
+    seen[static_cast<std::size_t>(c)]                  = 1;
+    _cluster_row_ranges[static_cast<std::size_t>(c)] = {run_start, static_cast<std::int64_t>(i)};
+    run_start                                          = static_cast<std::int64_t>(i);
+  }
+
+  // Each cluster's nearest clusters, from the centroids alone. This is what a search index
+  // cannot precompute: its query side has no cluster structure, while a join's does.
+  auto const n_probes = std::clamp<std::int64_t>(_request.n_probes, 1, _n_clusters);
+  auto const centers  = vss::list_column_as_dataset_view(_centroids->view(), _request.dim);
+  auto knn            = vss::brute_force_knn(res, centers, centers, n_probes, metric, mr);
+  stream.synchronize();
+  _cluster_neighbors.resize(static_cast<std::size_t>(_n_clusters * n_probes));
+  {
+    std::vector<std::int64_t> ids(_cluster_neighbors.size());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(ids.data(),
+                                  knn.neighbors->view().data<std::int64_t>(),
+                                  ids.size() * sizeof(std::int64_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    stream.synchronize();
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      _cluster_neighbors[i] = static_cast<std::int32_t>(ids[i]);
+    }
+  }
+
+  if (std::getenv("SIRIUS_VECTOR_JOIN_PRUNE_DEBUG") != nullptr) {
+    std::size_t empty = 0;
+    for (auto const& [b, e] : _cluster_row_ranges) {
+      if (e <= b) { ++empty; }
+    }
+    std::fprintf(stderr,
+                 "[vecjoin] cluster index: %ld clusters over %ld rows, %zu empty, n_probes=%ld\n",
+                 static_cast<long>(_n_clusters), static_cast<long>(labels.size()), empty,
+                 static_cast<long>(n_probes));
+  }
+}
+
 void sirius_physical_vector_join_stream::ensure_cluster_ranges(
   ::cucascade::memory::memory_space& space, rmm::cuda_stream_view stream)
 {
@@ -596,6 +703,14 @@ void sirius_physical_vector_join_stream::ensure_cluster_ranges(
                         static_cast<cudf::numeric_scalar<std::int32_t> const&>(*hi).value(stream));
   }
   _chunk_cluster_ranges = std::move(ranges);
+
+  if (std::getenv("SIRIUS_VECTOR_JOIN_PRUNE_DEBUG") != nullptr) {
+    std::fprintf(stderr, "[vecjoin] corpus chunks=%zu cluster spans:", _chunk_cluster_ranges.size());
+    for (auto const& [lo, hi] : _chunk_cluster_ranges) {
+      std::fprintf(stderr, " [%d,%d]", lo, hi);
+    }
+    std::fprintf(stderr, "\n");
+  }
 }
 
 std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
@@ -644,52 +759,177 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   std::unique_ptr<cudf::column> acc_neighbors;
   std::unique_ptr<cudf::column> acc_distances;
 
-  // Which clusters this batch's rows were assigned to. Computed per batch because it depends on
-  // the probe rows, and kept on the host as a sorted set so the per-chunk test below is a binary
-  // search rather than a device round-trip.
-  if (_centroids != nullptr) { ensure_cluster_ranges(*mem_space, stream); }
-
-  std::vector<std::int32_t> wanted;
+  // The clustered path replaces the whole-corpus fold below. It is a separate branch rather
+  // than a predicate inside it because the two iterate different things: the exhaustive fold
+  // walks corpus chunks, while this walks (probe run x neighbouring cluster) pairs.
   if (_centroids != nullptr) {
-    vss::assignment_spec assign_spec;
-    assign_spec.n_probes = _request.n_probes;
-    auto assignment      = vss::assign_to_centroids(res,
-                                               staged_probe.view,
-                                               _centroids->view(),
-                                               dim,
-                                               assign_spec,
-                                               /*row_id_base=*/0,
-                                               metric,
-                                               stream,
-                                               mr);
-    auto const distinct  = cudf::distinct(cudf::table_view{{assignment.cluster_ids->view()}},
-                                         std::vector<cudf::size_type>{0},
-                                         cudf::duplicate_keep_option::KEEP_ANY,
-                                         cudf::null_equality::EQUAL,
-                                         cudf::nan_equality::ALL_EQUAL,
-                                         stream,
-                                         mr);
-    auto const& ids      = distinct->get_column(0);
-    wanted.resize(static_cast<std::size_t>(ids.size()));
-    CUDF_CUDA_TRY(cudaMemcpyAsync(wanted.data(),
-                                  ids.view().data<std::int32_t>(),
-                                  wanted.size() * sizeof(std::int32_t),
+    ensure_cluster_index(*mem_space, stream, mr, res, metric);
+
+    auto const n_probes = std::clamp<std::int64_t>(_request.n_probes, 1, _n_clusters);
+
+    // Sorting the probe batch by cluster is what makes a run contiguous, and a contiguous run
+    // is what lets a search read a slice instead of a gathered copy. The permutation is kept so
+    // the answer can be put back in the caller's row order at the end.
+    vss::assignment_spec nearest;
+    nearest.n_probes = 1;
+    auto assignment  = vss::assign_to_centroids(
+      res, staged_probe.view, _centroids->view(), dim, nearest, 0, metric, stream, mr);
+
+    auto const order = cudf::sorted_order(
+      cudf::table_view{{assignment.cluster_ids->view()}}, {}, {}, stream, mr);
+    auto const sorted_probe = cudf::gather(cudf::table_view{{staged_probe.view}},
+                                           order->view(),
+                                           cudf::out_of_bounds_policy::DONT_CHECK,
+                                           stream,
+                                           mr);
+    auto const sorted_labels = cudf::gather(cudf::table_view{{assignment.cluster_ids->view()}},
+                                            order->view(),
+                                            cudf::out_of_bounds_policy::DONT_CHECK,
+                                            stream,
+                                            mr);
+    auto const probe_sorted_view =
+      vss::list_column_as_dataset_view(sorted_probe->get_column(0).view(), dim);
+
+    std::vector<std::int32_t> host_labels(static_cast<std::size_t>(n_left));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(host_labels.data(),
+                                  sorted_labels->get_column(0).view().data<std::int32_t>(),
+                                  host_labels.size() * sizeof(std::int32_t),
                                   cudaMemcpyDeviceToHost,
                                   stream.value()));
     stream.synchronize();
-    std::sort(wanted.begin(), wanted.end());
-  }
 
-  // A chunk is visited when any wanted cluster falls inside its span. Conservative by design:
-  // a span covering ids the chunk does not actually hold costs a needless visit, never a
-  // missed neighbour.
-  auto chunk_is_wanted = [&](std::size_t j) {
-    if (_centroids == nullptr) { return true; }
-    auto const [lo, hi] = _chunk_cluster_ranges[j];
-    if (lo > hi) { return false; }
-    auto const it = std::lower_bound(wanted.begin(), wanted.end(), lo);
-    return it != wanted.end() && *it <= hi;
-  };
+    auto const corpus_all = _corpus->num_chunks() > 0
+                              ? _corpus->stage(0, *mem_space, stream)
+                              : staged_vector_chunk{};
+    auto const corpus_view = vss::list_column_as_dataset_view(corpus_all.view, dim);
+
+    std::vector<std::unique_ptr<cudf::column>> run_neighbors;
+    std::vector<std::unique_ptr<cudf::column>> run_distances;
+    std::size_t visited = 0;
+
+    for (std::int64_t run_begin = 0; run_begin < n_left;) {
+      auto const c = host_labels[static_cast<std::size_t>(run_begin)];
+      std::int64_t run_end = run_begin + 1;
+      while (run_end < n_left && host_labels[static_cast<std::size_t>(run_end)] == c) { ++run_end; }
+      auto const run_rows = run_end - run_begin;
+
+      auto const queries_run = raft::make_device_matrix_view<const float, std::int64_t,
+                                                             raft::row_major>(
+        probe_sorted_view.data_handle() + run_begin * dim, run_rows, dim);
+
+      // Only this cluster's neighbours are searched, which is the pruning: every other cluster's
+      // rows are never read, let alone scored.
+      std::unique_ptr<cudf::column> run_acc_n;
+      std::unique_ptr<cudf::column> run_acc_d;
+      for (std::int64_t t = 0; t < n_probes; ++t) {
+        auto const nc = _cluster_neighbors[static_cast<std::size_t>(c * n_probes + t)];
+        if (nc < 0 || nc >= _n_clusters) { continue; }
+        auto const [cb, ce] = _cluster_row_ranges[static_cast<std::size_t>(nc)];
+        auto const rows     = ce - cb;
+        if (rows <= 0) { continue; }
+        ++visited;
+
+        auto const slice = raft::make_device_matrix_view<const float, std::int64_t,
+                                                         raft::row_major>(
+          corpus_view.data_handle() + cb * dim, rows, dim);
+        auto const k_eff = std::min<std::int64_t>(k_join, rows);
+        auto knn         = vss::brute_force_knn(res, slice, queries_run, k_eff, metric, mr);
+
+        // Neighbour ids come back local to the slice; the cluster's own start is the base that
+        // makes them corpus row ids, exactly as the chunk offset does in the exhaustive fold.
+        cudf::numeric_scalar<std::int64_t> const base(cb, true, stream);
+        auto shifted = cudf::binary_operation(knn.neighbors->view(),
+                                              base,
+                                              cudf::binary_operator::ADD,
+                                              cudf::data_type{cudf::type_id::INT64},
+                                              stream,
+                                              mr);
+        if (!run_acc_n) {
+          run_acc_n = std::move(shifted);
+          run_acc_d = std::move(knn.distances);
+          continue;
+        }
+        if (k_eff < k_join || run_acc_n->size() != static_cast<cudf::size_type>(run_rows * k_join)) {
+          // knn_merge_parts needs a uniform k across parts; a cluster smaller than k cannot
+          // supply one. Rare, and refused rather than silently dropping candidates.
+          throw std::runtime_error(
+            "[sirius_physical_vector_join_stream] cluster " + std::to_string(nc) + " holds " +
+            std::to_string(rows) + " rows, fewer than k=" + std::to_string(k_join) +
+            "; lower k or cluster with fewer, larger clusters");
+        }
+        auto const stacked_d = cudf::concatenate(
+          std::vector<cudf::column_view>{run_acc_d->view(), knn.distances->view()}, stream, mr);
+        auto const stacked_n = cudf::concatenate(
+          std::vector<cudf::column_view>{run_acc_n->view(), shifted->view()}, stream, mr);
+        auto merged = vss::knn_merge_parts_topk(
+          res, stacked_d->view(), stacked_n->view(), run_rows, 2, k_join, stream, mr);
+        run_acc_n = std::move(merged.neighbors);
+        run_acc_d = std::move(merged.distances);
+      }
+      if (!run_acc_n) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_stream] probe cluster " + std::to_string(c) +
+          " reached no non-empty corpus cluster");
+      }
+      run_neighbors.push_back(std::move(run_acc_n));
+      run_distances.push_back(std::move(run_acc_d));
+      run_begin = run_end;
+    }
+
+    if (std::getenv("SIRIUS_VECTOR_JOIN_PRUNE_DEBUG") != nullptr) {
+      std::fprintf(stderr,
+                   "[vecjoin] batch: %zu probe runs, %zu cluster visits of %ld possible "
+                   "(%.1f%% of the corpus scanned)\n",
+                   run_neighbors.size(), visited,
+                   static_cast<long>(run_neighbors.size() * _n_clusters),
+                   100.0 * static_cast<double>(visited) /
+                     static_cast<double>(run_neighbors.size() * _n_clusters));
+    }
+
+    // Runs are emitted in sorted order; concatenating them rebuilds the sorted answer, and
+    // scattering by the sort permutation puts it back in the caller's row order.
+    std::vector<cudf::column_view> nviews;
+    std::vector<cudf::column_view> dviews;
+    nviews.reserve(run_neighbors.size());
+    dviews.reserve(run_distances.size());
+    for (std::size_t i = 0; i < run_neighbors.size(); ++i) {
+      nviews.push_back(run_neighbors[i]->view());
+      dviews.push_back(run_distances[i]->view());
+    }
+    auto sorted_n = cudf::concatenate(nviews, stream, mr);
+    auto sorted_d = cudf::concatenate(dviews, stream, mr);
+
+    // The accumulator is [n_left x k_join] row-major, so a row moves as a block of k_join
+    // entries: expand the row permutation to element positions before scattering.
+    cudf::numeric_scalar<std::int32_t> const kscalar(static_cast<std::int32_t>(k_join), true, stream);
+    cudf::numeric_scalar<std::int32_t> const zero32(0, true, stream);
+    cudf::numeric_scalar<std::int32_t> const one32(1, true, stream);
+    auto const positions = cudf::sequence(
+      static_cast<cudf::size_type>(n_left * k_join), zero32, one32, stream, mr);
+    auto const src_row = cudf::binary_operation(positions->view(), kscalar,
+                                                cudf::binary_operator::DIV,
+                                                cudf::data_type{cudf::type_id::INT32}, stream, mr);
+    auto const in_row  = cudf::binary_operation(positions->view(), kscalar,
+                                               cudf::binary_operator::MOD,
+                                               cudf::data_type{cudf::type_id::INT32}, stream, mr);
+    auto const dest_row = cudf::gather(cudf::table_view{{order->view()}},
+                                       src_row->view(),
+                                       cudf::out_of_bounds_policy::DONT_CHECK,
+                                       stream, mr);
+    auto const dest_base = cudf::binary_operation(dest_row->get_column(0).view(), kscalar,
+                                                  cudf::binary_operator::MUL,
+                                                  cudf::data_type{cudf::type_id::INT32}, stream, mr);
+    auto const dest = cudf::binary_operation(dest_base->view(), in_row->view(),
+                                             cudf::binary_operator::ADD,
+                                             cudf::data_type{cudf::type_id::INT32}, stream, mr);
+    auto scattered = cudf::scatter(cudf::table_view{{sorted_n->view(), sorted_d->view()}},
+                                   dest->view(),
+                                   cudf::table_view{{sorted_n->view(), sorted_d->view()}},
+                                   stream, mr);
+    auto cols     = scattered->release();
+    acc_neighbors = std::move(cols[0]);
+    acc_distances = std::move(cols[1]);
+  } else {
 
   auto const n_chunks = _corpus->num_chunks();
   std::int64_t offset = 0;  // running base of the current chunk in right-table row space
@@ -732,16 +972,6 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   };
 
   for (std::size_t j = 0; j < n_chunks; ++j) {
-    // Skipping still has to advance `offset`: it is the base that turns a chunk-local neighbour
-    // index into a right-table row id, so dropping a chunk without counting its rows would
-    // silently shift every id found after it.
-    if (!chunk_is_wanted(j)) {
-      offset += static_cast<std::int64_t>(_corpus->chunk_rows(j));
-      release_staged(prefetched);
-      advance(j + 1);
-      continue;
-    }
-
     // Held for this iteration only; released at the bottom once its compute is ordered,
     // which is what keeps device memory bounded by the chunks in flight, not the corpus.
     auto staged           = std::move(prefetched);
@@ -812,6 +1042,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                             mr);
     acc_neighbors = std::move(merged.neighbors);
     acc_distances = std::move(merged.distances);
+  }
+
   }
 
   if (!acc_neighbors) {

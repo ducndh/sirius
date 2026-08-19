@@ -19,6 +19,9 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "vss/vector_join.hpp"
+
+#include <raft/core/device_resources.hpp>
+#include <cuvs/distance/distance.hpp>
 #include "vss/vector_join_materialized_side.hpp"
 
 #include "telemetry/data_batch_probe.hpp"
@@ -248,6 +251,13 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   void ensure_cluster_ranges(::cucascade::memory::memory_space& space,
                              rmm::cuda_stream_view stream);
 
+  /// Build @c _cluster_row_ranges and @c _cluster_neighbors on first use.
+  void ensure_cluster_index(::cucascade::memory::memory_space& space,
+                            rmm::cuda_stream_view stream,
+                            rmm::device_async_resource_ref mr,
+                            raft::device_resources const& res,
+                            cuvs::distance::DistanceType metric);
+
   /// Whether the build port is wired and its producing pipeline has finished. Always true on
   /// the pinned path. Caller holds _op_mutex.
   bool build_side_ready_locked();
@@ -271,6 +281,17 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// that entry is dropped. Null for an exhaustive join, which is what selects the fold's
   /// visit-everything path.
   const cudf::column* _centroids{nullptr};
+  /// Per cluster id, the corpus row range [begin, end) holding it, in the corpus's own row
+  /// space. Built once per join from the cluster column, and the reason pruning can work at
+  /// cluster granularity rather than chunk granularity: a cluster is a contiguous slice, so
+  /// visiting one costs a slice rather than a whole chunk.
+  std::vector<std::pair<std::int64_t, std::int64_t>> _cluster_row_ranges;
+  /// Row-major [n_clusters x n_probes] table of each cluster's nearest clusters, computed once
+  /// from the centroids. This is the join-specific part: because BOTH sides are clustered, a
+  /// probe row's neighbourhood is a property of its cluster, so it is resolved once per cluster
+  /// here instead of once per row at query time.
+  std::vector<std::int32_t> _cluster_neighbors;
+  std::int64_t _n_clusters{0};
   /// Per corpus chunk, the smallest and largest cluster id it holds, computed once at init.
   /// A chunk is skipped when a probe batch wants no cluster inside its range.
   ///
