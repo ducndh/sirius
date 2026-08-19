@@ -25,7 +25,10 @@
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <set>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -56,6 +59,22 @@ std::vector<std::vector<std::string>> ok_rows(duckdb::Connection& con, const std
 {
   auto r = query_ok(con, sql);
   return sirius::test::GpuExecutionFixture::collect_rows(*r, /*sort=*/true);
+}
+
+
+// (probe id, distance rounded) pairs, sorted. Rounding happens here rather than in SQL because a
+// projection over the join falls back to the CPU, which cannot execute the rewrite target.
+std::vector<std::pair<std::string, long long>> distance_multiset(duckdb::Connection& con,
+                                                                 const std::string& sql)
+{
+  auto const rows = ok_rows(con, sql);
+  std::vector<std::pair<std::string, long long>> out;
+  out.reserve(rows.size());
+  for (auto const& r : rows) {
+    out.emplace_back(r.at(0), std::llround(std::stod(r.at(1)) * 1000.0));
+  }
+  std::sort(out.begin(), out.end());
+  return out;
 }
 
 void expect_error(duckdb::Connection& con, const std::string& sql, const std::string& needle)
@@ -336,16 +355,20 @@ TEST_CASE_METHOD(KMeansFixture,
   constexpr int n_clusters = 8;
   create_clustered_join(*this, *con, "apx", n_clusters);
 
-  auto const exhaustive = ok_rows(*con,
-                                  "SELECT left_id, right_id FROM sirius_knn_join("
+  // Compared on DISTANCES, not neighbour ids. Equidistant corpus rows are interchangeable
+  // answers, and the two paths visit clusters in different orders, so they break those ties
+  // differently -- an id comparison reports that as a failure and undercuts by exactly the tie
+  // multiplicity. The distance multiset is what "same answer" actually means here.
+  auto const exhaustive = distance_multiset(*con,
+                                  "SELECT left_id, distance FROM sirius_knn_join("
                                   "'apx_probe','vec','apx_corpus','vec', "
                                   "search_mode => 'exact-gemm', metric => 'l2', k => 5);");
 
-  // n_probes == n_clusters wants every cluster, so no chunk can be skipped and the approximate
-  // path must reproduce the exhaustive answer exactly. This is what catches a mistake in the
-  // neighbour-id base, which pruning would otherwise hide as a plausible-looking wrong answer.
-  auto const probe_all = ok_rows(*con,
-                                 "SELECT left_id, right_id FROM sirius_knn_join("
+  // n_probes == n_clusters wants every cluster, so nothing is skipped and the approximate path
+  // must reproduce the exhaustive answer. This is what catches a mistake in the neighbour-id
+  // base, which pruning would otherwise hide as a plausible-looking wrong answer.
+  auto const probe_all = distance_multiset(*con,
+                                 "SELECT left_id, distance FROM sirius_knn_join("
                                  "'apx_probe','vec','apx_corpus','vec', "
                                  "search_mode => 'approx', metric => 'l2', k => 5, "
                                  "clustering => 'apx_c', cluster_column => 'cluster_id', "
