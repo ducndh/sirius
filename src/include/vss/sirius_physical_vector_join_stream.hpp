@@ -36,6 +36,10 @@
 #include <string>
 #include <vector>
 
+namespace duckdb {
+class SiriusContext;
+}  // namespace duckdb
+
 namespace sirius::scan_manager {
 class sirius_scan_manager;
 struct pinned_entry;
@@ -197,6 +201,9 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   ///                    child scan materialized by the build phase -- instead of a pinned
   ///                    catalog table, and the buffer is the row order both this operator and
   ///                    materialize resolve neighbour ids against.
+  /// @param sirius_ctx  Where the clustered path reports what it pruned. Only the planner can
+  ///                    resolve it, as with @p centroids; null on the exhaustive path, which
+  ///                    prunes nothing.
   sirius_physical_vector_join_stream(
     duckdb::vector<sirius::logical_type> types,
     duckdb::idx_t estimated_cardinality,
@@ -204,7 +211,8 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
     sirius::scan_manager::sirius_scan_manager* scan_manager,
     std::shared_ptr<sirius::vss::materialized_side_buffer> build_side = nullptr,
     std::shared_ptr<sirius::vss::materialized_side_buffer> probe_side = nullptr,
-    const cudf::column* centroids                                     = nullptr);
+    const cudf::column* centroids                                     = nullptr,
+    duckdb::SiriusContext* sirius_ctx                                 = nullptr);
 
   [[nodiscard]] const sirius::vss::vector_join_request& request() const { return _request; }
 
@@ -277,6 +285,8 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// that entry is dropped. Null for an exhaustive join, which is what selects the fold's
   /// visit-everything path.
   const cudf::column* _centroids{nullptr};
+  /// Session state the clustered path reports its prune statistics to. Outlives the query.
+  duckdb::SiriusContext* _sirius_ctx{nullptr};
   /// One contiguous run of a single cluster inside one corpus chunk. Rows are local to the
   /// chunk, so a slice can be searched the moment that chunk is staged and needs nothing from
   /// any other; @c _chunk_row_base turns its neighbour ids back into corpus row ids.

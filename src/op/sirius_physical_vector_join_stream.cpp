@@ -22,6 +22,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "sirius_context.hpp"
 #include "vss/brute_force_search.hpp"
 #include "vss/cudf_raft_interop.hpp"
 #include "vss/distance_metric.hpp"
@@ -353,14 +354,16 @@ sirius_physical_vector_join_stream::sirius_physical_vector_join_stream(
   sirius::scan_manager::sirius_scan_manager* scan_manager,
   std::shared_ptr<sirius::vss::materialized_side_buffer> build_side,
   std::shared_ptr<sirius::vss::materialized_side_buffer> probe_side,
-  const cudf::column* centroids)
+  const cudf::column* centroids,
+  duckdb::SiriusContext* sirius_ctx)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM, std::move(types), estimated_cardinality),
     _build_side(std::move(build_side)),
     _probe_side(std::move(probe_side)),
     _request(std::move(request)),
     _scan_manager(scan_manager),
-    _centroids(centroids)
+    _centroids(centroids),
+    _sirius_ctx(sirius_ctx)
 {
 }
 
@@ -1017,8 +1020,18 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       release_staged(staged);
     }
 
+    // What the pruning did, reported as a value rather than only a print: an approximate join
+    // that skipped nothing returns a correct answer, so nothing in the result set distinguishes
+    // it from one that pruned hard. This is what a test can assert on.
+    auto const exhaustive_pairs = n_left * _right_total_rows;
+    if (_sirius_ctx != nullptr) {
+      _sirius_ctx->record_vector_join_prune(static_cast<std::uint64_t>(scanned_pairs),
+                                            static_cast<std::uint64_t>(exhaustive_pairs),
+                                            needed_chunks.size(),
+                                            _chunk_cluster_runs.size());
+    }
+
     if (std::getenv("SIRIUS_VECTOR_JOIN_PRUNE_DEBUG") != nullptr) {
-      auto const exhaustive_pairs = n_left * _right_total_rows;
       std::fprintf(stderr,
                    "[vecjoin] batch: %zu probe runs, %zu of %zu corpus chunks staged, "
                    "%lld of %lld probe-row x corpus-row pairs scored (%.2f%%)\n",

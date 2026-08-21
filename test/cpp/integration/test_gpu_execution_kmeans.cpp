@@ -374,6 +374,7 @@ TEST_CASE_METHOD(KMeansFixture,
   // n_probes == n_clusters wants every cluster, so nothing is skipped and the approximate path
   // must reproduce the exhaustive answer. This is what catches a mistake in the neighbour-id
   // base, which pruning would otherwise hide as a plausible-looking wrong answer.
+  auto const before    = sirius::test::get_vector_join_prune_stats(*con);
   auto const probe_all = distance_multiset(*con,
                                            "SELECT left_id, distance FROM sirius_knn_join("
                                            "'apx_probe','vec','apx_corpus','vec', "
@@ -383,6 +384,16 @@ TEST_CASE_METHOD(KMeansFixture,
                                              std::to_string(n_clusters) + ");");
 
   REQUIRE(probe_all == exhaustive);
+
+  // The other half of the gate. Reproducing the exhaustive answer is only evidence of a correct
+  // neighbour-id base if this run really did visit every cluster -- and it is the same counter
+  // the pruning test asserts is small, so asserting it is maximal here is what stops that test
+  // passing on a counter that is simply always zero.
+  auto const after            = sirius::test::get_vector_join_prune_stats(*con);
+  auto const scored           = after.pairs_scored - before.pairs_scored;
+  auto const exhaustive_pairs = after.pairs_exhaustive - before.pairs_exhaustive;
+  CHECK(exhaustive_pairs > 0);
+  CHECK(scored == exhaustive_pairs);
 }
 
 TEST_CASE_METHOD(KMeansFixture,
@@ -394,6 +405,7 @@ TEST_CASE_METHOD(KMeansFixture,
   // One cluster per probe row prunes hard. Recall is expected to drop -- that is the trade --
   // but every pair returned must still be a real corpus row, and every probe row must be
   // answered, which is what separates "approximate" from "broken".
+  auto const before = sirius::test::get_vector_join_prune_stats(*con);
   auto const pruned = ok_rows(*con,
                               "SELECT left_id, right_id FROM sirius_knn_join("
                               "'apy_probe','vec','apy_corpus','vec', "
@@ -401,6 +413,16 @@ TEST_CASE_METHOD(KMeansFixture,
                               "clustering => 'apy_c', cluster_column => 'cluster_id', "
                               "n_probes => 1);");
   CHECK(pruned.size() == 200 * 5);
+
+  // What "approximate" has to mean. Every assertion below this one holds just as well for a run
+  // that scored the whole corpus and called itself pruned -- which is exactly what the
+  // chunk-granularity version did while passing this test. One cluster of eight is ~12.5% of the
+  // corpus; the bound is loose because k-means does not make clusters equal.
+  auto const after      = sirius::test::get_vector_join_prune_stats(*con);
+  auto const scored     = after.pairs_scored - before.pairs_scored;
+  auto const exhaustive = after.pairs_exhaustive - before.pairs_exhaustive;
+  CHECK(exhaustive > 0);
+  CHECK(scored * 4 < exhaustive);
 
   // Counted here rather than in SQL: an aggregate directly over the join falls back to the CPU,
   // which cannot execute the rewrite target at all.
@@ -449,6 +471,7 @@ TEST_CASE_METHOD(KMeansFixture,
                       "'apm_probe','vec','apm_corpus','vec', "
                       "search_mode => 'exact-gemm', metric => 'l2', k => 5);");
 
+  auto const before    = sirius::test::get_vector_join_prune_stats(*con);
   auto const probe_all = distance_multiset(*con,
                                            "SELECT left_id, distance FROM sirius_knn_join("
                                            "'apm_probe','vec','apm_corpus','vec', "
@@ -458,6 +481,14 @@ TEST_CASE_METHOD(KMeansFixture,
                                              std::to_string(n_clusters) + ");");
 
   REQUIRE(probe_all == exhaustive);
+
+  // The premise of this test, asserted rather than assumed: if DuckDB's row-group size ever
+  // changes, or the generator stops producing 300,000 rows, this silently becomes another
+  // single-chunk test and stops covering the thing it exists for. The counter accumulates one
+  // corpus-chunk count per probe batch, and 200 probe rows are a single batch, so the delta is
+  // the corpus's chunk count.
+  auto const after = sirius::test::get_vector_join_prune_stats(*con);
+  CHECK(after.chunks_available - before.chunks_available > 1);
 
   // Pruning across chunks is where a neighbour id is most easily mis-based: an id is local to
   // the slice it came from, and turning it back into a corpus row now takes the chunk's base

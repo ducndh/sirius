@@ -789,6 +789,27 @@ SiriusContext::transparent_execution_stats SiriusContext::get_transparent_execut
   };
 }
 
+SiriusContext::vector_join_prune_stats SiriusContext::get_vector_join_prune_stats() const noexcept
+{
+  return vector_join_prune_stats{
+    .pairs_scored     = vector_join_pairs_scored_.load(std::memory_order_relaxed),
+    .pairs_exhaustive = vector_join_pairs_exhaustive_.load(std::memory_order_relaxed),
+    .chunks_staged    = vector_join_chunks_staged_.load(std::memory_order_relaxed),
+    .chunks_available = vector_join_chunks_available_.load(std::memory_order_relaxed),
+  };
+}
+
+void SiriusContext::record_vector_join_prune(uint64_t pairs_scored,
+                                             uint64_t pairs_exhaustive,
+                                             uint64_t chunks_staged,
+                                             uint64_t chunks_available) noexcept
+{
+  vector_join_pairs_scored_.fetch_add(pairs_scored, std::memory_order_relaxed);
+  vector_join_pairs_exhaustive_.fetch_add(pairs_exhaustive, std::memory_order_relaxed);
+  vector_join_chunks_staged_.fetch_add(chunks_staged, std::memory_order_relaxed);
+  vector_join_chunks_available_.fetch_add(chunks_available, std::memory_order_relaxed);
+}
+
 void SiriusContext::record_transparent_rebind_success() noexcept
 {
   transparent_rebind_success_count_.fetch_add(1, std::memory_order_relaxed);
