@@ -556,20 +556,39 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
   std::lock_guard<std::mutex> const lock(_op_mutex);
   if (_cluster_index_built) { return; }
 
-  auto const* pin = _scan_manager->find_pinned_entry_for_duckdb_table(
-    _request.right.catalog, _request.right.schema, _request.right.table);
-  if (pin == nullptr) {
-    throw std::runtime_error(
-      "[sirius_physical_vector_join_stream] clustering needs the corpus table '" +
-      _request.right.table + "' pinned");
+  // The labels come from wherever the vectors come from, and chunk for chunk: a label's meaning
+  // is its position in the corpus row order, so reading them from a second source -- a pin
+  // behind a build-phase scan, say -- would be reading a different row order.
+  std::unique_ptr<vector_chunk_source> build_labels;
+  const scan_manager::pinned_entry* pin = nullptr;
+  if (_build_side) {
+    // The plan generator projects the corpus scan as [vector, emitted columns..., cluster id],
+    // so the cluster column's position is arithmetic rather than a name lookup -- the same
+    // arrangement that puts the vector column at 0. A `dim` of 1 gives the source a four-byte
+    // row width, which is what one INT32 label per row occupies.
+    build_labels =
+      make_materialized_chunk_source(*_build_side,
+                                     /*column_index=*/1 + _request.right.output_columns.size(),
+                                     /*dim=*/1,
+                                     batch_telemetry());
+  } else {
+    pin = _scan_manager->find_pinned_entry_for_duckdb_table(
+      _request.right.catalog, _request.right.schema, _request.right.table);
+    if (pin == nullptr) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] clustering needs the corpus table '" +
+        _request.right.table + "' pinned");
+    }
   }
 
-  auto const n_chunks = vss::pinned_column_chunk_count(*pin, _request.build_cluster_column);
+  auto const n_chunks = build_labels
+                          ? build_labels->num_chunks()
+                          : vss::pinned_column_chunk_count(*pin, _request.build_cluster_column);
   if (n_chunks != _corpus->num_chunks()) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_stream] cluster column '" + _request.build_cluster_column +
       "' has " + std::to_string(n_chunks) + " chunks but the vector column has " +
-      std::to_string(_corpus->num_chunks()) + "; both must come from the same pin");
+      std::to_string(_corpus->num_chunks()) + "; both must come from the same corpus");
   }
 
   _n_clusters = static_cast<std::int64_t>(
@@ -590,14 +609,29 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
   for (std::size_t j = 0; j < n_chunks; ++j) {
     _chunk_row_base[j] = row_base;
 
-    auto staged = vss::stage_pinned_column_chunk(
-      *pin, _request.build_cluster_column, j, space, stream, batch_telemetry());
-    auto const rows = static_cast<std::size_t>(staged.view.size());
+    // Both staged chunks are declared here so whichever one holds the labels outlives the copy.
+    staged_vector_chunk staged_build;
+    vss::staged_pinned_chunk staged_pin;
+    cudf::column_view labels_view;
+    if (build_labels) {
+      staged_build = build_labels->stage(j, space, stream);
+      labels_view  = staged_build.view;
+    } else {
+      staged_pin = vss::stage_pinned_column_chunk(
+        *pin, _request.build_cluster_column, j, space, stream, batch_telemetry());
+      labels_view = staged_pin.view;
+    }
+    if (labels_view.type().id() != cudf::type_id::INT32) {
+      throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column '" +
+                               _request.build_cluster_column +
+                               "' must be INTEGER; sirius_kmeans_assign emits cluster_id that way");
+    }
+    auto const rows = static_cast<std::size_t>(labels_view.size());
     if (rows == 0) { continue; }
 
     labels.resize(rows);
     CUDF_CUDA_TRY(cudaMemcpyAsync(labels.data(),
-                                  staged.view.data<std::int32_t>(),
+                                  labels_view.data<std::int32_t>(),
                                   rows * sizeof(std::int32_t),
                                   cudaMemcpyDeviceToHost,
                                   stream.value()));
@@ -638,7 +672,10 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
     throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column '" +
                              _request.build_cluster_column + "' is empty");
   }
-  if (row_base != _right_total_rows) {
+  // Only on the pinned path: there _right_total_rows is the pin's own count and exact, while on
+  // the build path it is summed from per-batch sizes that a spilled batch reports in bytes, so a
+  // mismatch there would mean the estimate is loose rather than that the labels are wrong.
+  if (pin != nullptr && row_base != _right_total_rows) {
     throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column has " +
                              std::to_string(row_base) + " rows but the corpus has " +
                              std::to_string(_right_total_rows) +

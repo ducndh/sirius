@@ -551,6 +551,75 @@ TEST_CASE_METHOD(KMeansFixture,
                "not stored in cluster order");
 }
 
+// -----------------------------------------------------------------------------
+// The approximate join no longer needs the corpus pinned.
+//
+// Clustering used to refuse build_source => 'scan' outright, so an approximate join
+// meant materializing a cluster-ordered copy AND pinning it -- and a pin of a column
+// subset makes that table's other columns unusable in the same query. The cluster ids
+// now ride along as a column of the corpus scan, in the same batches the fold
+// searches, which is the only way they can mean the same row order the neighbour ids
+// are resolved against.
+//
+// Verified against the pin path rather than against a recomputed oracle: the two must
+// answer identically, which is what isolates "where the bytes came from" from "what
+// the search did". Compared on distances because the build side's batch order is a
+// race -- any order is correct as long as every stage uses the same one, but two
+// orders break ties between equidistant rows differently.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_knn_join approx takes the corpus from a child scan",
+                 "[integration][gpu_execution][array][vss][kmeans][approx]")
+{
+  create_clustered_join(*this, *con, "apb", 8);
+
+  auto const pinned = distance_multiset(*con,
+                                        "SELECT left_id, distance FROM sirius_knn_join("
+                                        "'apb_probe','vec','apb_corpus','vec', "
+                                        "search_mode => 'approx', metric => 'l2', k => 5, "
+                                        "clustering => 'apb_c', cluster_column => 'cluster_id', "
+                                        "n_probes => 2, right_output_columns => ['id']);");
+
+  auto const before  = sirius::test::get_vector_join_prune_stats(*con);
+  auto const scanned = distance_multiset(*con,
+                                         "SELECT left_id, distance FROM sirius_knn_join("
+                                         "'apb_probe','vec','apb_corpus','vec', "
+                                         "search_mode => 'approx', metric => 'l2', k => 5, "
+                                         "clustering => 'apb_c', cluster_column => 'cluster_id', "
+                                         "n_probes => 2, right_output_columns => ['id'], "
+                                         "build_source => 'scan');");
+  auto const after   = sirius::test::get_vector_join_prune_stats(*con);
+
+  REQUIRE(scanned == pinned);
+
+  // Agreeing with the pin path is not enough on its own: an unpruned build-phase run would
+  // agree too, and more of the time. Two clusters of eight is ~25% of the corpus.
+  auto const scored     = after.pairs_scored - before.pairs_scored;
+  auto const exhaustive = after.pairs_exhaustive - before.pairs_exhaustive;
+  CHECK(exhaustive > 0);
+  CHECK(scored * 2 < exhaustive);
+
+  // The point of the change. Nothing above proves the pin was unused -- it was still there.
+  run_ok("SELECT * FROM unpin_table('apb_corpus');");
+  auto const unpinned = distance_multiset(*con,
+                                          "SELECT left_id, distance FROM sirius_knn_join("
+                                          "'apb_probe','vec','apb_corpus','vec', "
+                                          "search_mode => 'approx', metric => 'l2', k => 5, "
+                                          "clustering => 'apb_c', cluster_column => 'cluster_id', "
+                                          "n_probes => 2, right_output_columns => ['id'], "
+                                          "build_source => 'scan');");
+  REQUIRE(unpinned == pinned);
+
+  // The cluster ids are a column of that scan, so a cluster_column the catalog does not have
+  // has to be caught at bind: the plan generator would throw instead, and a throw there reads
+  // as "this query cannot run on the GPU" and is reported as something unrelated.
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('apb_probe','vec','apb_corpus','vec', "
+               "search_mode => 'approx', metric => 'l2', k => 5, clustering => 'apb_c', "
+               "cluster_column => 'not_a_column', build_source => 'scan');",
+               "not found in table");
+}
+
 TEST_CASE_METHOD(KMeansFixture,
                  "sirius_knn_join rejects approx without a usable clustering",
                  "[integration][gpu_execution][array][vss][kmeans][approx]")

@@ -2177,11 +2177,6 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
         "sirius_knn_join: clustering requires cluster_column => '<col>', the corpus column "
         "holding each row's cluster id");
     }
-    if (req.build_from_scan) {
-      throw BinderException(
-        "sirius_knn_join: clustering needs the corpus pinned; the build-phase path cannot "
-        "supply per-chunk cluster ranges yet");
-    }
     // Checked here rather than left to the planner: a throw during planning is caught as a
     // "this query cannot run on the GPU" signal and turns into a CPU fallback, which then fails
     // with an unrelated message. At bind it is a plain, accurate error.
@@ -2264,6 +2259,21 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
                           "]; both sides must share the same vector dimensionality");
   }
   req.dim = left_dim;
+
+  // The cluster ids reach the fold as a column of the corpus scan, so on the build path they
+  // have to exist in the catalog rather than in a pin. Checked here because the plan generator
+  // would otherwise throw, which is read as "this query cannot run on the GPU" and reported as
+  // something else entirely.
+  if (!req.clustering.empty() && req.build_from_scan) {
+    auto& corpus_entry = Catalog::GetEntry(
+      context, CatalogType::TABLE_ENTRY, req.right.catalog, req.right.schema, req.right.table);
+    auto const corpus_columns = corpus_entry.Cast<DuckTableEntry>().GetColumns().GetColumnNames();
+    if (std::find(corpus_columns.begin(), corpus_columns.end(), req.build_cluster_column) ==
+        corpus_columns.end()) {
+      throw BinderException("sirius_knn_join: cluster_column '" + req.build_cluster_column +
+                            "' not found in table '" + req.right.table + "'");
+    }
+  }
 
   // The split path (SIRIUS_VECTOR_JOIN_STREAMING=0) merges each right chunk's partial on
   // its own instead of folding the whole partition, and materialize's fixed-k slicing then

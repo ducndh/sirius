@@ -81,8 +81,13 @@ duckdb::vector<std::unique_ptr<sirius::ast::node>> translate_expressions(
 //! surface is a separate piece of work -- so a fed side's input is constructed here instead.
 //! The vector column is projected first, which is why both the fold and materialize can index
 //! it as column 0 without a name lookup.
+/// @param extra_column  Appended after the emitted columns when non-empty. Used for the
+///                      corpus's cluster ids, which the fold reads but the join never emits --
+///                      putting it last is what keeps materialize's column positions unchanged.
 duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_side_scan(
-  duckdb::ClientContext& context, const sirius::vss::vector_join_side& side)
+  duckdb::ClientContext& context,
+  const sirius::vss::vector_join_side& side,
+  const std::string& extra_column = {})
 {
   auto& entry_base = duckdb::Catalog::GetEntry(
     context, duckdb::CatalogType::TABLE_ENTRY, side.catalog, side.schema, side.table);
@@ -117,6 +122,16 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_side_scan(
     auto const idx = static_cast<duckdb::idx_t>(std::distance(names.begin(), out_it));
     column_ids.emplace_back(idx);
     projected_types.push_back(types[idx]);
+  }
+  if (!extra_column.empty()) {
+    auto const extra_it = std::find(names.begin(), names.end(), extra_column);
+    if (extra_it == names.end()) {
+      throw duckdb::InternalException("sirius_knn_join: cluster column '" + extra_column +
+                                      "' vanished between bind and plan");
+    }
+    auto const extra_idx = static_cast<duckdb::idx_t>(std::distance(names.begin(), extra_it));
+    column_ids.emplace_back(extra_idx);
+    projected_types.push_back(types[extra_idx]);
   }
 
   return duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(
@@ -767,7 +782,12 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       stream_op->children.push_back(
         probe_child.has_value() ? std::move(*probe_child) : make_side_scan(context, req.left));
     }
-    if (req.build_from_scan) { stream_op->children.push_back(make_side_scan(context, req.right)); }
+    if (req.build_from_scan) {
+      // The cluster ids ride along with the corpus so the fold can read them from the same
+      // batches it searches. Anything else -- a second scan, a pin behind the scan -- would be
+      // a different row order than the one the build side's snapshot fixed.
+      stream_op->children.push_back(make_side_scan(context, req.right, req.build_cluster_column));
+    }
     join_stage = std::move(stream_op);
   } else {
     auto selection = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_select>(
