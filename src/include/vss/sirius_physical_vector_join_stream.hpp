@@ -18,17 +18,16 @@
 
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "telemetry/data_batch_probe.hpp"
 #include "vss/vector_join.hpp"
-
-#include <raft/core/device_resources.hpp>
-#include <cuvs/distance/distance.hpp>
 #include "vss/vector_join_materialized_side.hpp"
 
-#include "telemetry/data_batch_probe.hpp"
+#include <cudf/column/column_view.hpp>
+
+#include <raft/core/device_resources.hpp>
 
 #include <cucascade/data/data_batch.hpp>
-
-#include <cudf/column/column_view.hpp>
+#include <cuvs/distance/distance.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -79,10 +78,10 @@ struct staged_vector_chunk {
  */
 class vector_chunk_source {
  public:
-  vector_chunk_source()                                = default;
+  vector_chunk_source()                                      = default;
   vector_chunk_source(const vector_chunk_source&)            = delete;
   vector_chunk_source& operator=(const vector_chunk_source&) = delete;
-  virtual ~vector_chunk_source()                       = default;
+  virtual ~vector_chunk_source()                             = default;
 
   [[nodiscard]] virtual std::size_t num_chunks() const = 0;
 
@@ -96,7 +95,7 @@ class vector_chunk_source {
 
   /// Rows in chunk @p i, and its device footprint, both without staging it. The memory
   /// estimate has to size a task before any copy happens.
-  [[nodiscard]] virtual std::size_t chunk_rows(std::size_t i) const = 0;
+  [[nodiscard]] virtual std::size_t chunk_rows(std::size_t i) const  = 0;
   [[nodiscard]] virtual std::size_t chunk_bytes(std::size_t i) const = 0;
 };
 
@@ -246,12 +245,9 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// @ref build_side_ready_locked, so callers must check that first.
   void ensure_initialized_locked();
 
-  /// Fill @c _chunk_cluster_ranges on first use. Deferred out of init because staging a chunk
-  /// needs a memory space, which only a running task supplies.
-  void ensure_cluster_ranges(::cucascade::memory::memory_space& space,
-                             rmm::cuda_stream_view stream);
-
-  /// Build @c _cluster_row_ranges and @c _cluster_neighbors on first use.
+  /// Build @c _chunk_cluster_runs, @c _cluster_rows and @c _cluster_neighbors on first use.
+  /// Deferred out of init because reading the cluster column needs a memory space, which only
+  /// a running task supplies.
   void ensure_cluster_index(::cucascade::memory::memory_space& space,
                             rmm::cuda_stream_view stream,
                             rmm::device_async_resource_ref mr,
@@ -281,25 +277,34 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// that entry is dropped. Null for an exhaustive join, which is what selects the fold's
   /// visit-everything path.
   const cudf::column* _centroids{nullptr};
-  /// Per cluster id, the corpus row range [begin, end) holding it, in the corpus's own row
-  /// space. Built once per join from the cluster column, and the reason pruning can work at
-  /// cluster granularity rather than chunk granularity: a cluster is a contiguous slice, so
-  /// visiting one costs a slice rather than a whole chunk.
-  std::vector<std::pair<std::int64_t, std::int64_t>> _cluster_row_ranges;
+  /// One contiguous run of a single cluster inside one corpus chunk. Rows are local to the
+  /// chunk, so a slice can be searched the moment that chunk is staged and needs nothing from
+  /// any other; @c _chunk_row_base turns its neighbour ids back into corpus row ids.
+  struct chunk_cluster_run {
+    std::int32_t cluster;
+    std::int64_t begin;
+    std::int64_t end;
+  };
+  /// Per corpus chunk, the cluster runs it holds, in row order. This is why pruning works at
+  /// cluster granularity rather than chunk granularity: a cluster is a slice of a chunk, so
+  /// visiting one costs a slice rather than a whole chunk. Keyed by chunk rather than by
+  /// cluster because staging is per chunk -- the search walks chunks, and a chunk no probe run
+  /// wants is never staged at all.
+  std::vector<std::vector<chunk_cluster_run>> _chunk_cluster_runs;
+  /// Per corpus chunk, its first row in corpus row space. A slice's neighbour ids come back
+  /// local to the slice; this plus the slice's own begin is the base that makes them corpus
+  /// row ids, exactly as the chunk offset does in the exhaustive fold.
+  std::vector<std::int64_t> _chunk_row_base;
+  /// Per cluster id, how many corpus rows it holds across every chunk. Lets a probe run's
+  /// candidate count be known before any search is issued.
+  std::vector<std::int64_t> _cluster_rows;
   /// Row-major [n_clusters x n_probes] table of each cluster's nearest clusters, computed once
   /// from the centroids. This is the join-specific part: because BOTH sides are clustered, a
   /// probe row's neighbourhood is a property of its cluster, so it is resolved once per cluster
   /// here instead of once per row at query time.
   std::vector<std::int32_t> _cluster_neighbors;
   std::int64_t _n_clusters{0};
-  /// Per corpus chunk, the smallest and largest cluster id it holds, computed once at init.
-  /// A chunk is skipped when a probe batch wants no cluster inside its range.
-  ///
-  /// The test is conservative rather than exact: a chunk holding a sparse set of ids still
-  /// reports a contiguous span, so an unsorted corpus simply stops pruning. Correctness never
-  /// depends on the corpus being stored in cluster order -- only the speedup does.
-  std::vector<std::pair<std::int32_t, std::int32_t>> _chunk_cluster_ranges;
-
+  bool _cluster_index_built{false};
   std::mutex _op_mutex;
   bool _initialized{false};
   bool _hint_returned{false};

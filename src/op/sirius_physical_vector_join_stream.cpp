@@ -17,6 +17,7 @@
 #include "vss/sirius_physical_vector_join_stream.hpp"
 
 #include "data/data_batch_utils.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -29,29 +30,15 @@
 #include "vss/pinned_column.hpp"
 #include "vss/vector_clustering.hpp"
 
-#include <cudf/aggregation.hpp>
-#include <cudf/copying.hpp>
-#include <cudf/filling.hpp>
-#include <cudf/reduction.hpp>
-#include <cudf/sorting.hpp>
-#include <cudf/stream_compaction.hpp>
-
-#include <cstdio>
-#include <cstdlib>
-
-#include "data/sirius_converter_registry.hpp"
-
-#include <cucascade/cudf/gpu_data_representation.hpp>
-#include <cucascade/cudf/host_data_representation.hpp>
-#include <cucascade/data/data_batch.hpp>
-#include <cucascade/memory/memory_reservation.hpp>
-
-#include <array>
-
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/sorting.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
@@ -61,9 +48,18 @@
 
 #include <nvtx3/nvtx3.hpp>
 
+#include <cucascade/cudf/gpu_data_representation.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -79,8 +75,8 @@ namespace {
 class gpu_pinned_chunk_source : public vector_chunk_source {
  public:
   gpu_pinned_chunk_source(const scan_manager::pinned_entry& pin,
-                           const std::string& column,
-                           cucascade::memory::memory_space& space)
+                          const std::string& column,
+                          cucascade::memory::memory_space& space)
     : _views(vss::pinned_column_chunk_views(pin, column, space))
   {
   }
@@ -110,17 +106,18 @@ class gpu_pinned_chunk_source : public vector_chunk_source {
 class host_pinned_chunk_source : public vector_chunk_source {
  public:
   host_pinned_chunk_source(const scan_manager::pinned_entry& pin,
-                            const std::string& column,
-                            std::int64_t dim,
-                            const telemetry::batch_telemetry_info& telemetry_info)
+                           const std::string& column,
+                           std::int64_t dim,
+                           const telemetry::batch_telemetry_info& telemetry_info)
     : _pin(pin), _telemetry_info(telemetry_info), _dim(dim)
   {
     auto const& names = _pin.cache_info.column_names();
     auto const it     = std::find(names.begin(), names.end(), column);
     if (it == names.end()) {
-      throw std::runtime_error("[sirius_physical_vector_join_stream] host-tier pin is missing "
-                               "column '" +
-                               column + "'");
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] host-tier pin is missing "
+        "column '" +
+        column + "'");
     }
     _column_index = static_cast<std::size_t>(std::distance(names.begin(), it));
   }
@@ -162,9 +159,9 @@ class host_pinned_chunk_source : public vector_chunk_source {
     std::shared_ptr<cucascade::memory::reservation> reservation{
       space.make_reservation_or_null(bytes)};
     if (!reservation) {
-      throw std::runtime_error(
-        "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(i) + " needs " +
-        std::to_string(bytes) + " bytes device-side, which exceeds this task's budget");
+      throw std::runtime_error("[sirius_physical_vector_join_stream] corpus chunk " +
+                               std::to_string(i) + " needs " + std::to_string(bytes) +
+                               " bytes device-side, which exceeds this task's budget");
     }
 
     auto const batch_id = sirius::get_next_batch_id();
@@ -429,16 +426,14 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
   auto const& left  = _request.left;
   auto const& right = _request.right;
 
-  const auto* left_pin =
-    _probe_side ? nullptr
-                : _scan_manager->find_pinned_entry_for_duckdb_table(
-                    left.catalog, left.schema, left.table);
+  const auto* left_pin = _probe_side ? nullptr
+                                     : _scan_manager->find_pinned_entry_for_duckdb_table(
+                                         left.catalog, left.schema, left.table);
   // The corpus comes from the build port on the build path, so only the probe side has to be
   // pinned there.
-  const auto* right_pin =
-    _build_side ? nullptr
-                : _scan_manager->find_pinned_entry_for_duckdb_table(
-                    right.catalog, right.schema, right.table);
+  const auto* right_pin = _build_side ? nullptr
+                                      : _scan_manager->find_pinned_entry_for_duckdb_table(
+                                          right.catalog, right.schema, right.table);
   if ((!_probe_side && left_pin == nullptr) || (!_build_side && right_pin == nullptr)) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_stream] left or right table is no longer pinned");
@@ -457,8 +452,8 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
   } else if (left_pin->tier == cucascade::memory::Tier::HOST) {
     _probe = make_host_pinned_chunk_source(*left_pin, left.column, _request.dim, batch_telemetry());
   } else {
-    _probe = make_gpu_pinned_chunk_source(
-      *left_pin, left.column, vss::pinned_entry_gpu_space(*left_pin));
+    _probe =
+      make_gpu_pinned_chunk_source(*left_pin, left.column, vss::pinned_entry_gpu_space(*left_pin));
   }
 
   if (_build_side) {
@@ -481,9 +476,7 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
     if (it != names.end()) {
       auto const col = static_cast<std::size_t>(std::distance(names.begin(), it));
       for (auto const& chunk : right_pin->host_chunks) {
-        if (chunk) {
-          _max_chunk_bytes = std::max(_max_chunk_bytes, chunk->column_size(col));
-        }
+        if (chunk) { _max_chunk_bytes = std::max(_max_chunk_bytes, chunk->column_size(col)); }
       }
     }
   } else {
@@ -558,7 +551,7 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
   cuvs::distance::DistanceType metric)
 {
   std::lock_guard<std::mutex> const lock(_op_mutex);
-  if (!_cluster_row_ranges.empty()) { return; }
+  if (_cluster_index_built) { return; }
 
   auto const* pin = _scan_manager->find_pinned_entry_for_duckdb_table(
     _request.right.catalog, _request.right.schema, _request.right.table);
@@ -568,58 +561,85 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
       _request.right.table + "' pinned");
   }
 
-  // The cluster column is read to the host once: it is one INT32 per corpus row, so even a
-  // 100M-row corpus is 400 MB, and having it host-side turns range lookup into arithmetic
-  // instead of a device round-trip on every probe run.
-  std::vector<std::int32_t> labels;
-  labels.reserve(static_cast<std::size_t>(_right_total_rows));
   auto const n_chunks = vss::pinned_column_chunk_count(*pin, _request.build_cluster_column);
-  for (std::size_t i = 0; i < n_chunks; ++i) {
-    auto staged     = vss::stage_pinned_column_chunk(
-      *pin, _request.build_cluster_column, i, space, stream, batch_telemetry());
-    auto const rows = static_cast<std::size_t>(staged.view.size());
-    if (rows == 0) { continue; }
-    auto const base = labels.size();
-    labels.resize(base + rows);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(labels.data() + base,
-                                  staged.view.data<std::int32_t>(),
-                                  rows * sizeof(std::int32_t),
-                                  cudaMemcpyDeviceToHost,
-                                  stream.value()));
-    stream.synchronize();
-  }
-  if (labels.empty()) {
-    throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column '" +
-                             _request.build_cluster_column + "' is empty");
+  if (n_chunks != _corpus->num_chunks()) {
+    throw std::runtime_error(
+      "[sirius_physical_vector_join_stream] cluster column '" + _request.build_cluster_column +
+      "' has " + std::to_string(n_chunks) + " chunks but the vector column has " +
+      std::to_string(_corpus->num_chunks()) + "; both must come from the same pin");
   }
 
   _n_clusters = static_cast<std::int64_t>(
     vss::list_column_as_dataset_view(_centroids->view(), _request.dim).extent(0));
 
-  // A cluster is one contiguous run because the corpus is stored in cluster order. A corpus
-  // that is not so ordered yields non-contiguous clusters, which this detects rather than
-  // silently answering from a partial range.
-  _cluster_row_ranges.assign(static_cast<std::size_t>(_n_clusters), {0, 0});
-  std::vector<char> seen(static_cast<std::size_t>(_n_clusters), 0);
-  std::int64_t run_start = 0;
-  for (std::size_t i = 1; i <= labels.size(); ++i) {
-    if (i < labels.size() && labels[i] == labels[run_start]) { continue; }
-    auto const c = labels[run_start];
-    if (c < 0 || c >= _n_clusters) {
-      throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column '" +
-                               _request.build_cluster_column + "' holds id " +
-                               std::to_string(c) + ", outside the clustering's " +
-                               std::to_string(_n_clusters) + " clusters");
+  _cluster_rows.assign(static_cast<std::size_t>(_n_clusters), 0);
+  _chunk_cluster_runs.clear();
+  _chunk_cluster_runs.resize(n_chunks);
+  _chunk_row_base.assign(n_chunks, 0);
+
+  // The cluster column is read to the host one chunk at a time: it is one INT32 per corpus
+  // row, so even a 100M-row corpus is 400 MB, and having it host-side turns slice lookup into
+  // arithmetic instead of a device round-trip on every probe run. Read per chunk rather than
+  // flattened because a slice is only searchable once its own chunk is staged, so what the
+  // fold needs is chunk-local rows -- a corpus row index would have to be undone again.
+  std::vector<std::int32_t> labels;
+  std::int64_t row_base = 0;
+  for (std::size_t j = 0; j < n_chunks; ++j) {
+    _chunk_row_base[j] = row_base;
+
+    auto staged = vss::stage_pinned_column_chunk(
+      *pin, _request.build_cluster_column, j, space, stream, batch_telemetry());
+    auto const rows = static_cast<std::size_t>(staged.view.size());
+    if (rows == 0) { continue; }
+
+    labels.resize(rows);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(labels.data(),
+                                  staged.view.data<std::int32_t>(),
+                                  rows * sizeof(std::int32_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    stream.synchronize();
+    row_base += static_cast<std::int64_t>(rows);
+
+    // Within a chunk the labels must be non-decreasing, which makes each cluster one run and
+    // bounds the runs per chunk by the cluster count. Chunks themselves may arrive in any
+    // order -- a slice carries its own chunk, so nothing reads across a chunk boundary. That
+    // is weaker than requiring the whole corpus to be sorted, and it is what a build phase can
+    // actually promise: its batches are ordered spans of an ORDER BY, but the order the
+    // batches are handed back in is a race.
+    std::size_t start = 0;
+    for (std::size_t i = 1; i <= rows; ++i) {
+      if (i < rows && labels[i] == labels[start]) { continue; }
+      auto const c = labels[start];
+      if (c < 0 || c >= _n_clusters) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column '" +
+                                 _request.build_cluster_column + "' holds id " + std::to_string(c) +
+                                 ", outside the clustering's " + std::to_string(_n_clusters) +
+                                 " clusters");
+      }
+      auto& runs = _chunk_cluster_runs[j];
+      if (!runs.empty() && c <= runs.back().cluster) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(j) +
+          " is not stored in cluster order: cluster id " + std::to_string(c) + " follows " +
+          std::to_string(runs.back().cluster) + ". Materialize the corpus with ORDER BY " +
+          _request.build_cluster_column);
+      }
+      runs.push_back(
+        chunk_cluster_run{c, static_cast<std::int64_t>(start), static_cast<std::int64_t>(i)});
+      _cluster_rows[static_cast<std::size_t>(c)] += static_cast<std::int64_t>(i - start);
+      start = i;
     }
-    if (seen[static_cast<std::size_t>(c)]) {
-      throw std::runtime_error(
-        "[sirius_physical_vector_join_stream] corpus is not stored in cluster order: cluster " +
-        std::to_string(c) + " appears in more than one run. Materialize the corpus with "
-        "ORDER BY " + _request.build_cluster_column);
-    }
-    seen[static_cast<std::size_t>(c)]                  = 1;
-    _cluster_row_ranges[static_cast<std::size_t>(c)] = {run_start, static_cast<std::int64_t>(i)};
-    run_start                                          = static_cast<std::int64_t>(i);
+  }
+  if (row_base == 0) {
+    throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column '" +
+                             _request.build_cluster_column + "' is empty");
+  }
+  if (row_base != _right_total_rows) {
+    throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column has " +
+                             std::to_string(row_base) + " rows but the corpus has " +
+                             std::to_string(_right_total_rows) +
+                             "; both must come from the same pin");
   }
 
   // Each cluster's nearest clusters, from the centroids alone. This is what a search index
@@ -641,75 +661,26 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
       _cluster_neighbors[i] = static_cast<std::int32_t>(ids[i]);
     }
   }
+  _cluster_index_built = true;
 
   if (std::getenv("SIRIUS_VECTOR_JOIN_PRUNE_DEBUG") != nullptr) {
     std::size_t empty = 0;
-    for (auto const& [b, e] : _cluster_row_ranges) {
-      if (e <= b) { ++empty; }
+    std::size_t runs  = 0;
+    for (auto const rows : _cluster_rows) {
+      if (rows == 0) { ++empty; }
+    }
+    for (auto const& per_chunk : _chunk_cluster_runs) {
+      runs += per_chunk.size();
     }
     std::fprintf(stderr,
-                 "[vecjoin] cluster index: %ld clusters over %ld rows, %zu empty, n_probes=%ld\n",
-                 static_cast<long>(_n_clusters), static_cast<long>(labels.size()), empty,
+                 "[vecjoin] cluster index: %ld clusters over %ld rows in %zu chunks, %zu runs, "
+                 "%zu empty, n_probes=%ld\n",
+                 static_cast<long>(_n_clusters),
+                 static_cast<long>(row_base),
+                 n_chunks,
+                 runs,
+                 empty,
                  static_cast<long>(n_probes));
-  }
-}
-
-void sirius_physical_vector_join_stream::ensure_cluster_ranges(
-  ::cucascade::memory::memory_space& space, rmm::cuda_stream_view stream)
-{
-  std::lock_guard<std::mutex> const lock(_op_mutex);
-  if (!_chunk_cluster_ranges.empty()) { return; }
-
-  // Read once for the whole join rather than per probe batch: the corpus is fixed, and a
-  // chunk's span is what every batch tests against. Deferred to here because staging needs a
-  // memory space, which only a running task has. Each chunk is staged and released, so this
-  // costs one chunk of device memory whatever the corpus size.
-  auto const* pin = _scan_manager->find_pinned_entry_for_duckdb_table(
-    _request.right.catalog, _request.right.schema, _request.right.table);
-  if (pin == nullptr) {
-    throw std::runtime_error(
-      "[sirius_physical_vector_join_stream] clustering needs the corpus table '" +
-      _request.right.table + "' pinned");
-  }
-
-  auto const n_chunks =
-    vss::pinned_column_chunk_count(*pin, _request.build_cluster_column);
-  if (n_chunks != _corpus->num_chunks()) {
-    throw std::runtime_error(
-      "[sirius_physical_vector_join_stream] cluster column '" + _request.build_cluster_column +
-      "' has " + std::to_string(n_chunks) + " chunks but the vector column has " +
-      std::to_string(_corpus->num_chunks()) + "; both must come from the same pin");
-  }
-
-  std::vector<std::pair<std::int32_t, std::int32_t>> ranges;
-  ranges.reserve(n_chunks);
-  for (std::size_t i = 0; i < n_chunks; ++i) {
-    auto staged = vss::stage_pinned_column_chunk(
-      *pin, _request.build_cluster_column, i, space, stream, batch_telemetry());
-    if (staged.view.size() == 0) {
-      ranges.emplace_back(1, 0);  // an empty span matches no cluster
-      continue;
-    }
-    auto const lo = cudf::reduce(staged.view,
-                                 *cudf::make_min_aggregation<cudf::reduce_aggregation>(),
-                                 cudf::data_type{cudf::type_id::INT32},
-                                 stream);
-    auto const hi = cudf::reduce(staged.view,
-                                 *cudf::make_max_aggregation<cudf::reduce_aggregation>(),
-                                 cudf::data_type{cudf::type_id::INT32},
-                                 stream);
-    stream.synchronize();
-    ranges.emplace_back(static_cast<cudf::numeric_scalar<std::int32_t> const&>(*lo).value(stream),
-                        static_cast<cudf::numeric_scalar<std::int32_t> const&>(*hi).value(stream));
-  }
-  _chunk_cluster_ranges = std::move(ranges);
-
-  if (std::getenv("SIRIUS_VECTOR_JOIN_PRUNE_DEBUG") != nullptr) {
-    std::fprintf(stderr, "[vecjoin] corpus chunks=%zu cluster spans:", _chunk_cluster_ranges.size());
-    for (auto const& [lo, hi] : _chunk_cluster_ranges) {
-      std::fprintf(stderr, " [%d,%d]", lo, hi);
-    }
-    std::fprintf(stderr, "\n");
   }
 }
 
@@ -763,7 +734,21 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // than a predicate inside it because the two iterate different things: the exhaustive fold
   // walks corpus chunks, while this walks (probe run x neighbouring cluster) pairs.
   if (_centroids != nullptr) {
+    auto const dbg = std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr;
+    auto phase_t0  = std::chrono::steady_clock::now();
+    auto phase     = [&](const char* name) {
+      if (!dbg) { return; }
+      stream.synchronize();
+      auto const now = std::chrono::steady_clock::now();
+      std::fprintf(stderr,
+                   "[vecjoin-phase] %-22s %8.3f s\n",
+                   name,
+                   std::chrono::duration<double>(now - phase_t0).count());
+      phase_t0 = now;
+    };
+
     ensure_cluster_index(*mem_space, stream, mr, res, metric);
+    phase("cluster index");
 
     auto const n_probes = std::clamp<std::int64_t>(_request.n_probes, 1, _n_clusters);
 
@@ -775,9 +760,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto assignment  = vss::assign_to_centroids(
       res, staged_probe.view, _centroids->view(), dim, nearest, 0, metric, stream, mr);
 
-    auto const order = cudf::sorted_order(
-      cudf::table_view{{assignment.cluster_ids->view()}}, {}, {}, stream, mr);
-    auto const sorted_probe = cudf::gather(cudf::table_view{{staged_probe.view}},
+    phase("assign probe->cluster");
+    auto const order =
+      cudf::sorted_order(cudf::table_view{{assignment.cluster_ids->view()}}, {}, {}, stream, mr);
+    phase("sort order");
+    auto const sorted_probe  = cudf::gather(cudf::table_view{{staged_probe.view}},
                                            order->view(),
                                            cudf::out_of_bounds_policy::DONT_CHECK,
                                            stream,
@@ -787,6 +774,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                             cudf::out_of_bounds_policy::DONT_CHECK,
                                             stream,
                                             mr);
+    phase("gather probe vectors");
     auto const probe_sorted_view =
       vss::list_column_as_dataset_view(sorted_probe->get_column(0).view(), dim);
 
@@ -797,253 +785,429 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                   cudaMemcpyDeviceToHost,
                                   stream.value()));
     stream.synchronize();
+    phase("labels to host");
 
-    auto const corpus_all = _corpus->num_chunks() > 0
-                              ? _corpus->stage(0, *mem_space, stream)
-                              : staged_vector_chunk{};
-    auto const corpus_view = vss::list_column_as_dataset_view(corpus_all.view, dim);
+    // One run per probe cluster present in this batch, in sorted order.
+    struct probe_run {
+      std::int32_t cluster;
+      std::int64_t begin;
+      std::int64_t end;
+    };
+    std::vector<probe_run> runs;
+    for (std::int64_t b = 0; b < n_left;) {
+      auto const c   = host_labels[static_cast<std::size_t>(b)];
+      std::int64_t e = b + 1;
+      while (e < n_left && host_labels[static_cast<std::size_t>(e)] == c) {
+        ++e;
+      }
+      runs.push_back(probe_run{c, b, e});
+      b = e;
+    }
 
-    std::vector<std::unique_ptr<cudf::column>> run_neighbors;
-    std::vector<std::unique_ptr<cudf::column>> run_distances;
-    std::size_t visited = 0;
-
-    for (std::int64_t run_begin = 0; run_begin < n_left;) {
-      auto const c = host_labels[static_cast<std::size_t>(run_begin)];
-      std::int64_t run_end = run_begin + 1;
-      while (run_end < n_left && host_labels[static_cast<std::size_t>(run_end)] == c) { ++run_end; }
-      auto const run_rows = run_end - run_begin;
-
-      auto const queries_run = raft::make_device_matrix_view<const float, std::int64_t,
-                                                             raft::row_major>(
-        probe_sorted_view.data_handle() + run_begin * dim, run_rows, dim);
-
-      // Only this cluster's neighbours are searched, which is the pruning: every other cluster's
-      // rows are never read, let alone scored.
-      std::unique_ptr<cudf::column> run_acc_n;
-      std::unique_ptr<cudf::column> run_acc_d;
+    // Inverted: for each corpus cluster, the runs that want it. Built per probe batch because
+    // it depends on which clusters this batch's rows landed in; the (cluster -> nearest
+    // clusters) table it reads is computed once for the whole join. Having it this way round is
+    // what lets the search walk chunks -- a chunk is staged once and every run that wants a
+    // slice of it is served before it is released.
+    std::vector<std::vector<std::size_t>> runs_wanting(static_cast<std::size_t>(_n_clusters));
+    for (std::size_t r = 0; r < runs.size(); ++r) {
+      auto const c = runs[r].cluster;
       for (std::int64_t t = 0; t < n_probes; ++t) {
         auto const nc = _cluster_neighbors[static_cast<std::size_t>(c * n_probes + t)];
         if (nc < 0 || nc >= _n_clusters) { continue; }
-        auto const [cb, ce] = _cluster_row_ranges[static_cast<std::size_t>(nc)];
-        auto const rows     = ce - cb;
-        if (rows <= 0) { continue; }
-        ++visited;
+        if (_cluster_rows[static_cast<std::size_t>(nc)] == 0) { continue; }
+        auto& wanting = runs_wanting[static_cast<std::size_t>(nc)];
+        // A cluster reached twice would fold the same corpus rows in twice and put a duplicate
+        // neighbour in the answer, so a repeated id is dropped rather than trusted not to occur.
+        if (std::find(wanting.begin(), wanting.end(), r) == wanting.end()) { wanting.push_back(r); }
+      }
+    }
 
-        auto const slice = raft::make_device_matrix_view<const float, std::int64_t,
-                                                         raft::row_major>(
-          corpus_view.data_handle() + cb * dim, rows, dim);
-        auto const k_eff = std::min<std::int64_t>(k_join, rows);
-        auto knn         = vss::brute_force_knn(res, slice, queries_run, k_eff, metric, mr);
+    // A run's candidates are the rows of the clusters it wants, which the cluster index already
+    // totals -- so a run that cannot supply k is refused before a single search is issued
+    // rather than after the merge has silently padded the answer out with misses.
+    std::vector<std::int64_t> run_candidates(runs.size(), 0);
+    for (std::int64_t nc = 0; nc < _n_clusters; ++nc) {
+      for (auto const r : runs_wanting[static_cast<std::size_t>(nc)]) {
+        run_candidates[r] += _cluster_rows[static_cast<std::size_t>(nc)];
+      }
+    }
+    for (std::size_t r = 0; r < runs.size(); ++r) {
+      if (run_candidates[r] == 0) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] probe cluster " +
+                                 std::to_string(runs[r].cluster) +
+                                 " reached no non-empty corpus cluster");
+      }
+      if (run_candidates[r] < k_join) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] probe cluster " +
+                                 std::to_string(runs[r].cluster) + " reaches only " +
+                                 std::to_string(run_candidates[r]) +
+                                 " corpus rows, fewer than k=" + std::to_string(k_join) +
+                                 "; raise n_probes or cluster with fewer, larger clusters");
+      }
+    }
 
-        // Neighbour ids come back local to the slice; the cluster's own start is the base that
-        // makes them corpus row ids, exactly as the chunk offset does in the exhaustive fold.
-        cudf::numeric_scalar<std::int64_t> const base(cb, true, stream);
-        auto shifted = cudf::binary_operation(knn.neighbors->view(),
-                                              base,
-                                              cudf::binary_operator::ADD,
-                                              cudf::data_type{cudf::type_id::INT64},
-                                              stream,
-                                              mr);
-        if (!run_acc_n) {
-          run_acc_n = std::move(shifted);
-          run_acc_d = std::move(knn.distances);
-          continue;
+    // The prune, made explicit: a chunk holding no cluster any run wants is never staged, so
+    // an out-of-core clustered corpus pays no transfer for the part it skips.
+    std::vector<std::size_t> needed_chunks;
+    for (std::size_t j = 0; j < _chunk_cluster_runs.size(); ++j) {
+      for (auto const& slice : _chunk_cluster_runs[j]) {
+        if (!runs_wanting[static_cast<std::size_t>(slice.cluster)].empty()) {
+          needed_chunks.push_back(j);
+          break;
         }
-        if (k_eff < k_join || run_acc_n->size() != static_cast<cudf::size_type>(run_rows * k_join)) {
-          // knn_merge_parts needs a uniform k across parts; a cluster smaller than k cannot
-          // supply one. Rare, and refused rather than silently dropping candidates.
+      }
+    }
+
+    // knn_merge_parts needs a uniform k across the parts it merges, and a cluster sliced by a
+    // chunk boundary can be shorter than k. Padding the short part with a miss -- id -1 at
+    // infinite distance -- is what keeps that slice mergeable; the padding can only be selected
+    // when a run had fewer than k real candidates, which was refused above. Shifting the ids to
+    // corpus row space happens BEFORE this, or the -1 would be shifted into a real row.
+    auto pad_part = [&](std::unique_ptr<cudf::column> neighbors,
+                        std::unique_ptr<cudf::column> distances,
+                        std::int64_t rows,
+                        std::int64_t k_eff) {
+      if (k_eff >= k_join) { return std::pair{std::move(neighbors), std::move(distances)}; }
+      cudf::numeric_scalar<std::int64_t> const miss_id(-1, true, stream);
+      cudf::numeric_scalar<float> const miss_distance(
+        std::numeric_limits<float>::infinity(), true, stream);
+      auto const total = static_cast<cudf::size_type>(rows * k_join);
+      std::vector<std::unique_ptr<cudf::column>> target_cols;
+      target_cols.push_back(cudf::make_column_from_scalar(miss_id, total, stream, mr));
+      target_cols.push_back(cudf::make_column_from_scalar(miss_distance, total, stream, mr));
+      cudf::table const target{std::move(target_cols)};
+
+      // Row-major, so element p of the [rows x k_eff] part belongs at
+      // (p / k_eff) * k_join + (p % k_eff) in the [rows x k_join] one.
+      cudf::numeric_scalar<std::int32_t> const zero32(0, true, stream);
+      cudf::numeric_scalar<std::int32_t> const one32(1, true, stream);
+      cudf::numeric_scalar<std::int32_t> const keff32(
+        static_cast<std::int32_t>(k_eff), true, stream);
+      cudf::numeric_scalar<std::int32_t> const kjoin32(
+        static_cast<std::int32_t>(k_join), true, stream);
+      auto const positions =
+        cudf::sequence(static_cast<cudf::size_type>(rows * k_eff), zero32, one32, stream, mr);
+      auto const src_row   = cudf::binary_operation(positions->view(),
+                                                  keff32,
+                                                  cudf::binary_operator::DIV,
+                                                  cudf::data_type{cudf::type_id::INT32},
+                                                  stream,
+                                                  mr);
+      auto const in_row    = cudf::binary_operation(positions->view(),
+                                                 keff32,
+                                                 cudf::binary_operator::MOD,
+                                                 cudf::data_type{cudf::type_id::INT32},
+                                                 stream,
+                                                 mr);
+      auto const dest_base = cudf::binary_operation(src_row->view(),
+                                                    kjoin32,
+                                                    cudf::binary_operator::MUL,
+                                                    cudf::data_type{cudf::type_id::INT32},
+                                                    stream,
+                                                    mr);
+      auto const dest      = cudf::binary_operation(dest_base->view(),
+                                               in_row->view(),
+                                               cudf::binary_operator::ADD,
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               stream,
+                                               mr);
+      auto padded          = cudf::scatter(cudf::table_view{{neighbors->view(), distances->view()}},
+                                  dest->view(),
+                                  target.view(),
+                                  stream,
+                                  mr);
+      auto cols            = padded->release();
+      return std::pair{std::move(cols[0]), std::move(cols[1])};
+    };
+
+    // One accumulator per run rather than one for the batch: a run's answer is merged from the
+    // slices it wants, and those arrive spread across chunks. Their total size is still
+    // [n_left x k_join] -- the runs partition the batch -- so this costs no more device memory
+    // than the single accumulator the exhaustive fold keeps.
+    std::vector<std::unique_ptr<cudf::column>> acc_n(runs.size());
+    std::vector<std::unique_ptr<cudf::column>> acc_d(runs.size());
+
+    // Staging runs on its own stream so the next needed chunk's H2D overlaps this one's
+    // compute, exactly as in the exhaustive fold below.
+    std::optional<rmm::cuda_stream> staging_stream;
+    if (_corpus->is_streaming()) { staging_stream.emplace(); }
+    auto const stage_on = staging_stream ? staging_stream->view() : stream;
+    std::vector<cucascade::read_only_data_batch> borrowed;
+    auto release_staged = [&](staged_vector_chunk& chunk) {
+      if (chunk.owner) {
+        auto mut = chunk.owner->to_mutable();
+        mut.rebind_stream(stream);
+      }
+      if (chunk.reader) { borrowed.push_back(std::move(*chunk.reader)); }
+      chunk = staged_vector_chunk{};
+    };
+
+    std::int64_t scanned_pairs = 0;
+    auto prefetched            = needed_chunks.empty()
+                                   ? staged_vector_chunk{}
+                                   : _corpus->stage(needed_chunks[0], *mem_space, stage_on);
+
+    for (std::size_t ci = 0; ci < needed_chunks.size(); ++ci) {
+      auto const j          = needed_chunks[ci];
+      auto staged           = std::move(prefetched);
+      auto const chunk_view = vss::list_column_as_dataset_view(staged.view, dim);
+      auto const chunk_base = _chunk_row_base[j];
+
+      for (auto const& slice : _chunk_cluster_runs[j]) {
+        auto const& wanting = runs_wanting[static_cast<std::size_t>(slice.cluster)];
+        if (wanting.empty()) { continue; }
+        // The slice was cut from the cluster column's chunk j; this is the first point at
+        // which the vector column's chunk j is resident and its row count exactly known. The
+        // two are the same pin's row groups, so a mismatch is a broken invariant rather than
+        // a user error -- but it would read past the end of the chunk, so it is checked.
+        if (slice.end > static_cast<std::int64_t>(chunk_view.extent(0))) {
           throw std::runtime_error(
-            "[sirius_physical_vector_join_stream] cluster " + std::to_string(nc) + " holds " +
-            std::to_string(rows) + " rows, fewer than k=" + std::to_string(k_join) +
-            "; lower k or cluster with fewer, larger clusters");
+            "[sirius_physical_vector_join_stream] cluster column chunk " + std::to_string(j) +
+            " describes row " + std::to_string(slice.end) + " but the vector column's chunk " +
+            "holds " + std::to_string(chunk_view.extent(0)) + "; both must come from the same pin");
         }
-        auto const stacked_d = cudf::concatenate(
-          std::vector<cudf::column_view>{run_acc_d->view(), knn.distances->view()}, stream, mr);
-        auto const stacked_n = cudf::concatenate(
-          std::vector<cudf::column_view>{run_acc_n->view(), shifted->view()}, stream, mr);
-        auto merged = vss::knn_merge_parts_topk(
-          res, stacked_d->view(), stacked_n->view(), run_rows, 2, k_join, stream, mr);
-        run_acc_n = std::move(merged.neighbors);
-        run_acc_d = std::move(merged.distances);
+        auto const slice_rows = slice.end - slice.begin;
+        auto const slice_view =
+          raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+            chunk_view.data_handle() + slice.begin * dim, slice_rows, dim);
+        auto const k_eff = std::min<std::int64_t>(k_join, slice_rows);
+
+        for (auto const r : wanting) {
+          auto const run_rows = runs[r].end - runs[r].begin;
+          auto const queries_run =
+            raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+              probe_sorted_view.data_handle() + runs[r].begin * dim, run_rows, dim);
+
+          auto knn = vss::brute_force_knn(res, slice_view, queries_run, k_eff, metric, mr);
+          scanned_pairs += slice_rows * run_rows;
+
+          // Neighbour ids come back local to the slice; the slice's own start in corpus row
+          // space is the base that makes them corpus row ids, exactly as the chunk offset does
+          // in the exhaustive fold.
+          cudf::numeric_scalar<std::int64_t> const base(chunk_base + slice.begin, true, stream);
+          auto shifted = cudf::binary_operation(knn.neighbors->view(),
+                                                base,
+                                                cudf::binary_operator::ADD,
+                                                cudf::data_type{cudf::type_id::INT64},
+                                                stream,
+                                                mr);
+          auto part    = pad_part(std::move(shifted), std::move(knn.distances), run_rows, k_eff);
+          if (!acc_n[r]) {
+            acc_n[r] = std::move(part.first);
+            acc_d[r] = std::move(part.second);
+            continue;
+          }
+          auto const stacked_d = cudf::concatenate(
+            std::vector<cudf::column_view>{acc_d[r]->view(), part.second->view()}, stream, mr);
+          auto const stacked_n = cudf::concatenate(
+            std::vector<cudf::column_view>{acc_n[r]->view(), part.first->view()}, stream, mr);
+          auto merged = vss::knn_merge_parts_topk(
+            res, stacked_d->view(), stacked_n->view(), run_rows, 2, k_join, stream, mr);
+          acc_n[r] = std::move(merged.neighbors);
+          acc_d[r] = std::move(merged.distances);
+        }
       }
-      if (!run_acc_n) {
-        throw std::runtime_error(
-          "[sirius_physical_vector_join_stream] probe cluster " + std::to_string(c) +
-          " reached no non-empty corpus cluster");
-      }
-      run_neighbors.push_back(std::move(run_acc_n));
-      run_distances.push_back(std::move(run_acc_d));
-      run_begin = run_end;
+
+      // The searches above are issued, not finished. Staging the next needed chunk now runs its
+      // H2D while the GPU works on this one.
+      prefetched = (ci + 1 < needed_chunks.size())
+                     ? _corpus->stage(needed_chunks[ci + 1], *mem_space, stage_on)
+                     : staged_vector_chunk{};
+      release_staged(staged);
     }
 
     if (std::getenv("SIRIUS_VECTOR_JOIN_PRUNE_DEBUG") != nullptr) {
+      auto const exhaustive_pairs = n_left * _right_total_rows;
       std::fprintf(stderr,
-                   "[vecjoin] batch: %zu probe runs, %zu cluster visits of %ld possible "
-                   "(%.1f%% of the corpus scanned)\n",
-                   run_neighbors.size(), visited,
-                   static_cast<long>(run_neighbors.size() * _n_clusters),
-                   100.0 * static_cast<double>(visited) /
-                     static_cast<double>(run_neighbors.size() * _n_clusters));
+                   "[vecjoin] batch: %zu probe runs, %zu of %zu corpus chunks staged, "
+                   "%lld of %lld probe-row x corpus-row pairs scored (%.2f%%)\n",
+                   runs.size(),
+                   needed_chunks.size(),
+                   _chunk_cluster_runs.size(),
+                   static_cast<long long>(scanned_pairs),
+                   static_cast<long long>(exhaustive_pairs),
+                   exhaustive_pairs == 0 ? 0.0
+                                         : 100.0 * static_cast<double>(scanned_pairs) /
+                                             static_cast<double>(exhaustive_pairs));
     }
 
+    phase("search+merge runs");
     // Runs are emitted in sorted order; concatenating them rebuilds the sorted answer, and
     // scattering by the sort permutation puts it back in the caller's row order.
     std::vector<cudf::column_view> nviews;
     std::vector<cudf::column_view> dviews;
-    nviews.reserve(run_neighbors.size());
-    dviews.reserve(run_distances.size());
-    for (std::size_t i = 0; i < run_neighbors.size(); ++i) {
-      nviews.push_back(run_neighbors[i]->view());
-      dviews.push_back(run_distances[i]->view());
+    nviews.reserve(acc_n.size());
+    dviews.reserve(acc_d.size());
+    for (std::size_t r = 0; r < acc_n.size(); ++r) {
+      if (!acc_n[r]) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] probe cluster " +
+                                 std::to_string(runs[r].cluster) +
+                                 " was answered by no corpus slice");
+      }
+      nviews.push_back(acc_n[r]->view());
+      dviews.push_back(acc_d[r]->view());
     }
     auto sorted_n = cudf::concatenate(nviews, stream, mr);
     auto sorted_d = cudf::concatenate(dviews, stream, mr);
+    phase("concat runs");
 
     // The accumulator is [n_left x k_join] row-major, so a row moves as a block of k_join
     // entries: expand the row permutation to element positions before scattering.
-    cudf::numeric_scalar<std::int32_t> const kscalar(static_cast<std::int32_t>(k_join), true, stream);
+    cudf::numeric_scalar<std::int32_t> const kscalar(
+      static_cast<std::int32_t>(k_join), true, stream);
     cudf::numeric_scalar<std::int32_t> const zero32(0, true, stream);
     cudf::numeric_scalar<std::int32_t> const one32(1, true, stream);
-    auto const positions = cudf::sequence(
-      static_cast<cudf::size_type>(n_left * k_join), zero32, one32, stream, mr);
-    auto const src_row = cudf::binary_operation(positions->view(), kscalar,
+    auto const positions =
+      cudf::sequence(static_cast<cudf::size_type>(n_left * k_join), zero32, one32, stream, mr);
+    auto const src_row   = cudf::binary_operation(positions->view(),
+                                                kscalar,
                                                 cudf::binary_operator::DIV,
-                                                cudf::data_type{cudf::type_id::INT32}, stream, mr);
-    auto const in_row  = cudf::binary_operation(positions->view(), kscalar,
+                                                cudf::data_type{cudf::type_id::INT32},
+                                                stream,
+                                                mr);
+    auto const in_row    = cudf::binary_operation(positions->view(),
+                                               kscalar,
                                                cudf::binary_operator::MOD,
-                                               cudf::data_type{cudf::type_id::INT32}, stream, mr);
-    auto const dest_row = cudf::gather(cudf::table_view{{order->view()}},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               stream,
+                                               mr);
+    auto const dest_row  = cudf::gather(cudf::table_view{{order->view()}},
                                        src_row->view(),
                                        cudf::out_of_bounds_policy::DONT_CHECK,
-                                       stream, mr);
-    auto const dest_base = cudf::binary_operation(dest_row->get_column(0).view(), kscalar,
+                                       stream,
+                                       mr);
+    auto const dest_base = cudf::binary_operation(dest_row->get_column(0).view(),
+                                                  kscalar,
                                                   cudf::binary_operator::MUL,
-                                                  cudf::data_type{cudf::type_id::INT32}, stream, mr);
-    auto const dest = cudf::binary_operation(dest_base->view(), in_row->view(),
+                                                  cudf::data_type{cudf::type_id::INT32},
+                                                  stream,
+                                                  mr);
+    auto const dest      = cudf::binary_operation(dest_base->view(),
+                                             in_row->view(),
                                              cudf::binary_operator::ADD,
-                                             cudf::data_type{cudf::type_id::INT32}, stream, mr);
-    auto scattered = cudf::scatter(cudf::table_view{{sorted_n->view(), sorted_d->view()}},
+                                             cudf::data_type{cudf::type_id::INT32},
+                                             stream,
+                                             mr);
+    auto scattered       = cudf::scatter(cudf::table_view{{sorted_n->view(), sorted_d->view()}},
                                    dest->view(),
                                    cudf::table_view{{sorted_n->view(), sorted_d->view()}},
-                                   stream, mr);
-    auto cols     = scattered->release();
-    acc_neighbors = std::move(cols[0]);
-    acc_distances = std::move(cols[1]);
+                                   stream,
+                                   mr);
+    auto cols            = scattered->release();
+    acc_neighbors        = std::move(cols[0]);
+    acc_distances        = std::move(cols[1]);
+    phase("scatter to row order");
   } else {
+    auto const n_chunks = _corpus->num_chunks();
+    std::int64_t offset = 0;  // running base of the current chunk in right-table row space
 
-  auto const n_chunks = _corpus->num_chunks();
-  std::int64_t offset = 0;  // running base of the current chunk in right-table row space
+    // Staging runs on its own stream so chunk j+1's H2D overlaps chunk j's compute. The
+    // converter host-synchronizes at the end of its copy, so what is actually overlapped is
+    // "host blocked on the copy" against "GPU busy with the previous chunk" -- the compute
+    // below is issued asynchronously and does not block the host. Only worth a stream when
+    // the corpus actually streams; a GPU-tier pin stages nothing.
+    std::optional<rmm::cuda_stream> staging_stream;
+    if (_corpus->is_streaming()) { staging_stream.emplace(); }
+    auto const stage_on = staging_stream ? staging_stream->view() : stream;
 
-  // Staging runs on its own stream so chunk j+1's H2D overlaps chunk j's compute. The
-  // converter host-synchronizes at the end of its copy, so what is actually overlapped is
-  // "host blocked on the copy" against "GPU busy with the previous chunk" -- the compute
-  // below is issued asynchronously and does not block the host. Only worth a stream when
-  // the corpus actually streams; a GPU-tier pin stages nothing.
-  std::optional<rmm::cuda_stream> staging_stream;
-  if (_corpus->is_streaming()) { staging_stream.emplace(); }
-  auto const stage_on = staging_stream ? staging_stream->view() : stream;
+    auto prefetched =
+      n_chunks > 0 ? _corpus->stage(0, *mem_space, stage_on) : staged_vector_chunk{};
 
-  auto prefetched = n_chunks > 0 ? _corpus->stage(0, *mem_space, stage_on) : staged_vector_chunk{};
+    auto advance = [&](std::size_t next) {
+      prefetched =
+        next < n_chunks ? _corpus->stage(next, *mem_space, stage_on) : staged_vector_chunk{};
+    };
 
-  auto advance = [&](std::size_t next) {
-    prefetched =
-      next < n_chunks ? _corpus->stage(next, *mem_space, stage_on) : staged_vector_chunk{};
-  };
+    // Borrowed build-side batches whose read locks have to outlive the searches reading them.
+    // A borrow costs no device memory -- the batch was already resident, which is why it was
+    // borrowed rather than copied -- so holding it to the end of the task only means the
+    // downgrade executor cannot spill that batch while this task is still reading it.
+    std::vector<cucascade::read_only_data_batch> borrowed;
 
-  // Borrowed build-side batches whose read locks have to outlive the searches reading them.
-  // A borrow costs no device memory -- the batch was already resident, which is why it was
-  // borrowed rather than copied -- so holding it to the end of the task only means the
-  // downgrade executor cannot spill that batch while this task is still reading it.
-  std::vector<cucascade::read_only_data_batch> borrowed;
+    // The staged copy is read by kernels that are still pending on the compute stream, but it
+    // was allocated on the staging stream, so dropping it here would hand the buffer back to
+    // RMM's free list for that other stream while a kernel is still reading it. Rebinding
+    // moves the deallocation onto the compute stream, where it is ordered behind that kernel.
+    // Only ever applied to a copy this task made: `owner` is null for a borrow, and upgrading a
+    // borrowed batch to mutable while its own read lock is held would deadlock against itself.
+    auto release_staged = [&](staged_vector_chunk& chunk) {
+      if (chunk.owner) {
+        auto mut = chunk.owner->to_mutable();
+        mut.rebind_stream(stream);
+      }
+      if (chunk.reader) { borrowed.push_back(std::move(*chunk.reader)); }
+      chunk = staged_vector_chunk{};
+    };
 
-  // The staged copy is read by kernels that are still pending on the compute stream, but it
-  // was allocated on the staging stream, so dropping it here would hand the buffer back to
-  // RMM's free list for that other stream while a kernel is still reading it. Rebinding
-  // moves the deallocation onto the compute stream, where it is ordered behind that kernel.
-  // Only ever applied to a copy this task made: `owner` is null for a borrow, and upgrading a
-  // borrowed batch to mutable while its own read lock is held would deadlock against itself.
-  auto release_staged = [&](staged_vector_chunk& chunk) {
-    if (chunk.owner) {
-      auto mut = chunk.owner->to_mutable();
-      mut.rebind_stream(stream);
-    }
-    if (chunk.reader) { borrowed.push_back(std::move(*chunk.reader)); }
-    chunk = staged_vector_chunk{};
-  };
+    for (std::size_t j = 0; j < n_chunks; ++j) {
+      // Held for this iteration only; released at the bottom once its compute is ordered,
+      // which is what keeps device memory bounded by the chunks in flight, not the corpus.
+      auto staged           = std::move(prefetched);
+      auto const dataset    = vss::list_column_as_dataset_view(staged.view, dim);
+      auto const batch_rows = static_cast<std::int64_t>(dataset.extent(0));
+      if (batch_rows == 0) {
+        advance(j + 1);
+        continue;
+      }
 
-  for (std::size_t j = 0; j < n_chunks; ++j) {
-    // Held for this iteration only; released at the bottom once its compute is ordered,
-    // which is what keeps device memory bounded by the chunks in flight, not the corpus.
-    auto staged           = std::move(prefetched);
-    auto const dataset    = vss::list_column_as_dataset_view(staged.view, dim);
-    auto const batch_rows = static_cast<std::int64_t>(dataset.extent(0));
-    if (batch_rows == 0) {
+      // knn_merge_parts requires a uniform k across the parts it merges. Every batch
+      // therefore has to supply k_join candidates; a batch shorter than k_join cannot,
+      // and padding it row-major is not expressible without a dedicated kernel.
+      if (n_chunks > 1 && batch_rows < k_join) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_stream] right batch " + std::to_string(j) + " has " +
+          std::to_string(batch_rows) + " rows, fewer than k=" + std::to_string(k_join) +
+          "; repartition the right table so every batch holds at least k rows");
+      }
+      auto const k_eff = std::min<std::int64_t>(k_join, batch_rows);
+
+      auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
+
+      // The search above is issued, not finished. Staging the next chunk now runs its H2D
+      // while the GPU works on this one; the host blocks inside the converter, the device
+      // does not.
       advance(j + 1);
-      continue;
+      release_staged(staged);
+
+      std::unique_ptr<cudf::column> neighbors = std::move(knn.neighbors);
+      auto const chunk_base                   = offset;
+      offset += batch_rows;
+      if (chunk_base != 0) {
+        cudf::numeric_scalar<std::int64_t> const off_scalar(chunk_base, true, stream);
+        neighbors = cudf::binary_operation(neighbors->view(),
+                                           off_scalar,
+                                           cudf::binary_operator::ADD,
+                                           cudf::data_type{cudf::type_id::INT64},
+                                           stream,
+                                           mr);
+      }
+
+      if (!acc_neighbors) {
+        acc_neighbors = std::move(neighbors);
+        acc_distances = std::move(knn.distances);
+        continue;
+      }
+
+      // Fold: stack accumulator and this batch part-major and merge them back down to
+      // k_join. This is knn_merge_parts with n_parts = 2 -- the same kernel the split
+      // design called once over every partial, applied incrementally instead.
+      auto const stacked_distances = cudf::concatenate(
+        std::vector<cudf::column_view>{acc_distances->view(), knn.distances->view()}, stream, mr);
+      auto const stacked_neighbors = cudf::concatenate(
+        std::vector<cudf::column_view>{acc_neighbors->view(), neighbors->view()}, stream, mr);
+
+      auto merged   = vss::knn_merge_parts_topk(res,
+                                              stacked_distances->view(),
+                                              stacked_neighbors->view(),
+                                              n_left,
+                                              /*n_parts=*/2,
+                                              k_join,
+                                              stream,
+                                              mr);
+      acc_neighbors = std::move(merged.neighbors);
+      acc_distances = std::move(merged.distances);
     }
-
-    // knn_merge_parts requires a uniform k across the parts it merges. Every batch
-    // therefore has to supply k_join candidates; a batch shorter than k_join cannot,
-    // and padding it row-major is not expressible without a dedicated kernel.
-    if (n_chunks > 1 && batch_rows < k_join) {
-      throw std::runtime_error(
-        "[sirius_physical_vector_join_stream] right batch " + std::to_string(j) + " has " +
-        std::to_string(batch_rows) + " rows, fewer than k=" + std::to_string(k_join) +
-        "; repartition the right table so every batch holds at least k rows");
-    }
-    auto const k_eff = std::min<std::int64_t>(k_join, batch_rows);
-
-    auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
-
-    // The search above is issued, not finished. Staging the next chunk now runs its H2D
-    // while the GPU works on this one; the host blocks inside the converter, the device
-    // does not.
-    advance(j + 1);
-    release_staged(staged);
-
-    std::unique_ptr<cudf::column> neighbors = std::move(knn.neighbors);
-    auto const chunk_base                   = offset;
-    offset += batch_rows;
-    if (chunk_base != 0) {
-      cudf::numeric_scalar<std::int64_t> const off_scalar(chunk_base, true, stream);
-      neighbors = cudf::binary_operation(neighbors->view(),
-                                         off_scalar,
-                                         cudf::binary_operator::ADD,
-                                         cudf::data_type{cudf::type_id::INT64},
-                                         stream,
-                                         mr);
-    }
-
-    if (!acc_neighbors) {
-      acc_neighbors = std::move(neighbors);
-      acc_distances = std::move(knn.distances);
-      continue;
-    }
-
-    // Fold: stack accumulator and this batch part-major and merge them back down to
-    // k_join. This is knn_merge_parts with n_parts = 2 -- the same kernel the split
-    // design called once over every partial, applied incrementally instead.
-    auto const stacked_distances =
-      cudf::concatenate(std::vector<cudf::column_view>{acc_distances->view(), knn.distances->view()},
-                        stream,
-                        mr);
-    auto const stacked_neighbors =
-      cudf::concatenate(std::vector<cudf::column_view>{acc_neighbors->view(), neighbors->view()},
-                        stream,
-                        mr);
-
-    auto merged = vss::knn_merge_parts_topk(res,
-                                            stacked_distances->view(),
-                                            stacked_neighbors->view(),
-                                            n_left,
-                                            /*n_parts=*/2,
-                                            k_join,
-                                            stream,
-                                            mr);
-    acc_neighbors = std::move(merged.neighbors);
-    acc_distances = std::move(merged.distances);
-  }
-
   }
 
   if (!acc_neighbors) {
@@ -1055,25 +1219,19 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   vss::shaped_join_result shaped;
   switch (_request.mode) {
     case vss::vector_join_mode::global_top_k: {
-      shaped = vss::shape_global_top_k(acc_neighbors->view(),
-                                       acc_distances->view(),
-                                       n_left,
-                                       k_join,
-                                       k_join,
-                                       stream,
-                                       mr);
+      shaped = vss::shape_global_top_k(
+        acc_neighbors->view(), acc_distances->view(), n_left, k_join, k_join, stream, mr);
       break;
     }
     case vss::vector_join_mode::threshold: {
       // The kernel works in distance space. For cosine with a similarity threshold the
       // user's "score >= eps" is the same set as "distance <= 1 - eps"; for a distance
       // threshold it is eps directly.
-      auto const max_distance =
-        _request.output_type == vss::vector_join_output_type::similarity
-          ? static_cast<float>(1.0 - _request.eps)
-          : static_cast<float>(_request.eps);
-      bool truncated = false;
-      shaped         = vss::shape_threshold(acc_neighbors->view(),
+      auto const max_distance = _request.output_type == vss::vector_join_output_type::similarity
+                                  ? static_cast<float>(1.0 - _request.eps)
+                                  : static_cast<float>(_request.eps);
+      bool truncated          = false;
+      shaped                  = vss::shape_threshold(acc_neighbors->view(),
                                     acc_distances->view(),
                                     n_left,
                                     k_join,
@@ -1159,14 +1317,10 @@ std::size_t sirius_physical_vector_join_stream::per_left_batch_estimate(std::siz
   // A streamed corpus also holds the staged chunk itself; it is drawn from this task's
   // budget, so it has to be reserved here too.
   std::size_t staged_chunk = 0;
-  if (_corpus && _corpus->is_streaming()) {
-    staged_chunk = _max_chunk_bytes;
-  }
+  if (_corpus && _corpus->is_streaming()) { staged_chunk = _max_chunk_bytes; }
   // A streamed probe side holds its chunk for the whole task, so it is live alongside the
   // corpus chunk rather than instead of it.
-  if (_probe && _probe->is_streaming()) {
-    staged_chunk += _max_probe_chunk_bytes;
-  }
+  if (_probe && _probe->is_streaming()) { staged_chunk += _max_probe_chunk_bytes; }
 
   return (block * 6) + cuvs_scratch + staged_chunk + (std::size_t{1} << 20);
 }

@@ -28,8 +28,8 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
-#include <utility>
 #include <string>
+#include <utility>
 #include <vector>
 
 using KMeansFixture = sirius::test::GpuExecutionFixture;
@@ -60,7 +60,6 @@ std::vector<std::vector<std::string>> ok_rows(duckdb::Connection& con, const std
   auto r = query_ok(con, sql);
   return sirius::test::GpuExecutionFixture::collect_rows(*r, /*sort=*/true);
 }
-
 
 // (probe id, distance rounded) pairs, sorted. Rounding happens here rather than in SQL because a
 // projection over the join falls back to the CPU, which cannot execute the rewrite target.
@@ -153,10 +152,10 @@ TEST_CASE_METHOD(KMeansFixture,
   CHECK(scalar_i64(*con, "SELECT count(*) FROM kmb_asg WHERE distance < 0;") == 0);
 
   // Each separated group lands wholly in one cluster, and the two land in different ones.
-  CHECK(scalar_i64(*con,
-                   "SELECT count(DISTINCT cluster_id) FROM kmb_asg WHERE row_id < 200;") == 1);
-  CHECK(scalar_i64(*con,
-                   "SELECT count(DISTINCT cluster_id) FROM kmb_asg WHERE row_id >= 200;") == 1);
+  CHECK(scalar_i64(*con, "SELECT count(DISTINCT cluster_id) FROM kmb_asg WHERE row_id < 200;") ==
+        1);
+  CHECK(scalar_i64(*con, "SELECT count(DISTINCT cluster_id) FROM kmb_asg WHERE row_id >= 200;") ==
+        1);
   CHECK(scalar_i64(*con, "SELECT count(DISTINCT cluster_id) FROM kmb_asg;") == 2);
 }
 
@@ -221,9 +220,9 @@ TEST_CASE_METHOD(KMeansFixture,
   // The whole cluster-ordering flow rests on the assignment's row_id addressing the same row
   // the table's rowid does; the ids were built to make that checkable.
   con->Query("SET gpu_execution = false;");
-  auto const mismatches = scalar_i64(
-    *con,
-    "SELECT count(*) FROM kmf_corpus c JOIN kmf_asg a ON c.rowid = a.row_id WHERE c.id <> a.row_id;");
+  auto const mismatches = scalar_i64(*con,
+                                     "SELECT count(*) FROM kmf_corpus c JOIN kmf_asg a ON c.rowid "
+                                     "= a.row_id WHERE c.id <> a.row_id;");
   con->Query("SET gpu_execution = true;");
   CHECK(mismatches == 0);
 }
@@ -260,9 +259,8 @@ TEST_CASE_METHOD(KMeansFixture,
   run_ok("SELECT * FROM pin_table(name => 'kmh_wide', tier => 'gpu', format => 'duckdb');");
 
   run_ok("SELECT * FROM sirius_kmeans_fit('kmh_corpus','vec', name => 'kmh_c', n_clusters => 2);");
-  expect_error(*con,
-               "SELECT * FROM sirius_kmeans_assign('kmh_wide','vec','kmh_c');",
-               "is over FLOAT[3]");
+  expect_error(
+    *con, "SELECT * FROM sirius_kmeans_assign('kmh_wide','vec','kmh_c');", "is over FLOAT[3]");
 }
 
 TEST_CASE_METHOD(KMeansFixture,
@@ -280,23 +278,23 @@ TEST_CASE_METHOD(KMeansFixture,
   // (row, centroid) distance in SQL, and keep each row's argmin. Nothing here shares code with
   // the GPU path, so agreement is evidence the assignment is right rather than self-consistent.
   con->Query("SET gpu_execution = false;");
-  auto const disagreements = scalar_i64(
-    *con,
-    "WITH cent AS ("
-    "  SELECT cluster_id,"
-    "         max(CASE WHEN dim_index = 0 THEN value END) AS c0,"
-    "         max(CASE WHEN dim_index = 1 THEN value END) AS c1,"
-    "         max(CASE WHEN dim_index = 2 THEN value END) AS c2"
-    "  FROM kmo_cent GROUP BY cluster_id),"
-    "ranked AS ("
-    "  SELECT t.rowid AS row_id, k.cluster_id,"
-    "         row_number() OVER (PARTITION BY t.rowid ORDER BY"
-    "           (t.vec[1]-k.c0)*(t.vec[1]-k.c0) + (t.vec[2]-k.c1)*(t.vec[2]-k.c1)"
-    "         + (t.vec[3]-k.c2)*(t.vec[3]-k.c2), k.cluster_id) AS rn"
-    "  FROM kmo_corpus t CROSS JOIN cent k),"
-    "oracle AS (SELECT row_id, cluster_id FROM ranked WHERE rn = 1)"
-    "SELECT count(*) FROM oracle o JOIN kmo_asg a USING (row_id)"
-    "  WHERE o.cluster_id <> a.cluster_id;");
+  auto const disagreements =
+    scalar_i64(*con,
+               "WITH cent AS ("
+               "  SELECT cluster_id,"
+               "         max(CASE WHEN dim_index = 0 THEN value END) AS c0,"
+               "         max(CASE WHEN dim_index = 1 THEN value END) AS c1,"
+               "         max(CASE WHEN dim_index = 2 THEN value END) AS c2"
+               "  FROM kmo_cent GROUP BY cluster_id),"
+               "ranked AS ("
+               "  SELECT t.rowid AS row_id, k.cluster_id,"
+               "         row_number() OVER (PARTITION BY t.rowid ORDER BY"
+               "           (t.vec[1]-k.c0)*(t.vec[1]-k.c0) + (t.vec[2]-k.c1)*(t.vec[2]-k.c1)"
+               "         + (t.vec[3]-k.c2)*(t.vec[3]-k.c2), k.cluster_id) AS rn"
+               "  FROM kmo_corpus t CROSS JOIN cent k),"
+               "oracle AS (SELECT row_id, cluster_id FROM ranked WHERE rn = 1)"
+               "SELECT count(*) FROM oracle o JOIN kmo_asg a USING (row_id)"
+               "  WHERE o.cluster_id <> a.cluster_id;");
   con->Query("SET gpu_execution = true;");
 
   CHECK(disagreements == 0);
@@ -310,27 +308,35 @@ TEST_CASE_METHOD(KMeansFixture,
 namespace {
 
 // A corpus stored in cluster order, plus a probe table, plus a clustering over both.
+//
+// @p corpus_rows sets how many pinned chunks the corpus lands in: batching follows DuckDB row
+// groups (122,880 rows), so anything under that is a single chunk.
 void create_clustered_join(KMeansFixture& fixture,
                            duckdb::Connection& con,
                            const std::string& prefix,
-                           int n_clusters)
+                           int n_clusters,
+                           int corpus_rows = 4000)
 {
   auto const corpus = prefix + "_corpus";
   auto const probe  = prefix + "_probe";
   auto const clust  = prefix + "_c";
 
   fixture.run_ok("CREATE TABLE " + prefix + "_raw (id INTEGER, vec FLOAT[3]);");
-  fixture.run_ok("INSERT INTO " + prefix + "_raw SELECT i, "
+  fixture.run_ok("INSERT INTO " + prefix +
+                 "_raw SELECT i, "
                  "[(i % 97)::float, ((i * 7) % 89)::float, ((i * 13) % 83)::float] "
-                 "FROM range(4000) t(i);");
+                 "FROM range(" +
+                 std::to_string(corpus_rows) + ") t(i);");
   fixture.run_ok("CREATE TABLE " + probe + " (id INTEGER, vec FLOAT[3]);");
-  fixture.run_ok("INSERT INTO " + probe + " SELECT i, "
+  fixture.run_ok("INSERT INTO " + probe +
+                 " SELECT i, "
                  "[((i * 3) % 97)::float, ((i * 11) % 89)::float, ((i * 5) % 83)::float] "
                  "FROM range(200) t(i);");
   fixture.run_ok("CHECKPOINT;");
 
-  // Cluster the raw table, then materialize a copy ordered by cluster so each pinned chunk
-  // holds a narrow span of cluster ids -- which is what gives the join anything to skip.
+  // Cluster the raw table, then materialize a copy ordered by cluster. The order is not an
+  // optimization: the join reads each chunk's cluster runs, and a chunk whose labels are not
+  // non-decreasing is refused rather than silently answered from a partial range.
   fixture.run_ok("SELECT * FROM pin_table(name => '" + prefix +
                  "_raw', tier => 'gpu', format => 'duckdb');");
   fixture.run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_raw','vec', name => '" + clust +
@@ -359,20 +365,22 @@ TEST_CASE_METHOD(KMeansFixture,
   // answers, and the two paths visit clusters in different orders, so they break those ties
   // differently -- an id comparison reports that as a failure and undercuts by exactly the tie
   // multiplicity. The distance multiset is what "same answer" actually means here.
-  auto const exhaustive = distance_multiset(*con,
-                                  "SELECT left_id, distance FROM sirius_knn_join("
-                                  "'apx_probe','vec','apx_corpus','vec', "
-                                  "search_mode => 'exact-gemm', metric => 'l2', k => 5);");
+  auto const exhaustive =
+    distance_multiset(*con,
+                      "SELECT left_id, distance FROM sirius_knn_join("
+                      "'apx_probe','vec','apx_corpus','vec', "
+                      "search_mode => 'exact-gemm', metric => 'l2', k => 5);");
 
   // n_probes == n_clusters wants every cluster, so nothing is skipped and the approximate path
   // must reproduce the exhaustive answer. This is what catches a mistake in the neighbour-id
   // base, which pruning would otherwise hide as a plausible-looking wrong answer.
   auto const probe_all = distance_multiset(*con,
-                                 "SELECT left_id, distance FROM sirius_knn_join("
-                                 "'apx_probe','vec','apx_corpus','vec', "
-                                 "search_mode => 'approx', metric => 'l2', k => 5, "
-                                 "clustering => 'apx_c', cluster_column => 'cluster_id', "
-                                 "n_probes => " + std::to_string(n_clusters) + ");");
+                                           "SELECT left_id, distance FROM sirius_knn_join("
+                                           "'apx_probe','vec','apx_corpus','vec', "
+                                           "search_mode => 'approx', metric => 'l2', k => 5, "
+                                           "clustering => 'apx_c', cluster_column => 'cluster_id', "
+                                           "n_probes => " +
+                                             std::to_string(n_clusters) + ");");
 
   REQUIRE(probe_all == exhaustive);
 }
@@ -415,6 +423,101 @@ TEST_CASE_METHOD(KMeansFixture,
   for (auto const& n : neighbours) {
     CHECK(valid.count(n) == 1);
   }
+}
+
+// -----------------------------------------------------------------------------
+// The same two gates against a corpus of more than one pinned chunk.
+//
+// Every clustered test above uses a corpus small enough to arrive as one chunk, and
+// that is the one shape in which the clustered path cannot be wrong about chunks: it
+// staged chunk 0 and treated a cluster's row range as an offset into it, which is
+// correct for one chunk and a read past the end of it for two. Pinned chunks follow
+// DuckDB row groups (122,880 rows), so the row count below is the whole difference --
+// the clustering, the queries and the assertions are the ones already used above.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_knn_join approx spans more than one corpus chunk",
+                 "[integration][gpu_execution][array][vss][kmeans][approx]")
+{
+  constexpr int n_clusters  = 8;
+  constexpr int corpus_rows = 300000;  // > 2 row groups
+  create_clustered_join(*this, *con, "apm", n_clusters, corpus_rows);
+
+  auto const exhaustive =
+    distance_multiset(*con,
+                      "SELECT left_id, distance FROM sirius_knn_join("
+                      "'apm_probe','vec','apm_corpus','vec', "
+                      "search_mode => 'exact-gemm', metric => 'l2', k => 5);");
+
+  auto const probe_all = distance_multiset(*con,
+                                           "SELECT left_id, distance FROM sirius_knn_join("
+                                           "'apm_probe','vec','apm_corpus','vec', "
+                                           "search_mode => 'approx', metric => 'l2', k => 5, "
+                                           "clustering => 'apm_c', cluster_column => 'cluster_id', "
+                                           "n_probes => " +
+                                             std::to_string(n_clusters) + ");");
+
+  REQUIRE(probe_all == exhaustive);
+
+  // Pruning across chunks is where a neighbour id is most easily mis-based: an id is local to
+  // the slice it came from, and turning it back into a corpus row now takes the chunk's base
+  // as well as the slice's own start. A wrong base still returns k plausible ids per probe
+  // row, so what catches it is that every id must name a real corpus row.
+  auto const pruned = ok_rows(*con,
+                              "SELECT left_id, right_id FROM sirius_knn_join("
+                              "'apm_probe','vec','apm_corpus','vec', "
+                              "search_mode => 'approx', metric => 'l2', k => 5, "
+                              "clustering => 'apm_c', cluster_column => 'cluster_id', "
+                              "n_probes => 1);");
+  CHECK(pruned.size() == 200 * 5);
+
+  std::set<std::string> answered;
+  std::set<std::string> neighbours;
+  for (auto const& row : pruned) {
+    answered.insert(row.at(0));
+    neighbours.insert(row.at(1));
+  }
+  CHECK(answered.size() == 200);
+
+  auto const corpus_ids = ok_rows(*con, "SELECT id FROM apm_corpus;");
+  std::set<std::string> valid;
+  for (auto const& row : corpus_ids) {
+    valid.insert(row.at(0));
+  }
+  for (auto const& n : neighbours) {
+    CHECK(valid.count(n) == 1);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// A corpus that is not stored in cluster order is refused, not answered.
+//
+// The join reads each chunk's labels as a run per cluster. An unordered corpus makes
+// that reading wrong rather than merely slow -- a cluster would be a partial range,
+// and the rows outside it would never be scored while the answer still looked whole.
+//
+// The refusal is thrown at execution, not at bind, because it needs the corpus labels
+// on the device. If DuckDB turns that into a CPU fallback the query still fails, but
+// with the GPU-only-TVF message instead of this one -- in which case it is the needle
+// that is wrong here, not the refusal.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_knn_join approx refuses a corpus not in cluster order",
+                 "[integration][gpu_execution][array][vss][kmeans][approx]")
+{
+  create_clustered_join(*this, *con, "apu", 8);
+
+  // Same rows, same clustering, only the storage order differs.
+  run_ok("CREATE TABLE apu_shuffled AS SELECT * FROM apu_corpus ORDER BY id;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'apu_shuffled', tier => 'gpu', format => 'duckdb');");
+
+  expect_error(*con,
+               "SELECT left_id, distance FROM sirius_knn_join("
+               "'apu_probe','vec','apu_shuffled','vec', "
+               "search_mode => 'approx', metric => 'l2', k => 5, "
+               "clustering => 'apu_c', cluster_column => 'cluster_id', n_probes => 2);",
+               "not stored in cluster order");
 }
 
 TEST_CASE_METHOD(KMeansFixture,
