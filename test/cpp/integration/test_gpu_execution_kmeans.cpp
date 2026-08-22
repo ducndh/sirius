@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <set>
 #include <string>
 #include <utility>
@@ -309,17 +310,25 @@ namespace {
 
 // A corpus stored in cluster order, plus a probe table, plus a clustering over both.
 //
-// @p corpus_rows sets how many pinned chunks the corpus lands in: batching follows DuckDB row
-// groups (122,880 rows), so anything under that is a single chunk.
+// @p scan_batch_bytes, when non-zero, lowers `scan_task_batch_size` so the corpus pins as more
+// than one chunk. That knob -- not the row count -- is what decides chunking: pinned chunks are
+// coalesced to a byte budget that defaults to 512 MB, so a corpus of any plausible test size is
+// a single chunk. Measured: 300,000 FLOAT[3] rows is 3.6 MB and one chunk at the default, and
+// three chunks at 256 KB.
 void create_clustered_join(KMeansFixture& fixture,
                            duckdb::Connection& con,
                            const std::string& prefix,
                            int n_clusters,
-                           int corpus_rows = 4000)
+                           int corpus_rows                = 4000,
+                           std::uint64_t scan_batch_bytes = 0)
 {
   auto const corpus = prefix + "_corpus";
   auto const probe  = prefix + "_probe";
   auto const clust  = prefix + "_c";
+
+  if (scan_batch_bytes != 0) {
+    fixture.run_ok("SET scan_task_batch_size = " + std::to_string(scan_batch_bytes) + ";");
+  }
 
   fixture.run_ok("CREATE TABLE " + prefix + "_raw (id INTEGER, vec FLOAT[3]);");
   fixture.run_ok("INSERT INTO " + prefix +
@@ -453,17 +462,21 @@ TEST_CASE_METHOD(KMeansFixture,
 // Every clustered test above uses a corpus small enough to arrive as one chunk, and
 // that is the one shape in which the clustered path cannot be wrong about chunks: it
 // staged chunk 0 and treated a cluster's row range as an offset into it, which is
-// correct for one chunk and a read past the end of it for two. Pinned chunks follow
-// DuckDB row groups (122,880 rows), so the row count below is the whole difference --
-// the clustering, the queries and the assertions are the ones already used above.
+// correct for one chunk and a read past the end of it for two.
+//
+// Getting a second chunk takes the batch-size knob, not more rows. Pinned chunks are
+// coalesced to `scan_task_batch_size`, which defaults to 512 MB -- so SIFT1M, at
+// exactly 512 MB, is itself a single chunk, and no corpus a test can afford to build
+// would ever have split on row count alone. That is why this was never covered.
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(KMeansFixture,
                  "sirius_knn_join approx spans more than one corpus chunk",
                  "[integration][gpu_execution][array][vss][kmeans][approx]")
 {
-  constexpr int n_clusters  = 8;
-  constexpr int corpus_rows = 300000;  // > 2 row groups
-  create_clustered_join(*this, *con, "apm", n_clusters, corpus_rows);
+  constexpr int n_clusters           = 8;
+  constexpr int corpus_rows          = 300000;
+  constexpr std::uint64_t scan_batch = 256 * 1024;  // measured: 3 chunks, 10 cluster runs
+  create_clustered_join(*this, *con, "apm", n_clusters, corpus_rows, scan_batch);
 
   auto const exhaustive =
     distance_multiset(*con,
@@ -482,11 +495,11 @@ TEST_CASE_METHOD(KMeansFixture,
 
   REQUIRE(probe_all == exhaustive);
 
-  // The premise of this test, asserted rather than assumed: if DuckDB's row-group size ever
-  // changes, or the generator stops producing 300,000 rows, this silently becomes another
-  // single-chunk test and stops covering the thing it exists for. The counter accumulates one
-  // corpus-chunk count per probe batch, and 200 probe rows are a single batch, so the delta is
-  // the corpus's chunk count.
+  // The premise of this test, asserted rather than assumed -- and it has already earned its
+  // keep: the first version of this test set the row count and no batch size, so the corpus
+  // arrived as one chunk and the test covered nothing. Only this assertion said so. The counter
+  // accumulates one corpus-chunk count per probe batch, and 200 probe rows are a single batch,
+  // so the delta is the corpus's chunk count.
   auto const after = sirius::test::get_vector_join_prune_stats(*con);
   CHECK(after.chunks_available - before.chunks_available > 1);
 
