@@ -18,6 +18,7 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -50,6 +51,17 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   std::string const schema  = !qname.schema.empty() ? qname.schema : schema_name;
   auto& entry_base          = duckdb::Catalog::GetEntry(
     context, duckdb::CatalogType::TABLE_ENTRY, catalog, schema, qname.name);
+  // A VIEW lives in the TABLE_ENTRY namespace, so GetEntry happily returns one and the Cast
+  // below reinterprets it as a table. In release that is undefined behaviour, not an error: a
+  // view name produced a bogus column count and an out-of-memory allocation failure rather than
+  // a message. Reject anything that is not a base table.
+  if (entry_base.type != duckdb::CatalogType::TABLE_ENTRY) {
+    throw duckdb::BinderException(
+      "sirius_knn_join: " + label + " '" + qname.name + "' is a " +
+      duckdb::CatalogTypeToString(entry_base.type) +
+      ", not a base table. Materialize it (CREATE TABLE ... AS SELECT ...) first; a subquery is "
+      "supported on the probe side only, via sirius_knn_join_rel.");
+  }
   auto& entry  = entry_base.Cast<duckdb::DuckTableEntry>();
   side.catalog = entry.ParentCatalog().GetName();
   side.schema  = entry.ParentSchema().name;

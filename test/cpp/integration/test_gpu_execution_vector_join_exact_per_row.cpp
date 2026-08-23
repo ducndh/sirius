@@ -918,3 +918,44 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM unpin_table('pp_probe');");
   run_ok("SELECT * FROM unpin_table('pp_corpus');");
 }
+
+// -----------------------------------------------------------------------------
+// A VIEW named as a join side must be REFUSED, not reinterpreted.
+//
+// `Catalog::GetEntry(TABLE_ENTRY, ...)` also resolves views, so the unchecked
+// `Cast<DuckTableEntry>()` that follows used to reinterpret a ViewCatalogEntry as a table. In a
+// release build that is undefined behaviour rather than an error: the bogus column count reached
+// the allocator and the query died with "Out of Memory Error: Allocation failure" instead of a
+// message. Passing a view is a reasonable thing for a user to try -- it is the obvious way to
+// express a filtered corpus -- so it has to fail by name.
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - a view as a join side is refused, not reinterpreted",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE vw_corpus (id INTEGER, vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO vw_corpus SELECT i, "
+    "list_transform(range(0, 3), j -> ((hash(i * 3 + j) % 1000) / 1000.0)::FLOAT)::FLOAT[3] "
+    "FROM range(500) t(i);");
+  run_ok("CREATE TABLE vw_probe (id INTEGER, vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO vw_probe SELECT i, "
+    "list_transform(range(0, 3), j -> ((hash(i * 7 + j) % 1000) / 1000.0)::FLOAT)::FLOAT[3] "
+    "FROM range(20) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vw_probe', tier => 'gpu', format => 'duckdb');");
+  run_ok("CREATE VIEW vw_corpus_v AS SELECT id, vec FROM vw_corpus WHERE id % 10 < 3;");
+
+  // Corpus side, on the scan path -- the shape a user would reach for to filter a corpus.
+  expect_error(*con,
+               "SELECT left_id FROM sirius_knn_join('vw_probe','vec','vw_corpus_v','vec', "
+               "k => 2, metric => 'l2', build_source => 'scan');",
+               "not a base table");
+
+  // Probe side too: the same resolver serves both, so both must reject a view.
+  run_ok("CREATE VIEW vw_probe_v AS SELECT id, vec FROM vw_probe;");
+  expect_error(*con,
+               "SELECT left_id FROM sirius_knn_join('vw_probe_v','vec','vw_corpus','vec', "
+               "k => 2, metric => 'l2', build_source => 'scan');",
+               "not a base table");
+}
