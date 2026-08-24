@@ -105,7 +105,24 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   };
 
   if (out_cols.empty()) {
+    // Everything the table has, MINUS its FLOAT[N] columns. The relational probe side already
+    // drops the one column it joins on, for a reason that covers all of them: an embedding is
+    // the join's input rather than something the caller wants echoed back, and at 128-960 floats
+    // it is by far the widest column -- a bare `SELECT *` that includes one prints a screenful
+    // of raw coordinates per row and buries the ids and the score.
+    //
+    // Dropping only the joined column is not enough: joining two embedding columns of ONE table
+    // (`sirius_knn_join('t','a_vec','t','b_vec')`) leaves each side echoing the OTHER side's
+    // vector, so `SELECT *` is still unreadable. Keying on the type rather than on which column
+    // this side happens to join on is both simpler to state and the one that actually holds.
+    //
+    // Nothing is withdrawn -- name a vector in left/right_output_columns to get it back.
     for (auto const& name : schema_names) {
+      auto const& col_type = type_of(name);
+      if (col_type.id() == duckdb::LogicalTypeId::ARRAY &&
+          duckdb::ArrayType::GetChildType(col_type).id() == duckdb::LogicalTypeId::FLOAT) {
+        continue;
+      }
       if (emittable(name)) { side.output_columns.push_back(name); }
     }
   } else {
@@ -138,14 +155,13 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   return dim;
 }
 
-std::int64_t resolve_relational_probe_side(
-  const duckdb::vector<duckdb::LogicalType>& input_types,
-  const duckdb::vector<duckdb::string>& input_names,
-  const std::string& column_arg,
-  const std::vector<std::string>& out_cols,
-  vector_join_side& side,
-  duckdb::vector<duckdb::LogicalType>& out_types,
-  duckdb::vector<duckdb::string>& out_names)
+std::int64_t resolve_relational_probe_side(const duckdb::vector<duckdb::LogicalType>& input_types,
+                                           const duckdb::vector<duckdb::string>& input_names,
+                                           const std::string& column_arg,
+                                           const std::vector<std::string>& out_cols,
+                                           vector_join_side& side,
+                                           duckdb::vector<duckdb::LogicalType>& out_types,
+                                           duckdb::vector<duckdb::string>& out_names)
 {
   side.column = column_arg;
   // catalog/schema/table stay empty: there is no table behind this side, and every path that

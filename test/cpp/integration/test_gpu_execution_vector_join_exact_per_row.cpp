@@ -1262,3 +1262,111 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM unpin_table('hv_probe');");
   run_ok("SELECT * FROM unpin_table('hv_corpus');");
 }
+
+// -----------------------------------------------------------------------------
+// The default output omits the vector column each side joins on.
+//
+// `SELECT *` is the first thing anyone types. With the embedding in the declared output it
+// printed 128 raw coordinates per side per row and buried the ids and the score -- and the
+// relational probe side had already decided against that, for reasons written in its own
+// comment. This pins the pinned-table side to the same rule.
+//
+// Note what is NOT claimed here: the vector is still available, it just has to be asked for.
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - the default output omits the joined vector column",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  auto column_names = [&](const std::string& sql) {
+    auto r = con->Query(sql);
+    REQUIRE(r);
+    if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
+    REQUIRE_FALSE(r->HasError());
+    return std::vector<std::string>(r->names.begin(), r->names.end());
+  };
+
+  run_ok("CREATE TABLE dv_corpus (id INTEGER, tag VARCHAR, vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO dv_corpus SELECT i, 'c' || i::VARCHAR, [i::FLOAT, 0.0::FLOAT, 0.0::FLOAT] "
+    "FROM range(500) t(i);");
+  run_ok("CREATE TABLE dv_probe (id INTEGER, vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO dv_probe SELECT i, [(i + 0.5)::FLOAT, 0.0::FLOAT, 0.0::FLOAT] FROM range(20) "
+    "t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'dv_probe',  tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'dv_corpus', tier => 'gpu', format => 'duckdb');");
+
+  const std::string args = "'dv_probe','vec','dv_corpus','vec', metric => 'l2', k => 2";
+
+  // `SELECT *` is now the three things a reader wants, plus the corpus's own scalar column.
+  auto const defaulted = column_names("SELECT * FROM sirius_knn_join(" + args + ") LIMIT 1;");
+  REQUIRE(defaulted == std::vector<std::string>{"left_id", "right_id", "right_tag", "distance"});
+
+  // Asking for it by name still works -- the column is omitted from the default, not withdrawn.
+  auto const explicit_vec =
+    column_names("SELECT * FROM sirius_knn_join(" + args +
+                 ", left_output_columns => ['id','vec'], right_output_columns => ['vec']) "
+                 "LIMIT 1;");
+  REQUIRE(explicit_vec == std::vector<std::string>{"left_id", "left_vec", "right_vec", "distance"});
+
+  // And the rows are unchanged by the narrower default: same pairs either way.
+  auto const with_default =
+    ok_rows(*con, "SELECT left_id, right_id FROM sirius_knn_join(" + args + ");");
+  auto const with_explicit =
+    ok_rows(*con,
+            "SELECT left_id, right_id FROM sirius_knn_join(" + args +
+              ", left_output_columns => ['id'], right_output_columns => ['id']);");
+  REQUIRE(with_default == with_explicit);
+  REQUIRE(with_default.size() == 20 * 2);
+
+  // The case the rule exists for: TWO embedding columns in ONE table. Dropping only the column
+  // each side joins on would leave each side echoing the other's vector, so `SELECT *` would
+  // still be a wall of coordinates.
+  run_ok("CREATE TABLE dv_two (id INTEGER, a_vec FLOAT[3], b_vec FLOAT[3]);");
+  run_ok(
+    "INSERT INTO dv_two SELECT i, [i::FLOAT, 0.0::FLOAT, 0.0::FLOAT], "
+    "[(i + 0.25)::FLOAT, 0.0::FLOAT, 0.0::FLOAT] FROM range(100) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'dv_two', tier => 'gpu', format => 'duckdb');");
+  auto const two_col = column_names(
+    "SELECT * FROM sirius_knn_join('dv_two','a_vec','dv_two','b_vec', metric => 'l2', k => 2) "
+    "LIMIT 1;");
+  REQUIRE(two_col == std::vector<std::string>{"left_id", "right_id", "distance"});
+  run_ok("SELECT * FROM unpin_table('dv_two');");
+
+  run_ok("SELECT * FROM unpin_table('dv_probe');");
+  run_ok("SELECT * FROM unpin_table('dv_corpus');");
+}
+
+// -----------------------------------------------------------------------------
+// The degenerate consequence of that default: a table whose only column IS the vector now
+// contributes nothing to the output, so `SELECT *` is the score alone. That is a legitimate
+// query -- "how far apart are these, ignoring which rows they were" -- and it must not become
+// a zero-column crash on the way through materialize.
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - a vector-only table contributes no default output columns",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE vo (vec FLOAT[2]);");
+  run_ok("INSERT INTO vo SELECT [i::FLOAT, 0.0::FLOAT] FROM range(200) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'vo', tier => 'gpu', format => 'duckdb');");
+
+  auto const r =
+    con->Query("SELECT * FROM sirius_knn_join('vo','vec','vo','vec', metric => 'l2', k => 3);");
+  REQUIRE(r);
+  if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
+  REQUIRE_FALSE(r->HasError());
+  auto& mat = r->Cast<duckdb::MaterializedQueryResult>();
+  REQUIRE(mat.names.size() == 1);
+  REQUIRE(mat.names[0] == "distance");
+  REQUIRE(sirius::test::GpuExecutionFixture::collect_rows(mat, true).size() == 200 * 3);
+
+  // Each row is its own nearest neighbour, so a third of the pairs sit at distance 0.
+  auto const zeros = ok_rows(*con,
+                             "SELECT count(*) FROM sirius_knn_join('vo','vec','vo','vec', "
+                             "metric => 'l2', k => 3) WHERE distance = 0.0;");
+  REQUIRE(zeros[0][0] == "200");
+
+  run_ok("SELECT * FROM unpin_table('vo');");
+}
