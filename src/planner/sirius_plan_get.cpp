@@ -41,19 +41,17 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "vss/kmeans_functions.hpp"
 #include "vss/sirius_physical_vector_join_materialize.hpp"
 #include "vss/sirius_physical_vector_join_reduce_local.hpp"
 #include "vss/sirius_physical_vector_join_select.hpp"
-#include "vss/kmeans_functions.hpp"
 #include "vss/sirius_physical_vector_join_stream.hpp"
 #include "vss/vector_join.hpp"
 
-#include <string_view>
-
 #include <cstdlib>
-
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <unordered_set>
 
 namespace sirius::planner {
@@ -645,8 +643,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   // fixed-k slicing then attributes neighbours to the wrong left rows. Select it with
   // SIRIUS_VECTOR_JOIN_STREAMING=0, and only on a single-chunk right table.
   const char* streaming_env = std::getenv("SIRIUS_VECTOR_JOIN_STREAMING");
-  bool const use_streaming =
-    streaming_env == nullptr || std::string_view{streaming_env} != "0";
+  bool const use_streaming  = streaming_env == nullptr || std::string_view{streaming_env} != "0";
 
   // Projection pushdown. The declared output is
   // [left_output_columns..., right_output_columns..., score]; column_ids names the subset the
@@ -658,35 +655,64 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   auto const declared_right = req.right.output_columns.size();
   auto const score_idx_orig = declared_left + declared_right;
 
-  std::vector<std::string> kept_left;
-  std::vector<std::string> kept_right;
-  duckdb::vector<duckdb::LogicalType> kept_types;
-  bool score_read = false;
-  for (auto const& column_id : op.GetColumnIds()) {
+  // What materialize emits is grouped by side -- [kept_left..., kept_right..., score] -- while
+  // what the query wants is one entry per `projection_ids` (or per `column_ids` when that is
+  // empty), in that order. Those two orders coincide only when column_ids happens to be
+  // ascending, so the two are tracked separately here and reconciled by a projection at the end.
+  auto const& column_ids = op.GetColumnIds();
+  std::size_t n_left     = 0;
+  std::size_t n_right    = 0;
+  bool score_read        = false;
+  for (auto const& column_id : column_ids) {
     if (!column_id.HasPrimaryIndex()) {
       throw duckdb::NotImplementedException("sirius_knn_join: virtual/rowid columns unsupported");
     }
     auto const idx = column_id.GetPrimaryIndex();
     if (idx < declared_left) {
-      kept_left.push_back(req.left.output_columns[idx]);
-      kept_types.push_back(op.returned_types[idx]);
+      ++n_left;
     } else if (idx < score_idx_orig) {
-      kept_right.push_back(req.right.output_columns[idx - declared_left]);
-      kept_types.push_back(op.returned_types[idx]);
+      ++n_right;
     } else {
       score_read = true;
     }
   }
+
+  std::vector<std::string> kept_left;
+  std::vector<std::string> kept_right;
+  kept_left.reserve(n_left);
+  kept_right.reserve(n_right);
+  // The score is always produced -- it is one column of the output rows, not of the corpus --
+  // and projected away below when unread.
+  duckdb::vector<duckdb::LogicalType> kept_types(n_left + n_right + 1);
+  // Physical position, in the emitted layout, of each entry of column_ids.
+  std::vector<std::size_t> emitted_pos(column_ids.size());
+  for (std::size_t ci = 0; ci < column_ids.size(); ++ci) {
+    auto const idx  = column_ids[ci].GetPrimaryIndex();
+    std::size_t pos = 0;
+    if (idx < declared_left) {
+      pos = kept_left.size();
+      kept_left.push_back(req.left.output_columns[idx]);
+    } else if (idx < score_idx_orig) {
+      pos = n_left + kept_right.size();
+      kept_right.push_back(req.right.output_columns[idx - declared_left]);
+    } else {
+      pos = n_left + n_right;
+    }
+    kept_types[pos] = op.returned_types[idx];
+    emitted_pos[ci] = pos;
+  }
+  kept_types[n_left + n_right] = op.returned_types[score_idx_orig];
   SIRIUS_LOG_DEBUG(
     "[vector_join] output columns: declared left={} right={}, read {} -> keeping left={} "
     "right={} score={}",
-    declared_left, declared_right, op.GetColumnIds().size(), kept_left.size(),
-    kept_right.size(), score_read);
+    declared_left,
+    declared_right,
+    op.GetColumnIds().size(),
+    kept_left.size(),
+    kept_right.size(),
+    score_read);
   req.left.output_columns  = std::move(kept_left);
   req.right.output_columns = std::move(kept_right);
-  // The score is always produced -- it is one column of the output rows, not of the corpus --
-  // and projected away below when unread.
-  kept_types.push_back(op.returned_types[score_idx_orig]);
 
   // Row orders for the fed sides, minted here so the fold and materialize resolve positions
   // against one list per side rather than each deriving one of their own.
@@ -713,7 +739,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
     duckdb::ColumnBindingResolver child_resolver;
     child_resolver.VisitOperator(*op.children[0]);
     duckdb::vector<duckdb::LogicalType> child_types = op.children[0]->types;
-    auto planned = create_plan(*op.children[0]);
+    auto planned                                    = create_plan(*op.children[0]);
 
     auto index_of = [&](const std::string& col) -> std::size_t {
       auto const& names = op.input_table_names;
@@ -728,8 +754,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
     auto add = [&](std::size_t idx) {
       types.push_back(child_types[idx]);
-      exprs.push_back(
-        duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_types[idx], idx));
+      exprs.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_types[idx], idx));
     };
     add(index_of(req.left.column));
     for (auto const& col : req.left.output_columns) {
@@ -773,14 +798,20 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       // the session's, and the clustered path reports what it pruned to it.
       prune_stats = sirius_ctx.get();
     }
-    auto stream_op = duckdb::make_uniq<sirius::op::sirius_physical_vector_join_stream>(
-      joined_types(), op.estimated_cardinality, req, &scan_manager, build_side, probe_side,
-      centroids, prune_stats);
+    auto stream_op =
+      duckdb::make_uniq<sirius::op::sirius_physical_vector_join_stream>(joined_types(),
+                                                                        op.estimated_cardinality,
+                                                                        req,
+                                                                        &scan_manager,
+                                                                        build_side,
+                                                                        probe_side,
+                                                                        centroids,
+                                                                        prune_stats);
     // Probe first, then corpus: wrap_vector_join walks the children in that order to decide
     // which is the build side, matching wrap_join's probe=0 / build=1 convention.
     if (req.probe_from_scan) {
-      stream_op->children.push_back(
-        probe_child.has_value() ? std::move(*probe_child) : make_side_scan(context, req.left));
+      stream_op->children.push_back(probe_child.has_value() ? std::move(*probe_child)
+                                                            : make_side_scan(context, req.left));
     }
     if (req.build_from_scan) {
       // The cluster ids ride along with the corpus so the fold can read them from the same
@@ -817,38 +848,87 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   // and the plan generator's post-pass wraps any TOP_N with MERGE_TOP_N, which is exactly the
   // cross-partition merge this needs — so left-side partitioning is not a restriction here.
   if (req.mode == sirius::vss::vector_join_mode::global_top_k) {
-    auto const score_idx = op.returned_types.size() - 1;  // materialize emits score last
+    // The score is last in what materialize EMITS, which is narrower than the declared
+    // output whenever DuckDB reads a subset -- indexing the declared width put this past
+    // the end of the table and surfaced as "TopN order index out of range".
+    auto const score_idx = n_left + n_right;
     auto const ascending =
       req.output_type == sirius::vss::vector_join_output_type::similarity ? false : true;
 
     duckdb::vector<duckdb::BoundOrderByNode> orders;
-    orders.emplace_back(ascending ? duckdb::OrderType::ASCENDING : duckdb::OrderType::DESCENDING,
-                        duckdb::OrderByNullType::NULLS_LAST,
-                        duckdb::make_uniq<duckdb::BoundReferenceExpression>(
-                          op.returned_types[score_idx], score_idx));
+    orders.emplace_back(
+      ascending ? duckdb::OrderType::ASCENDING : duckdb::OrderType::DESCENDING,
+      duckdb::OrderByNullType::NULLS_LAST,
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(kept_types[score_idx], score_idx));
 
-    auto top_n = duckdb::make_uniq<sirius::op::sirius_physical_top_n>(
-      sirius::from_duckdb_vec(op.returned_types),
-      std::move(orders),
-      static_cast<std::size_t>(req.k),
-      /*offset=*/std::size_t{0},
-      /*dynamic_filter=*/nullptr,
-      op.estimated_cardinality);
+    auto top_n =
+      duckdb::make_uniq<sirius::op::sirius_physical_top_n>(sirius::from_duckdb_vec(kept_types),
+                                                           std::move(orders),
+                                                           static_cast<std::size_t>(req.k),
+                                                           /*offset=*/std::size_t{0},
+                                                           /*dynamic_filter=*/nullptr,
+                                                           op.estimated_cardinality);
     top_n->children.push_back(std::move(node));
     node = std::move(top_n);
   }
 
-  // column_ids is ascending, and left columns precede right ones which precede the score, so
-  // the narrowed layout above is already in the order the query expects. The only mismatch
-  // left is the trailing score when nothing reads it.
-  if (score_read) { return node; }
+  // Reconcile the emitted layout with the requested one. `projection_ids`, when set, holds
+  // indices INTO column_ids and is what LogicalGet::GetColumnBindings/ResolveTypes use, so it
+  // -- not column_ids -- defines both the order and the width of this operator's output.
+  duckdb::vector<duckdb::idx_t> requested;
+  if (op.projection_ids.empty()) {
+    for (duckdb::idx_t i = 0; i < column_ids.size(); ++i) {
+      requested.push_back(i);
+    }
+  } else {
+    requested = op.projection_ids;
+  }
 
   duckdb::vector<duckdb::LogicalType> types;
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
-  for (std::size_t i = 0; i + 1 < kept_types.size(); ++i) {
-    types.push_back(kept_types[i]);
-    expressions.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(kept_types[i], i));
+  types.reserve(requested.size());
+  for (auto const request_idx : requested) {
+    if (request_idx >= emitted_pos.size()) {
+      throw duckdb::InternalException(
+        "sirius_knn_join: projection_ids entry %llu is out of range "
+        "for %llu read columns",
+        static_cast<std::uint64_t>(request_idx),
+        static_cast<std::uint64_t>(emitted_pos.size()));
+    }
+    auto const pos = emitted_pos[request_idx];
+    types.push_back(kept_types[pos]);
+    expressions.push_back(
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(kept_types[pos], pos));
   }
+
+  // The schema this operator hands upwards has to be exactly what the binder resolved, because
+  // everything above binds by POSITION: a mismatch does not fail, it silently reads the wrong
+  // column. That is how a `WHERE distance <= x` under a `GROUP BY` came to evaluate the
+  // predicate against `left_id`. Check it here rather than trusting the layout to line up.
+  if (types.size() != op.types.size()) {
+    throw duckdb::InternalException(
+      "sirius_knn_join: emitting %llu columns but the plan expects %llu",
+      static_cast<std::uint64_t>(types.size()),
+      static_cast<std::uint64_t>(op.types.size()));
+  }
+  for (std::size_t i = 0; i < types.size(); ++i) {
+    if (types[i] != op.types[i]) {
+      throw duckdb::InternalException(
+        "sirius_knn_join: output column %llu is %s but the plan expects %s",
+        static_cast<std::uint64_t>(i),
+        types[i].ToString(),
+        op.types[i].ToString());
+    }
+  }
+
+  // Nothing to do when the emitted layout already is the requested one -- the common case,
+  // and the only one the operator used to handle.
+  bool is_identity = requested.size() == kept_types.size();
+  for (std::size_t i = 0; is_identity && i < requested.size(); ++i) {
+    is_identity = emitted_pos[requested[i]] == i;
+  }
+  if (is_identity) { return node; }
+
   return push_projection(std::move(node),
                          sirius::from_duckdb_vec(types),
                          translate_expressions(std::move(expressions)),

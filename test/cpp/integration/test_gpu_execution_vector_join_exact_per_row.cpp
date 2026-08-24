@@ -579,7 +579,8 @@ TEST_CASE_METHOD(VectorJoinFixture,
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
   run_ok("CREATE TABLE ap_corpus (id INTEGER, vec FLOAT[3]);");
-  run_ok("INSERT INTO ap_corpus SELECT i, [i::float, (i+1)::float, (i+2)::float] FROM range(64) t(i);");
+  run_ok(
+    "INSERT INTO ap_corpus SELECT i, [i::float, (i+1)::float, (i+2)::float] FROM range(64) t(i);");
   run_ok("CREATE TABLE ap_probe (id INTEGER, vec FLOAT[3]);");
   run_ok("INSERT INTO ap_probe VALUES (0, [1.0, 2.0, 3.0]);");
   run_ok("CHECKPOINT;");
@@ -771,30 +772,31 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM pin_table(name => 'ps_probe', tier => 'gpu', format => 'duckdb');");
   auto const pinned = ok_rows(*con,
                               "SELECT left_id, left_region, right_id, distance FROM "
-                              "sirius_knn_join('ps_probe','vec','ps_corpus','vec', " + cols + ");");
+                              "sirius_knn_join('ps_probe','vec','ps_corpus','vec', " +
+                                cols + ");");
   REQUIRE(pinned.size() == 300 * 4);
   run_ok("SELECT * FROM unpin_table('ps_probe');");
 
   // Probe from a scan, corpus still pinned.
   REQUIRE(ok_rows(*con,
                   "SELECT left_id, left_region, right_id, distance FROM "
-                  "sirius_knn_join('ps_probe','vec','ps_corpus','vec', " + cols +
-                  ", probe_source => 'scan');") == pinned);
+                  "sirius_knn_join('ps_probe','vec','ps_corpus','vec', " +
+                    cols + ", probe_source => 'scan');") == pinned);
 
   // Both sides from scans, nothing pinned at all.
   run_ok("SELECT * FROM unpin_table('ps_corpus');");
   REQUIRE(ok_rows(*con,
                   "SELECT left_id, left_region, right_id, distance FROM "
-                  "sirius_knn_join('ps_probe','vec','ps_corpus','vec', " + cols +
-                  ", probe_source => 'scan', build_source => 'scan');") == pinned);
+                  "sirius_knn_join('ps_probe','vec','ps_corpus','vec', " +
+                    cols + ", probe_source => 'scan', build_source => 'scan');") == pinned);
 
   // Reversing both snapshots must not move a single row: any order is correct as long as every
   // stage uses the same one.
   setenv("SIRIUS_VECTOR_JOIN_REVERSE_BUILD_ORDER", "1", 1);
   auto const reversed = ok_rows(*con,
                                 "SELECT left_id, left_region, right_id, distance FROM "
-                                "sirius_knn_join('ps_probe','vec','ps_corpus','vec', " + cols +
-                                ", build_source => 'scan', probe_source => 'scan');");
+                                "sirius_knn_join('ps_probe','vec','ps_corpus','vec', " +
+                                  cols + ", build_source => 'scan', probe_source => 'scan');");
   unsetenv("SIRIUS_VECTOR_JOIN_REVERSE_BUILD_ORDER");
   REQUIRE(reversed == pinned);
 }
@@ -899,8 +901,10 @@ TEST_CASE_METHOD(VectorJoinFixture,
     "left_output_columns => ['id','region'], right_output_columns => ['id','category']";
 
   auto const everything =
-    ok_rows(*con, "SELECT left_id, left_region, right_id, right_category, distance FROM "
-                  "sirius_knn_join(" + args + ");");
+    ok_rows(*con,
+            "SELECT left_id, left_region, right_id, right_category, distance FROM "
+            "sirius_knn_join(" +
+              args + ");");
   REQUIRE(everything.size() == 200 * 4);
 
   // One column from each side, and the score dropped: the narrowed layout must still name the
@@ -915,13 +919,11 @@ TEST_CASE_METHOD(VectorJoinFixture,
   REQUIRE(narrowed == expected);
 
   // Nothing from the corpus at all -- the right-side gather has no columns to work on.
-  auto const left_only =
-    ok_rows(*con, "SELECT left_region FROM sirius_knn_join(" + args + ");");
+  auto const left_only = ok_rows(*con, "SELECT left_region FROM sirius_knn_join(" + args + ");");
   REQUIRE(left_only.size() == 200 * 4);
 
   // Nothing from either side: only the score survives.
-  auto const score_only =
-    ok_rows(*con, "SELECT distance FROM sirius_knn_join(" + args + ");");
+  auto const score_only = ok_rows(*con, "SELECT distance FROM sirius_knn_join(" + args + ");");
   REQUIRE(score_only.size() == 200 * 4);
 
   // And no output columns whatsoever.
@@ -972,4 +974,161 @@ TEST_CASE_METHOD(VectorJoinFixture,
                "SELECT left_id FROM sirius_knn_join('vw_probe_v','vec','vw_corpus','vec', "
                "k => 2, metric => 'l2', build_source => 'scan');",
                "not a base table");
+}
+
+// -----------------------------------------------------------------------------
+// A filter or aggregate ABOVE the join, reading the score.
+//
+// This is the shape that made the join return silently wrong answers. DuckDB narrows the read
+// set AND is free to order it however it likes: with a `GROUP BY` it asks for
+// `[distance, left_id]`, i.e. column_ids = [4, 0]. The operator emitted a fixed
+// `[left..., right..., score]` block regardless, so the predicate above it read `left_id` and
+// the grouping key read `distance` -- no error, just a wrong number.
+//
+// The data is built so no assertion here can turn on a floating-point last digit: every
+// probe's neighbours sit at exact distances 0.5, 1.5, 2.5, ... and the threshold is 2.0, so
+// the nearest pair to the cut is 0.5 away from it.
+//
+//   corpus  c_j = [j, 0]          j = 0 .. 2047
+//   probe   p_i = [32*i + 0.5, 0] i = 0 .. 63
+//
+// so p_i's six nearest are at 0.5, 0.5, 1.5, 1.5, 2.5, 2.5 -- and four of the six are within
+// 2.0. Probe 0 sits at the edge of the corpus and has only one neighbour below it, giving
+// 0.5, 0.5, 1.5, 2.5, 3.5, 4.5 and so three within 2.0: 63*4 + 3 = 255 surviving pairs.
+namespace {
+
+void create_halves_dataset(sirius::test::GpuExecutionFixture& fx)
+{
+  fx.run_ok("CREATE TABLE hv_corpus (id INTEGER, vec FLOAT[2]);");
+  fx.run_ok("INSERT INTO hv_corpus SELECT i, [i::FLOAT, 0.0::FLOAT] FROM range(2048) t(i);");
+  fx.run_ok("CREATE TABLE hv_probe (id INTEGER, vec FLOAT[2]);");
+  fx.run_ok(
+    "INSERT INTO hv_probe SELECT i, [(32*i + 0.5)::FLOAT, 0.0::FLOAT] FROM range(64) t(i);");
+  fx.run_ok("CHECKPOINT;");
+  fx.run_ok("SELECT * FROM pin_table(name => 'hv_probe',  tier => 'gpu', format => 'duckdb');");
+  fx.run_ok("SELECT * FROM pin_table(name => 'hv_corpus', tier => 'gpu', format => 'duckdb');");
+}
+
+constexpr int kHalvesSurvivors = 63 * 4 + 3;
+
+}  // namespace
+
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - a score filter under an aggregate reads the score",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  create_halves_dataset(*this);
+
+  const std::string args =
+    "'hv_probe','vec','hv_corpus','vec', search_mode => 'exact', metric => 'l2', k => 6";
+
+  // The CPU reference: the same top-6 per probe, filtered and grouped the same way, with
+  // gpu_execution off so nothing about this side can depend on the operator under test.
+  con->Query("SET gpu_execution = false;");
+  auto const cpu_groups = ok_rows(*con,
+                                  "SELECT p.id, count(*) FROM hv_probe p, LATERAL ("
+                                  "  SELECT array_distance(p.vec, c.vec) AS d FROM hv_corpus c "
+                                  "  ORDER BY array_distance(p.vec, c.vec) LIMIT 6) n "
+                                  "WHERE n.d <= 2.0 GROUP BY p.id;");
+  auto const cpu_pairs =
+    ok_rows(*con,
+            "SELECT array_distance(p.vec, c.vec), p.id FROM hv_probe p, hv_corpus c "
+            "WHERE c.id IN (SELECT n.cid FROM LATERAL ("
+            "  SELECT c2.id AS cid FROM hv_corpus c2 "
+            "  ORDER BY array_distance(p.vec, c2.vec) LIMIT 6) n) "
+            "AND array_distance(p.vec, c.vec) <= 2.0;");
+  con->Query("SET gpu_execution = true;");
+
+  // The reference itself must be the dataset we think it is, or agreeing with it proves nothing.
+  REQUIRE(cpu_groups.size() == 64);
+  REQUIRE(cpu_pairs.size() == kHalvesSurvivors);
+
+  // B1: filter on the score, then group by a non-score column. Returned 755 pairs / 746 groups
+  // against a true 6,611 / 2,158 on the SIFT repro; here a wrong layout shows up as grouping on
+  // the near-unique distance instead of on left_id.
+  auto const gpu_groups = ok_rows(*con,
+                                  "SELECT left_id, count(*) FROM sirius_knn_join(" + args +
+                                    ") WHERE distance <= 2.0 GROUP BY left_id;");
+  REQUIRE(gpu_groups == cpu_groups);
+
+  // Same rows, and with the score requested FIRST so the requested order is explicitly the
+  // reverse of the emitted one.
+  auto const gpu_pairs = ok_rows(
+    *con, "SELECT distance, left_id FROM sirius_knn_join(" + args + ") WHERE distance <= 2.0;");
+  REQUIRE(gpu_pairs == cpu_pairs);
+
+  // The total is the thing a user reads, so assert it directly rather than only as a set.
+  auto const gpu_total =
+    ok_rows(*con, "SELECT count(*) FROM sirius_knn_join(" + args + ") WHERE distance <= 2.0;");
+  REQUIRE(gpu_total[0][0] == std::to_string(kHalvesSurvivors));
+
+  // HAVING on top of that filter: 63 probes keep 4 of their 6, probe 0 keeps 3.
+  auto const gpu_having =
+    ok_rows(*con,
+            "SELECT count(*) FROM (SELECT left_id FROM sirius_knn_join(" + args +
+              ") WHERE distance <= 2.0 GROUP BY left_id "
+              "HAVING count(*) >= 4);");
+  REQUIRE(gpu_having[0][0] == "63");
+
+  // B4: min/max of a non-score column under a score filter. This failed as
+  // "CUDF failure ... min() operation requires matching output type" -- the aggregate was
+  // handed the INTEGER left_id where the plan said FLOAT.
+  auto const gpu_minmax = ok_rows(
+    *con,
+    "SELECT min(left_id), max(left_id) FROM sirius_knn_join(" + args + ") WHERE distance <= 2.0;");
+  REQUIRE(gpu_minmax.size() == 1);
+  REQUIRE(gpu_minmax[0][0] == "0");
+  REQUIRE(gpu_minmax[0][1] == "63");
+
+  run_ok("SELECT * FROM unpin_table('hv_probe');");
+  run_ok("SELECT * FROM unpin_table('hv_corpus');");
+}
+
+// -----------------------------------------------------------------------------
+// Global top-k, in the two shapes that used to die with "TopN order index out of range":
+// without an explicit output_columns list, and underneath an aggregate. Both come from the
+// TOP_N above materialize ordering by the score at its DECLARED index while materialize emits
+// only the narrowed set of columns the query actually reads.
+//
+// The halves dataset puts 128 pairs at distance 0.5 (two per probe), so any correct global
+// top-12 is some 12 of those. Asserting "12 rows, every distance 0.5" is exact under that tie
+// where naming the winning ids would not be.
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - global top-k with a narrowed or aggregated output",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  create_halves_dataset(*this);
+
+  const std::string args =
+    "'hv_probe','vec','hv_corpus','vec', search_mode => 'exact', metric => 'l2', k => 12, "
+    "join_mode => 'global'";
+
+  // B2: no left/right_output_columns, so the declared output is the full
+  // [left_id, left_vec, right_id, right_vec, distance] while only three columns are read.
+  auto const narrowed =
+    ok_rows(*con, "SELECT left_id, right_id, distance FROM sirius_knn_join(" + args + ");");
+  REQUIRE(narrowed.size() == 12);
+  for (auto const& row : narrowed) {
+    REQUIRE(row[2] == "0.5");
+  }
+
+  // Narrower still: the score alone, and no columns at all.
+  auto const score_only = ok_rows(*con, "SELECT distance FROM sirius_knn_join(" + args + ");");
+  REQUIRE(score_only.size() == 12);
+
+  // B3: an aggregate above global mode. Nothing but the row count is read here, which is the
+  // narrowest the output ever gets.
+  auto const counted = ok_rows(*con, "SELECT count(*) FROM sirius_knn_join(" + args + ");");
+  REQUIRE(counted.size() == 1);
+  REQUIRE(counted[0][0] == "12");
+
+  // And with an explicit output_columns list, which is the only shape that used to work.
+  auto const explicit_cols =
+    ok_rows(*con,
+            "SELECT count(*) FROM sirius_knn_join(" + args +
+              ", left_output_columns => ['id'], right_output_columns => ['id']);");
+  REQUIRE(explicit_cols[0][0] == "12");
+
+  run_ok("SELECT * FROM unpin_table('hv_probe');");
+  run_ok("SELECT * FROM unpin_table('hv_corpus');");
 }
