@@ -26,6 +26,7 @@
 #include "vss/brute_force_search.hpp"
 #include "vss/cudf_raft_interop.hpp"
 #include "vss/distance_metric.hpp"
+#include "vss/brute_force_threshold.hpp"
 #include "vss/join_result_shaping.hpp"
 #include "vss/knn_merge.hpp"
 #include "vss/pinned_column.hpp"
@@ -35,6 +36,7 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -770,6 +772,21 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   std::unique_ptr<cudf::column> acc_neighbors;
   std::unique_ptr<cudf::column> acc_distances;
 
+  // A radius join needs no fold. Top-k folds because chunk j+1 can displace chunk j's winners,
+  // so a running [n_left, k] merge is unavoidable; "within eps" is independent per chunk, so a
+  // chunk's surviving edges are final when produced and the chunks only have to be concatenated.
+  // That is why this path accumulates ragged edge lists instead of a fixed-width block, and why
+  // it has no k -- and therefore none of the k <= 1024 ceiling that knn_merge_parts imposes.
+  bool const radius_join = _request.mode == vss::vector_join_mode::threshold &&
+                           _request.search_mode != vss::vector_join_search_mode::approx;
+  std::vector<std::unique_ptr<cudf::column>> radius_left, radius_neighbors, radius_distances;
+  // The kernel works in distance space. For cosine with a similarity threshold the user's
+  // "score >= eps" is the same set as "distance <= 1 - eps"; for a distance threshold it is eps
+  // directly. Identical to what the shape_threshold path below computes.
+  auto const radius_eps = _request.output_type == vss::vector_join_output_type::similarity
+                            ? static_cast<float>(1.0 - _request.eps)
+                            : static_cast<float>(_request.eps);
+
   // The clustered path replaces the whole-corpus fold below. It is a separate branch rather
   // than a predicate inside it because the two iterate different things: the exhaustive fold
   // walks corpus chunks, while this walks (probe run x neighbouring cluster) pairs.
@@ -1201,6 +1218,33 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         continue;
       }
 
+      if (radius_join) {
+        auto edges = vss::brute_force_threshold(res, dataset, queries, radius_eps, metric, mr);
+        advance(j + 1);
+        release_staged(staged);
+        auto const chunk_base = offset;
+        offset += batch_rows;
+        if (edges.n_edges > 0) {
+          // Local dataset-batch rows -> right-table row space, the same shift the top-k path
+          // applies to its neighbour ids.
+          if (chunk_base != 0) {
+            cudf::numeric_scalar<std::int64_t> const off_scalar(chunk_base, true, stream);
+            edges.neighbors = cudf::binary_operation(edges.neighbors->view(),
+                                                     off_scalar,
+                                                     cudf::binary_operator::ADD,
+                                                     cudf::data_type{cudf::type_id::INT64},
+                                                     stream,
+                                                     mr);
+          }
+          // shaped_join_result carries left_rows as INT32; the kernel emits INT64.
+          radius_left.push_back(cudf::cast(
+            edges.query_rows->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr));
+          radius_neighbors.push_back(std::move(edges.neighbors));
+          radius_distances.push_back(std::move(edges.distances));
+        }
+        continue;
+      }
+
       // knn_merge_parts requires a uniform k across the parts it merges. Every batch
       // therefore has to supply k_join candidates; a batch shorter than k_join cannot,
       // and padding it row-major is not expressible without a dedicated kernel.
@@ -1260,13 +1304,30 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     }
   }
 
-  if (!acc_neighbors) {
+  if (!acc_neighbors && !radius_join) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_stream] right table produced no rows to join against");
   }
 
-  // The fold is mode-independent; only which of its candidates survive is not.
   vss::shaped_join_result shaped;
+  if (radius_join) {
+    // Concatenate the per-chunk edge lists. No merge and no truncation test: every edge the
+    // kernel emitted is inside eps and nothing later can displace it, so the answer is complete
+    // by construction rather than complete-if-k-was-big-enough.
+    auto const join_cols = [&](std::vector<std::unique_ptr<cudf::column>>& parts,
+                               cudf::type_id id) -> std::unique_ptr<cudf::column> {
+      if (parts.empty()) { return cudf::make_empty_column(cudf::data_type{id}); }
+      if (parts.size() == 1) { return std::move(parts.front()); }
+      std::vector<cudf::column_view> views;
+      views.reserve(parts.size());
+      for (auto const& c : parts) { views.push_back(c->view()); }
+      return cudf::concatenate(views, stream, mr);
+    };
+    shaped.left_rows = join_cols(radius_left, cudf::type_id::INT32);
+    shaped.neighbors = join_cols(radius_neighbors, cudf::type_id::INT64);
+    shaped.distances = join_cols(radius_distances, cudf::type_id::FLOAT32);
+  } else {
+  // The fold is mode-independent; only which of its candidates survive is not.
   switch (_request.mode) {
     case vss::vector_join_mode::global_top_k: {
       shaped = vss::shape_global_top_k(
@@ -1305,6 +1366,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         std::move(acc_neighbors), std::move(acc_distances), n_left, k_join, stream, mr);
       break;
     }
+  }
   }
 
   std::vector<std::unique_ptr<cudf::column>> out_cols;

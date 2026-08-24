@@ -480,12 +480,18 @@ TEST_CASE_METHOD(VectorJoinFixture,
 }
 
 // -----------------------------------------------------------------------------
-// A threshold join searches each left row only to depth k, so an eps loose enough to
-// admit more than k neighbours cannot be answered completely. It must say so rather
-// than return a silently truncated result set.
+// A threshold join has no k. This case used to assert the opposite -- the exact path
+// searched each left row only to depth k, so an eps admitting more than k neighbours
+// was refused as "truncated". `brute_force_threshold` thresholds inside the tiled GEMM
+// instead of filtering an already-computed top-k block, so k is not consulted at all
+// and the answer is complete by construction.
+//
+// The assertion is deliberately STRONGER than the refusal it replaces: an eps that
+// admits thousands of pairs against a k of 4 must return every one of them, matched
+// against an exhaustive CPU range query rather than merely "did not error".
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
-                 "sirius_knn_join - threshold join refuses to truncate",
+                 "sirius_knn_join - threshold join answers past k without truncating",
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
   run_ok("CREATE TABLE tt_corpus (id INTEGER, vec FLOAT[2]);");
@@ -497,13 +503,21 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM pin_table(name => 'tt_probe',  tier => 'gpu', format => 'duckdb');");
   run_ok("SELECT * FROM pin_table(name => 'tt_corpus', tier => 'gpu', format => 'duckdb');");
 
-  // eps => 50 admits thousands of pairs; k => 4 cannot represent them.
-  expect_error(*con,
-               "SELECT left_id, right_id FROM sirius_knn_join("
-               "'tt_probe','vec','tt_corpus','vec', search_mode => 'exact', metric => 'l2', "
-               "k => 4, join_mode => 'threshold', eps => 50.0, "
-               "left_output_columns => ['id'], right_output_columns => ['id']);",
-               "truncated");
+  con->Query("SET gpu_execution = false;");
+  auto const reference = ok_rows(*con,
+                                 "SELECT p.id, c.id FROM tt_probe p, tt_corpus c "
+                                 "WHERE array_distance(p.vec, c.vec) <= 50.0;");
+  con->Query("SET gpu_execution = true;");
+  REQUIRE(reference.size() > 4);  // the point of the case: far more pairs than k
+
+  // eps => 50 admits thousands of pairs and k => 4 is ignored, not a bound.
+  auto const joined = ok_rows(*con,
+                              "SELECT left_id, right_id FROM sirius_knn_join("
+                              "'tt_probe','vec','tt_corpus','vec', search_mode => 'exact', "
+                              "metric => 'l2', k => 4, join_mode => 'threshold', eps => 50.0, "
+                              "left_output_columns => ['id'], right_output_columns => ['id']);");
+  REQUIRE(joined.size() == reference.size());
+  REQUIRE(joined == reference);
 
   run_ok("SELECT * FROM unpin_table('tt_corpus');");
   run_ok("SELECT * FROM unpin_table('tt_probe');");

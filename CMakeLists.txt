@@ -402,6 +402,7 @@ set(CUDA_SOURCES
     src/cuda/scan/strings/uncompressed.cu
     src/cuda/vss/cudf_raft_interop.cu
     src/cuda/vss/brute_force_search.cu
+    src/cuda/vss/brute_force_threshold.cu
     src/cuda/vss/knn_merge.cu
     src/cuda/vss/ivf_flat_index.cu
     src/cuda/vss/vector_clustering.cu)
@@ -734,6 +735,7 @@ set(TEST_SOURCES
     test/cpp/telemetry/test_telemetry_context.cpp
     test/cpp/transparent/test_preserve_dynamic_filter_metadata.cpp
     test/cpp/vss/test_brute_force_search.cpp
+    test/cpp/vss/test_brute_force_threshold.cpp
     test/cpp/vss/test_cudf_raft_interop.cpp
     test/cpp/vss/test_cuvs_index_cache.cpp
     test/cpp/vss/test_distance_metric.cpp
