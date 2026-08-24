@@ -1132,3 +1132,133 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM unpin_table('hv_probe');");
   run_ok("SELECT * FROM unpin_table('hv_corpus');");
 }
+
+// -----------------------------------------------------------------------------
+// Expression composition over the join, for everything Sirius's GPU translator actually
+// supports (`src/expression/function_id.cpp` -- 28 function ids plus CASE / CAST / BETWEEN /
+// comparison / conjunction).
+//
+// This exists as the gate for optimization work: the join is only worth tuning if ordinary SQL
+// composes on top of it, and until now nothing checked that. Every case compares against a
+// reference materialized on the CPU with `gpu_execution = false`, so a disagreement is the join.
+//
+// Geometry is the halves dataset (see above): six neighbours per probe at exactly 0.5, 0.5, 1.5,
+// 1.5, 2.5, 2.5, so 255 of the 384 pairs are within 2.0 and nothing turns on a float last digit.
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - supported expressions compose over the join",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE xc (id INTEGER, nm VARCHAR, vec FLOAT[2]);");
+  run_ok(
+    "INSERT INTO xc SELECT i, 'corpus_' || i::VARCHAR, [i::FLOAT, 0.0::FLOAT] FROM range(2048) "
+    "t(i);");
+  run_ok("CREATE TABLE xp (id INTEGER, lb VARCHAR, vec FLOAT[2]);");
+  run_ok(
+    "INSERT INTO xp SELECT i, 'probe_' || i::VARCHAR, [(32*i + 0.5)::FLOAT, 0.0::FLOAT] "
+    "FROM range(64) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'xp', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'xc', tier => 'gpu', format => 'duckdb');");
+
+  const std::string args = "'xp','vec','xc','vec', search_mode => 'exact', metric => 'l2', k => 6";
+
+  // The reference pair set, built once on the CPU. Same columns the TVF emits, same names.
+  con->Query("SET gpu_execution = false;");
+  run_ok(
+    "CREATE TABLE xref AS SELECT p.id AS left_id, p.lb AS left_lb, n.cid AS right_id, "
+    "n.nm AS right_nm, n.d AS distance FROM xp p, LATERAL ("
+    "  SELECT c.id AS cid, c.nm AS nm, array_distance(p.vec, c.vec) AS d FROM xc c "
+    "  ORDER BY array_distance(p.vec, c.vec) LIMIT 6) n;");
+  con->Query("SET gpu_execution = true;");
+
+  auto const reference_rows = [&](const std::string& select_list, const std::string& tail) {
+    con->Query("SET gpu_execution = false;");
+    auto rows = ok_rows(*con, "SELECT " + select_list + " FROM xref " + tail + ";");
+    con->Query("SET gpu_execution = true;");
+    return rows;
+  };
+
+  // Each entry is a select list plus a trailing clause, evaluated over the join and over the
+  // CPU reference. The pair must be identical row for row.
+  struct composition_case {
+    const char* what;
+    const char* select_list;
+    const char* tail;
+  };
+  const std::vector<composition_case> cases = {
+    // arithmetic operators
+    {"add", "left_id + 1", ""},
+    {"sub", "right_id - left_id", ""},
+    {"mul", "right_id * 2", ""},
+    {"div", "distance / 2", ""},
+    {"mod", "right_id % 4", ""},
+    // string functions
+    {"length", "length(right_nm)", ""},
+    {"substring", "substring(left_lb, 1, 5)", ""},
+    {"concat", "left_lb || '-' || right_nm", ""},
+    {"contains", "left_id, right_id", "WHERE contains(right_nm, 'corpus_1')"},
+    {"like", "left_id, right_id", "WHERE right_nm LIKE 'corpus_1%'"},
+    // expression classes
+    {"case", "CASE WHEN distance <= 2.0 THEN 1 ELSE 0 END", ""},
+    {"cast", "CAST(distance AS DOUBLE)", ""},
+    {"between", "left_id, right_id", "WHERE distance BETWEEN 0.0 AND 2.0"},
+    {"conjunction", "left_id, right_id", "WHERE distance <= 2.0 AND right_id % 2 = 0"},
+    // an expression above an aggregate above the join
+    {"agg_over_expr", "left_id, sum(right_id % 4)", "WHERE distance <= 2.0 GROUP BY left_id"},
+  };
+
+  for (auto const& c : cases) {
+    UNSCOPED_INFO("composition case: " << c.what);
+    auto const gpu = ok_rows(*con,
+                             "SELECT " + std::string(c.select_list) + " FROM sirius_knn_join(" +
+                               args + ") " + c.tail + ";");
+    auto const cpu = reference_rows(c.select_list, c.tail);
+    REQUIRE(gpu.size() == cpu.size());
+    REQUIRE(gpu == cpu);
+  }
+
+  // The reference must be the dataset we think it is, or matching it proves nothing.
+  auto const survivors =
+    ok_rows(*con, "SELECT count(*) FROM sirius_knn_join(" + args + ") WHERE distance <= 2.0;");
+  REQUIRE(survivors[0][0] == std::to_string(kHalvesSurvivors));
+
+  run_ok("SELECT * FROM unpin_table('xp');");
+  run_ok("SELECT * FROM unpin_table('xc');");
+}
+
+// -----------------------------------------------------------------------------
+// The boundary: a function Sirius's GPU translator does NOT implement.
+//
+// `round`, `sqrt` and `abs` are absent from the forward table in
+// `src/expression/function_id.cpp`. That is a gap in Sirius generally, NOT in the vector join --
+// over an ordinary pinned table the same call fails on the GPU, falls back to DuckDB and returns
+// the right answer. Over the join the fallback has nowhere to land, because `sirius_knn_join`'s
+// CPU callback is a stub that throws, so the same gap becomes a hard error.
+//
+// Both halves are asserted here so that whoever gives the join a CPU representation sees this
+// test change, and so nobody re-files the missing function as a vector-join bug.
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - an unsupported function is fatal only because the join has no "
+                 "CPU fallback",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  create_halves_dataset(*this);
+
+  // Control: the very same call over an ordinary pinned table degrades to the CPU and is CORRECT.
+  auto const on_a_table =
+    ok_rows(*con,
+            "SELECT count(*) FROM (SELECT round(id / 7.0, 2) AS r FROM hv_corpus) WHERE "
+            "r > 0;");
+  REQUIRE(on_a_table[0][0] == "2047");
+
+  // Over the join the identical expression cannot fall back, so it fails -- and the message
+  // names the fallback, not the missing function, which is what makes this confusing in the wild.
+  expect_error(*con,
+               "SELECT count(*) FROM (SELECT round(distance, 1) AS x FROM sirius_knn_join("
+               "'hv_probe','vec','hv_corpus','vec', search_mode => 'exact', metric => 'l2', "
+               "k => 6)) WHERE x >= 0;",
+               "cannot run on the CPU");
+
+  run_ok("SELECT * FROM unpin_table('hv_probe');");
+  run_ok("SELECT * FROM unpin_table('hv_corpus');");
+}
