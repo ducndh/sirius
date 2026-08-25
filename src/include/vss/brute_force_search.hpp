@@ -47,6 +47,64 @@ struct knn_result {
 };
 
 /**
+ * @brief A brute-force index over a borrowed dataset, reusable across searches.
+ *
+ * cuVS's index build precomputes the dataset norms. Building one inside every search
+ * recomputes them per query batch, which the clustered fold pays for repeatedly: it
+ * searches one corpus slice with every probe run that wants it. Hoisting the index to
+ * the slice pays the build once.
+ *
+ * Non-owning: the dataset passed to @ref brute_force_build must outlive the index.
+ */
+class brute_force_index {
+ public:
+  brute_force_index(brute_force_index&&) noexcept;
+  brute_force_index& operator=(brute_force_index&&) noexcept;
+  brute_force_index(brute_force_index const&)            = delete;
+  brute_force_index& operator=(brute_force_index const&) = delete;
+  ~brute_force_index();
+
+  struct impl;
+
+ private:
+  explicit brute_force_index(std::unique_ptr<impl> pimpl);
+
+  friend brute_force_index brute_force_build(raft::device_resources const&,
+                                             dataset_matrix_view,
+                                             cuvs::distance::DistanceType);
+  friend knn_result brute_force_knn(raft::device_resources const&,
+                                    brute_force_index const&,
+                                    dataset_matrix_view,
+                                    int64_t,
+                                    rmm::device_async_resource_ref);
+
+  std::unique_ptr<impl> _pimpl;
+};
+
+/**
+ * @brief Build a reusable brute-force index over @p dataset.
+ *
+ * Enqueued on @p res's stream, like the search that follows it.
+ */
+brute_force_index brute_force_build(
+  raft::device_resources const& res,
+  dataset_matrix_view dataset,
+  cuvs::distance::DistanceType metric = cuvs::distance::DistanceType::L2SqrtUnexpanded);
+
+/**
+ * @brief Search a prebuilt index -- otherwise identical to the one-shot @ref brute_force_knn.
+ *
+ * @p queries must match the index's dataset dimensionality, and @p k must satisfy
+ * `1 <= k <= n_rows` of that dataset.
+ */
+knn_result brute_force_knn(raft::device_resources const& res,
+                           brute_force_index const& index,
+                           dataset_matrix_view queries,
+                           int64_t k,
+                           rmm::device_async_resource_ref mr =
+                             cudf::get_current_device_resource_ref());
+
+/**
  * @brief Exact (brute-force) k-nearest-neighbor search via cuVS.
  *
  * For every query vector, finds the @p k nearest dataset vectors under @p

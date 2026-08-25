@@ -39,6 +39,7 @@
 #include <cudf/unary.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/stream_compaction.hpp>
@@ -48,6 +49,7 @@
 #include <raft/core/device_resources.hpp>
 
 #include <rmm/cuda_stream.hpp>
+#include <rmm/device_uvector.hpp>
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -62,6 +64,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -714,6 +717,31 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
     for (auto const& per_chunk : _chunk_cluster_runs) {
       runs += per_chunk.size();
     }
+    // The clustering is session state and cuvs::cluster::kmeans::fit is not bit-stable across
+    // processes -- roughly one session in six converges to a different centroid set. The probe
+    // side is assigned from those centroids at join time, so two approximate runs are only
+    // comparable when this hash agrees; without it a re-fit reads as a result regression.
+    std::uint64_t centroid_hash = 1469598103934665603ull;
+    {
+      auto const nvals =
+        static_cast<std::size_t>(_n_clusters) * static_cast<std::size_t>(_request.dim);
+      std::vector<float> host_centroids(nvals);
+      auto const values = _centroids->view().child(cudf::lists_column_view::child_column_index);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(host_centroids.data(),
+                                    values.data<float>(),
+                                    nvals * sizeof(float),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.value()));
+      stream.synchronize();
+      for (auto const value : host_centroids) {
+        std::uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        centroid_hash = (centroid_hash ^ bits) * 1099511628211ull;
+      }
+    }
+    std::fprintf(stderr,
+                 "[vecjoin] centroids=%016llx\n",
+                 static_cast<unsigned long long>(centroid_hash));
     std::fprintf(stderr,
                  "[vecjoin] cluster index: %ld clusters over %ld rows in %zu chunks, %zu runs, "
                  "%zu empty, n_probes=%ld\n",
@@ -1030,35 +1058,100 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             chunk_view.data_handle() + slice.begin * dim, slice_rows, dim);
         auto const k_eff = std::min<std::int64_t>(k_join, slice_rows);
 
-        for (auto const r : wanting) {
+        // ONE search per slice, not one per (slice, run). Every run wanting this slice searches
+        // the same dataset, and the fold's dominant term is per-call rather than per-pair --
+        // X1 measured 278 us/call at 42-96% of runtime, and S1 measured 16x the span-visits
+        // costing 7.4x the time at identical pairs scored. Batching drops the call count from
+        // clusters x n_probes to clusters.
+        auto const slice_index = vss::brute_force_build(res, slice_view, metric);
+
+        std::int64_t batch_rows = 0;
+        std::vector<std::int64_t> run_offset(wanting.size());
+        for (std::size_t w = 0; w < wanting.size(); ++w) {
+          run_offset[w] = batch_rows;
+          batch_rows += runs[wanting[w]].end - runs[wanting[w]].begin;
+        }
+
+        // A run is contiguous in the sorted probe batch, so a lone wanting run is searched in
+        // place; only several of them need gathering into one query matrix. The gather is
+        // bounded by the probe batch itself -- a run wants a slice at most once -- so this
+        // costs at most one extra copy of the probe vectors per slice.
+        std::optional<rmm::device_uvector<float>> gathered;
+        auto queries_batch =
+          raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+            probe_sorted_view.data_handle() + runs[wanting.front()].begin * dim, batch_rows, dim);
+        if (wanting.size() > 1) {
+          gathered.emplace(static_cast<std::size_t>(batch_rows * dim), stream, mr);
+          for (std::size_t w = 0; w < wanting.size(); ++w) {
+            auto const& run      = runs[wanting[w]];
+            auto const copy_rows = run.end - run.begin;
+            CUDF_CUDA_TRY(cudaMemcpyAsync(gathered->data() + run_offset[w] * dim,
+                                          probe_sorted_view.data_handle() + run.begin * dim,
+                                          static_cast<std::size_t>(copy_rows * dim) * sizeof(float),
+                                          cudaMemcpyDeviceToDevice,
+                                          stream.value()));
+          }
+          queries_batch = raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+            gathered->data(), batch_rows, dim);
+        }
+
+        auto knn = vss::brute_force_knn(res, slice_index, queries_batch, k_eff, mr);
+        scanned_pairs += slice_rows * batch_rows;
+
+        // Neighbour ids come back local to the slice; the slice's own start in corpus row
+        // space is the base that makes them corpus row ids, exactly as the chunk offset does
+        // in the exhaustive fold. Shifted for the whole batch in one operation.
+        cudf::numeric_scalar<std::int64_t> const base(chunk_base + slice.begin, true, stream);
+        auto shifted = cudf::binary_operation(knn.neighbors->view(),
+                                              base,
+                                              cudf::binary_operator::ADD,
+                                              cudf::data_type{cudf::type_id::INT64},
+                                              stream,
+                                              mr);
+
+        // Results are row-major [batch_rows x k_eff], so a run's rows are one contiguous block
+        // and the split back into per-run parts is a slice rather than a gather.
+        for (std::size_t w = 0; w < wanting.size(); ++w) {
+          auto const r        = wanting[w];
           auto const run_rows = runs[r].end - runs[r].begin;
-          auto const queries_run =
-            raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
-              probe_sorted_view.data_handle() + runs[r].begin * dim, run_rows, dim);
+          auto const lo       = static_cast<cudf::size_type>(run_offset[w] * k_eff);
+          auto const hi       = static_cast<cudf::size_type>((run_offset[w] + run_rows) * k_eff);
+          auto part_n         = cudf::slice(shifted->view(), {lo, hi}).front();
+          auto part_d         = cudf::slice(knn.distances->view(), {lo, hi}).front();
 
-          auto knn = vss::brute_force_knn(res, slice_view, queries_run, k_eff, metric, mr);
-          scanned_pairs += slice_rows * run_rows;
+          // Padding materializes; without it the slices feed concatenate directly.
+          std::unique_ptr<cudf::column> padded_n;
+          std::unique_ptr<cudf::column> padded_d;
+          if (k_eff < k_join) {
+            auto padded = pad_part(std::make_unique<cudf::column>(part_n, stream, mr),
+                                   std::make_unique<cudf::column>(part_d, stream, mr),
+                                   run_rows,
+                                   k_eff);
+            padded_n    = std::move(padded.first);
+            padded_d    = std::move(padded.second);
+            part_n      = padded_n->view();
+            part_d      = padded_d->view();
+          }
 
-          // Neighbour ids come back local to the slice; the slice's own start in corpus row
-          // space is the base that makes them corpus row ids, exactly as the chunk offset does
-          // in the exhaustive fold.
-          cudf::numeric_scalar<std::int64_t> const base(chunk_base + slice.begin, true, stream);
-          auto shifted = cudf::binary_operation(knn.neighbors->view(),
-                                                base,
-                                                cudf::binary_operator::ADD,
-                                                cudf::data_type{cudf::type_id::INT64},
-                                                stream,
-                                                mr);
-          auto part    = pad_part(std::move(shifted), std::move(knn.distances), run_rows, k_eff);
           if (!acc_n[r]) {
-            acc_n[r] = std::move(part.first);
-            acc_d[r] = std::move(part.second);
+            if (padded_n) {
+              acc_n[r] = std::move(padded_n);
+              acc_d[r] = std::move(padded_d);
+            } else if (wanting.size() == 1) {
+              // The lone run owns the whole batch, so the accumulator takes it rather than
+              // copying it -- this is the n_probes=1 path, where batching is otherwise a no-op.
+              acc_n[r] = std::move(shifted);
+              acc_d[r] = std::move(knn.distances);
+            } else {
+              acc_n[r] = std::make_unique<cudf::column>(part_n, stream, mr);
+              acc_d[r] = std::make_unique<cudf::column>(part_d, stream, mr);
+            }
             continue;
           }
           auto const stacked_d = cudf::concatenate(
-            std::vector<cudf::column_view>{acc_d[r]->view(), part.second->view()}, stream, mr);
+            std::vector<cudf::column_view>{acc_d[r]->view(), part_d}, stream, mr);
           auto const stacked_n = cudf::concatenate(
-            std::vector<cudf::column_view>{acc_n[r]->view(), part.first->view()}, stream, mr);
+            std::vector<cudf::column_view>{acc_n[r]->view(), part_n}, stream, mr);
           auto merged = vss::knn_merge_parts_topk(
             res, stacked_d->view(), stacked_n->view(), run_rows, 2, k_join, stream, mr);
           acc_n[r] = std::move(merged.neighbors);
