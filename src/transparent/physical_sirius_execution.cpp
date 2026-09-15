@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <atomic>
 #include "transparent/physical_sirius_execution.hpp"
 
 #include "log/logging.hpp"
@@ -41,6 +42,7 @@ namespace sirius::transparent {
 // Global source state — owns the sirius_interface and the materialized result.
 // ---------------------------------------------------------------------------
 struct SiriusGlobalSourceState : public duckdb::GlobalSourceState {
+  std::atomic<duckdb::idx_t> next_batch_index{0};
   duckdb::unique_ptr<sirius::sirius_interface> iface;
   duckdb::unique_ptr<duckdb::QueryResult> result;
   duckdb::unique_ptr<duckdb::DataChunk> current_chunk;
@@ -139,6 +141,17 @@ duckdb::unique_ptr<duckdb::LocalSourceState> PhysicalSiriusExecution::GetLocalSo
   duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const
 {
   return duckdb::make_uniq<duckdb::LocalSourceState>();
+}
+
+duckdb::OperatorPartitionData PhysicalSiriusExecution::GetPartitionData(
+  duckdb::ExecutionContext&,
+  duckdb::DataChunk&,
+  duckdb::GlobalSourceState& gstate,
+  duckdb::LocalSourceState&,
+  const duckdb::OperatorPartitionInfo&) const
+{
+  auto& state = gstate.Cast<SiriusGlobalSourceState>();
+  return duckdb::OperatorPartitionData(state.next_batch_index.fetch_add(1));
 }
 
 duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
