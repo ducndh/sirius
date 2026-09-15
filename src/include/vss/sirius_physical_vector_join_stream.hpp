@@ -253,14 +253,12 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// @ref build_side_ready_locked, so callers must check that first.
   void ensure_initialized_locked();
 
-  /// Build @c _chunk_cluster_runs, @c _cluster_rows and @c _cluster_neighbors on first use.
-  /// Deferred out of init because reading the cluster column needs a memory space, which only
-  /// a running task supplies.
+  /// Build @c _chunk_cluster_runs and @c _cluster_rows on first use. Deferred out of init
+  /// because reading the cluster column needs a memory space, which only a running task
+  /// supplies.
   void ensure_cluster_index(::cucascade::memory::memory_space& space,
                             rmm::cuda_stream_view stream,
-                            rmm::device_async_resource_ref mr,
-                            raft::device_resources const& res,
-                            cuvs::distance::DistanceType metric);
+                            rmm::device_async_resource_ref mr);
 
   /// Whether the build port is wired and its producing pipeline has finished. Always true on
   /// the pinned path. Caller holds _op_mutex.
@@ -305,14 +303,9 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// local to the slice; this plus the slice's own begin is the base that makes them corpus
   /// row ids, exactly as the chunk offset does in the exhaustive fold.
   std::vector<std::int64_t> _chunk_row_base;
-  /// Per cluster id, how many corpus rows it holds across every chunk. Lets a probe run's
+  /// Per cluster id, how many corpus rows it holds across every chunk. Lets a probe row's
   /// candidate count be known before any search is issued.
   std::vector<std::int64_t> _cluster_rows;
-  /// Row-major [n_clusters x n_probes] table of each cluster's nearest clusters, computed once
-  /// from the centroids. This is the join-specific part: because BOTH sides are clustered, a
-  /// probe row's neighbourhood is a property of its cluster, so it is resolved once per cluster
-  /// here instead of once per row at query time.
-  std::vector<std::int32_t> _cluster_neighbors;
   std::int64_t _n_clusters{0};
   bool _cluster_index_built{false};
   std::mutex _op_mutex;

@@ -657,3 +657,78 @@ TEST_CASE_METHOD(KMeansFixture,
                "cluster_column => 'cluster_id');",
                "no clustering named");
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_knn_join approx routes each probe row by its own nearest centroids",
+                 "[integration][gpu_execution][array][vss][kmeans][approx]")
+{
+  // Three groups: A near the origin, C near x=10, B spread over y=26..34. A probe at (0,14,0)
+  // is nearer A's centroid (~14) than B's (~16), yet its nearest corpus row is in B (12 against
+  // ~13.4). Routing the probe through its home cluster's nearest centroids visits A and C --
+  // C's centroid is 10 from A's, B's is 30 -- and misses; routing the row by its own two nearest
+  // centroids visits A and B and finds it. The groups carry spread in every axis because a
+  // near-degenerate group let balanced k-means split A and C by parity instead of by position.
+  run_ok("CREATE TABLE rt_raw (id INTEGER, vec FLOAT[3]);");
+  run_ok("INSERT INTO rt_raw SELECT i, [((i % 17) * 0.05)::float, ((i % 13) * 0.05)::float, "
+         "((i % 7) * 0.05)::float] FROM range(300) t(i);");
+  run_ok("INSERT INTO rt_raw SELECT 300 + i, [(10 + (i % 17) * 0.05)::float, "
+         "((i % 13) * 0.05)::float, ((i % 7) * 0.05)::float] FROM range(300) t(i);");
+  run_ok("INSERT INTO rt_raw SELECT 600 + i, [((i % 17) * 0.05)::float, (26 + (i % 9))::float, "
+         "((i % 7) * 0.05)::float] FROM range(300) t(i);");
+  run_ok("CREATE TABLE rt_probe (id INTEGER, vec FLOAT[3]);");
+  run_ok("INSERT INTO rt_probe SELECT i, [(i * 0.01)::float, 14::float, 0::float] "
+         "FROM range(10) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'rt_raw', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_kmeans_fit('rt_raw','vec', name => 'rt_c', n_clusters => 3);");
+  run_ok("CREATE TABLE rt_asg AS SELECT * FROM sirius_kmeans_assign('rt_raw','vec','rt_c', "
+         "n_probes => 1);");
+  run_ok("CREATE TABLE rt_corpus AS SELECT r.id, r.vec, a.cluster_id FROM rt_raw r "
+         "JOIN rt_asg a ON r.rowid = a.row_id ORDER BY a.cluster_id;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'rt_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'rt_probe', tier => 'gpu', format => 'duckdb');");
+
+  // The oracle is per-row routing itself, computed on the CPU: each probe's nearest corpus row
+  // among the clusters that sirius_kmeans_assign ranks as ITS OWN n nearest. That is what the
+  // operator claims to do, and unlike the exact answer it holds for whatever clustering k-means
+  // happened to converge to.
+  auto const oracle = [&](int n_probes) {
+    return distance_multiset(*con,
+                             "SELECT q.id, min(array_distance(q.vec, c.vec)) FROM rt_probe q "
+                             "JOIN sirius_kmeans_assign('rt_probe','vec','rt_c', n_probes => " +
+                               std::to_string(n_probes) +
+                               ") a ON a.row_id = q.rowid "
+                               "JOIN rt_corpus c ON c.cluster_id = a.cluster_id GROUP BY q.id;");
+  };
+  auto const approx = [&](int n_probes) {
+    return distance_multiset(*con,
+                             "SELECT left_id, distance FROM sirius_knn_join("
+                             "'rt_probe','vec','rt_corpus','vec', "
+                             "search_mode => 'approx', metric => 'l2', k => 1, "
+                             "clustering => 'rt_c', cluster_column => 'cluster_id', "
+                             "n_probes => " +
+                               std::to_string(n_probes) + ");");
+  };
+  REQUIRE(approx(1) == oracle(1));
+
+  auto const before = sirius::test::get_vector_join_prune_stats(*con);
+  auto const routed = approx(2);
+  auto const after  = sirius::test::get_vector_join_prune_stats(*con);
+  REQUIRE(routed == oracle(2));
+
+  // The geometric claim on top: two probes are enough to reach the exact answer, and the home
+  // cluster alone is not -- so the second probe is what found it.
+  auto const exact = distance_multiset(*con,
+                                       "SELECT left_id, distance FROM sirius_knn_join("
+                                       "'rt_probe','vec','rt_corpus','vec', "
+                                       "search_mode => 'exact-gemm', metric => 'l2', k => 1);");
+  CHECK(routed == exact);
+  CHECK(approx(1) != exact);
+
+  // ...and it got there by visiting two of the three clusters, not all of them.
+  auto const scored = after.pairs_scored - before.pairs_scored;
+  auto const total  = after.pairs_exhaustive - before.pairs_exhaustive;
+  CHECK(total > 0);
+  CHECK(scored * 3 < total * 2 + total / 10);
+}
