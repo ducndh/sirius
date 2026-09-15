@@ -97,7 +97,7 @@ def main():
     write_vectors(f"{OUT}/probe_{tag}.parquet", gen_probe, a.queries, a.dim, a.queries)
     print(f"  vectors written in {time.perf_counter()-t0:.1f}s", flush=True)
 
-    backup = "/home/dnguyen56/vecjoin/data_backup/ooc_gt"
+    backup = os.environ.get("OOC_GT_BACKUP", os.path.expanduser("~/vecjoin/data_backup/ooc_gt"))
     if a.skip_gt:
         for f in (f"probe_{tag}.parquet", f"gt_{tag}.parquet"):
             src = f"{backup}/{f}"
@@ -155,7 +155,7 @@ def main():
     # The corpus is far too big for the 64 GB JuiceFS quota, but probe+gt are a few MB and are
     # the EXPENSIVE half to recompute (brute force over the whole corpus dominates generation).
     # Copy them off the ephemeral overlay so a wipe costs the corpus write, not the ground truth.
-    backup = "/home/dnguyen56/vecjoin/data_backup/ooc_gt"
+    backup = os.environ.get("OOC_GT_BACKUP", os.path.expanduser("~/vecjoin/data_backup/ooc_gt"))
     try:
         os.makedirs(backup, exist_ok=True)
         for f in (f"probe_{tag}.parquet", f"gt_{tag}.parquet"):

@@ -148,9 +148,17 @@ filter → join → equi-join → GROUP BY in one statement **0.141 s**; cuVS pa
 corpus resident, **2.634 s** one-shot. CTAS 0.141 s, COPY 0.141 s, round/sqrt over the join
 0.202 s — nothing falls to the CPU. Answers identical (97 categories, 25,000 matches).
 
+## 6h. Threshold + global top-k curves — DONE, see [threshold/README.md](threshold/README.md)
+Threshold join 0.47 s at eps 150–250 (0.26–12 M pairs), 1.8 s at 80 M pairs, 11.3 s at 379 M
+(output-bound) vs FAISS-CPU range_search 52–70 s. Global top-k = its emulation (0.45 s at k=100,
+2.2 s at k=1000); k=100k refused by the per-task budget.
+
+## 6i. Full suite GREEN on b21525fd and 54eea872 (sirius-1, sirius-3): 32,148,0xx assertions / 2,029 cases.
+
 ## 7. Still open / not covered here
-- Out-of-core (queued `30_out_of_core`), threshold and global top-k curves, composability (blocked
-  on B5/B6), corpus-as-subquery (blocked on S4).
+- S7 planner demotion under a selective scalar predicate; approximate threshold via the radius
+  kernel (approx mode still emulates); k-means assign row-id recipe; a large two-relation dataset
+  with meaning; GPU utilisation sampling (no profiler on the pods).
 - DuckDB `vss_join` head-to-head is running (`run_vss_join.sh`); at ~8 cores it is far slower
   than the LATERAL anchor and may hit its 1-hour cap — `vss_join_1k.sql` is the subset fallback
   (rate only; label it as an extrapolation).
