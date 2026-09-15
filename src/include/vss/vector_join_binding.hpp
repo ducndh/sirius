@@ -17,6 +17,7 @@
 #pragma once
 
 #include "vss/vector_join.hpp"
+#include "duckdb/planner/bound_statement.hpp"
 
 #include <cstdint>
 #include <string>
@@ -36,6 +37,11 @@ namespace sirius::vss {
 ///                     also decides which columns can be emitted. False for a side fed by the
 ///                     build phase: its scan reads the table whether or not a pin happens to be
 ///                     caching it, so columns come from the catalog and no pin is required.
+/// Bind `SELECT * FROM <view>` for a view-typed join side: the names and types the join can
+/// emit, and (in the planner) the logical plan to stream.
+duckdb::BoundStatement bind_view_select(duckdb::ClientContext& context,
+                                        const vector_join_side& side);
+
 std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
                                       duckdb::SiriusContext& sirius_ctx,
                                       const std::string& label,

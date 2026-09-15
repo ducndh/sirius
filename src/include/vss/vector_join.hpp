@@ -57,6 +57,9 @@ struct vector_join_side {
   std::string table;                        ///< base table
   std::string column;                       ///< vector column
   std::vector<std::string> output_columns;  ///< base-table columns to emit in order
+  /// A VIEW (named subquery) rather than a base table; only valid on a scanned corpus side.
+  /// The planner binds and streams it, and nothing looks for a pin.
+  bool is_view{false};
 };
 
 struct vector_join_request {

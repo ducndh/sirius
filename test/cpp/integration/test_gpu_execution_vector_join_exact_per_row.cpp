@@ -938,14 +938,14 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // -----------------------------------------------------------------------------
 // A VIEW named as a join side must be REFUSED, not reinterpreted.
 //
-// `Catalog::GetEntry(TABLE_ENTRY, ...)` also resolves views, so the unchecked
-// `Cast<DuckTableEntry>()` that follows used to reinterpret a ViewCatalogEntry as a table. In a
-// release build that is undefined behaviour rather than an error: the bogus column count reached
-// the allocator and the query died with "Out of Memory Error: Allocation failure" instead of a
-// message. Passing a view is a reasonable thing for a user to try -- it is the obvious way to
-// express a filtered corpus -- so it has to fail by name.
+// `Catalog::GetEntry(TABLE_ENTRY, ...)` also resolves views, so an unchecked
+// `Cast<DuckTableEntry>()` would reinterpret a ViewCatalogEntry as a table -- in a release build
+// undefined behaviour rather than an error. A view is the obvious way to express a filtered
+// corpus, so on the scanned corpus side it is now bound and streamed; everywhere else it has to
+// fail by name, never reach the cast.
 TEST_CASE_METHOD(VectorJoinFixture,
-                 "sirius_knn_join - a view as a join side is refused, not reinterpreted",
+                 "sirius_knn_join - a view is streamed on the scanned corpus side and refused by "
+                 "name elsewhere",
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
   run_ok("CREATE TABLE vw_corpus (id INTEGER, vec FLOAT[3]);");
@@ -962,18 +962,29 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM pin_table(name => 'vw_probe', tier => 'gpu', format => 'duckdb');");
   run_ok("CREATE VIEW vw_corpus_v AS SELECT id, vec FROM vw_corpus WHERE id % 10 < 3;");
 
-  // Corpus side, on the scan path -- the shape a user would reach for to filter a corpus.
+  // Corpus side, on the scan path -- the shape a user reaches for to filter a corpus: bound and
+  // streamed, answering from the 150 rows the view keeps.
+  auto const via_view = ok_rows(*con,
+                                "SELECT left_id, right_id FROM sirius_knn_join("
+                                "'vw_probe','vec','vw_corpus_v','vec', k => 2, metric => 'l2', "
+                                "right_output_columns => ['id'], build_source => 'scan');");
+  REQUIRE(via_view.size() == 20 * 2);
+  for (auto const& r : via_view) {
+    REQUIRE(std::stoi(r[1]) % 10 < 3);
+  }
+
+  // The same view on the pinned corpus path is refused, and the message says what to pass.
   expect_error(*con,
                "SELECT left_id FROM sirius_knn_join('vw_probe','vec','vw_corpus_v','vec', "
-               "k => 2, metric => 'l2', build_source => 'scan');",
-               "not a base table");
+               "k => 2, metric => 'l2');",
+               "build_source => 'scan'");
 
-  // Probe side too: the same resolver serves both, so both must reject a view.
+  // Probe side: a view is refused by name and pointed at the relational form.
   run_ok("CREATE VIEW vw_probe_v AS SELECT id, vec FROM vw_probe;");
   expect_error(*con,
                "SELECT left_id FROM sirius_knn_join('vw_probe_v','vec','vw_corpus','vec', "
                "k => 2, metric => 'l2', build_source => 'scan');",
-               "not a base table");
+               "sirius_knn_join_rel");
 }
 
 // -----------------------------------------------------------------------------
@@ -1229,35 +1240,32 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // -----------------------------------------------------------------------------
 // The boundary: a function Sirius's GPU translator does NOT implement.
 //
-// `round`, `sqrt` and `abs` are absent from the forward table in
-// `src/expression/function_id.cpp`. That is a gap in Sirius generally, NOT in the vector join --
-// over an ordinary pinned table the same call fails on the GPU, falls back to DuckDB and returns
-// the right answer. Over the join the fallback has nowhere to land, because `sirius_knn_join`'s
-// CPU callback is a stub that throws, so the same gap becomes a hard error.
-//
-// Both halves are asserted here so that whoever gives the join a CPU representation sees this
-// test change, and so nobody re-files the missing function as a vector-join bug.
+// `round`, `sqrt`, `abs` and friends used to be absent from the forward table in
+// `src/expression/function_id.cpp`; over an ordinary table that meant a CPU fallback, over the
+// join a hard error, because `sirius_knn_join`'s CPU callback is a stub that throws. They are now
+// evaluated on the GPU, so the same expression works over both, and this test pins that the join
+// no longer depends on a fallback it does not have.
 TEST_CASE_METHOD(VectorJoinFixture,
-                 "sirius_knn_join - an unsupported function is fatal only because the join has no "
-                 "CPU fallback",
+                 "sirius_knn_join - named math functions over the join run on the GPU",
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
   create_halves_dataset(*this);
 
-  // Control: the very same call over an ordinary pinned table degrades to the CPU and is CORRECT.
   auto const on_a_table =
     ok_rows(*con,
             "SELECT count(*) FROM (SELECT round(id / 7.0, 2) AS r FROM hv_corpus) WHERE "
             "r > 0;");
   REQUIRE(on_a_table[0][0] == "2047");
 
-  // Over the join the identical expression cannot fall back, so it fails -- and the message
-  // names the fallback, not the missing function, which is what makes this confusing in the wild.
-  expect_error(*con,
-               "SELECT count(*) FROM (SELECT round(distance, 1) AS x FROM sirius_knn_join("
-               "'hv_probe','vec','hv_corpus','vec', search_mode => 'exact', metric => 'l2', "
-               "k => 6)) WHERE x >= 0;",
-               "cannot run on the CPU");
+  auto const plain = ok_rows(*con,
+                             "SELECT count(*) FROM sirius_knn_join("
+                             "'hv_probe','vec','hv_corpus','vec', search_mode => 'exact', "
+                             "metric => 'l2', k => 6);");
+  auto const rounded = ok_rows(*con,
+                               "SELECT count(*) FROM (SELECT round(distance, 1) AS x FROM "
+                               "sirius_knn_join('hv_probe','vec','hv_corpus','vec', "
+                               "search_mode => 'exact', metric => 'l2', k => 6)) WHERE x >= 0;");
+  REQUIRE(rounded[0][0] == plain[0][0]);
 
   run_ok("SELECT * FROM unpin_table('hv_probe');");
   run_ok("SELECT * FROM unpin_table('hv_corpus');");

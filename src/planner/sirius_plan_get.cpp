@@ -38,10 +38,13 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_top_n.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "vss/kmeans_functions.hpp"
+#include "vss/vector_join_binding.hpp"
 #include "vss/sirius_physical_vector_join_materialize.hpp"
 #include "vss/sirius_physical_vector_join_reduce_local.hpp"
 #include "vss/sirius_physical_vector_join_select.hpp"
@@ -573,6 +576,52 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   return std::move(node);
 }
 
+// A view corpus: bind its SELECT, optimize it, plan it on the GPU and reorder its columns into
+// the layout the fold expects (vector, emitted columns, cluster column) -- the shape
+// make_side_scan produces from a base table. The nested bind runs under the internal-query
+// guard so the transparent optimizer hook does not recurse into it.
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::make_view_side(const sirius::vss::vector_join_side& side,
+                                               const std::string& extra_column)
+{
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  duckdb::unique_ptr<duckdb::SiriusContext::InternalQueryGuard> guard;
+  if (sirius_ctx) {
+    guard = duckdb::make_uniq<duckdb::SiriusContext::InternalQueryGuard>(*sirius_ctx);
+  }
+  auto bound  = sirius::vss::bind_view_select(context, side);
+  auto binder = duckdb::Binder::CreateBinder(context);
+  duckdb::Optimizer optimizer(*binder, context);
+  auto plan = optimizer.Optimize(std::move(bound.plan));
+  duckdb::ColumnBindingResolver resolver;
+  resolver.VisitOperator(*plan);
+  plan->ResolveOperatorTypes();
+  auto const child_types = plan->types;
+  auto const card        = plan->estimated_cardinality;
+  auto planned           = create_plan(*plan);
+
+  auto index_of = [&](const std::string& col) -> std::size_t {
+    for (std::size_t i = 0; i < bound.names.size(); ++i) {
+      if (bound.names[i] == col) { return i; }
+    }
+    throw duckdb::InternalException("sirius_knn_join: view column '" + col +
+                                    "' vanished between bind and plan");
+  };
+  duckdb::vector<duckdb::LogicalType> types;
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
+  auto add = [&](std::size_t idx) {
+    types.push_back(child_types[idx]);
+    exprs.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_types[idx], idx));
+  };
+  add(index_of(side.column));
+  for (auto const& col : side.output_columns) {
+    add(index_of(col));
+  }
+  if (!extra_column.empty()) { add(index_of(extra_column)); }
+  return push_projection(
+    std::move(planned), sirius::from_duckdb_vec(types), translate_expressions(std::move(exprs)), card);
+}
+
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
 {
@@ -817,7 +866,9 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       // The cluster ids ride along with the corpus so the fold can read them from the same
       // batches it searches. Anything else -- a second scan, a pin behind the scan -- would be
       // a different row order than the one the build side's snapshot fixed.
-      stream_op->children.push_back(make_side_scan(context, req.right, req.build_cluster_column));
+      stream_op->children.push_back(
+        req.right.is_view ? make_view_side(req.right, req.build_cluster_column)
+                          : make_side_scan(context, req.right, req.build_cluster_column));
     }
     join_stage = std::move(stream_op);
   } else {

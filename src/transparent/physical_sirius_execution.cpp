@@ -188,8 +188,10 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
           // making downstream Sirius wiring silently miss runtime-computed dynamic filters.
           fresh_plan = sirius::transparent::copy_logical_plan(*logical_plan_, context.client);
         } catch (duckdb::NotImplementedException&) {
-          // Drop logical_plan_ — we know it can't be copied, so future executes
-          // will skip straight to the replan path.
+          // A sub-plan spliced under a CPU sink (CREATE TABLE AS / COPY / INSERT) has no SQL
+          // text to replan from, so the template itself is consumed: it runs once, which is
+          // all a sink statement asks of it. Otherwise drop it and take the replan path.
+          if (query_sql_.empty()) { fresh_plan = std::move(logical_plan_); }
           logical_plan_.reset();
         }
       }

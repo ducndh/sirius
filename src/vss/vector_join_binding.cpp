@@ -20,7 +20,10 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
@@ -29,6 +32,21 @@
 #include <limits>
 
 namespace sirius::vss {
+
+duckdb::BoundStatement bind_view_select(duckdb::ClientContext& context,
+                                        const vector_join_side& side)
+{
+  auto const sql = "SELECT * FROM " + duckdb::KeywordHelper::WriteOptionallyQuoted(side.catalog) +
+                   "." + duckdb::KeywordHelper::WriteOptionallyQuoted(side.schema) + "." +
+                   duckdb::KeywordHelper::WriteOptionallyQuoted(side.table);
+  duckdb::Parser parser(context.GetParserOptions());
+  parser.ParseQuery(sql);
+  if (parser.statements.size() != 1) {
+    throw duckdb::BinderException("sirius_knn_join: could not bind view '" + side.table + "'");
+  }
+  auto binder = duckdb::Binder::CreateBinder(context);
+  return binder->Bind(*parser.statements[0]);
+}
 
 std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
                                       duckdb::SiriusContext& sirius_ctx,
@@ -51,25 +69,47 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   std::string const schema  = !qname.schema.empty() ? qname.schema : schema_name;
   auto& entry_base          = duckdb::Catalog::GetEntry(
     context, duckdb::CatalogType::TABLE_ENTRY, catalog, schema, qname.name);
-  // A VIEW lives in the TABLE_ENTRY namespace, so GetEntry happily returns one and the Cast
-  // below reinterprets it as a table. In release that is undefined behaviour, not an error: a
-  // view name produced a bogus column count and an out-of-memory allocation failure rather than
-  // a message. Reject anything that is not a base table.
-  if (entry_base.type != duckdb::CatalogType::TABLE_ENTRY) {
+  // A VIEW lives in the TABLE_ENTRY namespace, so GetEntry returns one and a Cast to a table
+  // entry would be undefined behaviour. A view is a named subquery: on a scanned corpus side the
+  // planner binds it and streams its rows into the join, which is what a filtered or joined
+  // corpus needs without a CTAS or a pin. Its columns come from binding "SELECT * FROM view".
+  bool const is_view = entry_base.type == duckdb::CatalogType::VIEW_ENTRY;
+  if (is_view && label == "left") {
+    throw duckdb::BinderException(
+      "sirius_knn_join: " + label + " '" + qname.name +
+      "' is a view; a probe-side relation is passed as a subquery via sirius_knn_join_rel");
+  }
+  if (is_view && require_pin) {
+    throw duckdb::BinderException(
+      "sirius_knn_join: " + label + " '" + qname.name +
+      "' is a view; a view corpus streams through a scan, so pass build_source => 'scan'");
+  }
+  if (!is_view && entry_base.type != duckdb::CatalogType::TABLE_ENTRY) {
     throw duckdb::BinderException(
       "sirius_knn_join: " + label + " '" + qname.name + "' is a " +
       duckdb::CatalogTypeToString(entry_base.type) +
-      ", not a base table. Materialize it (CREATE TABLE ... AS SELECT ...) first; a subquery is "
-      "supported on the probe side only, via sirius_knn_join_rel.");
+      ", not a base table or view. Materialize it (CREATE TABLE ... AS SELECT ...) or wrap it "
+      "in a view; a subquery is supported on the probe side via sirius_knn_join_rel.");
   }
-  auto& entry  = entry_base.Cast<duckdb::DuckTableEntry>();
-  side.catalog = entry.ParentCatalog().GetName();
-  side.schema  = entry.ParentSchema().name;
-  side.table   = entry.name;  // catalog-resolved name (matches query-side derivation)
+  side.catalog = entry_base.ParentCatalog().GetName();
+  side.schema  = entry_base.ParentSchema().name;
+  side.table   = entry_base.name;  // catalog-resolved name (matches query-side derivation)
+  side.is_view = is_view;
 
-  auto const& columns     = entry.GetColumns();
-  auto const schema_names = columns.GetColumnNames();
-  auto const schema_types = columns.GetColumnTypes();
+  duckdb::vector<duckdb::string> schema_names;
+  duckdb::vector<duckdb::LogicalType> schema_types;
+  std::uint64_t table_rows = 0;
+  if (is_view) {
+    auto bound   = bind_view_select(context, side);
+    schema_names = std::move(bound.names);
+    schema_types = std::move(bound.types);
+  } else {
+    auto& entry         = entry_base.Cast<duckdb::DuckTableEntry>();
+    auto const& columns = entry.GetColumns();
+    schema_names        = columns.GetColumnNames();
+    schema_types        = columns.GetColumnTypes();
+    table_rows          = static_cast<std::uint64_t>(entry.GetStorage().GetTotalRows());
+  }
 
   auto type_of = [&](const std::string& col) -> const duckdb::LogicalType& {
     for (std::size_t i = 0; i < schema_names.size(); ++i) {
@@ -144,9 +184,8 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
 
   // Row count for the cardinality estimate and the plan's k clamp. The pin's count is the
   // authority when the operator reads the pin; otherwise the table's own.
-  out_num_rows = (pin != nullptr && require_pin)
-                   ? static_cast<std::uint64_t>(pin->num_rows)
-                   : static_cast<std::uint64_t>(entry.GetStorage().GetTotalRows());
+  out_num_rows =
+    (pin != nullptr && require_pin) ? static_cast<std::uint64_t>(pin->num_rows) : table_rows;
 
   for (auto const& col : side.output_columns) {
     out_types.push_back(type_of(col));

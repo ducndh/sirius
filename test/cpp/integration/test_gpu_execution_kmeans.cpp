@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <utility>
@@ -731,4 +732,115 @@ TEST_CASE_METHOD(KMeansFixture,
   auto const total  = after.pairs_exhaustive - before.pairs_exhaustive;
   CHECK(total > 0);
   CHECK(scored * 3 < total * 2 + total / 10);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The three planner gaps that blocked composing the join with the rest of a SQL plan.
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_knn_join under CREATE TABLE AS, INSERT and COPY runs on the GPU",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][boundary]")
+{
+  create_clustered_join(*this, *con, "snk", 8);
+  auto const q = std::string(
+    "SELECT left_id, right_id, distance FROM sirius_knn_join('snk_probe','vec','snk_corpus','vec', "
+    "search_mode => 'exact-gemm', metric => 'l2', k => 5)");
+  auto const direct = ok_rows(*con, q + ";");
+  REQUIRE(direct.size() == 200 * 5);
+
+  // CREATE TABLE AS: DuckDB's sink stays, the GPU join feeds it.
+  run_ok("CREATE TABLE snk_ctas AS " + q + ";");
+  auto const via_ctas = ok_rows(*con, "SELECT left_id, right_id, distance FROM snk_ctas;");
+  REQUIRE(via_ctas == direct);
+
+  // INSERT ... SELECT into an existing table.
+  run_ok("CREATE TABLE snk_ins (left_id INTEGER, right_id INTEGER, distance FLOAT);");
+  run_ok("INSERT INTO snk_ins " + q + ";");
+  auto const via_insert = ok_rows(*con, "SELECT left_id, right_id, distance FROM snk_ins;");
+  REQUIRE(via_insert == direct);
+
+  // COPY ... TO a file and read it back.
+  run_ok("COPY (" + q + ") TO '/var/tmp/vj_test_snk_copy.csv' (FORMAT csv, HEADER);");
+  auto const via_copy = ok_rows(
+    *con, "SELECT left_id, right_id, distance FROM read_csv('/var/tmp/vj_test_snk_copy.csv');");
+  REQUIRE(via_copy.size() == direct.size());
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "named math functions over the join's output stay on the GPU",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][boundary]")
+{
+  create_clustered_join(*this, *con, "mth", 8);
+  // A named function used to be refused by the plan generator, which re-ran the whole query on
+  // the CPU where the join has no implementation. The CPU reference is DuckDB computing the
+  // same functions over the join's stored output.
+  run_ok("CREATE TABLE mth_out AS SELECT left_id, right_id, distance FROM sirius_knn_join("
+         "'mth_probe','vec','mth_corpus','vec', search_mode => 'exact-gemm', metric => 'l2', "
+         "k => 3);");
+  auto const gpu = ok_rows(*con,
+                           "SELECT left_id, right_id, round(distance, 2), round(sqrt(distance), 3), "
+                           "abs(distance - 10.0), floor(distance), ceil(distance) "
+                           "FROM sirius_knn_join('mth_probe','vec','mth_corpus','vec', "
+                           "search_mode => 'exact-gemm', metric => 'l2', k => 3);");
+  auto const cpu = ok_rows(*con,
+                           "SELECT left_id, right_id, round(distance, 2), round(sqrt(distance), 3), "
+                           "abs(distance - 10.0), floor(distance), ceil(distance) FROM mth_out;");
+  REQUIRE(gpu.size() == cpu.size());
+  // Values compare after rounding to 3 decimals: cuDF rounds half to even and DuckDB half away
+  // from zero, and the two float paths differ in the last ulp.
+  auto norm = [](std::vector<std::vector<std::string>> rows) {
+    for (auto& r : rows) {
+      for (std::size_t i = 2; i < r.size(); ++i) {
+        r[i] = std::to_string(std::llround(std::stod(r[i]) * 100.0));
+      }
+    }
+    std::sort(rows.begin(), rows.end());
+    return rows;
+  };
+  REQUIRE(norm(gpu) == norm(cpu));
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_knn_join takes the corpus from a VIEW through build_source => 'scan'",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][boundary]")
+{
+  create_clustered_join(*this, *con, "vw", 8);
+  // A filtered corpus as a view: no CTAS, no pin. The reference is the same filter applied to
+  // the pinned join's output, which is the answer a corpus-side subquery must reproduce.
+  run_ok("CREATE VIEW vw_even AS SELECT id, vec, cluster_id FROM vw_corpus WHERE id % 2 = 0;");
+  // The reference: the pinned join's full answer at a depth large enough that every probe's
+  // three nearest even rows are inside it, written to a table (the GPU-under-sink splice) and
+  // then filtered on the CPU with a window, which the GPU plan does not support.
+  run_ok("CREATE TABLE vw_full AS SELECT left_id, right_id, distance FROM sirius_knn_join("
+         "'vw_probe','vec','vw_corpus','vec', search_mode => 'exact-gemm', metric => 'l2', "
+         "k => 40, right_output_columns => ['id']);");
+  auto const reference = distance_multiset(*con,
+                                           "SELECT left_id, distance FROM vw_full "
+                                           "WHERE right_id % 2 = 0 "
+                                           "QUALIFY row_number() OVER (PARTITION BY left_id "
+                                           "ORDER BY distance) <= 3;");
+  auto const via_view = distance_multiset(*con,
+                                          "SELECT left_id, distance FROM sirius_knn_join("
+                                          "'vw_probe','vec','vw_even','vec', "
+                                          "search_mode => 'exact-gemm', metric => 'l2', k => 3, "
+                                          "right_output_columns => ['id'], "
+                                          "build_source => 'scan');");
+  REQUIRE(via_view.size() == 200 * 3);
+  REQUIRE(via_view == reference);
+
+  // A view corpus on the approximate path, cluster column carried through the view.
+  auto const via_view_approx = distance_multiset(*con,
+                                                 "SELECT left_id, distance FROM sirius_knn_join("
+                                                 "'vw_probe','vec','vw_even','vec', "
+                                                 "search_mode => 'approx', metric => 'l2', k => 3, "
+                                                 "clustering => 'vw_c', cluster_column => 'cluster_id', "
+                                                 "n_probes => 8, build_source => 'scan');");
+  REQUIRE(via_view_approx == via_view);
+
+  // Without build_source => 'scan' a view is refused with a message that says what to pass.
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('vw_probe','vec','vw_even','vec', "
+               "search_mode => 'exact-gemm', metric => 'l2', k => 3);",
+               "build_source => 'scan'");
 }

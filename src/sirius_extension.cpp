@@ -2265,9 +2265,16 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   // would otherwise throw, which is read as "this query cannot run on the GPU" and reported as
   // something else entirely.
   if (!req.clustering.empty() && req.build_from_scan) {
-    auto& corpus_entry = Catalog::GetEntry(
-      context, CatalogType::TABLE_ENTRY, req.right.catalog, req.right.schema, req.right.table);
-    auto const corpus_columns = corpus_entry.Cast<DuckTableEntry>().GetColumns().GetColumnNames();
+    // A view's columns come from binding it; a table entry's from the catalog. Casting a view
+    // entry to a table entry is undefined behaviour, which is why the two are kept apart.
+    vector<string> corpus_columns;
+    if (req.right.is_view) {
+      corpus_columns = sirius::vss::bind_view_select(context, req.right).names;
+    } else {
+      auto& corpus_entry = Catalog::GetEntry(
+        context, CatalogType::TABLE_ENTRY, req.right.catalog, req.right.schema, req.right.table);
+      corpus_columns = corpus_entry.Cast<DuckTableEntry>().GetColumns().GetColumnNames();
+    }
     if (std::find(corpus_columns.begin(), corpus_columns.end(), req.build_cluster_column) ==
         corpus_columns.end()) {
       throw BinderException("sirius_knn_join: cluster_column '" + req.build_cluster_column +

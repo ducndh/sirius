@@ -124,6 +124,13 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Called after physical plan generation, before execution.
   /// Replaces the DuckDB physical plan with a Sirius GPU plan when possible.
+  /// \brief Sink statement whose SELECT child needs the GPU: keep DuckDB's sink, replace the
+  /// child with a GPU operator. Returns DO_NOT_REBIND either way.
+  RebindQueryInfo splice_gpu_child_under_sink(ClientContext& context,
+                                              PreparedStatementData& prepared,
+                                              unique_ptr<LogicalOperator> logical_plan,
+                                              bool plan_reads_s3);
+
   RebindQueryInfo OnFinalizePrepare(ClientContext& context,
                                     PreparedStatementData& prepared_statement,
                                     PreparedStatementMode mode) final;
