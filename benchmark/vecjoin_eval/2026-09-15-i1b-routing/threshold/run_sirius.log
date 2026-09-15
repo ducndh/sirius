@@ -1,0 +1,95 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@EPS quantiles of the packaged ground-truth distances
+┌───────┬───────┬───────┐
+│ rank  │  p50  │  p90  │
+│ int32 │ float │ float │
+├───────┼───────┼───────┤
+│     0 │ 195.0 │ 245.1 │
+│     4 │ 218.3 │ 263.3 │
+│     9 │ 226.1 │ 270.7 │
+│    49 │ 244.1 │ 288.9 │
+└───────┴───────┴───────┘
+@@@RUN threshold_eps150
+Run Time (s): real 0.573 user 0.502124 sys 0.057294
+Run Time (s): real 0.483 user 0.436887 sys 0.026956
+Run Time (s): real 0.473 user 0.455957 sys 0.004317
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+@@@RUN threshold_eps200
+Run Time (s): real 0.483 user 0.470201 sys 0.003315
+Run Time (s): real 0.504 user 0.451549 sys 0.030469
+Run Time (s): real 0.503 user 0.476317 sys 0.009527
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+@@@RUN threshold_eps250
+Run Time (s): real 0.604 user 0.532471 sys 0.057626
+Run Time (s): real 0.635 user 0.544091 sys 0.075290
+Run Time (s): real 0.655 user 0.555139 sys 0.085329
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+@@@RUN threshold_eps300
+Run Time (s): real 1.887 user 1.206981 sys 0.684375
+Run Time (s): real 1.826 user 1.298017 sys 0.530254
+Run Time (s): real 1.891 user 1.298145 sys 0.595895
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+@@@RUN threshold_eps350
+Run Time (s): real 12.336 user 8.576153 sys 3.882796
+Run Time (s): real 11.905 user 9.050388 sys 2.973081
+Run Time (s): real 11.285 user 9.197649 sys 2.231656
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+@@@RUN global_k100
+Run Time (s): real 1.171 user 0.876658 sys 0.324277
+Run Time (s): real 0.500 user 0.467771 sys 0.006109
+Run Time (s): real 0.453 user 0.424986 sys 0.039164
+@@@RUN global_emul_k100
+Run Time (s): real 0.454 user 0.429382 sys 0.024079
+Run Time (s): real 0.453 user 0.429214 sys 0.017451
+Run Time (s): real 0.453 user 0.435629 sys 0.017849
+@@@RUN global_k1000
+Run Time (s): real 2.266 user 1.489434 sys 0.750147
+Run Time (s): real 2.206 user 1.442099 sys 0.781129
+Run Time (s): real 2.206 user 1.504978 sys 0.728100
+@@@RUN global_emul_k1000
+Run Time (s): real 2.216 user 1.457109 sys 0.780205
+Run Time (s): real 2.226 user 1.521546 sys 0.726210
+Run Time (s): real 2.216 user 1.487702 sys 0.749304
+@@@RUN global_k10000
+Run Time (s): real 2.669 user 1.795779 sys 0.899889
+Run Time (s): real 2.670 user 1.798830 sys 0.898222
+Run Time (s): real 2.680 user 1.761890 sys 0.941100
+@@@RUN global_k100000
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+Run Time (s): real 0.031 user 0.003231 sys 0.001408
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+Run Time (s): real 0.030 user 0.003475 sys 0.001157
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+Run Time (s): real 0.030 user 0.002583 sys 0.001866

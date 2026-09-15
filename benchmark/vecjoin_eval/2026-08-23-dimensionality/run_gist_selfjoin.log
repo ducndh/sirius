@@ -1,0 +1,13 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@ EXACT self-join 1M x 1M d=960
+Run Time (s): real 120.767 user 944.271157 sys 1.273200

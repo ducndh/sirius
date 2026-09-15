@@ -1,0 +1,6 @@
+corpus 1,000,000, probes 1,000, eps=100 plain L2
+
+method                                   build_s   query_s     pairs   ->10k probes
+sklearn radius_neighbors (brute)            0.06     1.791     1,349          17.9s  
+sklearn radius_neighbors (kd_tree)         24.38    17.687     1,349         176.9s  
+scipy cKDTree query_ball_point              2.75     6.963     1,349          69.6s  KD-trees degenerate at d=128

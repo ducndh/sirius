@@ -1,0 +1,107 @@
+[
+ {
+  "epoch": 0,
+  "system": "cuVS brute_force k=65 (exact)",
+  "build": 0.14078726060688496,
+  "search": 0.6717841569334269,
+  "recall": 1.0
+ },
+ {
+  "epoch": 0,
+  "system": "cuVS IVF-Flat 64/8",
+  "build": 0.4335693698376417,
+  "search": 1.1386897098273039,
+  "recall": 0.9894800000000001
+ },
+ {
+  "epoch": 0,
+  "system": "cuVS CAGRA nn_descent 32/64",
+  "build": 8.807372607290745,
+  "search": 0.2151466067880392,
+  "recall": 0.9788500000000002
+ },
+ {
+  "epoch": 1,
+  "system": "cuVS brute_force k=65 (exact)",
+  "build": 0.0011258795857429504,
+  "search": 0.4178408235311508,
+  "recall": 1.0
+ },
+ {
+  "epoch": 1,
+  "system": "cuVS IVF-Flat 64/8",
+  "build": 0.31374380737543106,
+  "search": 0.8748928476125002,
+  "recall": 0.98911
+ },
+ {
+  "epoch": 1,
+  "system": "cuVS CAGRA nn_descent 32/64",
+  "build": 8.38724916614592,
+  "search": 0.01568600721657276,
+  "recall": 0.97439
+ },
+ {
+  "epoch": 2,
+  "system": "cuVS brute_force k=65 (exact)",
+  "build": 0.001137852668762207,
+  "search": 0.4226031992584467,
+  "recall": 1.0
+ },
+ {
+  "epoch": 2,
+  "system": "cuVS IVF-Flat 64/8",
+  "build": 0.2912831772118807,
+  "search": 0.887938866391778,
+  "recall": 0.9887600000000001
+ },
+ {
+  "epoch": 2,
+  "system": "cuVS CAGRA nn_descent 32/64",
+  "build": 8.306028539314866,
+  "search": 0.014665978029370308,
+  "recall": 0.96757
+ },
+ {
+  "epoch": 3,
+  "system": "cuVS brute_force k=65 (exact)",
+  "build": 0.0011238064616918564,
+  "search": 0.42222485691308975,
+  "recall": 1.0
+ },
+ {
+  "epoch": 3,
+  "system": "cuVS IVF-Flat 64/8",
+  "build": 0.30478100664913654,
+  "search": 0.8856825474649668,
+  "recall": 0.98769
+ },
+ {
+  "epoch": 3,
+  "system": "cuVS CAGRA nn_descent 32/64",
+  "build": 8.367724044248462,
+  "search": 0.014522846788167953,
+  "recall": 0.9628
+ },
+ {
+  "epoch": 4,
+  "system": "cuVS brute_force k=65 (exact)",
+  "build": 0.0011420994997024536,
+  "search": 0.4241907261312008,
+  "recall": 1.0
+ },
+ {
+  "epoch": 4,
+  "system": "cuVS IVF-Flat 64/8",
+  "build": 0.31188989803195,
+  "search": 0.8770178612321615,
+  "recall": 0.9871699999999999
+ },
+ {
+  "epoch": 4,
+  "system": "cuVS CAGRA nn_descent 32/64",
+  "build": 8.408119540661573,
+  "search": 0.014208227396011353,
+  "recall": 0.9579799999999999
+ }
+]

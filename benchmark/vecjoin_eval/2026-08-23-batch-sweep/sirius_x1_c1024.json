@@ -1,0 +1,208 @@
+{
+ "setup": {
+  "fit n_clusters=1024": 0.212,
+  "assign+order corpus": 0.355
+ },
+ "rows": [
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 1000,
+   "mode": "p1",
+   "n_probes": 1,
+   "search_s": 0.223,
+   "recall_id": 0.4607,
+   "recall_dist": 0.4613
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 1000,
+   "mode": "p4",
+   "n_probes": 4,
+   "search_s": 0.819,
+   "recall_id": 0.5678,
+   "recall_dist": 0.5686
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 1000,
+   "mode": "p16",
+   "n_probes": 16,
+   "search_s": 3.187,
+   "recall_id": 0.7552,
+   "recall_dist": 0.7566
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 1000,
+   "mode": "p64",
+   "n_probes": 64,
+   "search_s": 11.467,
+   "recall_id": 0.9378,
+   "recall_dist": 0.9393
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 1000,
+   "mode": "exact",
+   "n_probes": null,
+   "search_s": 0.071,
+   "recall_id": 0.999,
+   "recall_dist": 1.0
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 10000,
+   "mode": "p1",
+   "n_probes": 1,
+   "search_s": 0.304,
+   "recall_id": 0.4607,
+   "recall_dist": 0.4613
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 10000,
+   "mode": "p4",
+   "n_probes": 4,
+   "search_s": 1.154,
+   "recall_id": 0.5678,
+   "recall_dist": 0.5686
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 10000,
+   "mode": "p16",
+   "n_probes": 16,
+   "search_s": 4.503,
+   "recall_id": 0.7552,
+   "recall_dist": 0.7566
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 10000,
+   "mode": "p64",
+   "n_probes": 64,
+   "search_s": 17.821,
+   "recall_id": 0.9378,
+   "recall_dist": 0.9393
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 10000,
+   "mode": "exact",
+   "n_probes": null,
+   "search_s": 0.334,
+   "recall_id": 0.999,
+   "recall_dist": 1.0
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 100000,
+   "mode": "p1",
+   "n_probes": 1,
+   "search_s": 0.344,
+   "recall_id": 0.4607,
+   "recall_dist": 0.4613
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 100000,
+   "mode": "p4",
+   "n_probes": 4,
+   "search_s": 1.224,
+   "recall_id": 0.5678,
+   "recall_dist": 0.5686
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 100000,
+   "mode": "p16",
+   "n_probes": 16,
+   "search_s": 4.704,
+   "recall_id": 0.7552,
+   "recall_dist": 0.7566
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 100000,
+   "mode": "p64",
+   "n_probes": 64,
+   "search_s": 18.643,
+   "recall_id": 0.9378,
+   "recall_dist": 0.9393
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 100000,
+   "mode": "exact",
+   "n_probes": null,
+   "search_s": 3.003,
+   "recall_id": 0.999,
+   "recall_dist": 1.0
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 1000000,
+   "mode": "p1",
+   "n_probes": 1,
+   "search_s": 0.495,
+   "recall_id": 0.4607,
+   "recall_dist": 0.4613
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 1000000,
+   "mode": "p4",
+   "n_probes": 4,
+   "search_s": 1.538,
+   "recall_id": 0.5678,
+   "recall_dist": 0.5686
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 1000000,
+   "mode": "p16",
+   "n_probes": 16,
+   "search_s": 7.017,
+   "recall_id": 0.7552,
+   "recall_dist": 0.7566
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 1000000,
+   "mode": "p64",
+   "n_probes": 64,
+   "search_s": 20.951,
+   "recall_id": 0.9378,
+   "recall_dist": 0.9393
+  },
+  {
+   "system": "sirius",
+   "tag": "c1024",
+   "probes_n": 1000000,
+   "mode": "exact",
+   "n_probes": null,
+   "search_s": 27.719,
+   "recall_id": 0.999,
+   "recall_dist": 1.0
+  }
+ ]
+}

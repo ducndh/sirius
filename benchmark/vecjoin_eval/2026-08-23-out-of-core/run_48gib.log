@@ -1,0 +1,25 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────────┐
+│ corpus_rows │
+│    int64    │
+├─────────────┤
+│   100663296 │
+└─────────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+=== TIMED sirius exact streaming, corpus host-pinned (streams to GPU), 48 GiB
+Run Time (s): real 32.394 user 32.782883 sys 0.619423

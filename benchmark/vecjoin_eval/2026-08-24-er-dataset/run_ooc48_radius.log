@@ -1,0 +1,42 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────────┐
+│ corpus_rows │
+│    int64    │
+├─────────────┤
+│   100663296 │
+└─────────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@ A exact k=10 baseline (recorded 32.39 s @ recall 1.0)
+Run Time (s): real 32.414 user 33.098387 sys 0.588907
+@@@ B RADIUS join out-of-core, eps=13.0
+┌────────┐
+│ pairs  │
+│ int64  │
+├────────┤
+│ 277937 │
+└────────┘
+Run Time (s): real 33.834 user 34.495527 sys 0.456940
+@@@ C RADIUS join out-of-core, eps=13.5
+┌─────────┐
+│  pairs  │
+│  int64  │
+├─────────┤
+│ 1435321 │
+└─────────┘
+Run Time (s): real 34.150 user 35.032718 sys 0.548987
+@@@ D export eps=13.5 pairs for correctness vs the packaged ground truth

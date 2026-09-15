@@ -1,0 +1,46 @@
+GIST1M d=960, packaged 1k queries x 1M, k=10, RTX A5000. Sirius end-to-end SQL; cuVS kernel-only. ratio = Sirius/cuVS.
+
+cuVS opponent                          recall  search   total |  Sirius        via  recall   amort  1-shot
+cuVS IVF-Flat nlist=1024 nprobe=1      0.2209   0.006   1.939 |   0.090     c64_p1  0.4479  15.00x   0.05x
+cuVS IVF-Flat nlist=64 nprobe=1        0.4452   0.085   1.552 |   0.090     c64_p1  0.4479   1.06x   0.06x
+cuVS IVF-Flat nlist=1024 nprobe=4      0.4888   0.024   1.922 |   0.100     c64_p2  0.6374   4.17x   0.05x
+cuVS CAGRA nn_descent deg=32 itopk=32  0.6166   0.009  20.787 |   0.100     c64_p2  0.6374  11.11x   0.00x
+cuVS IVF-Flat nlist=1024 nprobe=16     0.7779   0.097   2.130 |   0.101     c64_p4  0.8215   1.04x   0.05x
+cuVS CAGRA nn_descent deg=32 itopk=64  0.7812   0.015  20.792 |   0.101     c64_p4  0.8215   6.73x   0.00x
+cuVS CAGRA nn_descent deg=64 itopk=32  0.7854   0.015  21.793 |   0.101     c64_p4  0.8215   6.73x   0.00x
+cuVS IVF-Flat nlist=64 nprobe=4        0.8279   0.372   1.834 |   0.121     c64_p8  0.9438   0.33x   0.07x
+cuVS CAGRA nn_descent deg=32 itopk=128 0.8975   0.024  20.802 |   0.121     c64_p8  0.9438   5.04x   0.01x
+cuVS CAGRA nn_descent deg=64 itopk=64  0.9036   0.027  21.804 |   0.121     c64_p8  0.9438   4.48x   0.01x
+cuVS CAGRA nn_descent deg=32 itopk=256 0.9623   0.045  20.822 |   0.141    c64_p16  0.9924   3.13x   0.01x
+cuVS IVF-Flat nlist=1024 nprobe=64     0.9642   0.386   2.304 |   0.141    c64_p16  0.9924   0.37x   0.06x
+cuVS CAGRA nn_descent deg=64 itopk=128 0.9644   0.046  21.823 |   0.141    c64_p16  0.9924   3.07x   0.01x
+cuVS CAGRA nn_descent deg=64 itopk=256 0.9910   0.087  21.864 |   0.141    c64_p16  0.9924   1.62x   0.01x
+cuVS IVF-Flat nlist=64 nprobe=16       0.9919   1.456   2.892 |   0.141    c64_p16  0.9924   0.10x   0.05x
+cuVS IVF-Flat nlist=1024 nprobe=256    0.9986   1.504   3.439 |   0.181    c64_p32  0.9992   0.12x   0.05x
+cuVS brute_force (exact)               0.9992   0.583   0.735 |   0.181    c64_p32  0.9992   0.31x   0.25x
+cuVS IVF-Flat nlist=64 nprobe=64       0.9993   5.193   6.639 |   0.252    c64_p64  0.9993   0.05x   0.04x
+
+Sirius Pareto:
+  c1024_p1      0.372 s  recall 0.2008
+  c256_p1       0.192 s  recall 0.3075
+  c64_p1        0.090 s  recall 0.4479
+  c1024_p4      0.604 s  recall 0.4627
+  c256_p2       0.211 s  recall 0.4631
+  c64_p2        0.100 s  recall 0.6374
+  c256_p4       0.211 s  recall 0.6378
+  c1024_p16     0.644 s  recall 0.7753
+  c256_p8       0.221 s  recall 0.8014
+  c64_p4        0.101 s  recall 0.8215
+  c1024_p32     0.655 s  recall 0.8919
+  c256_p16      0.232 s  recall 0.9214
+  c64_p8        0.121 s  recall 0.9438
+  c1024_p64     0.654 s  recall 0.9618
+  c256_p32      0.242 s  recall 0.9801
+  c64_p16       0.141 s  recall 0.9924
+  c1024_p128    0.684 s  recall 0.9927
+  c256_p64      0.261 s  recall 0.9968
+  c1024_p256    0.704 s  recall 0.9989
+  exact         0.201 s  recall 0.9990
+  c256_p128     0.312 s  recall 0.9991
+  c64_p32       0.181 s  recall 0.9992
+  c64_p64       0.252 s  recall 0.9993

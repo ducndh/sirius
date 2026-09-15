@@ -1,0 +1,30 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@ GLOBAL q10k k=10
+Run Time (s): real 0.334 user 0.312448 sys 0.011300
+@@@ GLOBAL q10k k=1000
+Run Time (s): real 1.794 user 1.809011 sys 0.029732
+@@@ PER-ROW q10k k=10 reference
+Run Time (s): real 0.324 user 0.305202 sys 0.006613
+@@@ THRESHOLD q10k eps=100 and eps=150
+Run Time (s): real 1.794 user 1.801065 sys 0.023286
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+Executor Error: Sirius GPU execution failed: [sirius_physical_vector_join_stream] threshold join truncated: at least one left row has k=1024 neighbours inside the threshold, so pairs beyond k were never searched for. Raise k or tighten eps. (CPU fallback also failed: {"exception_type":"Invalid","exception_message":"sirius_knn_join is an internal rewrite target executed on the GPU; it cannot run on the CPU"})
+Run Time (s): real 1.773 user 1.801670 sys 0.018488

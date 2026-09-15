@@ -1,0 +1,156 @@
+[
+ {
+  "name": "cuVS brute_force (exact)",
+  "build_s": 0.024441261775791645,
+  "search_s": 0.3469016617164016,
+  "total_s": 0.3713429234921932,
+  "recall": 0.99935
+ },
+ {
+  "name": "cuVS IVF-Flat nlist=64 nprobe=1",
+  "build_s": 0.21028028801083565,
+  "search_s": 0.04827406909316778,
+  "total_s": 0.25855435710400343,
+  "recall": 0.62001
+ },
+ {
+  "name": "cuVS IVF-Flat nlist=64 nprobe=4",
+  "build_s": 0.2066973620094359,
+  "search_s": 0.20242549618706107,
+  "total_s": 0.40912285819649696,
+  "recall": 0.93515
+ },
+ {
+  "name": "cuVS IVF-Flat nlist=64 nprobe=16",
+  "build_s": 0.18343246402218938,
+  "search_s": 0.8153225667774677,
+  "total_s": 0.9987550307996571,
+  "recall": 0.99903
+ },
+ {
+  "name": "cuVS IVF-Flat nlist=64 nprobe=64",
+  "build_s": 0.18497943598777056,
+  "search_s": 3.0202103522606194,
+  "total_s": 3.20518978824839,
+  "recall": 0.99931
+ },
+ {
+  "name": "cuVS IVF-Flat nlist=1024 nprobe=1",
+  "build_s": 0.27118070563301444,
+  "search_s": 0.004712768830358982,
+  "total_s": 0.2758934744633734,
+  "recall": 0.36999
+ },
+ {
+  "name": "cuVS IVF-Flat nlist=1024 nprobe=4",
+  "build_s": 0.2613304741680622,
+  "search_s": 0.014719785191118717,
+  "total_s": 0.2760502593591809,
+  "recall": 0.69828
+ },
+ {
+  "name": "cuVS IVF-Flat nlist=1024 nprobe=16",
+  "build_s": 0.26626090006902814,
+  "search_s": 0.05403819493949413,
+  "total_s": 0.32029909500852227,
+  "recall": 0.93175
+ },
+ {
+  "name": "cuVS IVF-Flat nlist=1024 nprobe=64",
+  "build_s": 0.2648214087821543,
+  "search_s": 0.2088732961565256,
+  "total_s": 0.47369470493867993,
+  "recall": 0.99557
+ },
+ {
+  "name": "cuVS IVF-Flat nlist=1024 nprobe=256",
+  "build_s": 0.26447810186073184,
+  "search_s": 0.8107260442338884,
+  "total_s": 1.0752041460946202,
+  "recall": 0.99947
+ },
+ {
+  "name": "cuVS CAGRA nn_descent deg=32 itopk=32",
+  "build_s": 7.347545095719397,
+  "search_s": 0.005421624984592199,
+  "total_s": 7.352966720703989,
+  "recall": 0.92268
+ },
+ {
+  "name": "cuVS CAGRA nn_descent deg=32 itopk=64",
+  "build_s": 7.347545095719397,
+  "search_s": 0.008495992049574852,
+  "total_s": 7.356041087768972,
+  "recall": 0.97621
+ },
+ {
+  "name": "cuVS CAGRA nn_descent deg=32 itopk=128",
+  "build_s": 7.347545095719397,
+  "search_s": 0.014567582868039608,
+  "total_s": 7.362112678587437,
+  "recall": 0.99445
+ },
+ {
+  "name": "cuVS CAGRA nn_descent deg=32 itopk=256",
+  "build_s": 7.347545095719397,
+  "search_s": 0.027627033181488514,
+  "total_s": 7.375172128900886,
+  "recall": 0.99872
+ },
+ {
+  "name": "cuVS CAGRA nn_descent deg=64 itopk=32",
+  "build_s": 8.457797560840845,
+  "search_s": 0.008706002030521631,
+  "total_s": 8.466503562871367,
+  "recall": 0.97766
+ },
+ {
+  "name": "cuVS CAGRA nn_descent deg=64 itopk=64",
+  "build_s": 8.457797560840845,
+  "search_s": 0.014566143974661827,
+  "total_s": 8.472363704815507,
+  "recall": 0.99501
+ },
+ {
+  "name": "cuVS CAGRA nn_descent deg=64 itopk=128",
+  "build_s": 8.457797560840845,
+  "search_s": 0.02593219792470336,
+  "total_s": 8.483729758765548,
+  "recall": 0.99867
+ },
+ {
+  "name": "cuVS CAGRA nn_descent deg=64 itopk=256",
+  "build_s": 8.457797560840845,
+  "search_s": 0.04835375398397446,
+  "total_s": 8.50615131482482,
+  "recall": 0.99923
+ },
+ {
+  "name": "cuVS CAGRA ivf_pq deg=64 itopk=32",
+  "build_s": 25.0219287709333,
+  "search_s": 0.00692450487986207,
+  "total_s": 25.028853275813162,
+  "recall": 0.00085
+ },
+ {
+  "name": "cuVS CAGRA ivf_pq deg=64 itopk=64",
+  "build_s": 25.0219287709333,
+  "search_s": 0.011658744886517525,
+  "total_s": 25.033587515819818,
+  "recall": 0.00131
+ },
+ {
+  "name": "cuVS CAGRA ivf_pq deg=64 itopk=128",
+  "build_s": 25.0219287709333,
+  "search_s": 0.019207546021789312,
+  "total_s": 25.04113631695509,
+  "recall": 0.00173
+ },
+ {
+  "name": "cuVS CAGRA ivf_pq deg=64 itopk=256",
+  "build_s": 25.0219287709333,
+  "search_s": 0.03442770382389426,
+  "total_s": 25.056356474757195,
+  "recall": 0.00245
+ }
+]

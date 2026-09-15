@@ -1,0 +1,58 @@
+# base (1000000, 960), queries (1000, 960), gt (1000, 10), k=10
+cuVS brute_force (exact)           build   0.151s  search   0.583s  total   0.735s  recall 0.9992
+cuVS IVF-Flat nlist=64 nprobe=1    build   1.466s  search   0.085s  total   1.552s  recall 0.4452
+cuVS IVF-Flat nlist=64 nprobe=4    build   1.462s  search   0.372s  total   1.834s  recall 0.8279
+cuVS IVF-Flat nlist=64 nprobe=16   build   1.436s  search   1.456s  total   2.892s  recall 0.9919
+cuVS IVF-Flat nlist=64 nprobe=64   build   1.446s  search   5.193s  total   6.639s  recall 0.9993
+cuVS IVF-Flat nlist=1024 nprobe=1  build   1.933s  search   0.006s  total   1.939s  recall 0.2209
+cuVS IVF-Flat nlist=1024 nprobe=4  build   1.898s  search   0.024s  total   1.922s  recall 0.4888
+cuVS IVF-Flat nlist=1024 nprobe=16 build   2.033s  search   0.097s  total   2.130s  recall 0.7779
+cuVS IVF-Flat nlist=1024 nprobe=64 build   1.917s  search   0.386s  total   2.304s  recall 0.9642
+cuVS IVF-Flat nlist=1024 nprobe=256 build   1.936s  search   1.504s  total   3.439s  recall 0.9986
+cuVS CAGRA nn_descent deg=32 itopk=32 build  20.778s  search   0.009s  total  20.787s  recall 0.6166
+cuVS CAGRA nn_descent deg=32 itopk=64 build  20.778s  search   0.015s  total  20.792s  recall 0.7812
+cuVS CAGRA nn_descent deg=32 itopk=128 build  20.778s  search   0.024s  total  20.802s  recall 0.8975
+cuVS CAGRA nn_descent deg=32 itopk=256 build  20.778s  search   0.045s  total  20.822s  recall 0.9623
+cuVS CAGRA nn_descent deg=64 itopk=32 build  21.777s  search   0.015s  total  21.793s  recall 0.7854
+cuVS CAGRA nn_descent deg=64 itopk=64 build  21.777s  search   0.027s  total  21.804s  recall 0.9036
+cuVS CAGRA nn_descent deg=64 itopk=128 build  21.777s  search   0.046s  total  21.823s  recall 0.9644
+cuVS CAGRA nn_descent deg=64 itopk=256 build  21.777s  search   0.087s  total  21.864s  recall 0.9910
+Traceback (most recent call last):
+  File "benchmark/vecjoin_eval/2026-09-15-i1b-routing/cuvs_packaged_ds.py", line 117, in <module>
+    main()
+  File "benchmark/vecjoin_eval/2026-09-15-i1b-routing/cuvs_packaged_ds.py", line 100, in main
+    index = cagra.build(
+  File "cuvs/common/resources.pyx", line 99, in cuvs.common.resources.auto_sync_resources.wrapper
+  File "cuvs/neighbors/cagra/cagra.pyx", line 553, in cuvs.neighbors.cagra.cagra.build
+  File "cuvs/neighbors/cagra/cagra.pyx", line 554, in cuvs.neighbors.cagra.cagra.build
+  File "cuvs/common/exceptions.pyx", line 26, in cuvs.common.exceptions.check_cuvs
+cuvs.common.exceptions.CuvsException: RAFT failure at file=/__w/cuvs/cuvs/cpp/src/neighbors/ivf_flat/../ivf_list.cuh line=50: ivf::list: failed to allocate a big enough list to hold all data (requested size: 418 records, selected capacity: 256 records). Allocator exception: std::bad_alloc: out_of_memory: CUDA error (failed to allocate 983040 bytes) at: /__w/rmm/rmm/cpp/include/rmm/mr/cuda_memory_resource.hpp:51: cudaErrorMemoryAllocation out of memory
+Obtained 27 stack frames
+#1 in /home/dnguyen56/.local/lib/python3.10/site-packages/libcuvs/lib64/libcuvs.so: raft::logic_error::logic_error(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) +0x91 [0x74374775ea91]
+#2 in /home/dnguyen56/.local/lib/python3.10/site-packages/libcuvs/lib64/libcuvs.so: cuvs::neighbors::ivf::list<cuvs::neighbors::ivf_flat::list_spec, unsigned int, float, long>::list(raft::resources const&, cuvs::neighbors::ivf_flat::list_spec<unsigned int, float, long> const&, unsigned int) +0x1868 [0x7437481d26e8]
+#3 in /home/dnguyen56/.local/lib/python3.10/site-packages/libcuvs/lib64/libcuvs.so: void cuvs::neighbors::ivf_flat::detail::fill_refinement_index<float, long, long>(raft::resources const&, cuvs::neighbors::ivf_flat::index<float, long>*, float const*, long const*, long, unsigned int) +0x25b [0x7437488a9c9b]
+#4 in /home/dnguyen56/.local/lib/python3.10/site-packages/libcuvs/lib64/libcuvs.so(+0x16a2d8c) [0x7437488a2d8c]
+#5 in /home/dnguyen56/.local/lib/python3.10/site-packages/libcuvs/lib64/libcuvs.so: void cuvs::neighbors::cagra::detail::build_knn_graph<float, unsigned int, raft::host_device_accessor<cuda::std::__4::default_accessor<float const>, (raft::memory_type)2> >(raft::resources const&, cuda::std::__4::mdspan<float const, cuda::std::__4::extents<long, 18446744073709551615ul, 18446744073709551615ul>, cuda::std::__4::layout_right, raft::host_device_accessor<cuda::std::__4::default_accessor<float const>, (raft::memory_type)2> >, cuda::std::__4::mdspan<unsigned int, cuda::std::__4::extents<long, 18446744073709551615ul, 18446744073709551615ul>, cuda::std::__4::layout_right, raft::host_device_accessor<cuda::std::__4::default_accessor<unsigned int>, (raft::memory_type)0> >, cuvs::neighbors::graph_build_params::ivf_pq_params) +0xb0f [0x743747fb0adf]
+#6 in /home/dnguyen56/.local/lib/python3.10/site-packages/libcuvs/lib64/libcuvs.so: cuvs::neighbors::cagra::index<float, unsigned int> cuvs::neighbors::cagra::detail::build<float, unsigned int, raft::host_device_accessor<cuda::std::__4::default_accessor<float const>, (raft::memory_type)2> >(raft::resources const&, cuvs::neighbors::cagra::index_params const&, cuda::std::__4::mdspan<float const, cuda::std::__4::extents<long, 18446744073709551615ul, 18446744073709551615ul>, cuda::std::__4::layout_right, raft::host_device_accessor<cuda::std::__4::default_accessor<float const>, (raft::memory_type)2> >) +0x70b [0x743747fc803b]
+#7 in /home/dnguyen56/.local/lib/python3.10/site-packages/libcuvs/lib64/libcuvs.so: cuvs::neighbors::cagra::build(raft::resources const&, cuvs::neighbors::cagra::index_params const&, cuda::std::__4::mdspan<float const, cuda::std::__4::extents<long, 18446744073709551615ul, 18446744073709551615ul>, cuda::std::__4::layout_right, raft::host_device_accessor<cuda::std::__4::default_accessor<float const>, (raft::memory_type)2> >) +0x5c [0x743747f9795c]
+#8 in /home/dnguyen56/.local/lib/python3.10/site-packages/libcuvs/lib64/libcuvs_c.so: cuvsCagraBuild +0x9d1 [0x74372d6ac241]
+#9 in /home/dnguyen56/.local/lib/python3.10/site-packages/cuvs/neighbors/cagra/cagra.cpython-310-x86_64-linux-gnu.so(+0x274a7) [0x7438252a14a7]
+#10 in /home/dnguyen56/.local/lib/python3.10/site-packages/cuvs/neighbors/all_neighbors/all_neighbors.cpython-310-x86_64-linux-gnu.so(+0x8f19) [0x7438cef24f19]
+#11 in /home/dnguyen56/.local/lib/python3.10/site-packages/cuvs/common/resources.cpython-310-x86_64-linux-gnu.so(+0xb63d) [0x74382662a63d]
+#12 in python3: _PyObject_MakeTpCall +0x25b [0x5d30d1e7c3fb]
+#13 in python3: _PyEval_EvalFrameDefault +0x6d9b [0x5d30d1e74f4b]
+#14 in python3: _PyFunction_Vectorcall +0x7c [0x5d30d1e8653c]
+#15 in python3: _PyEval_EvalFrameDefault +0x6d9 [0x5d30d1e6e889]
+#16 in python3(+0x238976) [0x5d30d1f61976]
+#17 in python3: PyEval_EvalCode +0x86 [0x5d30d1f61816]
+#18 in python3(+0x263528) [0x5d30d1f8c528]
+#19 in python3(+0x25cc7b) [0x5d30d1f85c7b]
+#20 in python3(+0x263275) [0x5d30d1f8c275]
+#21 in python3: _PyRun_SimpleFileObject +0x1a8 [0x5d30d1f8b6b8]
+#22 in python3: _PyRun_AnyFileObject +0x43 [0x5d30d1f8b303]
+#23 in python3: Py_RunMain +0x2be [0x5d30d1f7de0e]
+#24 in python3: Py_BytesMain +0x2d [0x5d30d1f5468d]
+#25 in /lib/x86_64-linux-gnu/libc.so.6(+0x29d90) [0x7438cfeded90]
+#26 in /lib/x86_64-linux-gnu/libc.so.6: __libc_start_main +0x80 [0x7438cfedee40]
+#27 in python3: _start +0x25 [0x5d30d1f54585]
+

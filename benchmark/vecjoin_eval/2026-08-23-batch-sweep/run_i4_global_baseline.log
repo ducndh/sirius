@@ -1,0 +1,8 @@
+truth: global top-1000 over 10,000 x 1,000,000 pairs in 3.39 s; kth distance^2 = 3146.0000
+sirius: 1,000 pairs, distances 20.8087 .. 56.0892 (plain L2)
+        matches truth (as squared L2): True; max abs diff 0.0004
+
+cuVS brute_force k=1000 search: 1.433 s + reduction 0.003 s = 1.436 s
+        matches truth: True
+
+Sirius global top-1000, 10,000 probes: 1.794 s  -> 0.80x  (>1 = Sirius faster)

@@ -1,0 +1,53 @@
+========= COMPUTE-SANITIZER
+Filters: [approx]
+
+[0/7] (0%): sirius_knn_join approx probing every cluster equals the exhaustive join========= CUDA API Error: Duplicate entry kernels named "_ZN3cub6detail11EmptyKernelIvEEvv" detected. The Runtime will use the one that was registered first
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: cudaFuncGetAttributes [0x34b15ac] in sirius_unittest
+=========         Host Frame: cudaError cub::PtxVersionUncached<void>(int&, int) [0x2b9da05] in sirius_unittest
+=========         Host Frame: cudaError cub::PtxVersion<void>(int&, int) [0x2b9db20] in sirius_unittest
+=========         Host Frame: cudaError cub::detail::ptx_compute_cap<void>(cuda::__4::compute_capability&) [0x945400] in libcuvs.so
+=========         Host Frame: cudaError cub::DeviceHistogram::MultiHistogramEven<1, 1, unsigned int const*, unsigned long long, long, long>(void*, unsigned long&, unsigned int const*, cuda::std::__4::array<unsigned long long*, 1>, cuda::std::__4::array<int, 1>, cuda::std::__4::array<long, 1>, cuda::std::__4::array<long, 1>, long, long, unsigned long, CUstream_st*) [0xad2e8d] in libcuvs.so
+=========         Host Frame: void cuvs::cluster::kmeans::detail::countLabels<unsigned int const*, unsigned long long, long>(raft::resources const&, unsigned int const*, unsigned long long*, long, long, rmm::device_uvector<char>&) [0xad3a06] in libcuvs.so
+=========         Host Frame: void cuvs::cluster::kmeans::detail::calc_centers_and_sizes<float, float, long, unsigned int, unsigned long long, cuvs::spatial::knn::detail::utils::mapping<float> >(raft::resources const&, float*, unsigned long long*, long, long, float const*, long, unsigned int const*, bool, cuvs::spatial::knn::detail::utils::mapping<float>, cuda::mr::__4::__version_bump_ver4_::resource_ref<cuda::mr::__4::device_accessible>) [clone .constprop.0] [0xabfb76] in libcuvs.so
+=========         Host Frame: void cuvs::cluster::kmeans::detail::build_clusters<float, float, long, unsigned int, unsigned long long, cuvs::spatial::knn::detail::utils::mapping<float> >(raft::resources const&, cuvs::cluster::kmeans::balanced_params const&, long, float const*, long, long, float*, unsigned int*, unsigned long long*, cuvs::spatial::knn::detail::utils::mapping<float>, cuda::mr::__4::__version_bump_ver4_::resource_ref<cuda::mr::__4::device_accessible>, float const*) [clone .isra.0] [0xac41cc] in libcuvs.so
+=========         Host Frame: void cuvs::cluster::kmeans_balanced::fit<float, float, long, cuvs::spatial::knn::detail::utils::mapping<float> >(raft::resources const&, cuvs::cluster::kmeans::balanced_params const&, cuda::std::__4::mdspan<float const, cuda::std::__4::extents<long, 18446744073709551615ul, 18446744073709551615ul>, cuda::std::__4::layout_right, raft::host_device_accessor<cuda::std::__4::default_accessor<float const>, (raft::memory_type)2> >, cuda::std::__4::mdspan<float, cuda::std::__4::extents<long, 18446744073709551615ul, 18446744073709551615ul>, cuda::std::__4::layout_right, raft::host_device_accessor<cuda::std::__4::default_accessor<float>, (raft::memory_type)2> >, cuvs::spatial::knn::detail::utils::mapping<float>, std::optional<cuda::std::__4::mdspan<float, cuda::std::__4::extents<unsigned int, 1ul>, cuda::std::__4::layout_right, raft::host_device_accessor<cuda::std::__4::default_accessor<float>, (raft::memory_type)0> > >) [clone .isra.0] [0xac890a] in libcuvs.so
+=========         Host Frame: sirius::vss::train_centroids(std::vector<cudf::column_view, std::allocator<cudf::column_view> > const&, long, sirius::vss::clustering_spec const&, rmm::cuda_stream_view, cuda::mr::__4::__version_bump_ver4_::resource_ref<cuda::mr::__4::device_accessible>) [0x2bfc461] in sirius_unittest
+=========         Host Frame: sirius::vss::run_kmeans_fit(duckdb::SiriusContext&, sirius::vss::kmeans_fit_request const&) [0x2960f77] in sirius_unittest
+=========         Host Frame: duckdb::SiriusKMeansFitFunction(duckdb::ClientContext&, duckdb::TableFunctionInput&, duckdb::DataChunk&) [0x29258c9] in sirius_unittest
+=========         Host Frame: duckdb::PhysicalTableScan::GetDataInternal(duckdb::ExecutionContext&, duckdb::DataChunk&, duckdb::OperatorSourceInput&) const [0x4eb3258] in sirius_unittest
+=========         Host Frame: duckdb::PipelineExecutor::FetchFromSource(duckdb::DataChunk&) [0x51413fa] in sirius_unittest
+=========         Host Frame: duckdb::PipelineExecutor::Execute(unsigned long) [0x51511fc] in sirius_unittest
+=========         Host Frame: duckdb::PipelineTask::ExecuteTask(duckdb::TaskExecutionMode) [0x5151802] in sirius_unittest
+=========         Host Frame: duckdb::ExecutorTask::Execute(duckdb::TaskExecutionMode) [0x5143bae] in sirius_unittest
+=========         Host Frame: duckdb::Executor::ExecuteTask(bool) [0x5153749] in sirius_unittest
+=========         Host Frame: duckdb::ClientContext::ExecuteTaskInternal(duckdb::ClientContextLock&, duckdb::BaseQueryResult&, bool) [0x511a461] in sirius_unittest
+=========         Host Frame: duckdb::PendingQueryResult::ExecuteInternal(duckdb::ClientContextLock&) [0x511aaac] in sirius_unittest
+=========         Host Frame: duckdb::ClientContext::ExecutePendingQueryInternal(duckdb::ClientContextLock&, duckdb::PendingQueryResult&) [0x511ac3e] in sirius_unittest
+=========         Host Frame: duckdb::ClientContext::Query(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, duckdb::QueryParameters) [0x511e7eb] in sirius_unittest
+=========         Host Frame: duckdb::Connection::Query(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) [0x511efa3] in sirius_unittest
+=========         Host Frame: sirius::test::GpuExecutionFixture::run_ok(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) [0x1f23e91] in sirius_unittest
+=========         Host Frame: (anonymous namespace)::create_clustered_join(sirius::test::GpuExecutionFixture&, duckdb::Connection&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, int, int, unsigned long) [clone .constprop.0] [0x1fc7222] in sirius_unittest
+=========         Host Frame: (anonymous namespace)::____C_A_T_C_H____T_E_S_T____20::test() [0x1fca33d] in sirius_unittest
+=========         Host Frame: Catch::TestInvokerAsMethod<(anonymous namespace)::____C_A_T_C_H____T_E_S_T____20>::invoke() const [0x1fc668b] in sirius_unittest
+=========         Host Frame: Catch::RunContext::runCurrentTest(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&) [0x258d971] in sirius_unittest
+=========         Host Frame: Catch::RunContext::runTest(Catch::TestCase const&) [0x258dd5b] in sirius_unittest
+=========         Host Frame: Catch::Session::runInternal() [0x2599f6c] in sirius_unittest
+=========         Host Frame: Catch::Session::run() [0x259a8b9] in sirius_unittest
+=========         Host Frame: main [0x259b1e8] in sirius_unittest
+========= 
+
+[1/7] (14%): sirius_knn_join approx returns fewer, still-valid neighbours when pruning
+[2/7] (28%): sirius_knn_join approx spans more than one corpus chunk
+[3/7] (42%): sirius_knn_join approx refuses a corpus not in cluster order=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+
+[4/7] (57%): sirius_knn_join approx takes the corpus from a child scan
+[5/7] (71%): sirius_knn_join rejects approx without a usable clustering
+[6/7] (85%): sirius_knn_join approx routes each probe row by its own nearest centroids
+[7/7] (100%): sirius_knn_join approx routes each probe row by its own nearest centroids
+===============================================================================
+All tests passed (1928 assertions in 7 test cases)
+
+========= ERROR SUMMARY: 1 error

@@ -1,0 +1,73 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌────────────┬───────┬────────────┬─────────┐
+│ n_clusters │  dim  │ train_rows │ n_rows  │
+│   int64    │ int64 │   int64    │  int64  │
+├────────────┼───────┼────────────┼─────────┤
+│         64 │   128 │      16384 │ 1000000 │
+└────────────┴───────┴────────────┴─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌────────────┬───────┬────────────┬─────────┐
+│ n_clusters │  dim  │ train_rows │ n_rows  │
+│   int64    │ int64 │   int64    │  int64  │
+├────────────┼───────┼────────────┼─────────┤
+│        256 │   128 │      65536 │ 1000000 │
+└────────────┴───────┴────────────┴─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@RUN exact
+Run Time (s): real 45.321 user 14.053807 sys 31.736943
+Run Time (s): real 45.875 user 14.215648 sys 32.136012
+@@@RUN c64_p4
+Run Time (s): real 3.884 user 3.811027 sys 0.101550
+Run Time (s): real 3.918 user 3.817777 sys 0.119749
+@@@RUN c64_p8
+Run Time (s): real 7.452 user 7.419780 sys 0.082498
+Run Time (s): real 7.492 user 14.898155 sys 0.124292
+@@@RUN c64_p16
+Run Time (s): real 14.737 user 11.474627 sys 3.407290
+Run Time (s): real 14.814 user 11.500531 sys 3.445614
+@@@RUN c64_p32
+Run Time (s): real 28.747 user 16.490990 sys 12.530983
+Run Time (s): real 28.809 user 16.413394 sys 12.679669
+@@@RUN c256_p8
+Run Time (s): real 3.130 user 3.082872 sys 0.058618
+Run Time (s): real 3.175 user 3.099705 sys 0.082172
+@@@RUN c256_p16
+Run Time (s): real 5.920 user 5.899789 sys 0.067072
+Run Time (s): real 5.949 user 5.885015 sys 0.105729
+@@@RUN c256_p32
+Run Time (s): real 11.467 user 11.285273 sys 0.276714
+Run Time (s): real 11.526 user 11.301083 sys 0.333349
+@@@RUN c256_p64
+Run Time (s): real 22.472 user 18.033699 sys 4.654761
+Run Time (s): real 22.556 user 18.021515 sys 4.756368
+@@@RECALL

@@ -1,0 +1,7 @@
+base (1000000, 960) query (1000, 960)
+     index            param   build_s  search_s  recall@10        qps
+  ivf_flat       n_probes=1      0.89    0.0034     0.2081   289913.4
+  ivf_flat       n_probes=4      0.89    0.0127     0.4742    78913.4
+  ivf_flat      n_probes=16      0.89    0.0513     0.7748    19490.8
+  ivf_flat      n_probes=64      0.89    0.2056     0.9622     4864.4
+  ivf_flat     n_probes=256      0.89    0.8126     0.9988     1230.6

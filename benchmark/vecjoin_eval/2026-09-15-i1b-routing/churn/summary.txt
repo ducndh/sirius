@@ -1,0 +1,33 @@
+Sirius per-epoch seconds (RTX A5000; 1% of 1M corpus replaced per epoch; 10k packaged queries, k=10)
+epoch         mutate    materialize   a_exact_scan          b_pin b_exact_pinned          c_fit  c_assign_ctas          c_pin    c_approx_p8
+    0            nan            nan          0.614          0.030          0.453          0.071          1.118          0.040          0.181
+    1          0.252          0.946          0.483          0.040          0.453          0.040          1.047          0.040          0.141
+    2          0.231          1.028          0.493          0.040          0.453          0.051          1.096          0.040          0.141
+    3          0.242          0.997          0.484          0.040          0.453          0.040          1.038          0.040          0.141
+    4          0.241          0.967          0.483          0.040          0.453          0.040          1.058          0.050          0.141
+approx c64/p8 recall vs Sirius exact per epoch: ['0.9877', '0.98965', '0.98835', '0.98933', '0.98872']
+
+cuVS per-epoch seconds (same corpora, kernel-only):
+e0 cuVS brute_force k=65 (exact)    build  0.015 search  0.472 total  0.487 recall 1.0000
+e0 cuVS IVF-Flat 64/8               build  0.318 search  0.900 total  1.218 recall 0.9893
+e0 cuVS CAGRA nn_descent 32/64      build  9.406 search  0.163 total  9.568 recall 0.9788
+e1 cuVS brute_force k=65 (exact)    build  0.001 search  0.427 total  0.428 recall 1.0000
+e1 cuVS IVF-Flat 64/8               build  0.314 search  0.876 total  1.190 recall 0.9889
+e1 cuVS CAGRA nn_descent 32/64      build  9.403 search  0.015 total  9.418 recall 0.9784
+e2 cuVS brute_force k=65 (exact)    build  0.001 search  0.429 total  0.430 recall 1.0000
+e2 cuVS IVF-Flat 64/8               build  0.290 search  0.877 total  1.167 recall 0.9881
+e2 cuVS CAGRA nn_descent 32/64      build  9.468 search  0.015 total  9.483 recall 0.9776
+e3 cuVS brute_force k=65 (exact)    build  0.001 search  0.430 total  0.431 recall 1.0000
+e3 cuVS IVF-Flat 64/8               build  0.307 search  0.893 total  1.200 recall 0.9891
+e3 cuVS CAGRA nn_descent 32/64      build  9.416 search  0.016 total  9.431 recall 0.9779
+e4 cuVS brute_force k=65 (exact)    build  0.001 search  0.431 total  0.432 recall 1.0000
+e4 cuVS IVF-Flat 64/8               build  0.316 search  0.872 total  1.188 recall 0.9885
+e4 cuVS CAGRA nn_descent 32/64      build  9.497 search  0.015 total  9.512 recall 0.9769
+
+Steady-state (epochs 1-4) cost to answer 10k queries after a 1% corpus change:
+  Sirius exact, corpus scanned (no prep):        0.486 s   [+0.984 s CTAS+CHECKPOINT of the mutated table, paid once per epoch by every SQL path]
+  Sirius exact, re-pin + join:                   0.493 s
+  Sirius approx c64/p8, re-cluster + pin + join: 1.286 s  (recall ~0.988)
+  cuVS brute_force k=65 (exact)                 build  0.001 + search  0.429 =  0.430 s
+  cuVS IVF-Flat 64/8                            build  0.307 + search  0.880 =  1.186 s
+  cuVS CAGRA nn_descent 32/64                   build  9.446 + search  0.015 =  9.461 s

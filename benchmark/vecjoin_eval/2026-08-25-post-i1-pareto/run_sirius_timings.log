@@ -1,0 +1,99 @@
+@@@FIT c64
+Run Time (s): real 0.060 user 0.036350 sys 0.019963
+@@@FIT c256
+Run Time (s): real 0.082 user 0.070915 sys 0.004552
+@@@FIT c1024
+Run Time (s): real 0.173 user 0.159451 sys 0.008682
+@@@RUN exact
+Run Time (s): real 0.355 user 0.343404 sys 0.005558
+Run Time (s): real 0.314 user 0.303722 sys 0.007513
+Run Time (s): real 0.325 user 0.302452 sys 0.008319
+@@@RUN c64_p1
+Run Time (s): real 0.101 user 0.051475 sys 0.018396
+Run Time (s): real 0.071 user 0.050098 sys 0.008295
+Run Time (s): real 0.071 user 0.043626 sys 0.009516
+@@@RUN c64_p2
+Run Time (s): real 0.092 user 0.056064 sys 0.014181
+Run Time (s): real 0.081 user 0.056205 sys 0.006157
+Run Time (s): real 0.081 user 0.056220 sys 0.003558
+@@@RUN c64_p4
+Run Time (s): real 0.091 user 0.069241 sys 0.005875
+Run Time (s): real 0.092 user 0.070283 sys 0.006886
+Run Time (s): real 0.092 user 0.068177 sys 0.005551
+@@@RUN c64_p8
+Run Time (s): real 0.132 user 0.098015 sys 0.012725
+Run Time (s): real 0.132 user 0.104740 sys 0.008934
+Run Time (s): real 0.122 user 0.101972 sys 0.005493
+@@@RUN c64_p16
+Run Time (s): real 0.192 user 0.165943 sys 0.010328
+Run Time (s): real 0.192 user 0.179234 sys 0.003720
+Run Time (s): real 0.183 user 0.168329 sys 0.003734
+@@@RUN c64_p32
+Run Time (s): real 0.304 user 0.292600 sys 0.004923
+Run Time (s): real 0.325 user 0.306026 sys 0.009194
+Run Time (s): real 0.315 user 0.295001 sys 0.005565
+@@@RUN c64_p64
+Run Time (s): real 0.567 user 0.550684 sys 0.017363
+Run Time (s): real 0.598 user 0.584654 sys 0.015942
+Run Time (s): real 0.558 user 0.549139 sys 0.010476
+@@@RUN c256_p1
+Run Time (s): real 0.112 user 0.086638 sys 0.010443
+Run Time (s): real 0.122 user 0.098849 sys 0.005298
+Run Time (s): real 0.112 user 0.094298 sys 0.004472
+@@@RUN c256_p2
+Run Time (s): real 0.132 user 0.104668 sys 0.010429
+Run Time (s): real 0.143 user 0.121562 sys 0.008383
+Run Time (s): real 0.132 user 0.103401 sys 0.007128
+@@@RUN c256_p4
+Run Time (s): real 0.152 user 0.125086 sys 0.008562
+Run Time (s): real 0.163 user 0.136964 sys 0.011194
+Run Time (s): real 0.152 user 0.125909 sys 0.009787
+@@@RUN c256_p8
+Run Time (s): real 0.183 user 0.155692 sys 0.010012
+Run Time (s): real 0.193 user 0.175757 sys 0.007096
+Run Time (s): real 0.172 user 0.150267 sys 0.003266
+@@@RUN c256_p16
+Run Time (s): real 0.243 user 0.225170 sys 0.005728
+Run Time (s): real 0.284 user 0.264898 sys 0.007795
+Run Time (s): real 0.244 user 0.216806 sys 0.012339
+@@@RUN c256_p32
+Run Time (s): real 0.375 user 0.355275 sys 0.010121
+Run Time (s): real 0.446 user 0.434178 sys 0.012512
+Run Time (s): real 0.375 user 0.355178 sys 0.009991
+@@@RUN c256_p64
+Run Time (s): real 0.639 user 0.628723 sys 0.012704
+Run Time (s): real 0.791 user 0.783964 sys 0.018176
+Run Time (s): real 0.638 user 0.622791 sys 0.013046
+@@@RUN c256_p128
+Run Time (s): real 1.215 user 1.177026 sys 0.015411
+Run Time (s): real 1.512 user 1.522648 sys 0.014646
+Run Time (s): real 1.155 user 1.160931 sys 0.015796
+@@@RUN c1024_p1
+Run Time (s): real 0.304 user 0.277873 sys 0.015172
+Run Time (s): real 0.355 user 0.329304 sys 0.015362
+Run Time (s): real 0.304 user 0.284631 sys 0.010193
+@@@RUN c1024_p4
+Run Time (s): real 0.385 user 0.359016 sys 0.015401
+Run Time (s): real 0.498 user 0.476948 sys 0.019329
+Run Time (s): real 0.385 user 0.362845 sys 0.011225
+@@@RUN c1024_p16
+Run Time (s): real 0.638 user 0.631726 sys 0.014123
+Run Time (s): real 0.893 user 0.892798 sys 0.013632
+Run Time (s): real 0.645 user 0.622418 sys 0.018317
+@@@RUN c1024_p32
+Run Time (s): real 1.003 user 0.976186 sys 0.032599
+Run Time (s): real 0.993 user 0.971406 sys 0.024253
+Run Time (s): real 0.983 user 0.976199 sys 0.020106
+@@@RUN c1024_p64
+Run Time (s): real 1.712 user 1.715878 sys 0.028663
+Run Time (s): real 1.703 user 1.719607 sys 0.019128
+Run Time (s): real 1.702 user 1.711901 sys 0.029394
+@@@RUN c1024_p128
+Run Time (s): real 3.151 user 3.181143 sys 0.045646
+Run Time (s): real 3.142 user 3.191267 sys 0.032937
+Run Time (s): real 3.139 user 3.175860 sys 0.044368
+@@@RUN c1024_p256
+Run Time (s): real 6.006 user 6.099387 sys 0.086004
+Run Time (s): real 5.998 user 6.095292 sys 0.080115
+Run Time (s): real 5.978 user 6.095414 sys 0.071471
+@@@RECALL

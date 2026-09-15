@@ -1,0 +1,6 @@
+corpus 24 GiB vs device 23.5 GiB | k=10
+  (managed memory enabled so the IVF-PQ build input can oversubscribe)
+  ivfpq  pq_dim=32: build 65.91s search 0.3139s recall@10 0.4272
+    NOTE: compressed index is ~16x smaller than the fp32 corpus -- this is why it fits. Recall is bounded by the quantization.
+  uvm: RMM managed memory active (corpus may oversubscribe the device)
+  uvm    ivf_flat: build 87.33s search 5.5223s recall@10 1.0000

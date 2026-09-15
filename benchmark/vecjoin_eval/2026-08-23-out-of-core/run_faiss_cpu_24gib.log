@@ -1,0 +1,11 @@
+FAISS-CPU, 24 GiB corpus (50,331,648 rows), 64 threads, n_lists=4096, RSS ceiling 95.0 GB
+  train (2,000,000 sampled rows): 362.94 s  RSS 2.7 GB
+    added 20,000,000/50,331,648  RSS 25.6 GB
+    added 40,000,000/50,331,648  RSS 48.7 GB
+  add (streamed): 1562.99 s  ntotal=50,331,648  RSS 57.7 GB
+
+  build (train+add)  1925.93 s
+  search              58.581 s   recall@10 1.0000
+  TOTAL one-shot     1984.51 s
+  peak RSS              57.7 GB
+RESULT faiss_cpu 24 362.936 1562.989 58.581 1984.506 1.0000

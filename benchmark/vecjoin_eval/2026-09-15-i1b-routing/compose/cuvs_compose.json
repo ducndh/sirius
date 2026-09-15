@@ -1,0 +1,15 @@
+{
+ "amortized_corpus_resident": {
+  "filter+export_probes": 0.007323645055294037,
+  "search": 0.10521042719483376,
+  "import+join+aggregate": 0.012000499293208122,
+  "total": 0.12453457154333591
+ },
+ "one_shot_export_corpus": {
+  "export_corpus": 2.508447116240859,
+  "filter+export_probes": 0.007352989166975021,
+  "search": 0.1053831335157156,
+  "import+join+aggregate": 0.012670183554291725,
+  "total": 2.6338534224778414
+ }
+}

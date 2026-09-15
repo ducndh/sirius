@@ -1,0 +1,22 @@
+-- I1 bench DB: SIFT1M, cluster-ordered corpus at 64 and 256 clusters, probe tables.
+SET memory_limit='32GB';
+SET temp_directory='/var/tmp/ddb_spill';
+CREATE TABLE base  AS SELECT id, vec::FLOAT[128] AS vec FROM read_parquet('/var/tmp/vj/data/parquet/sift-128-euclidean_base.parquet');
+CREATE TABLE query AS SELECT id, vec::FLOAT[128] AS vec FROM read_parquet('/var/tmp/vj/data/parquet/sift-128-euclidean_query.parquet');
+CREATE TABLE gt    AS SELECT * FROM read_parquet('/var/tmp/vj/data/parquet/sift-128-euclidean_gt.parquet');
+CHECKPOINT;
+SELECT * FROM pin_table(name => 'base',  tier => 'gpu', format => 'duckdb');
+SELECT * FROM pin_table(name => 'query', tier => 'gpu', format => 'duckdb');
+SELECT * FROM sirius_kmeans_fit('base','vec', name => 'c64', n_clusters => 64);
+CREATE TABLE asg64 AS SELECT * FROM sirius_kmeans_assign('base','vec','c64', n_probes => 1);
+CREATE TABLE corpus64 AS SELECT b.id, b.vec, a.cluster_id FROM base b JOIN asg64 a ON b.rowid = a.row_id ORDER BY a.cluster_id;
+CREATE TABLE q64 AS SELECT * FROM sirius_kmeans_assign('query','vec','c64', n_probes => 1);
+CREATE TABLE probe64 AS SELECT q.id, q.vec, a.cluster_id FROM query q JOIN q64 a ON q.rowid = a.row_id ORDER BY a.cluster_id;
+SELECT * FROM sirius_kmeans_fit('base','vec', name => 'c256', n_clusters => 256);
+CREATE TABLE asg256 AS SELECT * FROM sirius_kmeans_assign('base','vec','c256', n_probes => 1);
+CREATE TABLE corpus256 AS SELECT b.id, b.vec, a.cluster_id FROM base b JOIN asg256 a ON b.rowid = a.row_id ORDER BY a.cluster_id;
+CREATE TABLE q256 AS SELECT * FROM sirius_kmeans_assign('query','vec','c256', n_probes => 1);
+CREATE TABLE probe256 AS SELECT q.id, q.vec, a.cluster_id FROM query q JOIN q256 a ON q.rowid = a.row_id ORDER BY a.cluster_id;
+CHECKPOINT;
+SELECT count(*) AS base_rows FROM base;
+SELECT count(*) AS probe_rows FROM probe64;

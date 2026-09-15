@@ -1,0 +1,26 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@RUN pipeline
+Run Time (s): real 0.332 user 0.184515 sys 0.133141
+Run Time (s): real 0.141 user 0.113811 sys 0.004877
+Run Time (s): real 0.141 user 0.111238 sys 0.006499
+@@@RUN ctas
+Run Time (s): real 0.141 user 0.113396 sys 0.004014
+@@@RUN ctas_then_aggregate
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+Run Time (s): real 0.030 user 0.031005 sys 0.006043
+@@@RUN copy
+Run Time (s): real 0.141 user 0.114117 sys 0.002429
+@@@RUN math_over_join
+Run Time (s): real 0.202 user 0.335059 sys 0.027864

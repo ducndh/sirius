@@ -1,0 +1,27 @@
+1M x 1M self-join (SIFT1M base vs itself), k=10, RTX A5000. Recall on the first 10k probe rows vs exact. Sirius = end-to-end SQL (min of 2); cuVS kernel-only.
+
+cuVS opponent                        recall   search    total |  Sirius       via  recall   amort  1-shot
+cuVS IVF-Flat 256/8                  0.9416    22.39    22.73 |    3.13   c256_p8  0.9426   0.14x   0.14x
+cuVS IVF-Flat 64/4                   0.9431    43.33    43.66 |    5.92  c256_p16  0.9860   0.14x   0.14x
+cuVS IVF-Flat 256/16                 0.9857    44.57    44.91 |    5.92  c256_p16  0.9860   0.13x   0.13x
+cuVS IVF-Flat 64/8                   0.9907    88.17    88.48 |   11.47  c256_p32  0.9980   0.13x   0.13x
+cuVS CAGRA nn_descent 32/64          0.9976     1.46    11.02 |   11.47  c256_p32  0.9980   7.85x   1.04x
+cuVS IVF-Flat 256/32                 0.9978    89.77    90.11 |   11.47  c256_p32  0.9980   0.13x   0.13x
+cuVS IVF-Flat 64/16                  0.9989   176.09   176.40 |   22.47  c256_p64  0.9991   0.13x   0.13x
+cuVS CAGRA nn_descent 32/128         0.9989     2.47    12.05 |   22.47  c256_p64  0.9991   9.09x   1.87x
+cuVS IVF-Flat 64/32                  0.9992   336.04   336.35 |   45.32     exact  1.0000   0.13x   0.13x
+cuVS IVF-Flat 256/64                 0.9992   176.67   177.01 |   45.32     exact  1.0000   0.26x   0.26x
+cuVS CAGRA nn_descent 64/128         0.9992     5.11    18.28 |   45.32     exact  1.0000   8.87x   2.48x
+cuVS CAGRA nn_descent 64/256         0.9992     9.71    22.94 |   45.32     exact  1.0000   4.67x   1.98x
+cuVS brute_force k=65 (exact)        1.0000    43.75    43.75 |   45.32     exact  1.0000   1.04x   1.04x
+
+Sirius:
+  c64_p4       3.88 s  recall 0.9386
+  c256_p8      3.13 s  recall 0.9426
+  c256_p16     5.92 s  recall 0.9860
+  c64_p8       7.45 s  recall 0.9888
+  c256_p32    11.47 s  recall 0.9980
+  c64_p16     14.74 s  recall 0.9988
+  c256_p64    22.47 s  recall 0.9991
+  c64_p32     28.75 s  recall 0.9991
+  exact       45.32 s  recall 1.0000

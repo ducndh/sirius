@@ -1,0 +1,4 @@
+cuVS brute_force k=10   search  0.6557s
+cuVS brute_force k=64   search  0.7397s
+cuVS brute_force k=65   search  0.4278s
+cuVS brute_force k=128  search  0.4337s

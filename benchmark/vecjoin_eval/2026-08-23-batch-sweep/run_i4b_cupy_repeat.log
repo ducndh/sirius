@@ -1,0 +1,3 @@
+cupy blocked brute force, 5 repeats each (corpus resident, after warm-up):
+  eps=   100  min=0.515  median=0.517  max=0.546  pairs=20,849
+  eps=   150  min=0.513  median=0.513  max=0.515  pairs=260,864

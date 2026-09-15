@@ -1,0 +1,5 @@
+*.db
+*.db.wal
+*.csv
+*.log
+duckdb_cli*

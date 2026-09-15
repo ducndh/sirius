@@ -1,0 +1,10 @@
+epoch,rows,hits,recall
+0,100000,98774,0.98774
+epoch,rows,hits,recall
+1,100000,98807,0.98807
+epoch,rows,hits,recall
+2,100000,98938,0.98938
+epoch,rows,hits,recall
+3,100000,98721,0.98721
+epoch,rows,hits,recall
+4,100000,98940,0.9894
