@@ -783,8 +783,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // chunk's surviving edges are final when produced and the chunks only have to be concatenated.
   // That is why this path accumulates ragged edge lists instead of a fixed-width block, and why
   // it has no k -- and therefore none of the k <= 1024 ceiling that knn_merge_parts imposes.
-  bool const radius_join = _request.mode == vss::vector_join_mode::threshold &&
-                           _request.search_mode != vss::vector_join_search_mode::approx;
+  bool const radius_join = _request.mode == vss::vector_join_mode::threshold;
   std::vector<std::unique_ptr<cudf::column>> radius_left, radius_neighbors, radius_distances;
   // The kernel works in distance space. For cosine with a similarity threshold the user's
   // "score >= eps" is the same set as "distance <= 1 - eps"; for a distance threshold it is eps
@@ -1021,7 +1020,6 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         // 42-96% of runtime). The rows are gathered into one query matrix; a row is gathered
         // once per cluster it visits, so the copies total n_probes probe batches per join --
         // the price of routing rows rather than runs.
-        auto const slice_index = vss::brute_force_build(res, slice_view, metric);
         auto const m           = ee - eb;
         auto const rows_c      = cudf::slice(sorted_rows,
                                         {static_cast<cudf::size_type>(eb),
@@ -1034,9 +1032,36 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                             mr);
         auto const queries_view =
           vss::list_column_as_dataset_view(queries_c->get_column(0).view(), dim);
-
-        auto knn = vss::brute_force_knn(res, slice_index, queries_view, k_eff, mr);
         scanned_pairs += slice_rows * m;
+
+        if (radius_join) {
+          // Same construction as the exhaustive radius path: a slice's in-range pairs are
+          // final when produced, so they are appended, never folded, and there is no k. The
+          // kernel numbers query rows within the gathered matrix; rows_c maps them back.
+          auto edges =
+            vss::brute_force_threshold(res, slice_view, queries_view, radius_eps, metric, mr);
+          if (edges.n_edges > 0) {
+            auto left = cudf::gather(cudf::table_view{{rows_c}},
+                                     edges.query_rows->view(),
+                                     cudf::out_of_bounds_policy::DONT_CHECK,
+                                     stream,
+                                     mr);
+            cudf::numeric_scalar<std::int64_t> const base(chunk_base + slice.begin, true, stream);
+            radius_left.push_back(cudf::cast(
+              left->get_column(0).view(), cudf::data_type{cudf::type_id::INT32}, stream, mr));
+            radius_neighbors.push_back(cudf::binary_operation(edges.neighbors->view(),
+                                                              base,
+                                                              cudf::binary_operator::ADD,
+                                                              cudf::data_type{cudf::type_id::INT64},
+                                                              stream,
+                                                              mr));
+            radius_distances.push_back(std::move(edges.distances));
+          }
+          continue;
+        }
+
+        auto const slice_index = vss::brute_force_build(res, slice_view, metric);
+        auto knn = vss::brute_force_knn(res, slice_index, queries_view, k_eff, mr);
 
         // Neighbour ids come back local to the slice; the slice's own start in corpus row
         // space is the base that makes them corpus row ids, exactly as the chunk offset does
