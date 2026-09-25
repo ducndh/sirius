@@ -370,8 +370,12 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
           if (spec.kind == aggregate_kind::AVG) {
+            // avg divides by the non-NULL count, not the row count: the merge step sums these
+            // per-batch counts, so a NULL-bearing column must not be charged for its NULLs.
             auto count_scalar = make_numeric_scalar_with_value<int64_t>(
-              cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()), stream);
+              cudf::data_type{cudf::type_id::INT64},
+              static_cast<int64_t>(col.size() - col.null_count()),
+              stream);
             cols.push_back(cudf::make_column_from_scalar(*count_scalar, 1, stream));
           }
           break;
