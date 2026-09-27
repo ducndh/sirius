@@ -72,11 +72,11 @@ class brute_force_index {
   friend brute_force_index brute_force_build(raft::device_resources const&,
                                              dataset_matrix_view,
                                              cuvs::distance::DistanceType);
-  friend knn_result brute_force_knn(raft::device_resources const&,
-                                    brute_force_index const&,
-                                    dataset_matrix_view,
-                                    int64_t,
-                                    rmm::device_async_resource_ref);
+  friend knn_result brute_force_knn_untrimmed(raft::device_resources const&,
+                                              brute_force_index const&,
+                                              dataset_matrix_view,
+                                              int64_t,
+                                              rmm::device_async_resource_ref);
 
   std::unique_ptr<impl> _pimpl;
 };
@@ -97,12 +97,26 @@ brute_force_index brute_force_build(
  * @p queries must match the index's dataset dimensionality, and @p k must satisfy
  * `1 <= k <= n_rows` of that dataset.
  */
-knn_result brute_force_knn(raft::device_resources const& res,
-                           brute_force_index const& index,
-                           dataset_matrix_view queries,
-                           int64_t k,
-                           rmm::device_async_resource_ref mr =
-                             cudf::get_current_device_resource_ref());
+knn_result brute_force_knn(
+  raft::device_resources const& res,
+  brute_force_index const& index,
+  dataset_matrix_view queries,
+  int64_t k,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief @ref brute_force_knn on a prebuilt index, leaving any over-search untrimmed.
+ *
+ * The result may hold more than @p k columns per row -- its own `k` says how many -- and the
+ * first @p k of each row are the answer, nearest first. For a caller that reads the rows with
+ * its own kernel anyway, the trim would only be a second pass over them.
+ */
+knn_result brute_force_knn_untrimmed(
+  raft::device_resources const& res,
+  brute_force_index const& index,
+  dataset_matrix_view queries,
+  int64_t k,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Exact (brute-force) k-nearest-neighbor search via cuVS.

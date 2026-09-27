@@ -403,6 +403,7 @@ set(CUDA_SOURCES
     src/cuda/vss/cudf_raft_interop.cu
     src/cuda/vss/brute_force_search.cu
     src/cuda/vss/brute_force_threshold.cu
+    src/cuda/vss/cluster_fold.cu
     src/cuda/vss/knn_merge.cu
     src/cuda/vss/ivf_flat_index.cu
     src/cuda/vss/vector_clustering.cu)
@@ -515,10 +516,10 @@ foreach(_target sirius_extension sirius_loadable_extension)
     yaml-cpp::yaml-cpp
     telemetry_bridge)
 
-  # Optional FAISS-GPU brute-force kernel behind the same seam as the cuVS one, for
-  # measuring the kernel gap under a single query (SIRIUS_VSS_KERNEL=faiss selects it).
-  # Off by default: FAISS is not a Sirius dependency, and its GpuResources allocates
-  # scratch outside cucascade's accounting.
+  # Optional FAISS-GPU brute-force kernel behind the same seam as the cuVS one,
+  # for measuring the kernel gap under a single query (SIRIUS_VSS_KERNEL=faiss
+  # selects it). Off by default: FAISS is not a Sirius dependency, and its
+  # GpuResources allocates scratch outside cucascade's accounting.
   if(SIRIUS_ENABLE_FAISS_KERNEL)
     target_compile_definitions(${_target} PRIVATE SIRIUS_ENABLE_FAISS_KERNEL)
     target_include_directories(${_target} PRIVATE ${FAISS_INCLUDE_DIR})

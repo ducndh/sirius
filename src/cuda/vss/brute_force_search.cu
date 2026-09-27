@@ -16,11 +16,8 @@
 
 #include "vss/brute_force_search.hpp"
 
-#include <cstdlib>
-#include <string_view>
-
-#include <cudf/column/column_factories.hpp>
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -35,6 +32,9 @@
 #include <raft/core/resource/cuda_stream.hpp>
 
 #include <cuvs/neighbors/brute_force.hpp>
+
+#include <cstdlib>
+#include <string_view>
 
 namespace sirius::vss {
 
@@ -90,16 +90,32 @@ void trim_to_k(std::unique_ptr<cudf::column>& neighbors_col,
 
   cudf::numeric_scalar<int32_t> const k_out(static_cast<int32_t>(k), true, stream);
   cudf::numeric_scalar<int32_t> const k_in(static_cast<int32_t>(k_search), true, stream);
-  auto const row = cudf::binary_operation(
-    positions->view(), k_out, cudf::binary_operator::DIV, cudf::data_type{cudf::type_id::INT32}, stream, mr);
-  auto const col = cudf::binary_operation(
-    positions->view(), k_out, cudf::binary_operator::MOD, cudf::data_type{cudf::type_id::INT32}, stream, mr);
-  auto const base = cudf::binary_operation(
-    row->view(), k_in, cudf::binary_operator::MUL, cudf::data_type{cudf::type_id::INT32}, stream, mr);
-  auto const gather_map = cudf::binary_operation(
-    base->view(), col->view(), cudf::binary_operator::ADD, cudf::data_type{cudf::type_id::INT32}, stream, mr);
+  auto const row        = cudf::binary_operation(positions->view(),
+                                          k_out,
+                                          cudf::binary_operator::DIV,
+                                          cudf::data_type{cudf::type_id::INT32},
+                                          stream,
+                                          mr);
+  auto const col        = cudf::binary_operation(positions->view(),
+                                          k_out,
+                                          cudf::binary_operator::MOD,
+                                          cudf::data_type{cudf::type_id::INT32},
+                                          stream,
+                                          mr);
+  auto const base       = cudf::binary_operation(row->view(),
+                                           k_in,
+                                           cudf::binary_operator::MUL,
+                                           cudf::data_type{cudf::type_id::INT32},
+                                           stream,
+                                           mr);
+  auto const gather_map = cudf::binary_operation(base->view(),
+                                                 col->view(),
+                                                 cudf::binary_operator::ADD,
+                                                 cudf::data_type{cudf::type_id::INT32},
+                                                 stream,
+                                                 mr);
 
-  auto trimmed = cudf::gather(cudf::table_view{{neighbors_col->view(), distances_col->view()}},
+  auto trimmed  = cudf::gather(cudf::table_view{{neighbors_col->view(), distances_col->view()}},
                               gather_map->view(),
                               cudf::out_of_bounds_policy::DONT_CHECK,
                               stream,
@@ -129,16 +145,15 @@ brute_force_index brute_force_build(raft::device_resources const& res,
   index_params.metric = metric;
   // With the non-owning dataset view this stores a reference to Sirius-owned memory and
   // precomputes norms. Enqueued on res's stream.
-  return brute_force_index{
-    std::make_unique<brute_force_index::impl>(
-      brute_force_index::impl{bf::build(res, index_params, dataset), dataset, metric})};
+  return brute_force_index{std::make_unique<brute_force_index::impl>(
+    brute_force_index::impl{bf::build(res, index_params, dataset), dataset, metric})};
 }
 
-knn_result brute_force_knn(raft::device_resources const& res,
-                           brute_force_index const& index,
-                           dataset_matrix_view queries,
-                           int64_t k,
-                           rmm::device_async_resource_ref mr)
+knn_result brute_force_knn_untrimmed(raft::device_resources const& res,
+                                     brute_force_index const& index,
+                                     dataset_matrix_view queries,
+                                     int64_t k,
+                                     rmm::device_async_resource_ref mr)
 {
   auto const& idx      = *index._pimpl;
   auto const n_rows    = idx.dataset.extent(0);
@@ -182,12 +197,28 @@ knn_result brute_force_knn(raft::device_resources const& res,
   bf::search_params search_params;
   bf::search(res, search_params, idx.index, queries, neighbors_view, distances_view);
 
-  if (k_search != k) {
-    trim_to_k(neighbors_col, distances_col, n_queries, k, k_search, stream, mr);
-  }
-
   // The search runs async on res's stream.
-  return knn_result{std::move(neighbors_col), std::move(distances_col), n_queries, k};
+  return knn_result{std::move(neighbors_col), std::move(distances_col), n_queries, k_search};
+}
+
+knn_result brute_force_knn(raft::device_resources const& res,
+                           brute_force_index const& index,
+                           dataset_matrix_view queries,
+                           int64_t k,
+                           rmm::device_async_resource_ref mr)
+{
+  auto result = brute_force_knn_untrimmed(res, index, queries, k, mr);
+  if (result.k != k) {
+    trim_to_k(result.neighbors,
+              result.distances,
+              result.n_queries,
+              k,
+              result.k,
+              raft::resource::get_cuda_stream(res),
+              mr);
+    result.k = k;
+  }
+  return result;
 }
 
 knn_result brute_force_knn(raft::device_resources const& res,
