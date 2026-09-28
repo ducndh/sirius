@@ -132,28 +132,70 @@ __global__ void count_non_uint8_kernel(float const* v, int64_t n, unsigned long 
   if (bad != 0) { atomicAdd(out, bad); }
 }
 
-__global__ void narrow_to_uint8_kernel(float const* in, int64_t n, uint8_t* out)
+// Byte-valued lists are stored shifted to int8 (x - 128): L2 is invariant under the shift, and
+// int8 is what the tensor-core GEMM multiplies exactly.
+__global__ void narrow_to_shifted_int8_kernel(float const* in, int64_t n, int8_t* out)
 {
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    out[i] = static_cast<uint8_t>(in[i]);
+    out[i] = static_cast<int8_t>(static_cast<int>(in[i]) - 128);
   }
 }
 
-__global__ void widen_uint8_kernel(uint8_t const* in, int64_t n, float* out)
+__global__ void widen_shifted_int8_kernel(int8_t const* in, int64_t n, float* out)
 {
   // Four bytes in, four floats out per thread: the widening runs at device bandwidth.
   auto const n4   = n / 4;
-  auto const* in4 = reinterpret_cast<uchar4 const*>(in);
+  auto const* in4 = reinterpret_cast<char4 const*>(in);
   auto* out4      = reinterpret_cast<float4*>(out);
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n4;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     auto const b = in4[i];
-    out4[i]      = make_float4(b.x, b.y, b.z, b.w);
+    out4[i]      = make_float4(b.x + 128.f, b.y + 128.f, b.z + 128.f, b.w + 128.f);
   }
   for (int64_t i = n4 * 4 + blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    out[i] = in[i];
+    out[i] = in[i] + 128.f;
+  }
+}
+
+// |x|^2 of shifted int8 rows, exact in int32 (at most dim * 128^2), one warp per row.
+__global__ void int8_row_sq_norms_kernel(int8_t const* x, int64_t rows, int64_t d, int32_t* out)
+{
+  auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
+  auto const lane  = static_cast<int64_t>(threadIdx.x % 32);
+  for (int64_t r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32; r < rows; r += warps) {
+    int32_t acc = 0;
+    for (int64_t j = lane; j < d; j += 32) {
+      int32_t const v = x[r * d + j];
+      acc += v * v;
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+      acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) { out[r] = acc; }
+  }
+}
+
+__global__ void gather_bytes_kernel(
+  uint8_t const* src, int64_t row_bytes, int64_t const* rows, int64_t m, uint8_t* out)
+{
+  auto const total = m * row_bytes;
+  for (int64_t p = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; p < total;
+       p += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const i = p / row_bytes;
+    out[p]       = src[rows[i] * row_bytes + (p - i * row_bytes)];
+  }
+}
+
+__global__ void gather_int32_kernel(int32_t const* src,
+                                    int64_t const* rows,
+                                    int64_t m,
+                                    int32_t* out)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < m;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    out[i] = src[rows[i]];
   }
 }
 
@@ -187,23 +229,55 @@ void count_non_uint8(float const* values,
   CUDF_CHECK_CUDA(stream.value());
 }
 
-void narrow_to_uint8(float const* in, int64_t n, uint8_t* out, rmm::cuda_stream_view stream)
+void narrow_to_shifted_int8(float const* in, int64_t n, int8_t* out, rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }
-  narrow_to_uint8_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(in, n, out);
+  narrow_to_shifted_int8_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+    in, n, out);
   CUDF_CHECK_CUDA(stream.value());
 }
 
-void widen_uint8(uint8_t const* in, int64_t n, float* out, rmm::cuda_stream_view stream)
+void widen_shifted_int8(int8_t const* in, int64_t n, float* out, rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }
-  // uchar4/float4 access needs 4- and 16-byte alignment; the callers' buffers start at
+  // char4/float4 access needs 4- and 16-byte alignment; the callers' buffers start at
   // allocation boundaries and chunks start on whole rows of a dim that is a multiple of 4.
   CUDF_EXPECTS(
     reinterpret_cast<uintptr_t>(in) % 4 == 0 && reinterpret_cast<uintptr_t>(out) % 16 == 0,
-    "widen_uint8: misaligned buffers");
-  widen_uint8_kernel<<<std::min(grid_for(n / 4 + 1), 65535), kBlock, 0, stream.value()>>>(
+    "widen_shifted_int8: misaligned buffers");
+  widen_shifted_int8_kernel<<<std::min(grid_for(n / 4 + 1), 65535), kBlock, 0, stream.value()>>>(
     in, n, out);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void int8_row_sq_norms(
+  int8_t const* x, int64_t rows, int64_t d, int32_t* out, rmm::cuda_stream_view stream)
+{
+  if (rows == 0) { return; }
+  auto const grid = static_cast<int>(std::min<int64_t>((rows + 7) / 8, 65535));
+  int8_row_sq_norms_kernel<<<grid, kBlock, 0, stream.value()>>>(x, rows, d, out);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void gather_bytes(void const* src,
+                  int64_t row_bytes,
+                  int64_t const* rows,
+                  int64_t m,
+                  void* out,
+                  rmm::cuda_stream_view stream)
+{
+  if (m == 0) { return; }
+  gather_bytes_kernel<<<std::min(grid_for(m * row_bytes), 65535), kBlock, 0, stream.value()>>>(
+    static_cast<uint8_t const*>(src), row_bytes, rows, m, static_cast<uint8_t*>(out));
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void gather_int32(
+  int32_t const* src, int64_t const* rows, int64_t m, int32_t* out, rmm::cuda_stream_view stream)
+{
+  if (m == 0) { return; }
+  gather_int32_kernel<<<std::min(grid_for(m), 65535), kBlock, 0, stream.value()>>>(
+    src, rows, m, out);
   CUDF_CHECK_CUDA(stream.value());
 }
 

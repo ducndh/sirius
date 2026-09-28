@@ -513,9 +513,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   // device whenever they fit, which is what takes the corpus stream off the query path.
   bool on_device = c.pin->tier == cucascade::memory::Tier::GPU || encoding == list_encoding::uint8;
   if (on_device) {
-    reservation = index_cache.reserve_index_memory(vec_bytes + row_bytes + (std::size_t{1} << 24),
-                                                   c.target_gpu);
-    on_device   = reservation != nullptr;
+    reservation = index_cache.reserve_index_memory(
+      vec_bytes + row_bytes + row_bytes / 2 + (std::size_t{1} << 24), c.target_gpu);
+    on_device = reservation != nullptr;
   }
   if (!on_device) {
     if (rows_per_block == 0) {
@@ -545,8 +545,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                              ? std::min<std::int64_t>(n_rows, staged_rows)
                              : std::min<std::int64_t>(n_rows, max_list_elements / dim);
     lists.rows_per_block = n_rows;
-    lists.device_vectors =
-      std::make_unique<rmm::device_buffer>(vec_bytes, persistent, persistent_mr);
+    // Four rows of slack past the end: the int8 search rounds a slice up to a multiple of 4 rows.
+    lists.device_vectors = std::make_unique<rmm::device_buffer>(
+      vec_bytes + 4 * static_cast<std::size_t>(dim) * elem_bytes, persistent, persistent_mr);
     block_ptrs.push_back(static_cast<std::byte*>(lists.device_vectors->data()));
   } else {
     lists.tier           = cucascade::memory::Tier::HOST;
@@ -562,7 +563,11 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       block_ptrs.push_back(lists.host_vectors->at(static_cast<std::size_t>(b)).data());
     }
   }
-  lists.row_ids      = std::make_unique<rmm::device_buffer>(row_bytes, persistent, persistent_mr);
+  lists.row_ids = std::make_unique<rmm::device_buffer>(row_bytes, persistent, persistent_mr);
+  if (encoding == list_encoding::uint8) {
+    lists.row_sq = std::make_unique<rmm::device_buffer>(
+      static_cast<std::size_t>(n_rows) * sizeof(std::int32_t), persistent, persistent_mr);
+  }
   lists.list_offsets = std::make_unique<rmm::device_buffer>(
     static_cast<std::size_t>(lists.chunk_rows + 1) * sizeof(std::int32_t),
     persistent,
@@ -635,12 +640,23 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                     stream.value()));
       gather_rows(vectors.data_handle(), dim, order_d.data(), rows, grouped.data(), stream);
       // The copies below read the grouped rows in the list encoding.
-      std::optional<rmm::device_uvector<std::uint8_t>> grouped_u8;
+      std::optional<rmm::device_uvector<std::int8_t>> grouped_i8;
+      std::optional<rmm::device_uvector<std::int32_t>> grouped_sq;
       auto const* grouped_bytes = reinterpret_cast<std::byte const*>(grouped.data());
       if (encoding == list_encoding::uint8) {
-        grouped_u8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
-        narrow_to_uint8(grouped.data(), rows * dim, grouped_u8->data(), stream);
-        grouped_bytes = reinterpret_cast<std::byte const*>(grouped_u8->data());
+        grouped_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
+        grouped_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
+        narrow_to_shifted_int8(grouped.data(), rows * dim, grouped_i8->data(), stream);
+        int8_row_sq_norms(grouped_i8->data(), rows, dim, grouped_sq->data(), stream);
+        grouped_bytes = reinterpret_cast<std::byte const*>(grouped_i8->data());
+        // The norms follow the rows: a run is one contiguous span of layout rows.
+        for (auto const& g : runs) {
+          CUDF_CUDA_TRY(cudaMemcpyAsync(static_cast<std::int32_t*>(lists.row_sq->data()) + g.dest,
+                                        grouped_sq->data() + g.first,
+                                        static_cast<std::size_t>(g.rows) * sizeof(std::int32_t),
+                                        cudaMemcpyDeviceToDevice,
+                                        stream.value()));
+        }
       }
       scatter_row_ids(
         chunk_dest.data(), rows, base, static_cast<std::int64_t*>(lists.row_ids->data()), stream);

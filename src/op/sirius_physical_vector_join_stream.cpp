@@ -648,10 +648,10 @@ class cluster_lists_chunk_source : public vector_chunk_source {
                static_cast<std::size_t>(first) * _lists.row_bytes();
     }
     if (narrow) {
-      vss::widen_uint8(reinterpret_cast<std::uint8_t const*>(stored),
-                       rows * _lists.dim,
-                       static_cast<float*>(buffer->data()),
-                       stream);
+      vss::widen_shifted_int8(reinterpret_cast<std::int8_t const*>(stored),
+                              rows * _lists.dim,
+                              static_cast<float*>(buffer->data()),
+                              stream);
     }
     // Synchronous like the pin converter: the caller overlaps "host waits on this copy" with
     // the compute it already issued, and the view must be complete before it is searched. It is
@@ -1359,16 +1359,58 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       chunk = staged_vector_chunk{};
     };
 
+    // Byte-valued lists on the device, searched by a byte-valued probe side, run on the int8 tensor
+    // cores straight from the stored bytes: no chunk is widened or staged, the row norms were
+    // computed at build time, and every dot product is exact. Only the probe is converted, once.
+    bool int8_search = gemm_search_enabled() && !radius_join && _lists != nullptr &&
+                       _lists->encoding == vss::list_encoding::uint8 &&
+                       _lists->tier == cucascade::memory::Tier::GPU && _lists->row_sq != nullptr &&
+                       (metric == cuvs::distance::DistanceType::L2Expanded ||
+                        metric == cuvs::distance::DistanceType::L2SqrtExpanded) &&
+                       dim % 4 == 0;
+    std::optional<rmm::device_uvector<std::int8_t>> probe_i8, routed_i8;
+    std::optional<rmm::device_uvector<std::int32_t>> probe_sq, routed_sq;
+    if (int8_search) {
+      rmm::device_uvector<unsigned long long> non_bytes(1, stream, mr);
+      CUDF_CUDA_TRY(
+        cudaMemsetAsync(non_bytes.data(), 0, sizeof(unsigned long long), stream.value()));
+      vss::count_non_uint8(queries.data_handle(), n_left * dim, non_bytes.data(), stream);
+      unsigned long long non_bytes_host = 0;
+      CUDF_CUDA_TRY(cudaMemcpyAsync(&non_bytes_host,
+                                    non_bytes.data(),
+                                    sizeof(non_bytes_host),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.value()));
+      stream.synchronize();
+      int8_search = non_bytes_host == 0;
+    }
+    if (int8_search) {
+      probe_i8.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
+      probe_sq.emplace(static_cast<std::size_t>(n_left), stream, mr);
+      routed_i8.emplace(static_cast<std::size_t>(max_routed * dim), stream, mr);
+      routed_sq.emplace(static_cast<std::size_t>(max_routed), stream, mr);
+      vss::narrow_to_shifted_int8(queries.data_handle(), n_left * dim, probe_i8->data(), stream);
+      vss::int8_row_sq_norms(probe_i8->data(), n_left, dim, probe_sq->data(), stream);
+    }
+
     std::int64_t scanned_pairs = 0;
-    auto prefetched            = needed_chunks.empty()
+    auto prefetched            = needed_chunks.empty() || int8_search
                                    ? staged_vector_chunk{}
                                    : _corpus->stage(needed_chunks[0], *mem_space, stage_on);
 
     for (std::size_t ci = 0; ci < needed_chunks.size(); ++ci) {
-      auto const j          = needed_chunks[ci];
-      auto staged           = std::move(prefetched);
-      auto const chunk_view = vss::list_column_as_dataset_view(staged.view, dim);
-      auto const chunk_base = _chunk_row_base[j];
+      auto const j            = needed_chunks[ci];
+      auto staged             = std::move(prefetched);
+      auto const chunk_base   = _chunk_row_base[j];
+      float const* chunk_data = nullptr;
+      std::int64_t chunk_n    = 0;
+      if (int8_search) {
+        chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
+      } else {
+        auto const chunk_view = vss::list_column_as_dataset_view(staged.view, dim);
+        chunk_data            = chunk_view.data_handle();
+        chunk_n               = chunk_view.extent(0);
+      }
 
       for (auto const& slice : _chunk_cluster_runs[j]) {
         auto const eb = edge_begin[static_cast<std::size_t>(slice.cluster)];
@@ -1378,16 +1420,16 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         // which the vector column's chunk j is resident and its row count exactly known. The
         // two are the same pin's row groups, so a mismatch is a broken invariant rather than
         // a user error -- but it would read past the end of the chunk, so it is checked.
-        if (slice.end > static_cast<std::int64_t>(chunk_view.extent(0))) {
+        if (slice.end > chunk_n) {
           throw std::runtime_error(
             "[sirius_physical_vector_join_stream] cluster column chunk " + std::to_string(j) +
             " describes row " + std::to_string(slice.end) + " but the vector column's chunk " +
-            "holds " + std::to_string(chunk_view.extent(0)) + "; both must come from the same pin");
+            "holds " + std::to_string(chunk_n) + "; both must come from the same pin");
         }
         auto const slice_rows = slice.end - slice.begin;
         auto const slice_view =
           raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
-            chunk_view.data_handle() + slice.begin * dim, slice_rows, dim);
+            chunk_data == nullptr ? nullptr : chunk_data + slice.begin * dim, slice_rows, dim);
         auto const k_eff = std::min<std::int64_t>(k_join, slice_rows);
 
         // ONE search per slice: every row routed here searches the same dataset, and the
@@ -1397,7 +1439,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         // the price of routing rows rather than runs.
         auto const m       = ee - eb;
         auto const* rows_c = routed_rows + eb;
-        vss::gather_rows(queries.data_handle(), dim, rows_c, m, routed_queries.data(), stream);
+        if (!int8_search) {
+          vss::gather_rows(queries.data_handle(), dim, rows_c, m, routed_queries.data(), stream);
+        }
         auto const queries_view =
           raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
             routed_queries.data(), m, dim);
@@ -1440,11 +1484,31 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
 
         // The GEMM-ranked search, as in the exhaustive fold: it also carries none of cuVS's
         // per-call device synchronization, which is paid here once per slice.
-        auto const knn =
-          gemm_search_enabled() && vss::gemm_search_supports(metric)
-            ? vss::gemm_topk(res, slice_view, queries_view, k_eff, metric, mr)
-            : vss::brute_force_knn_untrimmed(
-                res, vss::brute_force_build(res, slice_view, metric), queries_view, k_eff, mr);
+        auto const knn = [&] {
+          if (int8_search) {
+            vss::gather_bytes(probe_i8->data(), dim, rows_c, m, routed_i8->data(), stream);
+            vss::gather_int32(probe_sq->data(), rows_c, m, routed_sq->data(), stream);
+            return vss::gemm_int8_topk(
+              res,
+              static_cast<std::int8_t const*>(_lists->device_vectors->data()) + id_base * dim,
+              static_cast<std::int32_t const*>(_lists->row_sq->data()) + id_base,
+              slice_rows,
+              routed_i8->data(),
+              routed_sq->data(),
+              m,
+              dim,
+              k_eff,
+              metric == cuvs::distance::DistanceType::L2SqrtExpanded,
+              mr);
+          }
+          return gemm_search_enabled() && vss::gemm_search_supports(metric)
+                   ? vss::gemm_topk(res, slice_view, queries_view, k_eff, metric, mr)
+                   : vss::brute_force_knn_untrimmed(res,
+                                                    vss::brute_force_build(res, slice_view, metric),
+                                                    queries_view,
+                                                    k_eff,
+                                                    mr);
+        }();
 
         // Fold in place: a row is routed to a cluster at most once, so the rows of one slice
         // are distinct and no two threads of the fold write the same accumulator row.
@@ -1464,7 +1528,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
 
       // The searches above are issued, not finished. Staging the next needed chunk now runs its
       // H2D while the GPU works on this one.
-      prefetched = (ci + 1 < needed_chunks.size())
+      prefetched = (ci + 1 < needed_chunks.size() && !int8_search)
                      ? _corpus->stage(needed_chunks[ci + 1], *mem_space, stage_on)
                      : staged_vector_chunk{};
       release_staged(staged);

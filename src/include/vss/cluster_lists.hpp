@@ -55,7 +55,8 @@ namespace sirius::vss {
 enum class list_encoding : std::uint8_t {
   float32,
   /// One byte per component: every value was an integer in [0, 255] (SIFT, BigANN, and other
-  /// byte-quantized descriptors stored as FLOAT). A quarter of the memory and of the transfer.
+  /// byte-quantized descriptors stored as FLOAT), held as int8 x - 128. A quarter of the memory
+  /// and of the transfer, and exact input for an int8 GEMM.
   uint8,
 };
 
@@ -82,6 +83,9 @@ struct cluster_lists {
 
   /// INT64 [n_rows], device-resident on either tier: the pin row of each layout row.
   std::unique_ptr<rmm::device_buffer> row_ids;
+  /// UINT8 lists only: INT32 [n_rows] |x - 128|^2 per layout row, device-resident, which is what
+  /// the int8 search adds to its dot products in place of a per-query norm pass.
+  std::unique_ptr<rmm::device_buffer> row_sq;
   /// INT32 [chunk_rows + 1] offsets 0, dim, 2 dim, ... A LIST view of any chunk borrows a
   /// prefix of these, since every list in the column has the same width.
   std::unique_ptr<rmm::device_buffer> list_offsets;
@@ -145,14 +149,41 @@ void count_non_uint8(float const* values,
                      unsigned long long* out,
                      rmm::cuda_stream_view stream);
 
-/// out[i] = in[i] for values already known to be integers in [0, 255].
-void narrow_to_uint8(float const* in,
-                     std::int64_t n,
-                     std::uint8_t* out,
-                     rmm::cuda_stream_view stream);
+/// out[i] = in[i] - 128 as int8, for values already known to be integers in [0, 255]. Byte-valued
+/// lists are stored this way: L2 does not change under the shift, and int8 is what the
+/// tensor-core GEMM multiplies exactly.
+void narrow_to_shifted_int8(float const* in,
+                            std::int64_t n,
+                            std::int8_t* out,
+                            rmm::cuda_stream_view stream);
 
-/// out[i] = in[i] as FP32.
-void widen_uint8(std::uint8_t const* in, std::int64_t n, float* out, rmm::cuda_stream_view stream);
+/// out[i] = in[i] + 128 as FP32: the stored bytes back to the pinned values.
+void widen_shifted_int8(std::int8_t const* in,
+                        std::int64_t n,
+                        float* out,
+                        rmm::cuda_stream_view stream);
+
+/// |x|^2 per row of shifted int8 rows, exact in int32.
+void int8_row_sq_norms(std::int8_t const* x,
+                       std::int64_t rows,
+                       std::int64_t d,
+                       std::int32_t* out,
+                       rmm::cuda_stream_view stream);
+
+/// out[i, :] = src[rows[i], :] for rows of @p row_bytes bytes.
+void gather_bytes(void const* src,
+                  std::int64_t row_bytes,
+                  std::int64_t const* rows,
+                  std::int64_t m,
+                  void* out,
+                  rmm::cuda_stream_view stream);
+
+/// out[i] = src[rows[i]].
+void gather_int32(std::int32_t const* src,
+                  std::int64_t const* rows,
+                  std::int64_t m,
+                  std::int32_t* out,
+                  rmm::cuda_stream_view stream);
 
 /// INT32 offsets 0, dim, ..., n * dim into @p out (n + 1 entries).
 void fill_list_offsets(std::int32_t* out,
