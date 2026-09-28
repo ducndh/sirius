@@ -50,6 +50,15 @@ namespace sirius::vss {
  * Layout row r holds pin row @c row_ids[r], so a neighbour found in the lists is reported in
  * the pin's own row space and every downstream reader of the corpus is unaffected.
  */
+/// How the lists hold a vector. The join always searches FP32; an encoding is only ever used
+/// where it is lossless, so a staged chunk widens back to exactly the values that were pinned.
+enum class list_encoding : std::uint8_t {
+  float32,
+  /// One byte per component: every value was an integer in [0, 255] (SIFT, BigANN, and other
+  /// byte-quantized descriptors stored as FLOAT). A quarter of the memory and of the transfer.
+  uint8,
+};
+
 struct cluster_lists {
   const scan_manager::pinned_entry* pin{nullptr};  ///< The pin the lists were built from.
   std::string table;
@@ -62,6 +71,7 @@ struct cluster_lists {
   /// List c is layout rows [offsets[c], offsets[c + 1]).
   std::vector<std::int64_t> offsets;
   ::cucascade::memory::Tier tier{::cucascade::memory::Tier::GPU};
+  list_encoding encoding{list_encoding::float32};
 
   /// GPU tier: the whole [n_rows x dim] matrix.
   std::unique_ptr<rmm::device_buffer> device_vectors;
@@ -76,6 +86,11 @@ struct cluster_lists {
   /// prefix of these, since every list in the column has the same width.
   std::unique_ptr<rmm::device_buffer> list_offsets;
 
+  /// Stored bytes per row, in the list encoding.
+  [[nodiscard]] std::size_t row_bytes() const
+  {
+    return static_cast<std::size_t>(dim) * (encoding == list_encoding::uint8 ? 1 : sizeof(float));
+  }
   [[nodiscard]] std::int64_t num_chunks() const
   {
     return chunk_rows == 0 ? 0 : (n_rows + chunk_rows - 1) / chunk_rows;
@@ -94,7 +109,11 @@ struct cluster_lists_result {
   std::int64_t max_list{0};
   std::int64_t empty_lists{0};
   std::string tier;
+  std::string encoding;
 };
+
+/// `storage =>` of the build: FLOAT32 always, UINT8 or fail, or the tightest lossless one.
+enum class list_storage : std::uint8_t { automatic, float32, uint8 };
 
 /**
  * @brief `sirius_kmeans_build_lists(table, column, clustering)`: build @ref cluster_lists for a
@@ -103,7 +122,8 @@ struct cluster_lists_result {
  * GPU tier when the pin is GPU-resident and the copy fits the device, HOST tier otherwise.
  */
 cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
-                                            const kmeans_assign_request& req);
+                                            const kmeans_assign_request& req,
+                                            list_storage storage = list_storage::automatic);
 
 /// The lists built for @p clustering, or nullptr when there are none.
 [[nodiscard]] const cluster_lists* find_cluster_lists(duckdb::SiriusContext& ctx,
@@ -118,6 +138,21 @@ void scatter_row_ids(std::int64_t const* dest,
                      std::int64_t row_base,
                      std::int64_t* row_ids,
                      rmm::cuda_stream_view stream);
+
+/// Adds to @p out the number of the @p n values that are not an integer in [0, 255].
+void count_non_uint8(float const* values,
+                     std::int64_t n,
+                     unsigned long long* out,
+                     rmm::cuda_stream_view stream);
+
+/// out[i] = in[i] for values already known to be integers in [0, 255].
+void narrow_to_uint8(float const* in,
+                     std::int64_t n,
+                     std::uint8_t* out,
+                     rmm::cuda_stream_view stream);
+
+/// out[i] = in[i] as FP32.
+void widen_uint8(std::uint8_t const* in, std::int64_t n, float* out, rmm::cuda_stream_view stream);
 
 /// INT32 offsets 0, dim, ..., n * dim into @p out (n + 1 entries).
 void fill_list_offsets(std::int32_t* out,

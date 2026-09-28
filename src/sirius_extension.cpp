@@ -1888,6 +1888,7 @@ static void SiriusKMeansFitFunction(ClientContext& context,
 
 struct KMeansBuildListsData : public TableFunctionData {
   sirius::vss::kmeans_assign_request req;
+  sirius::vss::list_storage storage{sirius::vss::list_storage::automatic};
   bool finished = false;
 };
 
@@ -1909,8 +1910,24 @@ static unique_ptr<FunctionData> SiriusKMeansBuildListsBind(ClientContext& contex
   req.clustering          = input.inputs[2].ToString();
   std::string schema_name = "main";
   for (auto& kv : input.named_parameters) {
-    if (StringUtil::Lower(kv.first) == "schema_name" && !kv.second.IsNull()) {
+    auto const key = StringUtil::Lower(kv.first);
+    if (kv.second.IsNull()) { continue; }
+    if (key == "schema_name") {
       schema_name = kv.second.ToString();
+    } else if (key == "storage") {
+      auto const v = StringUtil::Lower(kv.second.ToString());
+      if (v == "auto") {
+        result->storage = sirius::vss::list_storage::automatic;
+      } else if (v == "float32") {
+        result->storage = sirius::vss::list_storage::float32;
+      } else if (v == "uint8") {
+        result->storage = sirius::vss::list_storage::uint8;
+      } else {
+        throw BinderException(
+          "sirius_kmeans_build_lists: storage must be 'auto', 'float32' or "
+          "'uint8', got '" +
+          v + "'");
+      }
     }
   }
   req.dim      = ResolveVectorColumn(context,
@@ -1927,7 +1944,8 @@ static unique_ptr<FunctionData> SiriusKMeansBuildListsBind(ClientContext& contex
                   LogicalType::BIGINT,
                   LogicalType::BIGINT,
                   LogicalType::VARCHAR};
-  names        = {"n_rows", "n_clusters", "min_list", "max_list", "empty_lists", "tier"};
+  return_types.push_back(LogicalType::VARCHAR);
+  names = {"n_rows", "n_clusters", "min_list", "max_list", "empty_lists", "tier", "encoding"};
   return std::move(result);
 }
 
@@ -1945,7 +1963,7 @@ static void SiriusKMeansBuildListsFunction(ClientContext& context,
     throw InvalidInputException(
       "sirius_kmeans_build_lists requires the Sirius context to be initialized");
   }
-  auto const built = sirius::vss::run_kmeans_build_lists(*sirius_ctx, data.req);
+  auto const built = sirius::vss::run_kmeans_build_lists(*sirius_ctx, data.req, data.storage);
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BIGINT(built.n_rows));
   output.SetValue(1, 0, Value::BIGINT(built.n_clusters));
@@ -1953,6 +1971,7 @@ static void SiriusKMeansBuildListsFunction(ClientContext& context,
   output.SetValue(3, 0, Value::BIGINT(built.max_list));
   output.SetValue(4, 0, Value::BIGINT(built.empty_lists));
   output.SetValue(5, 0, Value(built.tier));
+  output.SetValue(6, 0, Value(built.encoding));
   data.finished = true;
 }
 
@@ -2757,6 +2776,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     SiriusKMeansBuildListsFunction,
     SiriusKMeansBuildListsBind);
   kmeans_build_lists.named_parameters["schema_name"] = LogicalType::VARCHAR;
+  kmeans_build_lists.named_parameters["storage"]     = LogicalType::VARCHAR;
   CreateTableFunctionInfo kmeans_build_lists_info(kmeans_build_lists);
   catalog.CreateTableFunction(transaction, kmeans_build_lists_info);
 

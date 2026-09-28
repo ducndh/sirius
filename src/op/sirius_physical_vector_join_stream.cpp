@@ -536,9 +536,12 @@ class cluster_lists_chunk_source : public vector_chunk_source {
   {
     return static_cast<std::size_t>(_lists.num_chunks());
   }
+  /// A HOST-tier chunk is copied in and a UINT8 one is widened into a buffer: either way the
+  /// fold must size its budget for a staged FP32 chunk.
   [[nodiscard]] bool is_streaming() const override
   {
-    return _lists.tier == cucascade::memory::Tier::HOST;
+    return _lists.tier == cucascade::memory::Tier::HOST ||
+           _lists.encoding == vss::list_encoding::uint8;
   }
   [[nodiscard]] std::size_t chunk_rows(std::size_t i) const override
   {
@@ -546,22 +549,29 @@ class cluster_lists_chunk_source : public vector_chunk_source {
   }
   [[nodiscard]] std::size_t chunk_bytes(std::size_t i) const override
   {
-    return is_streaming() ? chunk_rows(i) * row_bytes() : 0;
+    if (!is_streaming()) { return 0; }
+    auto const staged_u8 =
+      _lists.tier == cucascade::memory::Tier::HOST && _lists.encoding == vss::list_encoding::uint8
+        ? chunk_rows(i) * _lists.row_bytes()
+        : 0;
+    return chunk_rows(i) * float_row_bytes() + staged_u8;
   }
 
   staged_vector_chunk stage(std::size_t i,
                             cucascade::memory::memory_space& space,
                             rmm::cuda_stream_view stream) override
   {
-    auto const rows  = static_cast<std::int64_t>(chunk_rows(i));
-    auto const first = static_cast<std::int64_t>(i) * _lists.chunk_rows;
+    auto const rows    = static_cast<std::int64_t>(chunk_rows(i));
+    auto const first   = static_cast<std::int64_t>(i) * _lists.chunk_rows;
+    bool const narrow  = _lists.encoding == vss::list_encoding::uint8;
+    bool const on_host = _lists.tier == cucascade::memory::Tier::HOST;
     if (!is_streaming()) {
       auto const* data =
         static_cast<const float*>(_lists.device_vectors->data()) + first * _lists.dim;
       return staged_vector_chunk{list_view(data, rows), nullptr, nullptr};
     }
 
-    auto const bytes = static_cast<std::size_t>(rows) * row_bytes();
+    auto const bytes = chunk_bytes(i);
     std::shared_ptr<cucascade::memory::reservation> reservation{
       space.make_reservation_or_null(bytes)};
     if (!reservation) {
@@ -569,23 +579,45 @@ class cluster_lists_chunk_source : public vector_chunk_source {
                                std::to_string(i) + " needs " + std::to_string(bytes) +
                                " bytes device-side, which exceeds this task's budget");
     }
-    auto buffer =
-      std::make_unique<rmm::device_buffer>(bytes, stream, reservation->get_memory_resource());
-    // A chunk starts on a block boundary, so it is whole blocks plus a short last one.
-    auto const block_rows = _lists.rows_per_block;
-    auto* out             = static_cast<std::byte*>(buffer->data());
-    for (std::int64_t r = 0; r < rows; r += block_rows) {
-      auto const n = std::min(block_rows, rows - r);
-      auto const block =
-        _lists.host_vectors->at(static_cast<std::size_t>((first + r) / block_rows));
-      CUDF_CUDA_TRY(cudaMemcpyAsync(out + static_cast<std::size_t>(r) * row_bytes(),
-                                    block.data(),
-                                    static_cast<std::size_t>(n) * row_bytes(),
-                                    cudaMemcpyHostToDevice,
-                                    stream.value()));
+    auto const mr = reservation->get_memory_resource();
+    auto buffer   = std::make_unique<rmm::device_buffer>(
+      static_cast<std::size_t>(rows) * float_row_bytes(), stream, mr);
+
+    // The chunk in its stored encoding, device-side: in place for the GPU tier, copied in block by
+    // block for the HOST tier -- a chunk starts on a block boundary, so it is whole blocks plus a
+    // short last one.
+    std::byte const* stored = nullptr;
+    std::optional<rmm::device_buffer> copied;
+    if (on_host) {
+      if (narrow) {
+        copied.emplace(static_cast<std::size_t>(rows) * _lists.row_bytes(), stream, mr);
+      }
+      auto* out             = static_cast<std::byte*>(narrow ? copied->data() : buffer->data());
+      auto const block_rows = _lists.rows_per_block;
+      for (std::int64_t r = 0; r < rows; r += block_rows) {
+        auto const n = std::min(block_rows, rows - r);
+        auto const block =
+          _lists.host_vectors->at(static_cast<std::size_t>((first + r) / block_rows));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(out + static_cast<std::size_t>(r) * _lists.row_bytes(),
+                                      block.data(),
+                                      static_cast<std::size_t>(n) * _lists.row_bytes(),
+                                      cudaMemcpyHostToDevice,
+                                      stream.value()));
+      }
+      if (narrow) { stored = static_cast<std::byte const*>(copied->data()); }
+    } else {
+      stored = static_cast<std::byte const*>(_lists.device_vectors->data()) +
+               static_cast<std::size_t>(first) * _lists.row_bytes();
+    }
+    if (narrow) {
+      vss::widen_uint8(reinterpret_cast<std::uint8_t const*>(stored),
+                       rows * _lists.dim,
+                       static_cast<float*>(buffer->data()),
+                       stream);
     }
     // Synchronous like the pin converter: the caller overlaps "host waits on this copy" with
-    // the compute it already issued, and the view must be complete before it is searched.
+    // the compute it already issued, and the view must be complete before it is searched. It is
+    // also what lets the byte staging buffer go at the end of this call.
     stream.synchronize();
     auto view = list_view(static_cast<const float*>(buffer->data()), rows);
     staged_vector_chunk staged{view, nullptr, std::move(reservation)};
@@ -594,7 +626,7 @@ class cluster_lists_chunk_source : public vector_chunk_source {
   }
 
  private:
-  [[nodiscard]] std::size_t row_bytes() const
+  [[nodiscard]] std::size_t float_row_bytes() const
   {
     return static_cast<std::size_t>(_lists.dim) * sizeof(float);
   }

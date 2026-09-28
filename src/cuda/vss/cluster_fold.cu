@@ -121,6 +121,42 @@ __global__ void scatter_row_ids_kernel(int64_t const* dest,
   }
 }
 
+__global__ void count_non_uint8_kernel(float const* v, int64_t n, unsigned long long* out)
+{
+  unsigned long long bad = 0;
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const x = v[i];
+    bad += !(x >= 0.f && x <= 255.f && x == rintf(x));
+  }
+  if (bad != 0) { atomicAdd(out, bad); }
+}
+
+__global__ void narrow_to_uint8_kernel(float const* in, int64_t n, uint8_t* out)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    out[i] = static_cast<uint8_t>(in[i]);
+  }
+}
+
+__global__ void widen_uint8_kernel(uint8_t const* in, int64_t n, float* out)
+{
+  // Four bytes in, four floats out per thread: the widening runs at device bandwidth.
+  auto const n4   = n / 4;
+  auto const* in4 = reinterpret_cast<uchar4 const*>(in);
+  auto* out4      = reinterpret_cast<float4*>(out);
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n4;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const b = in4[i];
+    out4[i]      = make_float4(b.x, b.y, b.z, b.w);
+  }
+  for (int64_t i = n4 * 4 + blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    out[i] = in[i];
+  }
+}
+
 __global__ void fill_list_offsets_kernel(int32_t* out, int64_t n, int64_t dim)
 {
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i <= n;
@@ -137,6 +173,37 @@ void scatter_row_ids(
   if (n == 0) { return; }
   auto const grid = std::min(grid_for(n), 65535);
   scatter_row_ids_kernel<<<grid, kBlock, 0, stream.value()>>>(dest, n, row_base, row_ids);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void count_non_uint8(float const* values,
+                     int64_t n,
+                     unsigned long long* out,
+                     rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  count_non_uint8_kernel<<<std::min(grid_for(n), 4096), kBlock, 0, stream.value()>>>(
+    values, n, out);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void narrow_to_uint8(float const* in, int64_t n, uint8_t* out, rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  narrow_to_uint8_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(in, n, out);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void widen_uint8(uint8_t const* in, int64_t n, float* out, rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  // uchar4/float4 access needs 4- and 16-byte alignment; the callers' buffers start at
+  // allocation boundaries and chunks start on whole rows of a dim that is a multiple of 4.
+  CUDF_EXPECTS(
+    reinterpret_cast<uintptr_t>(in) % 4 == 0 && reinterpret_cast<uintptr_t>(out) % 16 == 0,
+    "widen_uint8: misaligned buffers");
+  widen_uint8_kernel<<<std::min(grid_for(n / 4 + 1), 65535), kBlock, 0, stream.value()>>>(
+    in, n, out);
   CUDF_CHECK_CUDA(stream.value());
 }
 

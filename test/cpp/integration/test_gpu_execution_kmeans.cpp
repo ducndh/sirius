@@ -868,13 +868,19 @@ TEST_CASE_METHOD(KMeansFixture,
 // -----------------------------------------------------------------------------
 namespace {
 
-void create_lists_tables(KMeansFixture& fixture, const std::string& prefix, const std::string& tier)
+void create_lists_tables(KMeansFixture& fixture,
+                         const std::string& prefix,
+                         const std::string& tier,
+                         bool bytes = false)
 {
   // Hashed rather than modular so no two rows repeat: duplicate rows make every top-k a set of
-  // exact ties, and the comparison below would then only be testing tie-breaking.
-  auto const gen = [](const std::string& seed) {
-    return "list_transform(range(256), lambda d: ((hash(i * 1000 + d + " + seed +
-           ") % 1000)::FLOAT / 1000.0))::FLOAT[256]";
+  // exact ties, and the comparison below would then only be testing tie-breaking. With `bytes`
+  // every component is an integer in [0, 255], which is what lets the lists store UINT8.
+  auto const gen = [bytes](const std::string& seed) {
+    return bytes ? "list_transform(range(256), lambda d: (hash(i * 1000 + d + " + seed +
+                     ") % 256)::FLOAT)::FLOAT[256]"
+                 : "list_transform(range(256), lambda d: ((hash(i * 1000 + d + " + seed +
+                     ") % 1000)::FLOAT / 1000.0))::FLOAT[256]";
   };
   fixture.run_ok("CREATE TABLE " + prefix + "_corpus AS SELECT i::INTEGER AS id, " + gen("0") +
                  " AS vec FROM range(70000) t(i);");
@@ -893,18 +899,23 @@ TEST_CASE_METHOD(KMeansFixture,
                  "sirius_knn_join over cluster lists probing every cluster equals the exact join",
                  "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
 {
+  // FP32 lists on each tier, and byte-valued data, which the lists store as UINT8 on the device
+  // whatever tier the pin is on and widen back when a chunk is staged.
   auto const tier   = GENERATE(std::string("gpu"), std::string("host"));
-  auto const prefix = "kml_" + tier;
-  create_lists_tables(*this, prefix, tier);
+  auto const bytes  = GENERATE(false, true);
+  auto const prefix = std::string("kml_") + tier + (bytes ? "_u8" : "_f32");
+  create_lists_tables(*this, prefix, tier, bytes);
 
   run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
          "_c', n_clusters => 16);");
-  auto built = query_ok(*con,
-                        "SELECT n_rows, n_clusters, tier FROM sirius_kmeans_build_lists('" +
-                          prefix + "_corpus','vec','" + prefix + "_c');");
+  auto built =
+    query_ok(*con,
+             "SELECT n_rows, n_clusters, tier, encoding FROM sirius_kmeans_build_lists('" + prefix +
+               "_corpus','vec','" + prefix + "_c');");
   CHECK(built->GetValue(0, 0).GetValue<std::int64_t>() == 70000);
   CHECK(built->GetValue(1, 0).GetValue<std::int64_t>() == 16);
-  CHECK(built->GetValue(2, 0).ToString() == tier);
+  CHECK(built->GetValue(2, 0).ToString() == (bytes ? std::string("gpu") : tier));
+  CHECK(built->GetValue(3, 0).ToString() == (bytes ? "uint8" : "float32"));
 
   auto const join = [&](const std::string& extra) {
     return "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
@@ -959,4 +970,21 @@ TEST_CASE_METHOD(KMeansFixture,
   // Lists built under the old centroids would route rows to clusters the new ones do not have.
   run_ok("SELECT * FROM sirius_kmeans_fit('kmx_corpus','vec', name => 'kmx_c', n_clusters => 8);");
   expect_error(*con, join, "sirius_kmeans_build_lists");
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "cluster lists store UINT8 only where it is lossless",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  create_lists_tables(*this, "kmu", "gpu");
+  run_ok("SELECT * FROM sirius_kmeans_fit('kmu_corpus','vec', name => 'kmu_c', n_clusters => 8);");
+  // Values in [0, 1) are not bytes: asking for UINT8 is refused rather than rounded...
+  expect_error(*con,
+               "SELECT * FROM sirius_kmeans_build_lists('kmu_corpus','vec','kmu_c', "
+               "storage => 'uint8');",
+               "integer in [0, 255]");
+  // ...and left to choose, the build keeps FP32.
+  auto built =
+    query_ok(*con, "SELECT encoding FROM sirius_kmeans_build_lists('kmu_corpus','vec','kmu_c');");
+  CHECK(built->GetValue(0, 0).ToString() == "float32");
 }
