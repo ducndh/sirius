@@ -26,6 +26,8 @@
 
 #include <raft/core/device_resources.hpp>
 
+#include <rmm/device_buffer.hpp>
+
 #include <cucascade/data/data_batch.hpp>
 #include <cuvs/distance/distance.hpp>
 
@@ -52,6 +54,10 @@ class reservation;
 }  // namespace memory
 }  // namespace cucascade
 
+namespace sirius::vss {
+struct cluster_lists;
+}  // namespace sirius::vss
+
 namespace sirius::op {
 
 /**
@@ -71,6 +77,9 @@ struct staged_vector_chunk {
   /// that was already device-resident. The shared lock is what stops the downgrade executor
   /// spilling that batch out from under the fold; dropping it ends the borrow.
   std::optional<::cucascade::read_only_data_batch> reader;
+  /// A staged copy this chunk made itself rather than through a data batch. Allocated from
+  /// @c reservation, so it is declared after it and freed first.
+  std::unique_ptr<rmm::device_buffer> buffer;
 };
 
 /**
@@ -116,6 +125,11 @@ std::unique_ptr<vector_chunk_source> make_host_pinned_chunk_source(
   const std::string& column,
   std::int64_t dim,
   const telemetry::batch_telemetry_info& telemetry_info);
+
+/// Cluster lists: chunks are fixed-size spans of the cluster-ordered copy, viewed in place on the
+/// GPU tier and copied block by block from pinned host memory on the HOST tier.
+std::unique_ptr<vector_chunk_source> make_cluster_lists_chunk_source(
+  const sirius::vss::cluster_lists& lists);
 
 /// Build phase: chunks are the batches a child scan deposited in the join's build port, taken
 /// in the buffer's snapshot order. A batch the downgrade executor has spilled is brought back
@@ -283,6 +297,9 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// that entry is dropped. Null for an exhaustive join, which is what selects the fold's
   /// visit-everything path.
   const cudf::column* _centroids{nullptr};
+  /// The corpus in cluster order, when the clustering was built into lists rather than carried
+  /// as a column of the table. Owned by the index cache, like the centroids.
+  const sirius::vss::cluster_lists* _lists{nullptr};
   /// Session state the clustered path reports its prune statistics to. Outlives the query.
   duckdb::SiriusContext* _sirius_ctx{nullptr};
   /// One contiguous run of a single cluster inside one corpus chunk. Rows are local to the

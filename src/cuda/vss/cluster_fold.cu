@@ -15,6 +15,7 @@
  */
 
 #include "vss/cluster_fold.hpp"
+#include "vss/cluster_lists.hpp"
 
 #include <cudf/utilities/error.hpp>
 
@@ -57,7 +58,8 @@ __global__ void fold_topk_rows_kernel(float* acc_d,
                                       int64_t k_eff,
                                       int64_t const* rows,
                                       int64_t m,
-                                      int64_t id_base)
+                                      int64_t id_base,
+                                      int64_t const* id_map)
 {
   auto const i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
   if (i >= m) { return; }
@@ -84,7 +86,7 @@ __global__ void fold_topk_rows_kernel(float* acc_d,
     if (ia == 0 || (ib > 0 && pd[ib - 1] >= ad[ia - 1])) {
       --ib;
       ad[p] = pd[ib];
-      an[p] = pn[ib] + id_base;
+      an[p] = id_map != nullptr ? id_map[pn[ib]] : pn[ib] + id_base;
     } else {
       --ia;
       ad[p] = ad[ia];
@@ -98,16 +100,52 @@ __global__ void remap_radius_edges_kernel(int64_t const* query_rows,
                                           int32_t* left,
                                           int64_t* neighbors,
                                           int64_t n_edges,
-                                          int64_t id_base)
+                                          int64_t id_base,
+                                          int64_t const* id_map)
 {
   for (int64_t e = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; e < n_edges;
        e += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    left[e] = static_cast<int32_t>(rows[query_rows[e]]);
-    neighbors[e] += id_base;
+    left[e]      = static_cast<int32_t>(rows[query_rows[e]]);
+    neighbors[e] = id_map != nullptr ? id_map[neighbors[e]] : neighbors[e] + id_base;
+  }
+}
+
+__global__ void scatter_row_ids_kernel(int64_t const* dest,
+                                       int64_t n,
+                                       int64_t row_base,
+                                       int64_t* row_ids)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    row_ids[dest[i]] = row_base + i;
+  }
+}
+
+__global__ void fill_list_offsets_kernel(int32_t* out, int64_t n, int64_t dim)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i <= n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    out[i] = static_cast<int32_t>(i * dim);
   }
 }
 
 }  // namespace
+
+void scatter_row_ids(
+  int64_t const* dest, int64_t n, int64_t row_base, int64_t* row_ids, rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  auto const grid = std::min(grid_for(n), 65535);
+  scatter_row_ids_kernel<<<grid, kBlock, 0, stream.value()>>>(dest, n, row_base, row_ids);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void fill_list_offsets(int32_t* out, int64_t n, int64_t dim, rmm::cuda_stream_view stream)
+{
+  auto const grid = std::min(grid_for(n + 1), 65535);
+  fill_list_offsets_kernel<<<grid, kBlock, 0, stream.value()>>>(out, n, dim);
+  CUDF_CHECK_CUDA(stream.value());
+}
 
 void gather_rows(float const* src,
                  int64_t dim,
@@ -132,7 +170,8 @@ void fold_topk_rows(float* acc_distances,
                     int64_t const* rows,
                     int64_t m,
                     int64_t id_base,
-                    rmm::cuda_stream_view stream)
+                    rmm::cuda_stream_view stream,
+                    int64_t const* id_map)
 {
   if (m == 0 || k_eff == 0) { return; }
   CUDF_EXPECTS(k_eff <= part_width && k_eff <= k, "fold_topk_rows: k_eff exceeds its row");
@@ -145,7 +184,8 @@ void fold_topk_rows(float* acc_distances,
                                                                     k_eff,
                                                                     rows,
                                                                     m,
-                                                                    id_base);
+                                                                    id_base,
+                                                                    id_map);
   CUDF_CHECK_CUDA(stream.value());
 }
 
@@ -155,12 +195,13 @@ void remap_radius_edges(int64_t const* query_rows,
                         int64_t* neighbors,
                         int64_t n_edges,
                         int64_t id_base,
-                        rmm::cuda_stream_view stream)
+                        rmm::cuda_stream_view stream,
+                        int64_t const* id_map)
 {
   if (n_edges == 0) { return; }
   auto const grid = std::min(grid_for(n_edges), 65535);
   remap_radius_edges_kernel<<<grid, kBlock, 0, stream.value()>>>(
-    query_rows, rows, left, neighbors, n_edges, id_base);
+    query_rows, rows, left, neighbors, n_edges, id_base, id_map);
   CUDF_CHECK_CUDA(stream.value());
 }
 

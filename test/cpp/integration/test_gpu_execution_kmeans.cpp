@@ -670,22 +670,28 @@ TEST_CASE_METHOD(KMeansFixture,
   // centroids visits A and B and finds it. The groups carry spread in every axis because a
   // near-degenerate group let balanced k-means split A and C by parity instead of by position.
   run_ok("CREATE TABLE rt_raw (id INTEGER, vec FLOAT[3]);");
-  run_ok("INSERT INTO rt_raw SELECT i, [((i % 17) * 0.05)::float, ((i % 13) * 0.05)::float, "
-         "((i % 7) * 0.05)::float] FROM range(300) t(i);");
-  run_ok("INSERT INTO rt_raw SELECT 300 + i, [(10 + (i % 17) * 0.05)::float, "
-         "((i % 13) * 0.05)::float, ((i % 7) * 0.05)::float] FROM range(300) t(i);");
-  run_ok("INSERT INTO rt_raw SELECT 600 + i, [((i % 17) * 0.05)::float, (26 + (i % 9))::float, "
-         "((i % 7) * 0.05)::float] FROM range(300) t(i);");
+  run_ok(
+    "INSERT INTO rt_raw SELECT i, [((i % 17) * 0.05)::float, ((i % 13) * 0.05)::float, "
+    "((i % 7) * 0.05)::float] FROM range(300) t(i);");
+  run_ok(
+    "INSERT INTO rt_raw SELECT 300 + i, [(10 + (i % 17) * 0.05)::float, "
+    "((i % 13) * 0.05)::float, ((i % 7) * 0.05)::float] FROM range(300) t(i);");
+  run_ok(
+    "INSERT INTO rt_raw SELECT 600 + i, [((i % 17) * 0.05)::float, (26 + (i % 9))::float, "
+    "((i % 7) * 0.05)::float] FROM range(300) t(i);");
   run_ok("CREATE TABLE rt_probe (id INTEGER, vec FLOAT[3]);");
-  run_ok("INSERT INTO rt_probe SELECT i, [(i * 0.01)::float, 14::float, 0::float] "
-         "FROM range(10) t(i);");
+  run_ok(
+    "INSERT INTO rt_probe SELECT i, [(i * 0.01)::float, 14::float, 0::float] "
+    "FROM range(10) t(i);");
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'rt_raw', tier => 'gpu', format => 'duckdb');");
   run_ok("SELECT * FROM sirius_kmeans_fit('rt_raw','vec', name => 'rt_c', n_clusters => 3);");
-  run_ok("CREATE TABLE rt_asg AS SELECT * FROM sirius_kmeans_assign('rt_raw','vec','rt_c', "
-         "n_probes => 1);");
-  run_ok("CREATE TABLE rt_corpus AS SELECT r.id, r.vec, a.cluster_id FROM rt_raw r "
-         "JOIN rt_asg a ON r.rowid = a.row_id ORDER BY a.cluster_id;");
+  run_ok(
+    "CREATE TABLE rt_asg AS SELECT * FROM sirius_kmeans_assign('rt_raw','vec','rt_c', "
+    "n_probes => 1);");
+  run_ok(
+    "CREATE TABLE rt_corpus AS SELECT r.id, r.vec, a.cluster_id FROM rt_raw r "
+    "JOIN rt_asg a ON r.rowid = a.row_id ORDER BY a.cluster_id;");
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'rt_corpus', tier => 'gpu', format => 'duckdb');");
   run_ok("SELECT * FROM pin_table(name => 'rt_probe', tier => 'gpu', format => 'duckdb');");
@@ -775,17 +781,20 @@ TEST_CASE_METHOD(KMeansFixture,
   // A named function used to be refused by the plan generator, which re-ran the whole query on
   // the CPU where the join has no implementation. The CPU reference is DuckDB computing the
   // same functions over the join's stored output.
-  run_ok("CREATE TABLE mth_out AS SELECT left_id, right_id, distance FROM sirius_knn_join("
-         "'mth_probe','vec','mth_corpus','vec', search_mode => 'exact-gemm', metric => 'l2', "
-         "k => 3);");
-  auto const gpu = ok_rows(*con,
-                           "SELECT left_id, right_id, round(distance, 2), round(sqrt(distance), 3), "
-                           "abs(distance - 10.0), floor(distance), ceil(distance) "
-                           "FROM sirius_knn_join('mth_probe','vec','mth_corpus','vec', "
-                           "search_mode => 'exact-gemm', metric => 'l2', k => 3);");
-  auto const cpu = ok_rows(*con,
-                           "SELECT left_id, right_id, round(distance, 2), round(sqrt(distance), 3), "
-                           "abs(distance - 10.0), floor(distance), ceil(distance) FROM mth_out;");
+  run_ok(
+    "CREATE TABLE mth_out AS SELECT left_id, right_id, distance FROM sirius_knn_join("
+    "'mth_probe','vec','mth_corpus','vec', search_mode => 'exact-gemm', metric => 'l2', "
+    "k => 3);");
+  auto const gpu =
+    ok_rows(*con,
+            "SELECT left_id, right_id, round(distance, 2), round(sqrt(distance), 3), "
+            "abs(distance - 10.0), floor(distance), ceil(distance) "
+            "FROM sirius_knn_join('mth_probe','vec','mth_corpus','vec', "
+            "search_mode => 'exact-gemm', metric => 'l2', k => 3);");
+  auto const cpu =
+    ok_rows(*con,
+            "SELECT left_id, right_id, round(distance, 2), round(sqrt(distance), 3), "
+            "abs(distance - 10.0), floor(distance), ceil(distance) FROM mth_out;");
   REQUIRE(gpu.size() == cpu.size());
   // Values compare after rounding to 3 decimals: cuDF rounds half to even and DuckDB half away
   // from zero, and the two float paths differ in the last ulp.
@@ -812,30 +821,32 @@ TEST_CASE_METHOD(KMeansFixture,
   // The reference: the pinned join's full answer at a depth large enough that every probe's
   // three nearest even rows are inside it, written to a table (the GPU-under-sink splice) and
   // then filtered on the CPU with a window, which the GPU plan does not support.
-  run_ok("CREATE TABLE vw_full AS SELECT left_id, right_id, distance FROM sirius_knn_join("
-         "'vw_probe','vec','vw_corpus','vec', search_mode => 'exact-gemm', metric => 'l2', "
-         "k => 40, right_output_columns => ['id']);");
+  run_ok(
+    "CREATE TABLE vw_full AS SELECT left_id, right_id, distance FROM sirius_knn_join("
+    "'vw_probe','vec','vw_corpus','vec', search_mode => 'exact-gemm', metric => 'l2', "
+    "k => 40, right_output_columns => ['id']);");
   auto const reference = distance_multiset(*con,
                                            "SELECT left_id, distance FROM vw_full "
                                            "WHERE right_id % 2 = 0 "
                                            "QUALIFY row_number() OVER (PARTITION BY left_id "
                                            "ORDER BY distance) <= 3;");
-  auto const via_view = distance_multiset(*con,
+  auto const via_view  = distance_multiset(*con,
                                           "SELECT left_id, distance FROM sirius_knn_join("
-                                          "'vw_probe','vec','vw_even','vec', "
-                                          "search_mode => 'exact-gemm', metric => 'l2', k => 3, "
-                                          "right_output_columns => ['id'], "
-                                          "build_source => 'scan');");
+                                           "'vw_probe','vec','vw_even','vec', "
+                                           "search_mode => 'exact-gemm', metric => 'l2', k => 3, "
+                                           "right_output_columns => ['id'], "
+                                           "build_source => 'scan');");
   REQUIRE(via_view.size() == 200 * 3);
   REQUIRE(via_view == reference);
 
   // A view corpus on the approximate path, cluster column carried through the view.
-  auto const via_view_approx = distance_multiset(*con,
-                                                 "SELECT left_id, distance FROM sirius_knn_join("
-                                                 "'vw_probe','vec','vw_even','vec', "
-                                                 "search_mode => 'approx', metric => 'l2', k => 3, "
-                                                 "clustering => 'vw_c', cluster_column => 'cluster_id', "
-                                                 "n_probes => 8, build_source => 'scan');");
+  auto const via_view_approx =
+    distance_multiset(*con,
+                      "SELECT left_id, distance FROM sirius_knn_join("
+                      "'vw_probe','vec','vw_even','vec', "
+                      "search_mode => 'approx', metric => 'l2', k => 3, "
+                      "clustering => 'vw_c', cluster_column => 'cluster_id', "
+                      "n_probes => 8, build_source => 'scan');");
   REQUIRE(via_view_approx == via_view);
 
   // Without build_source => 'scan' a view is refused with a message that says what to pass.
@@ -843,4 +854,109 @@ TEST_CASE_METHOD(KMeansFixture,
                "SELECT * FROM sirius_knn_join('vw_probe','vec','vw_even','vec', "
                "search_mode => 'exact-gemm', metric => 'l2', k => 3);",
                "build_source => 'scan'");
+}
+
+// -----------------------------------------------------------------------------
+// Cluster lists: sirius_kmeans_build_lists writes the pinned corpus in cluster order, and the
+// join reads that copy when it is given a clustering without a cluster column.
+//
+// FLOAT[256] so that one host block holds only 1024 rows: 70,000 rows then span 69 blocks and
+// two staged chunks on the HOST tier, and most lists cross a block boundary -- the shapes the
+// copy-by-run scatter and the block-wise staging can get wrong. Probing every cluster must give
+// back exactly what the exhaustive join gives, which is what makes this an oracle rather than a
+// recall check: any row misplaced, duplicated or dropped by the lists changes some row's top-k.
+// -----------------------------------------------------------------------------
+namespace {
+
+void create_lists_tables(KMeansFixture& fixture, const std::string& prefix, const std::string& tier)
+{
+  // Hashed rather than modular so no two rows repeat: duplicate rows make every top-k a set of
+  // exact ties, and the comparison below would then only be testing tie-breaking.
+  auto const gen = [](const std::string& seed) {
+    return "list_transform(range(256), lambda d: ((hash(i * 1000 + d + " + seed +
+           ") % 1000)::FLOAT / 1000.0))::FLOAT[256]";
+  };
+  fixture.run_ok("CREATE TABLE " + prefix + "_corpus AS SELECT i::INTEGER AS id, " + gen("0") +
+                 " AS vec FROM range(70000) t(i);");
+  fixture.run_ok("CREATE TABLE " + prefix + "_probe AS SELECT i::INTEGER AS id, " +
+                 gen("100000000") + " AS vec FROM range(50) t(i);");
+  fixture.run_ok("CHECKPOINT;");
+  fixture.run_ok("SELECT * FROM pin_table(name => '" + prefix + "_corpus', tier => '" + tier +
+                 "', format => 'duckdb');");
+  fixture.run_ok("SELECT * FROM pin_table(name => '" + prefix +
+                 "_probe', tier => 'gpu', format => 'duckdb');");
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_knn_join over cluster lists probing every cluster equals the exact join",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  auto const tier   = GENERATE(std::string("gpu"), std::string("host"));
+  auto const prefix = "kml_" + tier;
+  create_lists_tables(*this, prefix, tier);
+
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => 16);");
+  auto built = query_ok(*con,
+                        "SELECT n_rows, n_clusters, tier FROM sirius_kmeans_build_lists('" +
+                          prefix + "_corpus','vec','" + prefix + "_c');");
+  CHECK(built->GetValue(0, 0).GetValue<std::int64_t>() == 70000);
+  CHECK(built->GetValue(1, 0).GetValue<std::int64_t>() == 16);
+  CHECK(built->GetValue(2, 0).ToString() == tier);
+
+  auto const join = [&](const std::string& extra) {
+    return "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
+           "_corpus','vec', metric => 'l2', k => 5, " + extra + ");";
+  };
+  auto const exact = distance_multiset(*con, join("search_mode => 'exact-gemm'"));
+  auto const lists = distance_multiset(
+    *con, join("search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 16"));
+  REQUIRE(exact.size() == 50 * 5);
+  REQUIRE(lists.size() == exact.size());
+  // Per probe row, the same k distances. Compared within 2e-3 rather than exactly: the two
+  // searches tile the GEMM differently, so their float sums round differently.
+  for (std::size_t i = 0; i < exact.size(); ++i) {
+    CHECK(lists[i].first == exact[i].first);
+    CHECK(std::llabs(lists[i].second - exact[i].second) <= 2);
+  }
+
+  // And the ids are pin rows: every neighbour is a corpus id at its reported distance.
+  auto const rows    = ok_rows(*con,
+                            "SELECT left_id, right_id FROM sirius_knn_join('" + prefix +
+                              "_probe','vec','" + prefix +
+                              "_corpus','vec', metric => 'l2', k => 5, search_mode => 'approx', "
+                                 "clustering => '" +
+                              prefix + "_c', n_probes => 16);");
+  auto const ex_rows = ok_rows(*con,
+                               "SELECT left_id, right_id FROM sirius_knn_join('" + prefix +
+                                 "_probe','vec','" + prefix +
+                                 "_corpus','vec', metric => 'l2', k => 5, "
+                                 "search_mode => 'exact-gemm');");
+  std::size_t same   = 0;
+  std::set<std::vector<std::string>> ex_set(ex_rows.begin(), ex_rows.end());
+  for (auto const& r : rows) {
+    same += ex_set.count(r);
+  }
+  // Equal distance multisets already rule out a misplaced row; ties can still swap which of two
+  // equidistant corpus rows is reported, so the pairs are only required to mostly agree.
+  CHECK(same * 10 >= rows.size() * 9);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "cluster lists do not outlive a re-fit of their clustering",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  create_lists_tables(*this, "kmx", "gpu");
+  run_ok("SELECT * FROM sirius_kmeans_fit('kmx_corpus','vec', name => 'kmx_c', n_clusters => 8);");
+  run_ok("SELECT * FROM sirius_kmeans_build_lists('kmx_corpus','vec','kmx_c');");
+  auto const join =
+    "SELECT left_id FROM sirius_knn_join('kmx_probe','vec','kmx_corpus','vec', metric => 'l2', "
+    "k => 5, search_mode => 'approx', clustering => 'kmx_c', n_probes => 2);";
+  CHECK(ok_rows(*con, join).size() == 50 * 5);
+
+  // Lists built under the old centroids would route rows to clusters the new ones do not have.
+  run_ok("SELECT * FROM sirius_kmeans_fit('kmx_corpus','vec', name => 'kmx_c', n_clusters => 8);");
+  expect_error(*con, join, "sirius_kmeans_build_lists");
 }

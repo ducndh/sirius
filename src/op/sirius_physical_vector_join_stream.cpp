@@ -26,6 +26,7 @@
 #include "vss/brute_force_search.hpp"
 #include "vss/brute_force_threshold.hpp"
 #include "vss/cluster_fold.hpp"
+#include "vss/cluster_lists.hpp"
 #include "vss/cudf_raft_interop.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/join_result_shaping.hpp"
@@ -325,6 +326,97 @@ class materialized_chunk_source : public vector_chunk_source {
   std::int64_t _dim{0};
 };
 
+/// Cluster lists: a chunk is a fixed span of layout rows. On the GPU tier it is a view into the
+/// lists themselves; on the HOST tier its pinned blocks are copied into one device buffer drawn
+/// from the task's budget, the same bargain the host pin makes.
+class cluster_lists_chunk_source : public vector_chunk_source {
+ public:
+  explicit cluster_lists_chunk_source(const vss::cluster_lists& lists) : _lists(lists) {}
+
+  [[nodiscard]] std::size_t num_chunks() const override
+  {
+    return static_cast<std::size_t>(_lists.num_chunks());
+  }
+  [[nodiscard]] bool is_streaming() const override
+  {
+    return _lists.tier == cucascade::memory::Tier::HOST;
+  }
+  [[nodiscard]] std::size_t chunk_rows(std::size_t i) const override
+  {
+    return static_cast<std::size_t>(_lists.rows_in_chunk(static_cast<std::int64_t>(i)));
+  }
+  [[nodiscard]] std::size_t chunk_bytes(std::size_t i) const override
+  {
+    return is_streaming() ? chunk_rows(i) * row_bytes() : 0;
+  }
+
+  staged_vector_chunk stage(std::size_t i,
+                            cucascade::memory::memory_space& space,
+                            rmm::cuda_stream_view stream) override
+  {
+    auto const rows  = static_cast<std::int64_t>(chunk_rows(i));
+    auto const first = static_cast<std::int64_t>(i) * _lists.chunk_rows;
+    if (!is_streaming()) {
+      auto const* data =
+        static_cast<const float*>(_lists.device_vectors->data()) + first * _lists.dim;
+      return staged_vector_chunk{list_view(data, rows), nullptr, nullptr};
+    }
+
+    auto const bytes = static_cast<std::size_t>(rows) * row_bytes();
+    std::shared_ptr<cucascade::memory::reservation> reservation{
+      space.make_reservation_or_null(bytes)};
+    if (!reservation) {
+      throw std::runtime_error("[sirius_physical_vector_join_stream] corpus chunk " +
+                               std::to_string(i) + " needs " + std::to_string(bytes) +
+                               " bytes device-side, which exceeds this task's budget");
+    }
+    auto buffer =
+      std::make_unique<rmm::device_buffer>(bytes, stream, reservation->get_memory_resource());
+    // A chunk starts on a block boundary, so it is whole blocks plus a short last one.
+    auto const block_rows = _lists.rows_per_block;
+    auto* out             = static_cast<std::byte*>(buffer->data());
+    for (std::int64_t r = 0; r < rows; r += block_rows) {
+      auto const n = std::min(block_rows, rows - r);
+      auto const block =
+        _lists.host_vectors->at(static_cast<std::size_t>((first + r) / block_rows));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(out + static_cast<std::size_t>(r) * row_bytes(),
+                                    block.data(),
+                                    static_cast<std::size_t>(n) * row_bytes(),
+                                    cudaMemcpyHostToDevice,
+                                    stream.value()));
+    }
+    // Synchronous like the pin converter: the caller overlaps "host waits on this copy" with
+    // the compute it already issued, and the view must be complete before it is searched.
+    stream.synchronize();
+    auto view = list_view(static_cast<const float*>(buffer->data()), rows);
+    staged_vector_chunk staged{view, nullptr, std::move(reservation)};
+    staged.buffer = std::move(buffer);
+    return staged;
+  }
+
+ private:
+  [[nodiscard]] std::size_t row_bytes() const
+  {
+    return static_cast<std::size_t>(_lists.dim) * sizeof(float);
+  }
+
+  [[nodiscard]] cudf::column_view list_view(const float* data, std::int64_t rows) const
+  {
+    auto const n = static_cast<cudf::size_type>(rows);
+    cudf::column_view const offsets{
+      cudf::data_type{cudf::type_id::INT32}, n + 1, _lists.list_offsets->data(), nullptr, 0};
+    cudf::column_view const child{cudf::data_type{cudf::type_id::FLOAT32},
+                                  static_cast<cudf::size_type>(rows * _lists.dim),
+                                  data,
+                                  nullptr,
+                                  0};
+    return cudf::column_view{
+      cudf::data_type{cudf::type_id::LIST}, n, nullptr, nullptr, 0, 0, {offsets, child}};
+  }
+
+  const vss::cluster_lists& _lists;
+};
+
 }  // namespace
 
 std::unique_ptr<vector_chunk_source> make_materialized_chunk_source(
@@ -342,6 +434,12 @@ std::unique_ptr<vector_chunk_source> make_gpu_pinned_chunk_source(
   cucascade::memory::memory_space& space)
 {
   return std::make_unique<gpu_pinned_chunk_source>(pin, column, space);
+}
+
+std::unique_ptr<vector_chunk_source> make_cluster_lists_chunk_source(
+  const vss::cluster_lists& lists)
+{
+  return std::make_unique<cluster_lists_chunk_source>(lists);
 }
 
 std::unique_ptr<vector_chunk_source> make_host_pinned_chunk_source(
@@ -475,6 +573,22 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
     for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
       _max_chunk_bytes = std::max(_max_chunk_bytes, _corpus->chunk_bytes(i));
     }
+  } else if (_centroids != nullptr && _request.build_cluster_column.empty()) {
+    // Lists mode: the corpus is the cluster-ordered copy, and the pin stays behind only as the
+    // row space that copy's neighbour ids are reported in.
+    _lists =
+      _sirius_ctx != nullptr ? vss::find_cluster_lists(*_sirius_ctx, _request.clustering) : nullptr;
+    if (_lists == nullptr || _lists->pin != right_pin || _lists->column != right.column ||
+        _lists->n_rows != static_cast<std::int64_t>(right_pin->num_rows)) {
+      throw std::runtime_error("[sirius_physical_vector_join_stream] clustering '" +
+                               _request.clustering + "' has no lists over the current pin of '" +
+                               right.table + "." + right.column +
+                               "'; run sirius_kmeans_build_lists after pinning");
+    }
+    _corpus = make_cluster_lists_chunk_source(*_lists);
+    for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
+      _max_chunk_bytes = std::max(_max_chunk_bytes, _corpus->chunk_bytes(i));
+    }
   } else if (right_pin->tier == cucascade::memory::Tier::HOST) {
     _corpus =
       make_host_pinned_chunk_source(*right_pin, right.column, _request.dim, batch_telemetry());
@@ -560,6 +674,41 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
   std::lock_guard<std::mutex> const lock(_op_mutex);
   if (_cluster_index_built) { return; }
 
+  _n_clusters = static_cast<std::int64_t>(
+    vss::list_column_as_dataset_view(_centroids->view(), _request.dim).extent(0));
+
+  // Lists carry their order on the host already: list c is one range of layout rows, and a
+  // chunk is a fixed range of them, so the runs are the overlaps of the two.
+  if (_lists != nullptr) {
+    if (_lists->n_clusters != _n_clusters) {
+      throw std::runtime_error("[sirius_physical_vector_join_stream] lists hold " +
+                               std::to_string(_lists->n_clusters) + " clusters but clustering '" +
+                               _request.clustering + "' has " + std::to_string(_n_clusters));
+    }
+    auto const n_chunks = static_cast<std::size_t>(_lists->num_chunks());
+    _cluster_rows.assign(static_cast<std::size_t>(_n_clusters), 0);
+    _chunk_cluster_runs.assign(n_chunks, {});
+    _chunk_row_base.assign(n_chunks, 0);
+    for (std::size_t j = 0; j < n_chunks; ++j) {
+      _chunk_row_base[j] = static_cast<std::int64_t>(j) * _lists->chunk_rows;
+    }
+    for (std::int64_t c = 0; c < _n_clusters; ++c) {
+      auto const lo                              = _lists->offsets[static_cast<std::size_t>(c)];
+      auto const hi                              = _lists->offsets[static_cast<std::size_t>(c) + 1];
+      _cluster_rows[static_cast<std::size_t>(c)] = hi - lo;
+      for (auto r = lo; r < hi;) {
+        auto const j    = r / _lists->chunk_rows;
+        auto const base = _chunk_row_base[static_cast<std::size_t>(j)];
+        auto const end  = std::min(hi, base + _lists->chunk_rows);
+        _chunk_cluster_runs[static_cast<std::size_t>(j)].push_back(
+          chunk_cluster_run{static_cast<std::int32_t>(c), r - base, end - base});
+        r = end;
+      }
+    }
+    _cluster_index_built = true;
+    return;
+  }
+
   // The labels come from wherever the vectors come from, and chunk for chunk: a label's meaning
   // is its position in the corpus row order, so reading them from a second source -- a pin
   // behind a build-phase scan, say -- would be reading a different row order.
@@ -594,9 +743,6 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
       "' has " + std::to_string(n_chunks) + " chunks but the vector column has " +
       std::to_string(_corpus->num_chunks()) + "; both must come from the same corpus");
   }
-
-  _n_clusters = static_cast<std::int64_t>(
-    vss::list_column_as_dataset_view(_centroids->view(), _request.dim).extent(0));
 
   _cluster_rows.assign(static_cast<std::size_t>(_n_clusters), 0);
   _chunk_cluster_runs.clear();
@@ -933,6 +1079,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         auto mut = chunk.owner->to_mutable();
         mut.rebind_stream(stream);
       }
+      if (chunk.buffer) { chunk.buffer->set_stream(stream); }
       if (chunk.reader) { borrowed.push_back(std::move(*chunk.reader)); }
       chunk = staged_vector_chunk{};
     };
@@ -984,6 +1131,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         // space is the base that makes them corpus row ids, exactly as the chunk offset does
         // in the exhaustive fold.
         auto const id_base = chunk_base + slice.begin;
+        // Lists are in cluster order, not pin order; their row map turns a layout row back into
+        // the pin row every later stage reads the corpus by.
+        auto const* id_map = _lists != nullptr
+                               ? static_cast<const std::int64_t*>(_lists->row_ids->data()) + id_base
+                               : nullptr;
 
         if (radius_join) {
           // Same construction as the exhaustive radius path: a slice's in-range pairs are
@@ -1003,7 +1155,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                     edges.neighbors->mutable_view().data<std::int64_t>(),
                                     edges.n_edges,
                                     id_base,
-                                    stream);
+                                    stream,
+                                    id_map);
             radius_left.push_back(std::move(left));
             radius_neighbors.push_back(std::move(edges.neighbors));
             radius_distances.push_back(std::move(edges.distances));
@@ -1026,7 +1179,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                             rows_c,
                             m,
                             id_base,
-                            stream);
+                            stream,
+                            id_map);
       }
 
       // The searches above are issued, not finished. Staging the next needed chunk now runs its
@@ -1101,6 +1255,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         auto mut = chunk.owner->to_mutable();
         mut.rebind_stream(stream);
       }
+      if (chunk.buffer) { chunk.buffer->set_stream(stream); }
       if (chunk.reader) { borrowed.push_back(std::move(*chunk.reader)); }
       chunk = staged_vector_chunk{};
     };

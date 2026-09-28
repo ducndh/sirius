@@ -66,11 +66,11 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 // #include "from_substrait.hpp"
 #ifdef SIRIUS_ENABLE_LEGACY
@@ -94,6 +94,7 @@ extern "C" int cudaProfilerStop();
 #include "sirius_interface.hpp"
 #include "sirius_sql_rewrite.hpp"
 #include "util/segfault_backtrace.hpp"
+#include "vss/cluster_lists.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/ivf_flat_index.hpp"
@@ -1826,8 +1827,9 @@ static unique_ptr<FunctionData> SiriusKMeansFitBind(ClientContext& context,
     }
   }
   if (req.name.empty()) {
-    throw BinderException("sirius_kmeans_fit requires a 'name' named parameter to store the "
-                          "clustering under");
+    throw BinderException(
+      "sirius_kmeans_fit requires a 'name' named parameter to store the "
+      "clustering under");
   }
   if (req.spec.n_clusters < 0) {
     throw BinderException("sirius_kmeans_fit: n_clusters must be >= 0 (0 = auto)");
@@ -1841,15 +1843,18 @@ static unique_ptr<FunctionData> SiriusKMeansFitBind(ClientContext& context,
                           req.metric + "'");
   }
 
-  req.dim = ResolveVectorColumn(
-    context, "sirius_kmeans_fit", table_arg, schema_name, req.column, req.catalog, req.schema,
-    req.table);
+  req.dim = ResolveVectorColumn(context,
+                                "sirius_kmeans_fit",
+                                table_arg,
+                                schema_name,
+                                req.column,
+                                req.catalog,
+                                req.schema,
+                                req.table);
 
-  return_types = {LogicalType::BIGINT,
-                  LogicalType::BIGINT,
-                  LogicalType::BIGINT,
-                  LogicalType::BIGINT};
-  names        = {"n_clusters", "dim", "train_rows", "n_rows"};
+  return_types = {
+    LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT};
+  names = {"n_clusters", "dim", "train_rows", "n_rows"};
   return std::move(result);
 }
 
@@ -1877,6 +1882,76 @@ static void SiriusKMeansFitFunction(ClientContext& context,
   data.finished = true;
 }
 
+struct KMeansBuildListsData : public TableFunctionData {
+  sirius::vss::kmeans_assign_request req;
+  bool finished = false;
+};
+
+static unique_ptr<FunctionData> SiriusKMeansBuildListsBind(ClientContext& context,
+                                                           TableFunctionBindInput& input,
+                                                           vector<LogicalType>& return_types,
+                                                           vector<string>& names)
+{
+  auto result = make_uniq<KMeansBuildListsData>();
+  auto& req   = result->req;
+  if (input.inputs.size() < 3 || input.inputs[0].IsNull() || input.inputs[1].IsNull() ||
+      input.inputs[2].IsNull()) {
+    throw BinderException(
+      "sirius_kmeans_build_lists requires three non-NULL positional "
+      "arguments: table, column and clustering");
+  }
+  auto const table_arg    = input.inputs[0].ToString();
+  req.column              = input.inputs[1].ToString();
+  req.clustering          = input.inputs[2].ToString();
+  std::string schema_name = "main";
+  for (auto& kv : input.named_parameters) {
+    if (StringUtil::Lower(kv.first) == "schema_name" && !kv.second.IsNull()) {
+      schema_name = kv.second.ToString();
+    }
+  }
+  req.dim      = ResolveVectorColumn(context,
+                                "sirius_kmeans_build_lists",
+                                table_arg,
+                                schema_name,
+                                req.column,
+                                req.catalog,
+                                req.schema,
+                                req.table);
+  return_types = {LogicalType::BIGINT,
+                  LogicalType::BIGINT,
+                  LogicalType::BIGINT,
+                  LogicalType::BIGINT,
+                  LogicalType::BIGINT,
+                  LogicalType::VARCHAR};
+  names        = {"n_rows", "n_clusters", "min_list", "max_list", "empty_lists", "tier"};
+  return std::move(result);
+}
+
+static void SiriusKMeansBuildListsFunction(ClientContext& context,
+                                           TableFunctionInput& data_p,
+                                           DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<KMeansBuildListsData>();
+  if (data.finished) {
+    output.SetCardinality(0);
+    return;
+  }
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) {
+    throw InvalidInputException(
+      "sirius_kmeans_build_lists requires the Sirius context to be initialized");
+  }
+  auto const built = sirius::vss::run_kmeans_build_lists(*sirius_ctx, data.req);
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value::BIGINT(built.n_rows));
+  output.SetValue(1, 0, Value::BIGINT(built.n_clusters));
+  output.SetValue(2, 0, Value::BIGINT(built.min_list));
+  output.SetValue(3, 0, Value::BIGINT(built.max_list));
+  output.SetValue(4, 0, Value::BIGINT(built.empty_lists));
+  output.SetValue(5, 0, Value(built.tier));
+  data.finished = true;
+}
+
 struct KMeansAssignBindData : public TableFunctionData {
   sirius::vss::kmeans_assign_request req;
   duckdb::vector<sirius::logical_type> reader_types;
@@ -1897,8 +1972,9 @@ static unique_ptr<FunctionData> SiriusKMeansAssignBind(ClientContext& context,
 
   if (input.inputs.size() < 3 || input.inputs[0].IsNull() || input.inputs[1].IsNull() ||
       input.inputs[2].IsNull()) {
-    throw BinderException("sirius_kmeans_assign requires three non-NULL positional arguments: "
-                          "table, column and clustering");
+    throw BinderException(
+      "sirius_kmeans_assign requires three non-NULL positional arguments: "
+      "table, column and clustering");
   }
   auto const table_arg = input.inputs[0].ToString();
   req.column           = input.inputs[1].ToString();
@@ -1921,7 +1997,9 @@ static unique_ptr<FunctionData> SiriusKMeansAssignBind(ClientContext& context,
       schema_name = kv.second.ToString();
     }
   }
-  if (req.spec.n_probes < 1) { throw BinderException("sirius_kmeans_assign: n_probes must be >= 1"); }
+  if (req.spec.n_probes < 1) {
+    throw BinderException("sirius_kmeans_assign: n_probes must be >= 1");
+  }
   if (req.spec.radius_factor < 0.0) {
     throw BinderException("sirius_kmeans_assign: radius_factor must be >= 0 (0 = fixed n_probes)");
   }
@@ -1995,8 +2073,8 @@ static unique_ptr<FunctionData> SiriusKMeansCentroidsBind(ClientContext& context
   return std::move(result);
 }
 
-static unique_ptr<GlobalTableFunctionState> SiriusKMeansCentroidsInit(
-  ClientContext& context, TableFunctionInitInput& input)
+static unique_ptr<GlobalTableFunctionState> SiriusKMeansCentroidsInit(ClientContext& context,
+                                                                      TableFunctionInitInput& input)
 {
   auto& bind_data = input.bind_data->Cast<KMeansCentroidsBindData>();
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
@@ -2038,7 +2116,7 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   auto& req   = result->req;
   // The relational form's probe is the child relation, so it always runs the scan path on that
   // side; the caller has no say and there is no `probe_source` to set.
-  req.probe_from_scan   = relational;
+  req.probe_from_scan       = relational;
   result->probe_is_relation = relational;
 
   // Required positional params. The relational form's first argument is the subquery, which
@@ -2172,17 +2250,25 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
       throw BinderException(
         "sirius_knn_join: clustering only applies under search_mode => 'approx'");
     }
+    // Without a cluster column the corpus order comes from lists built for this clustering,
+    // which exist only over a pin -- never over a scanned build side.
     if (req.build_cluster_column.empty()) {
-      throw BinderException(
-        "sirius_knn_join: clustering requires cluster_column => '<col>', the corpus column "
-        "holding each row's cluster id");
+      auto ctx_for_lists = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      const auto* lists =
+        ctx_for_lists ? sirius::vss::find_cluster_lists(*ctx_for_lists, req.clustering) : nullptr;
+      if (lists == nullptr || req.build_from_scan) {
+        throw BinderException(
+          "sirius_knn_join: clustering requires cluster_column => '<col>', the corpus column "
+          "holding each row's cluster id, or lists built over the pinned corpus with "
+          "sirius_kmeans_build_lists");
+      }
     }
     // Checked here rather than left to the planner: a throw during planning is caught as a
     // "this query cannot run on the GPU" signal and turns into a CPU fallback, which then fails
     // with an unrelated message. At bind it is a plain, accurate error.
     auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-    if (sirius_ctx && sirius::vss::find_clustering_centroids(*sirius_ctx, req.clustering) ==
-                        nullptr) {
+    if (sirius_ctx &&
+        sirius::vss::find_clustering_centroids(*sirius_ctx, req.clustering) == nullptr) {
       throw BinderException("sirius_knn_join: no clustering named '" + req.clustering +
                             "'; run sirius_kmeans_fit first");
     }
@@ -2221,26 +2307,26 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
     throw InvalidInputException("sirius_knn_join requires the Sirius context to be initialized");
   }
 
-  auto const left_dim =
-    relational ? sirius::vss::resolve_relational_probe_side(input.input_table_types,
-                                                            input.input_table_names,
-                                                            left_column,
-                                                            left_out_cols,
-                                                            req.left,
-                                                            return_types,
-                                                            names)
-               : resolve_vector_join_side(context,
-                                          *sirius_ctx,
-                                          "left",
-                                          left_table,
-                                          left_column,
-                                          left_schema,
-                                          left_out_cols,
-                                          /*require_pin=*/!req.probe_from_scan,
-                                          req.left,
-                                          return_types,
-                                          names,
-                                          result->left_rows);
+  auto const left_dim  = relational
+                           ? sirius::vss::resolve_relational_probe_side(input.input_table_types,
+                                                                       input.input_table_names,
+                                                                       left_column,
+                                                                       left_out_cols,
+                                                                       req.left,
+                                                                       return_types,
+                                                                       names)
+                           : resolve_vector_join_side(context,
+                                                     *sirius_ctx,
+                                                     "left",
+                                                     left_table,
+                                                     left_column,
+                                                     left_schema,
+                                                     left_out_cols,
+                                                     /*require_pin=*/!req.probe_from_scan,
+                                                     req.left,
+                                                     return_types,
+                                                     names,
+                                                     result->left_rows);
   auto const right_dim = resolve_vector_join_side(context,
                                                   *sirius_ctx,
                                                   "right",
@@ -2311,7 +2397,6 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
     }
   }
 
-
   return_types.push_back(LogicalType::FLOAT);
   names.push_back(req.output_type == vector_join_output_type::similarity ? "similarity"
                                                                          : "distance");
@@ -2329,8 +2414,8 @@ static unique_ptr<NodeStatistics> SiriusVectorJoinCardinality(ClientContext&,
   // subquery instead of an unfiltered table. create_plan_knn_join applies the k itself, where
   // the child's estimate is in hand.
   if (typed->probe_is_relation) { return nullptr; }
-  auto const rows = sirius::vss::estimate_vector_join_cardinality(
-    typed->req, typed->left_rows, typed->right_rows);
+  auto const rows =
+    sirius::vss::estimate_vector_join_cardinality(typed->req, typed->left_rows, typed->right_rows);
   // Sound as a maximum in every mode: threshold only ever drops pairs from the
   // same per-row top-k candidate set the other modes emit in full.
   return make_uniq<NodeStatistics>(rows, rows);
@@ -2557,14 +2642,23 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo kmeans_fit_info(kmeans_fit);
   catalog.CreateTableFunction(transaction, kmeans_fit_info);
 
+  // sirius_kmeans_build_lists(table, column, clustering, schema_name =>)
+  TableFunction kmeans_build_lists(
+    "sirius_kmeans_build_lists",
+    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+    SiriusKMeansBuildListsFunction,
+    SiriusKMeansBuildListsBind);
+  kmeans_build_lists.named_parameters["schema_name"] = LogicalType::VARCHAR;
+  CreateTableFunctionInfo kmeans_build_lists_info(kmeans_build_lists);
+  catalog.CreateTableFunction(transaction, kmeans_build_lists_info);
+
   // sirius_kmeans_assign(table, column, clustering, n_probes =>, radius_factor =>,
   //   max_probes =>, schema_name =>)
-  TableFunction kmeans_assign(
-    "sirius_kmeans_assign",
-    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-    SiriusKMeansAssignFunction,
-    SiriusKMeansAssignBind,
-    SiriusKMeansAssignInit);
+  TableFunction kmeans_assign("sirius_kmeans_assign",
+                              {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+                              SiriusKMeansAssignFunction,
+                              SiriusKMeansAssignBind,
+                              SiriusKMeansAssignInit);
   kmeans_assign.named_parameters["n_probes"]      = LogicalType::BIGINT;
   kmeans_assign.named_parameters["radius_factor"] = LogicalType::DOUBLE;
   kmeans_assign.named_parameters["max_probes"]    = LogicalType::BIGINT;
@@ -2609,7 +2703,7 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join.cardinality                              = SiriusVectorJoinCardinality;
   // Lets DuckDB narrow column_ids to what the query reads. create_plan_knn_join drops the rest
   // before the corpus's output columns are concatenated, which is where the cost is.
-  vector_join.projection_pushdown                      = true;
+  vector_join.projection_pushdown = true;
   CreateTableFunctionInfo vector_join_info(vector_join);
   catalog.CreateTableFunction(transaction, vector_join_info);
 
@@ -2624,10 +2718,10 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     {LogicalType::TABLE, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
     SiriusVectorJoinFunction,
     SiriusVectorJoinRelBind);
-  vector_join_rel.named_parameters = vector_join.named_parameters;
-  vector_join_rel.cardinality          = SiriusVectorJoinCardinality;
-  vector_join_rel.projection_pushdown  = true;
-  vector_join_rel.in_out_function  = SiriusVectorJoinInOutFunction;
+  vector_join_rel.named_parameters    = vector_join.named_parameters;
+  vector_join_rel.cardinality         = SiriusVectorJoinCardinality;
+  vector_join_rel.projection_pushdown = true;
+  vector_join_rel.in_out_function     = SiriusVectorJoinInOutFunction;
   CreateTableFunctionInfo vector_join_rel_info(vector_join_rel);
   catalog.CreateTableFunction(transaction, vector_join_rel_info);
 }

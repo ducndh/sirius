@@ -14,11 +14,10 @@
  * limitations under the License.
  */
 
-#include "vss/vector_clustering.hpp"
-
 #include "vss/brute_force_search.hpp"
 #include "vss/cudf_raft_interop.hpp"
 #include "vss/scoped_device_resource.hpp"
+#include "vss/vector_clustering.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -74,14 +73,10 @@ std::unique_ptr<cudf::column> sample_vector_rows(cudf::column_view const& vector
   auto const start  = static_cast<std::int32_t>(seed % static_cast<std::uint64_t>(stride));
   cudf::numeric_scalar<std::int32_t> const init(start, true, stream);
   cudf::numeric_scalar<std::int32_t> const step(static_cast<std::int32_t>(stride), true, stream);
-  auto const map =
-    cudf::sequence(static_cast<cudf::size_type>(take), init, step, stream, mr);
+  auto const map = cudf::sequence(static_cast<cudf::size_type>(take), init, step, stream, mr);
 
-  auto gathered = cudf::gather(cudf::table_view{{vectors}},
-                               map->view(),
-                               cudf::out_of_bounds_policy::DONT_CHECK,
-                               stream,
-                               mr);
+  auto gathered = cudf::gather(
+    cudf::table_view{{vectors}}, map->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
   return std::move(gathered->release()[0]);
 }
 
@@ -89,8 +84,7 @@ std::int64_t resolve_n_clusters(std::int64_t requested, std::int64_t n_rows)
 {
   if (n_rows <= 0) { return 0; }
   auto const resolved =
-    requested > 0 ? requested
-                  : static_cast<std::int64_t>(std::sqrt(static_cast<double>(n_rows)));
+    requested > 0 ? requested : static_cast<std::int64_t>(std::sqrt(static_cast<double>(n_rows)));
   return std::clamp<std::int64_t>(resolved, 1, n_rows);
 }
 
@@ -171,8 +165,8 @@ std::unique_ptr<cudf::column> train_centroids(std::vector<cudf::column_view> con
 
   cudf::numeric_scalar<std::int32_t> const zero(0, true, stream);
   cudf::numeric_scalar<std::int32_t> const width(static_cast<std::int32_t>(dim), true, stream);
-  auto offsets = cudf::sequence(
-    static_cast<cudf::size_type>(n_clusters + 1), zero, width, stream, mr);
+  auto offsets =
+    cudf::sequence(static_cast<cudf::size_type>(n_clusters + 1), zero, width, stream, mr);
 
   return cudf::make_lists_column(static_cast<cudf::size_type>(n_clusters),
                                  std::move(offsets),
@@ -233,8 +227,8 @@ cluster_assignment assign_to_centroids(raft::device_resources const& res,
                                                 mr);
 
   cudf::numeric_scalar<std::int64_t> const base(row_id_base, true, stream);
-  auto const row_ids_local = cudf::cast(
-    local_row->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
+  auto const row_ids_local =
+    cudf::cast(local_row->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
   auto row_ids = cudf::binary_operation(row_ids_local->view(),
                                         base,
                                         cudf::binary_operator::ADD,
@@ -255,7 +249,7 @@ cluster_assignment assign_to_centroids(raft::device_resources const& res,
                                                   cudf::data_type{cudf::type_id::INT32},
                                                   stream,
                                                   mr);
-  auto const nearest = cudf::gather(cudf::table_view{{distances->view()}},
+  auto const nearest     = cudf::gather(cudf::table_view{{distances->view()}},
                                     nearest_pos->view(),
                                     cudf::out_of_bounds_policy::DONT_CHECK,
                                     stream,
@@ -283,8 +277,33 @@ cluster_assignment assign_to_centroids(raft::device_resources const& res,
     stream,
     mr);
   auto columns = filtered->release();
-  return cluster_assignment{
-    std::move(columns[0]), std::move(columns[1]), std::move(columns[2])};
+  return cluster_assignment{std::move(columns[0]), std::move(columns[1]), std::move(columns[2])};
+}
+
+void nearest_centroid_labels(raft::device_resources const& res,
+                             cudf::column_view const& vectors,
+                             cudf::column_view const& centroids,
+                             std::int64_t dim,
+                             cuvs::distance::DistanceType metric,
+                             std::int32_t* labels,
+                             rmm::device_async_resource_ref mr)
+{
+  auto const queries = list_column_as_dataset_view(vectors, dim);
+  auto const centers = list_column_as_dataset_view(centroids, dim);
+  if (centers.extent(0) == 0) {
+    throw std::invalid_argument("nearest_centroid_labels: no centroids");
+  }
+  if (queries.extent(0) == 0) { return; }
+  // cuVS takes no allocator, so its scratch is routed by the ambient resource.
+  scoped_current_device_resource const route{mr};
+  cuvs::cluster::kmeans::balanced_params params;
+  params.metric = metric;
+  cuvs::cluster::kmeans::predict(
+    res,
+    params,
+    queries,
+    centers,
+    raft::make_device_vector_view<int, std::int64_t>(labels, queries.extent(0)));
 }
 
 }  // namespace sirius::vss

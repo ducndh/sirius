@@ -21,10 +21,10 @@
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 
+#include <raft/core/device_resources.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
-
-#include <raft/core/device_resources.hpp>
 
 #include <cuvs/distance/distance.hpp>
 
@@ -93,7 +93,7 @@ struct assignment_spec {
 struct cluster_assignment {
   std::unique_ptr<cudf::column> row_ids;      ///< INT64 row id in the source table's row space.
   std::unique_ptr<cudf::column> cluster_ids;  ///< INT32 centroid index, in centroid row order.
-  std::unique_ptr<cudf::column> distances;    ///< FLOAT32 distance from the vector to that centroid.
+  std::unique_ptr<cudf::column> distances;  ///< FLOAT32 distance from the vector to that centroid.
 };
 
 /// Requested count, or sqrt(n_rows) when @p requested is 0. Clamped to [1, n_rows].
@@ -117,12 +117,11 @@ struct cluster_assignment {
  * corpus chunk by chunk can shrink each chunk to its share of the training sample and drop the
  * staged chunk before taking the next.
  */
-[[nodiscard]] std::unique_ptr<cudf::column> sample_vector_rows(
-  cudf::column_view const& vectors,
-  std::int64_t take,
-  std::uint64_t seed,
-  rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr);
+[[nodiscard]] std::unique_ptr<cudf::column> sample_vector_rows(cudf::column_view const& vectors,
+                                                               std::int64_t take,
+                                                               std::uint64_t seed,
+                                                               rmm::cuda_stream_view stream,
+                                                               rmm::device_async_resource_ref mr);
 
 /**
  * @brief Train balanced k-means centroids over @p chunks.
@@ -178,5 +177,20 @@ struct cluster_assignment {
                                                      cuvs::distance::DistanceType metric,
                                                      rmm::cuda_stream_view stream,
                                                      rmm::device_async_resource_ref mr);
+
+/**
+ * @brief Each row's single nearest centroid, as INT32 labels written to @p labels.
+ *
+ * The one-probe case of @ref assign_to_centroids without its edge list: cuVS's k-means predict
+ * fuses the distance and the argmin into one pass, where a top-1 search materializes every
+ * row-centroid distance and then selects from it. Same enqueue-only contract.
+ */
+void nearest_centroid_labels(raft::device_resources const& res,
+                             cudf::column_view const& vectors,
+                             cudf::column_view const& centroids,
+                             std::int64_t dim,
+                             cuvs::distance::DistanceType metric,
+                             std::int32_t* labels,
+                             rmm::device_async_resource_ref mr);
 
 }  // namespace sirius::vss

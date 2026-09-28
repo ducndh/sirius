@@ -42,6 +42,8 @@ namespace sirius::vss {
 enum class index_kind : std::uint8_t {
   ivf_flat,
   kmeans_centroids,
+  /// The cluster-ordered copy of a corpus a clustering was built into (@ref cluster_lists).
+  cluster_lists,
   // ivf_pq,  // not supported yet
   // cagra,  // not supported yet
 };

@@ -44,7 +44,8 @@ void gather_rows(float const* src,
  * are its nearest-first answer, with ids local to the slice, and @p id_base shifts them into
  * the accumulator's id space. Accumulator rows are nearest-first and stay so. On equal
  * distances the accumulator's entry ranks first, which is the order a merge of
- * [accumulator, part] would give. @p rows must not repeat within a call.
+ * [accumulator, part] would give. @p rows must not repeat within a call. With @p id_map the
+ * part's local id j becomes id_map[j] instead of j + @p id_base.
  */
 void fold_topk_rows(float* acc_distances,
                     int64_t* acc_neighbors,
@@ -56,12 +57,14 @@ void fold_topk_rows(float* acc_distances,
                     int64_t const* rows,
                     int64_t m,
                     int64_t id_base,
-                    rmm::cuda_stream_view stream);
+                    rmm::cuda_stream_view stream,
+                    int64_t const* id_map = nullptr);
 
 /**
  * @brief Map a slice's radius edges back to probe rows and corpus rows, in place of a cast.
  *
- * left[e] = rows[query_rows[e]] narrowed to INT32; neighbors[e] += id_base.
+ * left[e] = rows[query_rows[e]] narrowed to INT32; neighbors[e] += id_base, or with @p id_map
+ * neighbors[e] = id_map[neighbors[e]].
  */
 void remap_radius_edges(int64_t const* query_rows,
                         int64_t const* rows,
@@ -69,6 +72,7 @@ void remap_radius_edges(int64_t const* query_rows,
                         int64_t* neighbors,
                         int64_t n_edges,
                         int64_t id_base,
-                        rmm::cuda_stream_view stream);
+                        rmm::cuda_stream_view stream,
+                        int64_t const* id_map = nullptr);
 
 }  // namespace sirius::vss
