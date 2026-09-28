@@ -404,6 +404,7 @@ set(CUDA_SOURCES
     src/cuda/vss/brute_force_search.cu
     src/cuda/vss/brute_force_threshold.cu
     src/cuda/vss/cluster_fold.cu
+    src/cuda/vss/gemm_topk.cu
     src/cuda/vss/knn_merge.cu
     src/cuda/vss/ivf_flat_index.cu
     src/cuda/vss/vector_clustering.cu)

@@ -154,6 +154,25 @@ knn_result brute_force_knn(
   cuvs::distance::DistanceType metric = cuvs::distance::DistanceType::L2SqrtUnexpanded,
   rmm::device_async_resource_ref mr   = cudf::get_current_device_resource_ref());
 
+/**
+ * @brief Expanded-L2 top-k as one GEMM and one selection, with no distance pass in between.
+ *
+ * cuVS writes the [queries x corpus] dot products, rewrites every one of them into a distance,
+ * then selects -- three passes over a matrix of 1e10 entries at SIFT1M x 10k, where the GEMM was
+ * 43% of the kernel time. Ranking a query's corpus rows needs only |x|^2 - 2 q.x, since |q|^2 is
+ * the same for all of them, and that is itself a single GEMM over [q, 1] and [-2x, |x|^2]. So
+ * the selection reads the GEMM output directly and only the k survivors are turned into
+ * distances. Same FP32 arithmetic as the expanded metric (no TF32), same output contract as
+ * @ref brute_force_knn; @p take_sqrt selects L2SqrtExpanded over L2Expanded.
+ */
+knn_result gemm_l2_topk(
+  raft::device_resources const& res,
+  dataset_matrix_view dataset,
+  dataset_matrix_view queries,
+  int64_t k,
+  bool take_sqrt,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
 #ifdef SIRIUS_ENABLE_FAISS_KERNEL
 /**
  * @brief The same search, run by FAISS-GPU instead of cuVS.

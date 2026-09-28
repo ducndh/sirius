@@ -1366,8 +1366,24 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           continue;
         }
 
-        auto const slice_index = vss::brute_force_build(res, slice_view, metric);
-        auto const knn = vss::brute_force_knn_untrimmed(res, slice_index, queries_view, k_eff, mr);
+        // Expanded L2 through the fused-ranking GEMM, as in the exhaustive fold: it also carries
+        // none of cuVS's per-call device synchronization, which is paid here once per slice.
+        static bool const gemm_topk = [] {
+          auto const* v = std::getenv("SIRIUS_VSS_GEMM_TOPK");
+          return v == nullptr || std::string_view{v} != "0";
+        }();
+        bool const expanded_l2 = metric == cuvs::distance::DistanceType::L2Expanded ||
+                                 metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+        auto const knn =
+          gemm_topk && expanded_l2
+            ? vss::gemm_l2_topk(res,
+                                slice_view,
+                                queries_view,
+                                k_eff,
+                                metric == cuvs::distance::DistanceType::L2SqrtExpanded,
+                                mr)
+            : vss::brute_force_knn_untrimmed(
+                res, vss::brute_force_build(res, slice_view, metric), queries_view, k_eff, mr);
 
         // Fold in place: a row is routed to a cluster at most once, so the rows of one slice
         // are distinct and no two threads of the fold write the same accumulator row.
@@ -1535,7 +1551,22 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       }
       auto const k_eff = std::min<std::int64_t>(k_join, batch_rows);
 
-      auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
+      // Expanded L2 goes through the fused-ranking GEMM; SIRIUS_VSS_GEMM_TOPK=0 restores the cuVS
+      // search for an A/B. The unexpanded `exact` mode and cosine keep cuVS.
+      static bool const gemm_topk = [] {
+        auto const* v = std::getenv("SIRIUS_VSS_GEMM_TOPK");
+        return v == nullptr || std::string_view{v} != "0";
+      }();
+      bool const expanded_l2 = metric == cuvs::distance::DistanceType::L2Expanded ||
+                               metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+      auto knn = gemm_topk && expanded_l2
+                   ? vss::gemm_l2_topk(res,
+                                       dataset,
+                                       queries,
+                                       k_eff,
+                                       metric == cuvs::distance::DistanceType::L2SqrtExpanded,
+                                       mr)
+                   : vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
 
       // The search above is issued, not finished. Staging the next chunk now runs its H2D
       // while the GPU works on this one; the host blocks inside the converter, the device
