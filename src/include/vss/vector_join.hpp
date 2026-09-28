@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/function/function.hpp"
 
 #include <cstdint>
@@ -62,6 +63,15 @@ struct vector_join_side {
   bool is_view{false};
 };
 
+/// `column <op> constant` on a corpus column, taken from a filter over the join's output that
+/// DuckDB offered the table function. Evaluated against the corpus before it is searched.
+struct corpus_predicate {
+  enum class op : std::uint8_t { eq, ne, lt, le, gt, ge };
+  std::string column;
+  op cmp{op::eq};
+  duckdb::Value value;
+};
+
 struct vector_join_request {
   vector_join_side left;
   vector_join_side right;
@@ -90,6 +100,10 @@ struct vector_join_request {
   /// `sirius_kmeans_assign`. Pruning is only effective when the corpus is stored in cluster
   /// order, since a chunk is skipped on its [min, max] cluster range.
   std::string build_cluster_column;
+  /// Conjuncts over right-side output columns pushed into the join. Only ever set where
+  /// filtering the corpus first gives the same pairs as filtering the join's output: a
+  /// threshold join, whose pairs are independent of every other corpus row.
+  std::vector<corpus_predicate> right_predicates;
 };
 
 struct SiriusVectorJoinBindData : public duckdb::TableFunctionData {

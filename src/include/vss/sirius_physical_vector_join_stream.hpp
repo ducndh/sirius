@@ -139,7 +139,8 @@ std::unique_ptr<vector_chunk_source> make_materialized_chunk_source(
   sirius::vss::materialized_side_buffer& buffer,
   std::size_t column_index,
   std::int64_t dim,
-  const telemetry::batch_telemetry_info& telemetry_info);
+  const telemetry::batch_telemetry_info& telemetry_info,
+  duckdb::SiriusContext* ctx = nullptr);
 
 /**
  * @brief The input handed to one sirius_physical_vector_join_stream::execute() call.
@@ -300,7 +301,11 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// The corpus in cluster order, when the clustering was built into lists rather than carried
   /// as a column of the table. Owned by the index cache, like the centroids.
   const sirius::vss::cluster_lists* _lists{nullptr};
-  /// Session state the clustered path reports its prune statistics to. Outlives the query.
+  /// The pinned corpus, when there is one: where pushed-down corpus predicates read their
+  /// columns. Null on the build path.
+  const sirius::scan_manager::pinned_entry* _right_pin{nullptr};
+  /// Session state: the clustered path reports its prune statistics to it, and a streamed build
+  /// side asks its downgrade executor for room. Outlives the query.
   duckdb::SiriusContext* _sirius_ctx{nullptr};
   /// One contiguous run of a single cluster inside one corpus chunk. Rows are local to the
   /// chunk, so a slice can be searched the moment that chunk is staged and needs nothing from

@@ -80,6 +80,10 @@ extern "C" int cudaProfilerStop();
 #endif
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "helper/type_conversions.hpp"
 #include "log/logging.hpp"
 #include "op/result/host_table_chunk_reader.hpp"
@@ -2403,6 +2407,110 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   return std::move(result);
 }
 
+//! Take `right_<col> <op> constant` conjuncts off a filter above the join and apply them to the
+//! corpus instead, so the rows they reject are never searched. Written as a filter on the join's
+//! output, the query otherwise scores every corpus row and discards pairs afterwards -- the same
+//! cost as the unfiltered join.
+//!
+//! Only where that is the same answer. A threshold join's pair (l, r) depends on l and r alone,
+//! so dropping r first or dropping the pair later agree. A top-k join's does not: removing a
+//! corpus row promotes the next one into its place, which is a different query than filtering
+//! the k that were returned. Restricted as well to an exhaustive search over a pinned corpus,
+//! the one path that evaluates these.
+static void SiriusVectorJoinPushdownFilter(ClientContext&,
+                                           LogicalGet& get,
+                                           FunctionData* bind_data_p,
+                                           vector<unique_ptr<Expression>>& filters)
+{
+  auto* bind = dynamic_cast<SiriusVectorJoinBindData*>(bind_data_p);
+  if (bind == nullptr) { return; }
+  auto const& req = bind->req;
+  if (req.mode != vector_join_mode::threshold || req.build_from_scan || req.right.is_view ||
+      req.search_mode == vector_join_search_mode::approx) {
+    return;
+  }
+  auto const n_left_out  = req.left.output_columns.size();
+  auto const& column_ids = get.GetColumnIds();
+
+  using cmp               = sirius::vss::corpus_predicate::op;
+  auto to_expression_type = [](cmp c) {
+    switch (c) {
+      case cmp::eq: return ExpressionType::COMPARE_EQUAL;
+      case cmp::ne: return ExpressionType::COMPARE_NOTEQUAL;
+      case cmp::lt: return ExpressionType::COMPARE_LESSTHAN;
+      case cmp::le: return ExpressionType::COMPARE_LESSTHANOREQUALTO;
+      case cmp::gt: return ExpressionType::COMPARE_GREATERTHAN;
+      case cmp::ge: return ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+    }
+    return ExpressionType::COMPARE_EQUAL;
+  };
+  auto op_of = [](ExpressionType t, bool flipped) -> std::optional<cmp> {
+    switch (t) {
+      case ExpressionType::COMPARE_EQUAL: return cmp::eq;
+      case ExpressionType::COMPARE_NOTEQUAL: return cmp::ne;
+      case ExpressionType::COMPARE_LESSTHAN: return flipped ? cmp::gt : cmp::lt;
+      case ExpressionType::COMPARE_LESSTHANOREQUALTO: return flipped ? cmp::ge : cmp::le;
+      case ExpressionType::COMPARE_GREATERTHAN: return flipped ? cmp::lt : cmp::gt;
+      case ExpressionType::COMPARE_GREATERTHANOREQUALTO: return flipped ? cmp::le : cmp::ge;
+      default: return std::nullopt;
+    }
+  };
+
+  for (auto it = filters.begin(); it != filters.end();) {
+    auto& expr = **it;
+    if (expr.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
+      ++it;
+      continue;
+    }
+    auto& comparison   = expr.Cast<BoundComparisonExpression>();
+    bool const flipped = comparison.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT;
+    auto& col_side     = flipped ? *comparison.right : *comparison.left;
+    auto& const_side   = flipped ? *comparison.left : *comparison.right;
+    auto const op      = op_of(comparison.GetExpressionType(), flipped);
+    if (!op || col_side.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+        const_side.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+      ++it;
+      continue;
+    }
+    auto const& ref      = col_side.Cast<BoundColumnRefExpression>();
+    auto const& constant = const_side.Cast<BoundConstantExpression>().value;
+    auto const& type     = constant.type();
+    bool const supported = type.IsNumeric() || type.id() == LogicalTypeId::BOOLEAN ||
+                           type.id() == LogicalTypeId::VARCHAR;
+    if (ref.binding.table_index != get.table_index ||
+        ref.binding.column_index >= column_ids.size() || constant.IsNull() || !supported ||
+        type.id() == LogicalTypeId::DECIMAL || type.id() == LogicalTypeId::HUGEINT ||
+        type.id() == LogicalTypeId::UHUGEINT) {
+      ++it;
+      continue;
+    }
+    auto const out = column_ids[ref.binding.column_index].GetPrimaryIndex();
+    if (out < n_left_out || out >= n_left_out + req.right.output_columns.size() ||
+        out >= get.returned_types.size()) {
+      ++it;
+      continue;
+    }
+    // The types the operator can compare on the device without a cast of its own.
+    auto const& col_type = get.returned_types[out];
+    bool const comparable =
+      (col_type.IsIntegral() && col_type.id() != LogicalTypeId::HUGEINT &&
+       col_type.id() != LogicalTypeId::UHUGEINT) ||
+      col_type.id() == LogicalTypeId::FLOAT || col_type.id() == LogicalTypeId::DOUBLE ||
+      col_type.id() == LogicalTypeId::BOOLEAN || col_type.id() == LogicalTypeId::VARCHAR;
+    if (!comparable) {
+      ++it;
+      continue;
+    }
+    // Recorded on the LogicalGet rather than in the bind data: the plan is copied by
+    // serialization before it is planned for the GPU, and a copy re-binds the function from its
+    // arguments, which would drop anything written here. Table filters are serialized with the
+    // operator; create_plan_knn_join reads them back into the request.
+    get.table_filters.PushFilter(ColumnIndex(out),
+                                 make_uniq<ConstantFilter>(to_expression_type(*op), constant));
+    it = filters.erase(it);
+  }
+}
+
 static unique_ptr<NodeStatistics> SiriusVectorJoinCardinality(ClientContext&,
                                                               FunctionData const* bind_data_p)
 {
@@ -2703,7 +2811,8 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join.cardinality                              = SiriusVectorJoinCardinality;
   // Lets DuckDB narrow column_ids to what the query reads. create_plan_knn_join drops the rest
   // before the corpus's output columns are concatenated, which is where the cost is.
-  vector_join.projection_pushdown = true;
+  vector_join.projection_pushdown     = true;
+  vector_join.pushdown_complex_filter = SiriusVectorJoinPushdownFilter;
   CreateTableFunctionInfo vector_join_info(vector_join);
   catalog.CreateTableFunction(transaction, vector_join_info);
 
@@ -2718,10 +2827,11 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
     {LogicalType::TABLE, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
     SiriusVectorJoinFunction,
     SiriusVectorJoinRelBind);
-  vector_join_rel.named_parameters    = vector_join.named_parameters;
-  vector_join_rel.cardinality         = SiriusVectorJoinCardinality;
-  vector_join_rel.projection_pushdown = true;
-  vector_join_rel.in_out_function     = SiriusVectorJoinInOutFunction;
+  vector_join_rel.named_parameters        = vector_join.named_parameters;
+  vector_join_rel.cardinality             = SiriusVectorJoinCardinality;
+  vector_join_rel.projection_pushdown     = true;
+  vector_join_rel.pushdown_complex_filter = SiriusVectorJoinPushdownFilter;
+  vector_join_rel.in_out_function         = SiriusVectorJoinInOutFunction;
   CreateTableFunctionInfo vector_join_rel_info(vector_join_rel);
   catalog.CreateTableFunction(transaction, vector_join_rel_info);
 }

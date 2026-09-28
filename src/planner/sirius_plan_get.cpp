@@ -18,8 +18,12 @@
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/block_manager.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -38,18 +42,16 @@
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_top_n.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
-#include "duckdb/planner/binder.hpp"
-#include "duckdb/optimizer/optimizer.hpp"
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "vss/kmeans_functions.hpp"
-#include "vss/vector_join_binding.hpp"
 #include "vss/sirius_physical_vector_join_materialize.hpp"
 #include "vss/sirius_physical_vector_join_reduce_local.hpp"
 #include "vss/sirius_physical_vector_join_select.hpp"
 #include "vss/sirius_physical_vector_join_stream.hpp"
 #include "vss/vector_join.hpp"
+#include "vss/vector_join_binding.hpp"
 
 #include <cstdlib>
 #include <memory>
@@ -618,8 +620,10 @@ sirius_physical_plan_generator::make_view_side(const sirius::vss::vector_join_si
     add(index_of(col));
   }
   if (!extra_column.empty()) { add(index_of(extra_column)); }
-  return push_projection(
-    std::move(planned), sirius::from_duckdb_vec(types), translate_expressions(std::move(exprs)), card);
+  return push_projection(std::move(planned),
+                         sirius::from_duckdb_vec(types),
+                         translate_expressions(std::move(exprs)),
+                         card);
 }
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
@@ -652,6 +656,42 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   // depending on where this join's corpus is coming from.
   auto req              = bind_data.req;
   auto const right_rows = static_cast<std::int64_t>(bind_data.right_rows);
+
+  // Corpus predicates the table function took off a filter above it (see
+  // SiriusVectorJoinPushdownFilter), keyed by output column. Only right-side columns are ever
+  // pushed, and only as constant comparisons or conjunctions of them.
+  for (auto const& [out, filter] : op.table_filters.filters) {
+    auto const n_left_out = req.left.output_columns.size();
+    if (out < n_left_out || out >= n_left_out + req.right.output_columns.size()) {
+      throw duckdb::InternalException("sirius_knn_join: a table filter on a non-corpus column");
+    }
+    auto const& column = req.right.output_columns[out - n_left_out];
+    auto add           = [&](duckdb::TableFilter const& f) {
+      if (f.filter_type != duckdb::TableFilterType::CONSTANT_COMPARISON) {
+        throw duckdb::InternalException("sirius_knn_join: unsupported pushed corpus filter");
+      }
+      auto const& c = f.Cast<duckdb::ConstantFilter>();
+      using cmp     = sirius::vss::corpus_predicate::op;
+      cmp op_kind;
+      switch (c.comparison_type) {
+        case duckdb::ExpressionType::COMPARE_EQUAL: op_kind = cmp::eq; break;
+        case duckdb::ExpressionType::COMPARE_NOTEQUAL: op_kind = cmp::ne; break;
+        case duckdb::ExpressionType::COMPARE_LESSTHAN: op_kind = cmp::lt; break;
+        case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO: op_kind = cmp::le; break;
+        case duckdb::ExpressionType::COMPARE_GREATERTHAN: op_kind = cmp::gt; break;
+        case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: op_kind = cmp::ge; break;
+        default: throw duckdb::InternalException("sirius_knn_join: unsupported pushed comparison");
+      }
+      req.right_predicates.push_back({column, op_kind, c.constant});
+    };
+    if (filter->filter_type == duckdb::TableFilterType::CONJUNCTION_AND) {
+      for (auto const& child : filter->Cast<duckdb::ConjunctionAndFilter>().child_filters) {
+        add(*child);
+      }
+    } else {
+      add(*filter);
+    }
+  }
   if (right_rows > 0 && req.k > right_rows) { req.k = right_rows; }
 
   // Three-stage pipeline: select (per-pair top-k) → reduce_local (per-left-batch
@@ -830,10 +870,12 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
     // Resolved here rather than inside the operator: the operator holds only a scan manager and
     // has no route to the session's index cache, while the planner does. The cache owns the
     // centroids, so the operator borrows them for the life of the query.
-    const cudf::column* centroids      = nullptr;
-    duckdb::SiriusContext* prune_stats = nullptr;
+    const cudf::column* centroids = nullptr;
+    // Borrowed for the life of the query: the context is the session's, the clustered path
+    // reports what it pruned to it, and a streamed corpus asks its downgrade executor for room.
+    auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    duckdb::SiriusContext* prune_stats = sirius_ctx.get();
     if (!req.clustering.empty()) {
-      auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
       if (!sirius_ctx) {
         throw duckdb::InvalidInputException(
           "sirius_knn_join: clustering requires the Sirius context to be initialized");
@@ -843,9 +885,6 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
         throw duckdb::InvalidInputException("sirius_knn_join: no clustering named '" +
                                             req.clustering + "'; run sirius_kmeans_fit first");
       }
-      // Borrowed for the life of the query on the same terms as the centroids: the context is
-      // the session's, and the clustered path reports what it pruned to it.
-      prune_stats = sirius_ctx.get();
     }
     auto stream_op =
       duckdb::make_uniq<sirius::op::sirius_physical_vector_join_stream>(joined_types(),

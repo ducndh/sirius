@@ -1257,10 +1257,10 @@ TEST_CASE_METHOD(VectorJoinFixture,
             "r > 0;");
   REQUIRE(on_a_table[0][0] == "2047");
 
-  auto const plain = ok_rows(*con,
+  auto const plain   = ok_rows(*con,
                              "SELECT count(*) FROM sirius_knn_join("
-                             "'hv_probe','vec','hv_corpus','vec', search_mode => 'exact', "
-                             "metric => 'l2', k => 6);");
+                               "'hv_probe','vec','hv_corpus','vec', search_mode => 'exact', "
+                               "metric => 'l2', k => 6);");
   auto const rounded = ok_rows(*con,
                                "SELECT count(*) FROM (SELECT round(distance, 1) AS x FROM "
                                "sirius_knn_join('hv_probe','vec','hv_corpus','vec', "
@@ -1377,4 +1377,68 @@ TEST_CASE_METHOD(VectorJoinFixture,
   REQUIRE(zeros[0][0] == "200");
 
   run_ok("SELECT * FROM unpin_table('vo');");
+}
+
+// -----------------------------------------------------------------------------
+// A filter on the corpus side of a threshold join is applied to the corpus before the search,
+// not to the join's output after it. Both orders give the same pairs -- a pair within eps is
+// one whatever the other corpus rows are -- and the test holds the pushed form to the answer
+// an exhaustive CPU range query gives with the predicate in its WHERE clause.
+//
+// A top-k join must NOT be rewritten that way: dropping corpus rows first would promote other
+// rows into each probe's k, a different query than filtering the k that were returned.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - corpus predicates are pushed into a threshold join only",
+                 "[integration][gpu_execution][array][vss][vector_join][pushdown]")
+{
+  run_ok("CREATE TABLE f_corpus (id INTEGER, cat INTEGER, tag VARCHAR, vec FLOAT[2]);");
+  run_ok(
+    "INSERT INTO f_corpus SELECT i, i % 3, CASE WHEN i % 7 = 0 THEN 'x' ELSE 'y' END, "
+    "[(i%100)::float, (i/100)::float] FROM range(10000) t(i);");
+  run_ok("CREATE TABLE f_probe (id INTEGER, vec FLOAT[2]);");
+  run_ok("INSERT INTO f_probe VALUES (0,[10.0,10.0]),(1,[50.5,50.5]),(2,[99.0,99.0]);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'f_probe',  tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'f_corpus', tier => 'gpu', format => 'duckdb');");
+
+  con->Query("SET gpu_execution = false;");
+  auto const reference = ok_rows(*con,
+                                 "SELECT p.id, c.id FROM f_probe p, f_corpus c "
+                                 "WHERE array_distance(p.vec, c.vec) <= 6.0 AND c.cat = 1 "
+                                 "AND c.tag <> 'x' AND c.id >= 500;");
+  con->Query("SET gpu_execution = true;");
+  REQUIRE_FALSE(reference.empty());
+
+  auto const threshold =
+    "FROM sirius_knn_join('f_probe','vec','f_corpus','vec', search_mode => 'exact', "
+    "metric => 'l2', join_mode => 'threshold', eps => 6.0, left_output_columns => ['id'], "
+    "right_output_columns => ['id','cat','tag']) "
+    "WHERE right_cat = 1 AND right_tag <> 'x' AND 500 <= right_id";
+  auto const joined = ok_rows(*con, std::string("SELECT left_id, right_id ") + threshold + ";");
+  REQUIRE(joined == reference);
+
+  // All three conjuncts were taken by the join: nothing is left for a filter above it.
+  auto plan = con->Query(std::string("EXPLAIN SELECT left_id, right_id ") + threshold + ";");
+  REQUIRE_FALSE(plan->HasError());
+  UNSCOPED_INFO("plan: " << plan->ToString());
+  CHECK(plan->ToString().find("FILTER") == std::string::npos);
+
+  // Per-row top-k keeps its filter-after-search meaning.
+  run_ok(
+    "CREATE TABLE f_topk AS SELECT left_id, right_id, right_cat FROM sirius_knn_join("
+    "'f_probe','vec','f_corpus','vec', search_mode => 'exact', metric => 'l2', k => 9, "
+    "left_output_columns => ['id'], right_output_columns => ['id','cat']);");
+  auto const topk_reference =
+    ok_rows(*con, "SELECT left_id, right_id FROM f_topk WHERE right_cat = 1;");
+  auto const topk = ok_rows(*con,
+                            "SELECT left_id, right_id FROM sirius_knn_join("
+                            "'f_probe','vec','f_corpus','vec', search_mode => 'exact', "
+                            "metric => 'l2', k => 9, left_output_columns => ['id'], "
+                            "right_output_columns => ['id','cat']) WHERE right_cat = 1;");
+  REQUIRE(topk == topk_reference);
+  REQUIRE(topk.size() < 3 * 9);
+
+  run_ok("SELECT * FROM unpin_table('f_corpus');");
+  run_ok("SELECT * FROM unpin_table('f_probe');");
 }

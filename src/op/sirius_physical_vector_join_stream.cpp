@@ -67,10 +67,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <typeinfo>
 #include <utility>
 #include <vector>
@@ -205,8 +207,10 @@ class materialized_chunk_source : public vector_chunk_source {
   materialized_chunk_source(vss::materialized_side_buffer& buffer,
                             std::size_t column_index,
                             std::int64_t dim,
-                            const telemetry::batch_telemetry_info& telemetry_info)
+                            const telemetry::batch_telemetry_info& telemetry_info,
+                            duckdb::SiriusContext* ctx)
     : _repo(buffer.repo()),
+      _ctx(ctx),
       _batch_ids(buffer.batch_ids()),
       _telemetry_info(telemetry_info),
       _column_index(column_index),
@@ -266,8 +270,7 @@ class materialized_chunk_source : public vector_chunk_source {
     auto data_rep    = host_repr(ro).slice(cols);
     auto const bytes = data_rep->get_size_in_bytes();
 
-    std::shared_ptr<cucascade::memory::reservation> reservation{
-      space.make_reservation_or_null(bytes)};
+    std::shared_ptr<cucascade::memory::reservation> reservation{reserve_or_spill(space, bytes)};
     if (!reservation) {
       throw std::runtime_error("[sirius_physical_vector_join_stream] corpus chunk " +
                                std::to_string(i) + " needs " + std::to_string(bytes) +
@@ -295,6 +298,31 @@ class materialized_chunk_source : public vector_chunk_source {
     return static_cast<std::size_t>(_dim) * sizeof(float);
   }
 
+  // The device can be full of build-side batches this fold has already read, and nothing but
+  // the downgrade executor will move them: a task's own reservation request does not, and a
+  // blocking wait for memory that no one is freeing never returns. So ask it directly, the way
+  // the pipeline executor does for a short task reservation, until the copy-back fits or
+  // there is nothing left it may spill.
+  std::unique_ptr<cucascade::memory::reservation> reserve_or_spill(
+    cucascade::memory::memory_space& space, std::size_t bytes) const
+  {
+    auto res = space.make_reservation_or_null(bytes);
+    if (res || _ctx == nullptr) { return res; }
+    std::unique_ptr<cucascade::memory::reservation> got;
+    std::mutex m;
+    _ctx->get_downgrade_executor(space.get_id())
+      .request_downgrade([&]() {
+        std::lock_guard<std::mutex> const lock(m);
+        if (!got) {
+          auto r = space.make_reservation_or_null(bytes);
+          if (r && r->size() >= bytes) { got = std::move(r); }
+        }
+        return got != nullptr;
+      })
+      .get();
+    return got;
+  }
+
   [[nodiscard]] std::shared_ptr<cucascade::data_batch> fetch(std::uint64_t id) const
   {
     auto batch = _repo->get_data_batch_by_id(id, /*partition_idx=*/0);
@@ -318,12 +346,183 @@ class materialized_chunk_source : public vector_chunk_source {
   }
 
   cucascade::shared_data_repository* _repo;
+  duckdb::SiriusContext* _ctx{nullptr};
   std::vector<std::uint64_t> _batch_ids;
   std::vector<std::size_t> _rows;
   std::vector<std::size_t> _bytes;
   telemetry::batch_telemetry_info _telemetry_info;
   std::size_t _column_index{0};
   std::int64_t _dim{0};
+};
+
+/// A pushed-down predicate's constant, as the cuDF scalar its column compares against.
+std::unique_ptr<cudf::scalar> predicate_scalar(duckdb::Value const& v,
+                                               cudf::data_type type,
+                                               rmm::cuda_stream_view stream)
+{
+  switch (type.id()) {
+    case cudf::type_id::BOOL8:
+      return std::make_unique<cudf::numeric_scalar<bool>>(v.GetValue<bool>(), true, stream);
+    case cudf::type_id::INT8:
+      return std::make_unique<cudf::numeric_scalar<std::int8_t>>(
+        v.GetValue<std::int8_t>(), true, stream);
+    case cudf::type_id::INT16:
+      return std::make_unique<cudf::numeric_scalar<std::int16_t>>(
+        v.GetValue<std::int16_t>(), true, stream);
+    case cudf::type_id::INT32:
+      return std::make_unique<cudf::numeric_scalar<std::int32_t>>(
+        v.GetValue<std::int32_t>(), true, stream);
+    case cudf::type_id::INT64:
+      return std::make_unique<cudf::numeric_scalar<std::int64_t>>(
+        v.GetValue<std::int64_t>(), true, stream);
+    case cudf::type_id::UINT8:
+      return std::make_unique<cudf::numeric_scalar<std::uint8_t>>(
+        v.GetValue<std::uint8_t>(), true, stream);
+    case cudf::type_id::UINT16:
+      return std::make_unique<cudf::numeric_scalar<std::uint16_t>>(
+        v.GetValue<std::uint16_t>(), true, stream);
+    case cudf::type_id::UINT32:
+      return std::make_unique<cudf::numeric_scalar<std::uint32_t>>(
+        v.GetValue<std::uint32_t>(), true, stream);
+    case cudf::type_id::UINT64:
+      return std::make_unique<cudf::numeric_scalar<std::uint64_t>>(
+        v.GetValue<std::uint64_t>(), true, stream);
+    case cudf::type_id::FLOAT32:
+      return std::make_unique<cudf::numeric_scalar<float>>(v.GetValue<float>(), true, stream);
+    case cudf::type_id::FLOAT64:
+      return std::make_unique<cudf::numeric_scalar<double>>(v.GetValue<double>(), true, stream);
+    case cudf::type_id::STRING:
+      return std::make_unique<cudf::string_scalar>(v.ToString(), true, stream);
+    default:
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] a pushed-down corpus predicate compares a column "
+        "of an unsupported device type");
+  }
+}
+
+cudf::binary_operator predicate_operator(vss::corpus_predicate::op op)
+{
+  using cmp = vss::corpus_predicate::op;
+  switch (op) {
+    case cmp::eq: return cudf::binary_operator::EQUAL;
+    case cmp::ne: return cudf::binary_operator::NOT_EQUAL;
+    case cmp::lt: return cudf::binary_operator::LESS;
+    case cmp::le: return cudf::binary_operator::LESS_EQUAL;
+    case cmp::gt: return cudf::binary_operator::GREATER;
+    case cmp::ge: return cudf::binary_operator::GREATER_EQUAL;
+  }
+  return cudf::binary_operator::EQUAL;
+}
+
+/// The rows of corpus chunk @p j that every pushed-down predicate keeps, compacted into one
+/// row-major matrix, with each kept row's corpus row id alongside. A null compares false, as it
+/// does in the WHERE clause the predicate came from.
+struct filtered_chunk {
+  rmm::device_uvector<float> vectors;
+  std::unique_ptr<cudf::column> row_ids;  ///< INT64 corpus row of each kept row
+  std::int64_t rows{0};
+};
+
+filtered_chunk filter_corpus_chunk(const scan_manager::pinned_entry& pin,
+                                   std::vector<vss::corpus_predicate> const& preds,
+                                   std::size_t j,
+                                   vss::dataset_matrix_view vectors,
+                                   std::int64_t row_base,
+                                   cucascade::memory::memory_space& space,
+                                   rmm::cuda_stream_view stream,
+                                   rmm::device_async_resource_ref mr,
+                                   telemetry::batch_telemetry_info const& telemetry_info)
+{
+  std::vector<vss::staged_pinned_chunk> columns;
+  std::unique_ptr<cudf::column> mask;
+  for (auto const& p : preds) {
+    columns.push_back(
+      vss::stage_pinned_column_chunk(pin, p.column, j, space, stream, telemetry_info));
+    auto const& col   = columns.back().view;
+    auto const scalar = predicate_scalar(p.value, col.type(), stream);
+    auto keep         = cudf::binary_operation(
+      col, *scalar, predicate_operator(p.cmp), cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
+    mask = mask ? cudf::binary_operation(mask->view(),
+                                         keep->view(),
+                                         cudf::binary_operator::LOGICAL_AND,
+                                         cudf::data_type{cudf::type_id::BOOL8},
+                                         stream,
+                                         mr)
+                : std::move(keep);
+  }
+  // Compacting a LIST column through cuDF rebuilds its offsets and gathers its child element
+  // by element, which cost more than the searched rows it saved. The mask is applied to row
+  // indices instead, and the kept rows are copied whole.
+  auto const n = static_cast<cudf::size_type>(vectors.extent(0));
+  cudf::numeric_scalar<std::int64_t> const zero(0, true, stream);
+  cudf::numeric_scalar<std::int64_t> const base(row_base, true, stream);
+  cudf::numeric_scalar<std::int64_t> const step(1, true, stream);
+  auto const local  = cudf::sequence(n, zero, step, stream, mr);
+  auto const global = cudf::sequence(n, base, step, stream, mr);
+  auto kept         = cudf::apply_boolean_mask(
+    cudf::table_view{{local->view(), global->view()}}, mask->view(), stream, mr);
+  auto const rows = static_cast<std::int64_t>(kept->num_rows());
+  auto const dim  = vectors.extent(1);
+  filtered_chunk out{
+    rmm::device_uvector<float>(static_cast<std::size_t>(rows * dim), stream, mr), nullptr, rows};
+  vss::gather_rows(vectors.data_handle(),
+                   dim,
+                   kept->get_column(0).view().data<std::int64_t>(),
+                   rows,
+                   out.vectors.data(),
+                   stream);
+  out.row_ids = std::move(kept->release()[1]);
+  // The staged predicate columns are released on return; the mask read them.
+  stream.synchronize();
+  return out;
+}
+
+/// Read locks on borrowed build-side batches, each held only until the searches that read it
+/// have finished on the compute stream. A borrow costs no device memory, but a locked batch
+/// cannot be spilled, so holding every borrow to the end of the task pinned the whole corpus on
+/// the device: past the pool size the first spilled chunk found no room to be copied back.
+/// Keeping the last few in flight is what lets a corpus larger than the pool stream at all.
+class borrow_window {
+ public:
+  explicit borrow_window(rmm::cuda_stream_view stream) : _stream(stream) {}
+  borrow_window(const borrow_window&)            = delete;
+  borrow_window& operator=(const borrow_window&) = delete;
+  ~borrow_window()
+  {
+    while (!_held.empty()) {
+      release_front();
+    }
+  }
+
+  void hold(cucascade::read_only_data_batch reader)
+  {
+    cudaEvent_t done = nullptr;
+    CUDF_CUDA_TRY(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+    CUDF_CUDA_TRY(cudaEventRecord(done, _stream.value()));
+    _held.push_back(held{done, std::move(reader)});
+    while (_held.size() > kInFlight) {
+      release_front();
+    }
+  }
+
+ private:
+  // The chunk being searched and the one before it: deeper than that only delays the spill.
+  static constexpr std::size_t kInFlight = 2;
+  struct held {
+    cudaEvent_t done;
+    cucascade::read_only_data_batch reader;
+  };
+
+  void release_front()
+  {
+    auto& front = _held.front();
+    cudaEventSynchronize(front.done);
+    cudaEventDestroy(front.done);
+    _held.pop_front();
+  }
+
+  rmm::cuda_stream_view _stream;
+  std::deque<held> _held;
 };
 
 /// Cluster lists: a chunk is a fixed span of layout rows. On the GPU tier it is a view into the
@@ -423,9 +622,11 @@ std::unique_ptr<vector_chunk_source> make_materialized_chunk_source(
   sirius::vss::materialized_side_buffer& buffer,
   std::size_t column_index,
   std::int64_t dim,
-  const telemetry::batch_telemetry_info& telemetry_info)
+  const telemetry::batch_telemetry_info& telemetry_info,
+  duckdb::SiriusContext* ctx)
 {
-  return std::make_unique<materialized_chunk_source>(buffer, column_index, dim, telemetry_info);
+  return std::make_unique<materialized_chunk_source>(
+    buffer, column_index, dim, telemetry_info, ctx);
 }
 
 std::unique_ptr<vector_chunk_source> make_gpu_pinned_chunk_source(
@@ -545,6 +746,7 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
     throw std::runtime_error(
       "[sirius_physical_vector_join_stream] left or right table is no longer pinned");
   }
+  _right_pin = right_pin;
 
   // Both sides go behind the same seam. The probe side used to be required GPU-resident on
   // the argument that it is the small one; that is false for any join where both sides are
@@ -555,7 +757,7 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
     auto* port = get_port("default");
     _probe_side->ensure_snapshot(*port->repo);
     _probe = make_materialized_chunk_source(
-      *_probe_side, /*column_index=*/0, _request.dim, batch_telemetry());
+      *_probe_side, /*column_index=*/0, _request.dim, batch_telemetry(), _sirius_ctx);
   } else if (left_pin->tier == cucascade::memory::Tier::HOST) {
     _probe = make_host_pinned_chunk_source(*left_pin, left.column, _request.dim, batch_telemetry());
   } else {
@@ -569,7 +771,7 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
     auto* port = get_port("build");
     _build_side->ensure_snapshot(*port->repo);
     _corpus = make_materialized_chunk_source(
-      *_build_side, /*column_index=*/0, _request.dim, batch_telemetry());
+      *_build_side, /*column_index=*/0, _request.dim, batch_telemetry(), _sirius_ctx);
     for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
       _max_chunk_bytes = std::max(_max_chunk_bytes, _corpus->chunk_bytes(i));
     }
@@ -1073,14 +1275,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     std::optional<rmm::cuda_stream> staging_stream;
     if (_corpus->is_streaming()) { staging_stream.emplace(); }
     auto const stage_on = staging_stream ? staging_stream->view() : stream;
-    std::vector<cucascade::read_only_data_batch> borrowed;
+    borrow_window borrowed{stream};
     auto release_staged = [&](staged_vector_chunk& chunk) {
       if (chunk.owner) {
         auto mut = chunk.owner->to_mutable();
         mut.rebind_stream(stream);
       }
       if (chunk.buffer) { chunk.buffer->set_stream(stream); }
-      if (chunk.reader) { borrowed.push_back(std::move(*chunk.reader)); }
+      if (chunk.reader) { borrowed.hold(std::move(*chunk.reader)); }
       chunk = staged_vector_chunk{};
     };
 
@@ -1239,10 +1441,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     };
 
     // Borrowed build-side batches whose read locks have to outlive the searches reading them.
-    // A borrow costs no device memory -- the batch was already resident, which is why it was
-    // borrowed rather than copied -- so holding it to the end of the task only means the
-    // downgrade executor cannot spill that batch while this task is still reading it.
-    std::vector<cucascade::read_only_data_batch> borrowed;
+    borrow_window borrowed{stream};
 
     // The staged copy is read by kernels that are still pending on the compute stream, but it
     // was allocated on the staging stream, so dropping it here would hand the buffer back to
@@ -1256,7 +1455,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         mut.rebind_stream(stream);
       }
       if (chunk.buffer) { chunk.buffer->set_stream(stream); }
-      if (chunk.reader) { borrowed.push_back(std::move(*chunk.reader)); }
+      if (chunk.reader) { borrowed.hold(std::move(*chunk.reader)); }
       chunk = staged_vector_chunk{};
     };
 
@@ -1272,15 +1471,42 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       }
 
       if (radius_join) {
-        auto edges = vss::brute_force_threshold(res, dataset, queries, radius_eps, metric, mr);
+        // Pushed-down corpus predicates: only the rows they keep are searched, and those rows
+        // carry their corpus ids, so the kernel's local ids map back through them instead of
+        // through the chunk offset.
+        std::optional<filtered_chunk> kept;
+        auto searched = dataset;
+        if (!_request.right_predicates.empty()) {
+          kept.emplace(filter_corpus_chunk(*_right_pin,
+                                           _request.right_predicates,
+                                           j,
+                                           dataset,
+                                           offset,
+                                           *mem_space,
+                                           stream,
+                                           mr,
+                                           batch_telemetry()));
+          searched = raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+            kept->vectors.data(), kept->rows, dim);
+        }
+        auto edges = searched.extent(0) == 0
+                       ? vss::threshold_join_result{nullptr, nullptr, nullptr, 0}
+                       : vss::brute_force_threshold(res, searched, queries, radius_eps, metric, mr);
         advance(j + 1);
         release_staged(staged);
         auto const chunk_base = offset;
         offset += batch_rows;
         if (edges.n_edges > 0) {
-          // Local dataset-batch rows -> right-table row space, the same shift the top-k path
-          // applies to its neighbour ids.
-          if (chunk_base != 0) {
+          if (kept) {
+            auto mapped     = cudf::gather(cudf::table_view{{kept->row_ids->view()}},
+                                       edges.neighbors->view(),
+                                       cudf::out_of_bounds_policy::DONT_CHECK,
+                                       stream,
+                                       mr);
+            edges.neighbors = std::move(mapped->release().front());
+          } else if (chunk_base != 0) {
+            // Local dataset-batch rows -> right-table row space, the same shift the top-k path
+            // applies to its neighbour ids.
             cudf::numeric_scalar<std::int64_t> const off_scalar(chunk_base, true, stream);
             edges.neighbors = cudf::binary_operation(edges.neighbors->view(),
                                                      off_scalar,
