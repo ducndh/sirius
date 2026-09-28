@@ -488,14 +488,23 @@ bool gemm_search_enabled()
   return enabled;
 }
 
+/// Probe rows below which the exhaustive fold keeps cuVS (the per-slice searches of the clustered
+/// path always use the GEMM form: cuVS there also syncs the device per call). The GEMM search
+/// rewrites the corpus chunk into its prepared layout on every call, which a GEMM over hundreds of
+/// queries amortizes and a handful does not: on Vec-H (1024-d, 2.4M rows) one-query searches ran
+/// 10-30 ms slower through it, and on SIFT1M it wins from ~1k probes.
+constexpr std::int64_t kGemmMinProbeRows = 512;
+
 vss::threshold_join_result threshold_search(raft::device_resources const& res,
                                             vss::dataset_matrix_view dataset,
                                             vss::dataset_matrix_view queries,
                                             float eps,
                                             cuvs::distance::DistanceType metric,
-                                            rmm::device_async_resource_ref mr)
+                                            rmm::device_async_resource_ref mr,
+                                            std::int64_t min_gemm_rows = 0)
 {
-  return gemm_search_enabled() && vss::gemm_search_supports(metric)
+  return gemm_search_enabled() && vss::gemm_search_supports(metric) &&
+             queries.extent(0) >= min_gemm_rows
            ? vss::gemm_threshold(res, dataset, queries, eps, metric, mr)
            : vss::brute_force_threshold(res, dataset, queries, eps, metric, mr);
 }
@@ -1656,9 +1665,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                      static_cast<std::size_t>(dim + 4) * sizeof(float) +
                                    2 * last_edge_bytes);
         }
-        auto edges = searched.extent(0) == 0
-                       ? vss::threshold_join_result{nullptr, nullptr, nullptr, 0}
-                       : threshold_search(res, searched, queries, radius_eps, metric, mr);
+        auto edges =
+          searched.extent(0) == 0
+            ? vss::threshold_join_result{nullptr, nullptr, nullptr, 0}
+            : threshold_search(res, searched, queries, radius_eps, metric, mr, kGemmMinProbeRows);
         last_edge_bytes =
           static_cast<std::size_t>(edges.n_edges) * (2 * sizeof(std::int64_t) + sizeof(float));
         advance(j + 1);
@@ -1704,9 +1714,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           vss::gemm_search_tile_bytes() + static_cast<std::size_t>(batch_rows) *
                                             static_cast<std::size_t>(dim + 4) * sizeof(float));
       }
-      auto knn = gemm_search_enabled() && vss::gemm_search_supports(metric)
-                   ? vss::gemm_topk(res, dataset, queries, k_eff, metric, mr)
-                   : vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
+      auto knn =
+        gemm_search_enabled() && vss::gemm_search_supports(metric) && n_left >= kGemmMinProbeRows
+          ? vss::gemm_topk(res, dataset, queries, k_eff, metric, mr)
+          : vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
 
       // The search above is issued, not finished. Staging the next chunk now runs its H2D
       // while the GPU works on this one; the host blocks inside the converter, the device
