@@ -500,6 +500,21 @@ vss::threshold_join_result threshold_search(raft::device_resources const& res,
            : vss::brute_force_threshold(res, dataset, queries, eps, metric, mr);
 }
 
+/// Ask the downgrade executor to spill until @p bytes of the device are free. A streamed corpus
+/// fills the pool with build-side batches this fold has already read; if the next chunk's
+/// scratch then does not fit, the allocation fails, and the task is restarted from its first
+/// chunk -- repeatedly, since the next attempt meets the same full pool. Spilling first costs a
+/// copy of batches no one will read again.
+void ensure_device_headroom(duckdb::SiriusContext* ctx,
+                            cucascade::memory::memory_space& space,
+                            std::size_t bytes)
+{
+  if (ctx == nullptr || space.get_available_memory() >= bytes) { return; }
+  ctx->get_downgrade_executor(space.get_id())
+    .request_downgrade([&space, bytes]() { return space.get_available_memory() >= bytes; })
+    .get();
+}
+
 /// Read locks on borrowed build-side batches, each held only until the searches that read it
 /// have finished on the compute stream. A borrow costs no device memory, but a locked batch
 /// cannot be spilled, so holding every borrow to the end of the task pinned the whole corpus on
@@ -1518,6 +1533,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       chunk = staged_vector_chunk{};
     };
 
+    std::size_t last_edge_bytes = 0;
     for (std::size_t j = 0; j < n_chunks; ++j) {
       // Held for this iteration only; released at the bottom once its compute is ordered,
       // which is what keeps device memory bounded by the chunks in flight, not the corpus.
@@ -1548,9 +1564,21 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           searched = raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
             kept->vectors.data(), kept->rows, dim);
         }
+        // The search holds its score tile and the prepared chunk, and its edges grow the result;
+        // the last chunk's edge count is the estimate for this one's.
+        if (_corpus->is_streaming()) {
+          ensure_device_headroom(_sirius_ctx,
+                                 *mem_space,
+                                 vss::gemm_search_tile_bytes() +
+                                   static_cast<std::size_t>(batch_rows) *
+                                     static_cast<std::size_t>(dim + 4) * sizeof(float) +
+                                   2 * last_edge_bytes);
+        }
         auto edges = searched.extent(0) == 0
                        ? vss::threshold_join_result{nullptr, nullptr, nullptr, 0}
                        : threshold_search(res, searched, queries, radius_eps, metric, mr);
+        last_edge_bytes =
+          static_cast<std::size_t>(edges.n_edges) * (2 * sizeof(std::int64_t) + sizeof(float));
         advance(j + 1);
         release_staged(staged);
         auto const chunk_base = offset;
@@ -1596,6 +1624,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
 
       // Expanded L2 and cosine go through the GEMM-ranked search; the unexpanded `exact` mode keeps
       // cuVS.
+      if (_corpus->is_streaming()) {
+        ensure_device_headroom(
+          _sirius_ctx,
+          *mem_space,
+          vss::gemm_search_tile_bytes() + static_cast<std::size_t>(batch_rows) *
+                                            static_cast<std::size_t>(dim + 4) * sizeof(float));
+      }
       auto knn = gemm_search_enabled() && vss::gemm_search_supports(metric)
                    ? vss::gemm_topk(res, dataset, queries, k_eff, metric, mr)
                    : vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
