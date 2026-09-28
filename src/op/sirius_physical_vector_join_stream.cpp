@@ -23,6 +23,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "vss/bound_gemm.hpp"
 #include "vss/brute_force_search.hpp"
 #include "vss/brute_force_threshold.hpp"
 #include "vss/cluster_fold.hpp"
@@ -1304,14 +1305,44 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     for (std::size_t c = 0; c < static_cast<std::size_t>(_n_clusters); ++c) {
       edge_begin[c + 1] += edge_begin[c];
     }
+    std::vector<std::int64_t> nearest_edges(static_cast<std::size_t>(_n_clusters), 0);
+    for (std::int64_t r = 0; r < n_left; ++r) {
+      ++nearest_edges[static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)])];
+    }
     phase("edges to host");
 
     // Sorted by cluster, each cluster's rows are one contiguous range of the edge list. That
     // range is what a slice's search gathers its queries from and what its answer folds back
     // through. Only the per-cluster counts are needed to place the ranges, and those are
     // already on the host, so the sorted labels never come back.
-    auto const order =
-      cudf::sorted_order(cudf::table_view{{assignment.cluster_ids->view()}}, {}, {}, stream, mr);
+    // Within a cluster, the rows for which it is the nearest cluster come first: the bounded search
+    // below seeds every row from its nearest cluster before it searches any of the others. Rows
+    // then run in probe order, which keeps a tile's probe-row loads close together.
+    cudf::numeric_scalar<std::int32_t> const edge0(0, true, stream), edge_step(1, true, stream);
+    cudf::numeric_scalar<std::int32_t> const probes_scalar(
+      static_cast<std::int32_t>(n_probes), true, stream);
+    auto const edge_ids =
+      cudf::sequence(static_cast<cudf::size_type>(n_edges), edge0, edge_step, stream, mr);
+    auto const edge_rank = cudf::binary_operation(edge_ids->view(),
+                                                  probes_scalar,
+                                                  cudf::binary_operator::MOD,
+                                                  cudf::data_type{cudf::type_id::INT32},
+                                                  stream,
+                                                  mr);
+    cudf::numeric_scalar<std::int32_t> const rank0(0, true, stream);
+    auto const later_edge = cudf::binary_operation(edge_rank->view(),
+                                                   rank0,
+                                                   cudf::binary_operator::GREATER,
+                                                   cudf::data_type{cudf::type_id::BOOL8},
+                                                   stream,
+                                                   mr);
+    auto const order      = cudf::sorted_order(
+      cudf::table_view{
+             {assignment.cluster_ids->view(), later_edge->view(), assignment.row_ids->view()}},
+      {},
+      {},
+      stream,
+      mr);
     auto const sorted      = cudf::gather(cudf::table_view{{assignment.row_ids->view()}},
                                      order->view(),
                                      cudf::out_of_bounds_policy::DONT_CHECK,
@@ -1409,145 +1440,291 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       vss::int8_row_sq_norms(probe_i8->data(), n_left, dim, probe_sq->data(), stream);
     }
 
+    // Bounded search: sweep 0 searches each row's nearest cluster and folds as usual, which gives
+    // every row a k-th distance; sweep 1 searches the remaining clusters with a GEMM that keeps
+    // only pairs under that bound, so the scores of the other n_probes - 1 clusters never reach
+    // memory. Distances stay squared until the end, where the bound is compared.
+    bool const bounded = int8_search && n_probes > 1 && vss::bound_filter_int8_supports(dim) && [] {
+      auto const* v = std::getenv("SIRIUS_VSS_BOUND_GEMM");
+      return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    bool const sqrt_at_end = bounded && metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+    std::optional<rmm::device_uvector<float>> bound;
+    std::optional<vss::bound_candidates> candidates;
+    std::int64_t pending = 0, bounded_emitted = 0, bounded_merges = 0, bounded_launches = 0,
+                 bounded_padded = 0;
+    auto flush                  = [&] {
+      if (pending == 0) { return; }
+      ++bounded_merges;
+      vss::merge_bound_candidates(acc_distances->mutable_view().data<float>(),
+                                  acc_neighbors->mutable_view().data<std::int64_t>(),
+                                  n_left,
+                                  k_join,
+                                  *candidates,
+                                  pending,
+                                  bound->data(),
+                                  stream,
+                                  mr);
+      CUDF_CUDA_TRY(
+        cudaMemsetAsync(candidates->count.data(), 0, sizeof(unsigned long long), stream.value()));
+      pending = 0;
+    };
+    // The buffer's fill is read back once per group of slices, not per slice: a group that
+    // overflowed is rolled back to the count before it and replayed a slice at a time, first
+    // after the buffered pairs are merged, which tightens the bound, then into a bigger buffer.
+    struct bounded_slice {
+      std::int8_t const* x;
+      std::int32_t const* x_sq;
+      std::int64_t n;
+      std::int64_t id_base;
+      std::int64_t const* id_map;
+      std::int64_t const* rows;
+      std::int64_t m;
+    };
+    constexpr std::size_t kBoundedGroup = 64;
+    std::vector<bounded_slice> group;
+    auto launch_bounded = [&](bounded_slice const& sl) {
+      vss::bound_filter_int8(sl.x,
+                             sl.x_sq,
+                             sl.n,
+                             sl.id_base,
+                             sl.id_map,
+                             probe_i8->data(),
+                             probe_sq->data(),
+                             sl.rows,
+                             sl.m,
+                             dim,
+                             bound->data(),
+                             *candidates,
+                             stream);
+    };
+    auto read_count = [&] {
+      unsigned long long total = 0;
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        &total, candidates->count.data(), sizeof(total), cudaMemcpyDeviceToHost, stream.value()));
+      stream.synchronize();
+      return static_cast<std::int64_t>(total);
+    };
+    auto rollback = [&] {
+      auto const keep = static_cast<unsigned long long>(pending);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        candidates->count.data(), &keep, sizeof(keep), cudaMemcpyHostToDevice, stream.value()));
+    };
+    auto check_group = [&] {
+      if (group.empty()) { return; }
+      auto total = read_count();
+      if (total > candidates->capacity()) {
+        rollback();
+        for (auto const& sl : group) {
+          while (true) {
+            launch_bounded(sl);
+            total = read_count();
+            if (total <= candidates->capacity()) { break; }
+            auto const slice_pairs = total - pending;
+            rollback();
+            if (pending > 0) {
+              flush();
+            } else {
+              candidates.reset();
+              candidates.emplace(slice_pairs + slice_pairs / 4, stream, mr);
+            }
+          }
+          pending = total;
+        }
+      }
+      pending = total;
+      bounded_emitted += static_cast<std::int64_t>(total);
+      group.clear();
+      if (pending > candidates->capacity() / 2) { flush(); }
+    };
+
     std::int64_t scanned_pairs = 0;
     auto prefetched            = needed_chunks.empty() || int8_search
                                    ? staged_vector_chunk{}
                                    : _corpus->stage(needed_chunks[0], *mem_space, stage_on);
 
-    for (std::size_t ci = 0; ci < needed_chunks.size(); ++ci) {
-      auto const j            = needed_chunks[ci];
-      auto staged             = std::move(prefetched);
-      auto const chunk_base   = _chunk_row_base[j];
-      float const* chunk_data = nullptr;
-      std::int64_t chunk_n    = 0;
-      if (int8_search) {
-        chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
-      } else {
-        auto const chunk_view = vss::list_column_as_dataset_view(staged.view, dim);
-        chunk_data            = chunk_view.data_handle();
-        chunk_n               = chunk_view.extent(0);
+    for (int sweep = 0; sweep < (bounded ? 2 : 1); ++sweep) {
+      if (sweep == 1) {
+        phase("nearest-cluster sweep");
+        bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
+        vss::kth_distance_bound(
+          acc_distances->view().data<float>(), n_left, k_join, bound->data(), stream);
+        candidates.emplace(
+          std::max<std::int64_t>(std::int64_t{1} << 22, 4 * n_left * k_join), stream, mr);
       }
-
-      for (auto const& slice : _chunk_cluster_runs[j]) {
-        auto const eb = edge_begin[static_cast<std::size_t>(slice.cluster)];
-        auto const ee = edge_begin[static_cast<std::size_t>(slice.cluster) + 1];
-        if (eb == ee) { continue; }
-        // The slice was cut from the cluster column's chunk j; this is the first point at
-        // which the vector column's chunk j is resident and its row count exactly known. The
-        // two are the same pin's row groups, so a mismatch is a broken invariant rather than
-        // a user error -- but it would read past the end of the chunk, so it is checked.
-        if (slice.end > chunk_n) {
-          throw std::runtime_error(
-            "[sirius_physical_vector_join_stream] cluster column chunk " + std::to_string(j) +
-            " describes row " + std::to_string(slice.end) + " but the vector column's chunk " +
-            "holds " + std::to_string(chunk_n) + "; both must come from the same pin");
+      for (std::size_t ci = 0; ci < needed_chunks.size(); ++ci) {
+        auto const j            = needed_chunks[ci];
+        auto staged             = std::move(prefetched);
+        auto const chunk_base   = _chunk_row_base[j];
+        float const* chunk_data = nullptr;
+        std::int64_t chunk_n    = 0;
+        if (int8_search) {
+          chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
+        } else {
+          auto const chunk_view = vss::list_column_as_dataset_view(staged.view, dim);
+          chunk_data            = chunk_view.data_handle();
+          chunk_n               = chunk_view.extent(0);
         }
-        auto const slice_rows = slice.end - slice.begin;
-        auto const slice_view =
-          raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
-            chunk_data == nullptr ? nullptr : chunk_data + slice.begin * dim, slice_rows, dim);
-        auto const k_eff = std::min<std::int64_t>(k_join, slice_rows);
 
-        // ONE search per slice: every row routed here searches the same dataset, and the
-        // fold's dominant term is per call rather than per pair (X1 measured 278 us/call at
-        // 42-96% of runtime). The rows are gathered into one query matrix; a row is gathered
-        // once per cluster it visits, so the copies total n_probes probe batches per join --
-        // the price of routing rows rather than runs.
-        auto const m       = ee - eb;
-        auto const* rows_c = routed_rows + eb;
-        if (!int8_search) {
-          vss::gather_rows(queries.data_handle(), dim, rows_c, m, routed_queries.data(), stream);
-        }
-        auto const queries_view =
-          raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
-            routed_queries.data(), m, dim);
-        scanned_pairs += slice_rows * m;
-        // Neighbour ids come back local to the slice; the slice's own start in corpus row
-        // space is the base that makes them corpus row ids, exactly as the chunk offset does
-        // in the exhaustive fold.
-        auto const id_base = chunk_base + slice.begin;
-        // Lists are in cluster order, not pin order; their row map turns a layout row back into
-        // the pin row every later stage reads the corpus by.
-        auto const* id_map = _lists != nullptr
-                               ? static_cast<const std::int64_t*>(_lists->row_ids->data()) + id_base
-                               : nullptr;
-
-        if (radius_join) {
-          // Same construction as the exhaustive radius path: a slice's in-range pairs are
-          // final when produced, so they are appended, never folded, and there is no k. The
-          // kernel numbers query rows within the gathered matrix; rows_c maps them back.
-          auto edges = threshold_search(res, slice_view, queries_view, radius_eps, metric, mr);
-          if (edges.n_edges > 0) {
-            auto left = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                                  static_cast<cudf::size_type>(edges.n_edges),
-                                                  cudf::mask_state::UNALLOCATED,
-                                                  stream,
-                                                  mr);
-            vss::remap_radius_edges(edges.query_rows->view().data<std::int64_t>(),
-                                    rows_c,
-                                    left->mutable_view().data<std::int32_t>(),
-                                    edges.neighbors->mutable_view().data<std::int64_t>(),
-                                    edges.n_edges,
-                                    id_base,
-                                    stream,
-                                    id_map);
-            radius_left.push_back(std::move(left));
-            radius_neighbors.push_back(std::move(edges.neighbors));
-            radius_distances.push_back(std::move(edges.distances));
+        for (auto const& slice : _chunk_cluster_runs[j]) {
+          auto eb = edge_begin[static_cast<std::size_t>(slice.cluster)];
+          auto ee = edge_begin[static_cast<std::size_t>(slice.cluster) + 1];
+          if (bounded) {
+            auto const split       = eb + nearest_edges[static_cast<std::size_t>(slice.cluster)];
+            (sweep == 0 ? ee : eb) = split;
           }
-          continue;
-        }
+          if (eb == ee) { continue; }
+          // The slice was cut from the cluster column's chunk j; this is the first point at
+          // which the vector column's chunk j is resident and its row count exactly known. The
+          // two are the same pin's row groups, so a mismatch is a broken invariant rather than
+          // a user error -- but it would read past the end of the chunk, so it is checked.
+          if (slice.end > chunk_n) {
+            throw std::runtime_error(
+              "[sirius_physical_vector_join_stream] cluster column chunk " + std::to_string(j) +
+              " describes row " + std::to_string(slice.end) + " but the vector column's chunk " +
+              "holds " + std::to_string(chunk_n) + "; both must come from the same pin");
+          }
+          auto const slice_rows = slice.end - slice.begin;
+          auto const slice_view =
+            raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+              chunk_data == nullptr ? nullptr : chunk_data + slice.begin * dim, slice_rows, dim);
+          auto const k_eff = std::min<std::int64_t>(k_join, slice_rows);
 
-        // The GEMM-ranked search, as in the exhaustive fold: it also carries none of cuVS's
-        // per-call device synchronization, which is paid here once per slice.
-        auto const knn = [&] {
-          if (int8_search) {
-            vss::gather_bytes(probe_i8->data(), dim, rows_c, m, routed_i8->data(), stream);
-            vss::gather_int32(probe_sq->data(), rows_c, m, routed_sq->data(), stream);
-            return vss::gemm_int8_topk(
-              res,
+          // ONE search per slice: every row routed here searches the same dataset, and the
+          // fold's dominant term is per call rather than per pair (X1 measured 278 us/call at
+          // 42-96% of runtime). The rows are gathered into one query matrix; a row is gathered
+          // once per cluster it visits, so the copies total n_probes probe batches per join --
+          // the price of routing rows rather than runs.
+          auto const m       = ee - eb;
+          auto const* rows_c = routed_rows + eb;
+          if (!int8_search) {
+            vss::gather_rows(queries.data_handle(), dim, rows_c, m, routed_queries.data(), stream);
+          }
+          auto const queries_view =
+            raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+              routed_queries.data(), m, dim);
+          scanned_pairs += slice_rows * m;
+          // Neighbour ids come back local to the slice; the slice's own start in corpus row
+          // space is the base that makes them corpus row ids, exactly as the chunk offset does
+          // in the exhaustive fold.
+          auto const id_base = chunk_base + slice.begin;
+          // Lists are in cluster order, not pin order; their row map turns a layout row back into
+          // the pin row every later stage reads the corpus by.
+          auto const* id_map =
+            _lists != nullptr ? static_cast<const std::int64_t*>(_lists->row_ids->data()) + id_base
+                              : nullptr;
+
+          if (sweep == 1) {
+            bounded_slice const sl{
               static_cast<std::int8_t const*>(_lists->device_vectors->data()) + id_base * dim,
               static_cast<std::int32_t const*>(_lists->row_sq->data()) + id_base,
               slice_rows,
-              routed_i8->data(),
-              routed_sq->data(),
-              m,
-              dim,
-              k_eff,
-              metric == cuvs::distance::DistanceType::L2SqrtExpanded,
-              mr);
+              id_base,
+              id_map,
+              rows_c,
+              m};
+            launch_bounded(sl);
+            ++bounded_launches;
+            bounded_padded += ((slice_rows + 127) / 128) * ((m + 127) / 128);
+            group.push_back(sl);
+            if (group.size() >= kBoundedGroup) { check_group(); }
+            continue;
           }
-          return gemm_search_enabled() && vss::gemm_search_supports(metric)
-                   ? vss::gemm_topk(res, slice_view, queries_view, k_eff, metric, mr)
-                   : vss::brute_force_knn_untrimmed(res,
-                                                    vss::brute_force_build(res, slice_view, metric),
-                                                    queries_view,
-                                                    k_eff,
+
+          if (radius_join) {
+            // Same construction as the exhaustive radius path: a slice's in-range pairs are
+            // final when produced, so they are appended, never folded, and there is no k. The
+            // kernel numbers query rows within the gathered matrix; rows_c maps them back.
+            auto edges = threshold_search(res, slice_view, queries_view, radius_eps, metric, mr);
+            if (edges.n_edges > 0) {
+              auto left = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                    static_cast<cudf::size_type>(edges.n_edges),
+                                                    cudf::mask_state::UNALLOCATED,
+                                                    stream,
                                                     mr);
-        }();
+              vss::remap_radius_edges(edges.query_rows->view().data<std::int64_t>(),
+                                      rows_c,
+                                      left->mutable_view().data<std::int32_t>(),
+                                      edges.neighbors->mutable_view().data<std::int64_t>(),
+                                      edges.n_edges,
+                                      id_base,
+                                      stream,
+                                      id_map);
+              radius_left.push_back(std::move(left));
+              radius_neighbors.push_back(std::move(edges.neighbors));
+              radius_distances.push_back(std::move(edges.distances));
+            }
+            continue;
+          }
 
-        // Fold in place: a row is routed to a cluster at most once, so the rows of one slice
-        // are distinct and no two threads of the fold write the same accumulator row.
-        vss::fold_topk_rows(acc_distances->mutable_view().data<float>(),
-                            acc_neighbors->mutable_view().data<std::int64_t>(),
-                            k_join,
-                            knn.distances->view().data<float>(),
-                            knn.neighbors->view().data<std::int64_t>(),
-                            knn.k,
-                            k_eff,
-                            rows_c,
-                            m,
-                            id_base,
-                            stream,
-                            id_map);
+          // The GEMM-ranked search, as in the exhaustive fold: it also carries none of cuVS's
+          // per-call device synchronization, which is paid here once per slice.
+          auto const knn = [&] {
+            if (int8_search) {
+              vss::gather_bytes(probe_i8->data(), dim, rows_c, m, routed_i8->data(), stream);
+              vss::gather_int32(probe_sq->data(), rows_c, m, routed_sq->data(), stream);
+              return vss::gemm_int8_topk(
+                res,
+                static_cast<std::int8_t const*>(_lists->device_vectors->data()) + id_base * dim,
+                static_cast<std::int32_t const*>(_lists->row_sq->data()) + id_base,
+                slice_rows,
+                routed_i8->data(),
+                routed_sq->data(),
+                m,
+                dim,
+                k_eff,
+                metric == cuvs::distance::DistanceType::L2SqrtExpanded && !bounded,
+                mr);
+            }
+            return gemm_search_enabled() && vss::gemm_search_supports(metric)
+                     ? vss::gemm_topk(res, slice_view, queries_view, k_eff, metric, mr)
+                     : vss::brute_force_knn_untrimmed(
+                         res,
+                         vss::brute_force_build(res, slice_view, metric),
+                         queries_view,
+                         k_eff,
+                         mr);
+          }();
+
+          // Fold in place: a row is routed to a cluster at most once, so the rows of one slice
+          // are distinct and no two threads of the fold write the same accumulator row.
+          vss::fold_topk_rows(acc_distances->mutable_view().data<float>(),
+                              acc_neighbors->mutable_view().data<std::int64_t>(),
+                              k_join,
+                              knn.distances->view().data<float>(),
+                              knn.neighbors->view().data<std::int64_t>(),
+                              knn.k,
+                              k_eff,
+                              rows_c,
+                              m,
+                              id_base,
+                              stream,
+                              id_map);
+        }
+
+        // The searches above are issued, not finished. Staging the next needed chunk now runs its
+        // H2D while the GPU works on this one.
+        prefetched = (ci + 1 < needed_chunks.size() && !int8_search)
+                       ? _corpus->stage(needed_chunks[ci + 1], *mem_space, stage_on)
+                       : staged_vector_chunk{};
+        release_staged(staged);
       }
-
-      // The searches above are issued, not finished. Staging the next needed chunk now runs its
-      // H2D while the GPU works on this one.
-      prefetched = (ci + 1 < needed_chunks.size() && !int8_search)
-                     ? _corpus->stage(needed_chunks[ci + 1], *mem_space, stage_on)
-                     : staged_vector_chunk{};
-      release_staged(staged);
+    }
+    if (bounded) {
+      check_group();
+      flush();
+      if (dbg) {
+        std::fprintf(stderr,
+                     "[vecjoin-phase] bounded: ~%lld pairs passed, %lld merges, %lld launches, "
+                     "%lld 128x128 tiles\n",
+                     static_cast<long long>(bounded_emitted),
+                     static_cast<long long>(bounded_merges),
+                     static_cast<long long>(bounded_launches),
+                     static_cast<long long>(bounded_padded));
+      }
+      if (sqrt_at_end) {
+        vss::sqrt_in_place(acc_distances->mutable_view().data<float>(), n_left * k_join, stream);
+      }
     }
 
     // What the pruning did, reported as a value rather than only a print: an approximate join

@@ -401,6 +401,7 @@ set(CUDA_SOURCES
     src/cuda/scan/strings/fsst.cu
     src/cuda/scan/strings/uncompressed.cu
     src/cuda/vss/cudf_raft_interop.cu
+    src/cuda/vss/bound_gemm.cu
     src/cuda/vss/brute_force_search.cu
     src/cuda/vss/brute_force_threshold.cu
     src/cuda/vss/cluster_fold.cu
