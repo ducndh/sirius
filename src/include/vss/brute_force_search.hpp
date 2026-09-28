@@ -173,6 +173,22 @@ knn_result gemm_l2_topk(
   bool take_sqrt,
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
+/// Whether @ref gemm_topk (and gemm_threshold) handle @p metric: the expanded L2 variants and
+/// CosineExpanded. Cosine ranks by -q^.x^ over unit vectors, one GEMM with no extra column.
+bool gemm_search_supports(cuvs::distance::DistanceType metric);
+
+/// Largest [queries x corpus] score tile a GEMM-ranked search holds at once (default 512 MiB,
+/// SIRIUS_VSS_GEMM_TILE_MB overrides). Part of what a task has to reserve for one.
+std::size_t gemm_search_tile_bytes();
+
+/// @ref gemm_l2_topk for any metric @ref gemm_search_supports accepts.
+knn_result gemm_topk(raft::device_resources const& res,
+                     dataset_matrix_view dataset,
+                     dataset_matrix_view queries,
+                     int64_t k,
+                     cuvs::distance::DistanceType metric,
+                     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
 #ifdef SIRIUS_ENABLE_FAISS_KERNEL
 /**
  * @brief The same search, run by FAISS-GPU instead of cuVS.

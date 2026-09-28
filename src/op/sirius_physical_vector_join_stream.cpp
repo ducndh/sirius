@@ -477,6 +477,29 @@ filtered_chunk filter_corpus_chunk(const scan_manager::pinned_entry& pin,
   return out;
 }
 
+/// Whether the GEMM-ranked kernels replace cuVS where they can; SIRIUS_VSS_GEMM_TOPK=0 is the
+/// A/B switch back to cuVS for both the top-k and the threshold searches.
+bool gemm_search_enabled()
+{
+  static bool const enabled = [] {
+    auto const* v = std::getenv("SIRIUS_VSS_GEMM_TOPK");
+    return v == nullptr || std::string_view{v} != "0";
+  }();
+  return enabled;
+}
+
+vss::threshold_join_result threshold_search(raft::device_resources const& res,
+                                            vss::dataset_matrix_view dataset,
+                                            vss::dataset_matrix_view queries,
+                                            float eps,
+                                            cuvs::distance::DistanceType metric,
+                                            rmm::device_async_resource_ref mr)
+{
+  return gemm_search_enabled() && vss::gemm_search_supports(metric)
+           ? vss::gemm_threshold(res, dataset, queries, eps, metric, mr)
+           : vss::brute_force_threshold(res, dataset, queries, eps, metric, mr);
+}
+
 /// Read locks on borrowed build-side batches, each held only until the searches that read it
 /// have finished on the compute stream. A borrow costs no device memory, but a locked batch
 /// cannot be spilled, so holding every borrow to the end of the task pinned the whole corpus on
@@ -1375,8 +1398,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           // Same construction as the exhaustive radius path: a slice's in-range pairs are
           // final when produced, so they are appended, never folded, and there is no k. The
           // kernel numbers query rows within the gathered matrix; rows_c maps them back.
-          auto edges =
-            vss::brute_force_threshold(res, slice_view, queries_view, radius_eps, metric, mr);
+          auto edges = threshold_search(res, slice_view, queries_view, radius_eps, metric, mr);
           if (edges.n_edges > 0) {
             auto left = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                                   static_cast<cudf::size_type>(edges.n_edges),
@@ -1398,22 +1420,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           continue;
         }
 
-        // Expanded L2 through the fused-ranking GEMM, as in the exhaustive fold: it also carries
-        // none of cuVS's per-call device synchronization, which is paid here once per slice.
-        static bool const gemm_topk = [] {
-          auto const* v = std::getenv("SIRIUS_VSS_GEMM_TOPK");
-          return v == nullptr || std::string_view{v} != "0";
-        }();
-        bool const expanded_l2 = metric == cuvs::distance::DistanceType::L2Expanded ||
-                                 metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+        // The GEMM-ranked search, as in the exhaustive fold: it also carries none of cuVS's
+        // per-call device synchronization, which is paid here once per slice.
         auto const knn =
-          gemm_topk && expanded_l2
-            ? vss::gemm_l2_topk(res,
-                                slice_view,
-                                queries_view,
-                                k_eff,
-                                metric == cuvs::distance::DistanceType::L2SqrtExpanded,
-                                mr)
+          gemm_search_enabled() && vss::gemm_search_supports(metric)
+            ? vss::gemm_topk(res, slice_view, queries_view, k_eff, metric, mr)
             : vss::brute_force_knn_untrimmed(
                 res, vss::brute_force_build(res, slice_view, metric), queries_view, k_eff, mr);
 
@@ -1539,7 +1550,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         }
         auto edges = searched.extent(0) == 0
                        ? vss::threshold_join_result{nullptr, nullptr, nullptr, 0}
-                       : vss::brute_force_threshold(res, searched, queries, radius_eps, metric, mr);
+                       : threshold_search(res, searched, queries, radius_eps, metric, mr);
         advance(j + 1);
         release_staged(staged);
         auto const chunk_base = offset;
@@ -1583,21 +1594,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       }
       auto const k_eff = std::min<std::int64_t>(k_join, batch_rows);
 
-      // Expanded L2 goes through the fused-ranking GEMM; SIRIUS_VSS_GEMM_TOPK=0 restores the cuVS
-      // search for an A/B. The unexpanded `exact` mode and cosine keep cuVS.
-      static bool const gemm_topk = [] {
-        auto const* v = std::getenv("SIRIUS_VSS_GEMM_TOPK");
-        return v == nullptr || std::string_view{v} != "0";
-      }();
-      bool const expanded_l2 = metric == cuvs::distance::DistanceType::L2Expanded ||
-                               metric == cuvs::distance::DistanceType::L2SqrtExpanded;
-      auto knn = gemm_topk && expanded_l2
-                   ? vss::gemm_l2_topk(res,
-                                       dataset,
-                                       queries,
-                                       k_eff,
-                                       metric == cuvs::distance::DistanceType::L2SqrtExpanded,
-                                       mr)
+      // Expanded L2 and cosine go through the GEMM-ranked search; the unexpanded `exact` mode keeps
+      // cuVS.
+      auto knn = gemm_search_enabled() && vss::gemm_search_supports(metric)
+                   ? vss::gemm_topk(res, dataset, queries, k_eff, metric, mr)
                    : vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
 
       // The search above is issued, not finished. Staging the next chunk now runs its H2D
@@ -1778,7 +1778,24 @@ std::size_t sirius_physical_vector_join_stream::per_left_batch_estimate(std::siz
   // corpus chunk rather than instead of it.
   if (_probe && _probe->is_streaming()) { staged_chunk += _max_probe_chunk_bytes; }
 
-  return (block * 6) + cuvs_scratch + staged_chunk + (std::size_t{1} << 20);
+  // The GEMM-ranked search holds its score tile, the prepared corpus chunk ([rows x d+pad]) and
+  // the prepared probe chunk at once, and a threshold search its edge buffer (1M edges to start).
+  // Left out, a task under a small pool reserved a fraction of what it used, ran out mid-fold
+  // and was restarted from its first chunk, over and over.
+  std::size_t gemm_scratch = 0;
+  if (gemm_search_enabled()) {
+    auto const row_bytes       = static_cast<std::size_t>(_request.dim + 4) * sizeof(float);
+    std::size_t max_chunk_rows = 0;
+    for (std::size_t i = 0; _corpus && i < _corpus->num_chunks(); ++i) {
+      max_chunk_rows = std::max(max_chunk_rows, _corpus->chunk_rows(i));
+    }
+    gemm_scratch = vss::gemm_search_tile_bytes() + max_chunk_rows * row_bytes + n_left * row_bytes;
+    if (_request.mode == vss::vector_join_mode::threshold) {
+      gemm_scratch += (std::size_t{1} << 20) * (2 * sizeof(std::int64_t) + sizeof(float));
+    }
+  }
+
+  return (block * 6) + std::max(cuvs_scratch, gemm_scratch) + staged_chunk + (std::size_t{1} << 20);
 }
 
 std::size_t sirius_physical_vector_join_stream::no_history_peak_memory_estimate(

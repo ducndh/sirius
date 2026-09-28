@@ -1442,3 +1442,49 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM unpin_table('f_corpus');");
   run_ok("SELECT * FROM unpin_table('f_probe');");
 }
+
+// -----------------------------------------------------------------------------
+// The GEMM-ranked threshold (exact-gemm): the pairs come from comparing GEMM scores against a
+// per-row bound rather than from distances, so the boundary is what has to be right. Checked for
+// L2 and cosine against DuckDB's own range predicate. Run it with SIRIUS_VSS_GEMM_TILE_MB=1 to
+// spread the corpus over several score tiles.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - GEMM threshold matches the CPU range query for l2 and cosine",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE g_corpus (id INTEGER, vec FLOAT[16]);");
+  run_ok(
+    "INSERT INTO g_corpus SELECT i, list_transform(range(16), lambda d: "
+    "((hash(i * 100 + d) % 1000)::FLOAT / 1000.0))::FLOAT[16] FROM range(20000) t(i);");
+  run_ok("CREATE TABLE g_probe (id INTEGER, vec FLOAT[16]);");
+  run_ok(
+    "INSERT INTO g_probe SELECT i, list_transform(range(16), lambda d: "
+    "((hash(i * 100 + d + 7777777) % 1000)::FLOAT / 1000.0))::FLOAT[16] FROM range(300) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'g_probe',  tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'g_corpus', tier => 'gpu', format => 'duckdb');");
+
+  con->Query("SET gpu_execution = false;");
+  auto const l2_ref  = ok_rows(*con,
+                              "SELECT p.id, c.id FROM g_probe p, g_corpus c "
+                               "WHERE array_distance(p.vec, c.vec) <= 0.8;");
+  auto const cos_ref = ok_rows(*con,
+                               "SELECT p.id, c.id FROM g_probe p, g_corpus c "
+                               "WHERE array_cosine_similarity(p.vec, c.vec) >= 0.93;");
+  con->Query("SET gpu_execution = true;");
+  REQUIRE(l2_ref.size() > 1000);
+  REQUIRE(cos_ref.size() > 1000);
+
+  auto const join = [](const std::string& args) {
+    return "SELECT left_id, right_id FROM sirius_knn_join('g_probe','vec','g_corpus','vec', "
+           "search_mode => 'exact-gemm', join_mode => 'threshold', " +
+           args + ", left_output_columns => ['id'], right_output_columns => ['id']);";
+  };
+  CHECK(ok_rows(*con, join("metric => 'l2', eps => 0.8")) == l2_ref);
+  CHECK(ok_rows(*con, join("metric => 'cosine', eps => 0.93, output_type => 'similarity'")) ==
+        cos_ref);
+
+  run_ok("SELECT * FROM unpin_table('g_corpus');");
+  run_ok("SELECT * FROM unpin_table('g_probe');");
+}
