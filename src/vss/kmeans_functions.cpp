@@ -52,8 +52,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
@@ -570,6 +572,46 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     lists.row_sq = std::make_unique<rmm::device_buffer>(
       static_cast<std::size_t>(n_rows) * sizeof(std::int32_t), persistent, persistent_mr);
   }
+  // FLOAT16 lists also keep the FP32 rows, in layout order on the host, for the bounded search to
+  // re-score against; without the room for them the lists still work, only through the lossy path.
+  std::vector<std::byte*> exact_ptrs;
+  std::optional<rmm::device_uvector<unsigned int>> max_norm_bits;
+  auto const exact_rows_per_block =
+    static_cast<std::int64_t>(block_bytes / (static_cast<std::size_t>(dim) * sizeof(float)));
+  if (encoding == list_encoding::float16 && host_mr != nullptr && exact_rows_per_block > 0) {
+    auto const n_blocks = (n_rows + exact_rows_per_block - 1) / exact_rows_per_block;
+    try {
+      lists.exact_vectors =
+        host_mr->allocate_multiple_blocks(static_cast<std::size_t>(n_blocks) * block_bytes);
+    } catch (std::exception const&) {
+      lists.exact_vectors = {};
+    }
+    if (lists.exact_vectors) {
+      lists.exact_rows_per_block = exact_rows_per_block;
+      std::vector<float const*> device_ptrs;
+      exact_ptrs.reserve(static_cast<std::size_t>(n_blocks));
+      device_ptrs.reserve(static_cast<std::size_t>(n_blocks));
+      for (std::int64_t b = 0; b < n_blocks; ++b) {
+        auto* host = lists.exact_vectors->at(static_cast<std::size_t>(b)).data();
+        void* dev  = nullptr;
+        CUDF_CUDA_TRY(cudaHostGetDevicePointer(&dev, host, 0));
+        exact_ptrs.push_back(host);
+        device_ptrs.push_back(static_cast<float const*>(dev));
+      }
+      lists.exact_blocks = std::make_unique<rmm::device_buffer>(
+        device_ptrs.size() * sizeof(float const*), persistent, persistent_mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(lists.exact_blocks->data(),
+                                    device_ptrs.data(),
+                                    device_ptrs.size() * sizeof(float const*),
+                                    cudaMemcpyHostToDevice,
+                                    persistent.value()));
+      lists.row_sq_f32 = std::make_unique<rmm::device_buffer>(
+        static_cast<std::size_t>(n_rows) * sizeof(float), persistent, persistent_mr);
+      max_norm_bits.emplace(1, persistent, persistent_mr);
+      CUDF_CUDA_TRY(
+        cudaMemsetAsync(max_norm_bits->data(), 0, sizeof(unsigned int), persistent.value()));
+    }
+  }
   lists.list_offsets = std::make_unique<rmm::device_buffer>(
     static_cast<std::size_t>(lists.chunk_rows + 1) * sizeof(std::int32_t),
     persistent,
@@ -651,6 +693,34 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         narrow_to_float16(grouped.data(), rows * dim, grouped_f16->data(), stream);
         grouped_bytes = reinterpret_cast<std::byte const*>(grouped_f16->data());
       }
+      std::optional<rmm::device_uvector<float>> grouped_sqf;
+      if (lists.exact_vectors) {
+        grouped_sqf.emplace(static_cast<std::size_t>(rows), stream, mr);
+        float_row_sq_norms(
+          grouped.data(), rows, dim, grouped_sqf->data(), max_norm_bits->data(), stream);
+        auto const exact_row_bytes = static_cast<std::size_t>(dim) * sizeof(float);
+        for (auto const& g : runs) {
+          CUDF_CUDA_TRY(cudaMemcpyAsync(static_cast<float*>(lists.row_sq_f32->data()) + g.dest,
+                                        grouped_sqf->data() + g.first,
+                                        static_cast<std::size_t>(g.rows) * sizeof(float),
+                                        cudaMemcpyDeviceToDevice,
+                                        stream.value()));
+          for (std::int64_t t = 0; t < g.rows;) {
+            auto const r     = g.dest + t;
+            auto const in_bl = r % exact_rows_per_block;
+            auto const n     = std::min(g.rows - t, exact_rows_per_block - in_bl);
+            CUDF_CUDA_TRY(
+              cudaMemcpyAsync(exact_ptrs[static_cast<std::size_t>(r / exact_rows_per_block)] +
+                                static_cast<std::size_t>(in_bl) * exact_row_bytes,
+                              reinterpret_cast<std::byte const*>(grouped.data()) +
+                                static_cast<std::size_t>(g.first + t) * exact_row_bytes,
+                              static_cast<std::size_t>(n) * exact_row_bytes,
+                              cudaMemcpyDeviceToHost,
+                              stream.value()));
+            t += n;
+          }
+        }
+      }
       if (encoding == list_encoding::uint8) {
         grouped_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
         grouped_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
@@ -691,6 +761,20 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   }
   labels.clear();
   labels.shrink_to_fit();
+  if (max_norm_bits) {
+    unsigned int bits = 0;
+    CUDF_CUDA_TRY(cudaMemcpy(&bits, max_norm_bits->data(), sizeof(bits), cudaMemcpyDeviceToHost));
+    float max_sq = 0;
+    std::memcpy(&max_sq, &bits, sizeof(max_sq));
+    lists.max_row_norm = std::sqrt(max_sq);
+    // A component past half's range would have become infinity; a norm this large is the only
+    // way to have one.
+    if (!(lists.max_row_norm < 65504.f)) {
+      throw duckdb::InvalidInputException(fn + ": a row norm of " +
+                                          std::to_string(lists.max_row_norm) +
+                                          " is outside float16's range; use storage => 'float32'");
+    }
+  }
 
   phase("pass 2 scatter");
 

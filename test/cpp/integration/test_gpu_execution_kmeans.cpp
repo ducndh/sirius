@@ -988,3 +988,54 @@ TEST_CASE_METHOD(KMeansFixture,
     query_ok(*con, "SELECT encoding FROM sirius_kmeans_build_lists('kmu_corpus','vec','kmu_c');");
   CHECK(built->GetValue(0, 0).ToString() == "float32");
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "float16 cluster lists still give the exact join's answer",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // Values in [0, 1) at 1/1000 steps, most of which half cannot represent: the lists hold rounded
+  // rows, and probing every cluster must still give back the FP32 answer, because the search only
+  // uses the half rows to filter and re-scores what passes against the FP32 ones.
+  create_lists_tables(*this, "kmh", "host");
+  run_ok("SELECT * FROM sirius_kmeans_fit('kmh_corpus','vec', name => 'kmh_c', n_clusters => 16);");
+  auto built = query_ok(*con,
+                        "SELECT tier, encoding FROM sirius_kmeans_build_lists('kmh_corpus','vec',"
+                        "'kmh_c', storage => 'float16');");
+  CHECK(built->GetValue(0, 0).ToString() == "gpu");
+  CHECK(built->GetValue(1, 0).ToString() == "float16");
+
+  for (auto const k : {5, 50}) {
+    auto const join = [&](const std::string& extra) {
+      return "SELECT left_id, right_id, distance FROM sirius_knn_join('kmh_probe','vec',"
+             "'kmh_corpus','vec', metric => 'l2', k => " +
+             std::to_string(k) + ", " + extra + ");";
+    };
+    // Distances to 1e-5 relative, which half rows are nowhere near (theirs are off by ~1e-4),
+    // and the pairs themselves: the two FP32 searches round differently, so only a near-tie may
+    // swap which of two rows is reported.
+    auto const fetch = [&](const std::string& extra) {
+      std::vector<std::tuple<std::string, double, std::string>> out;
+      for (auto const& r : ok_rows(*con, join(extra))) {
+        out.emplace_back(r.at(0), std::stod(r.at(2)), r.at(1));
+      }
+      std::sort(out.begin(), out.end());
+      return out;
+    };
+    auto const exact = fetch("search_mode => 'exact-gemm'");
+    auto const lists = fetch("search_mode => 'approx', clustering => 'kmh_c', n_probes => 16");
+    REQUIRE(exact.size() == static_cast<std::size_t>(50 * k));
+    REQUIRE(lists.size() == exact.size());
+    std::set<std::pair<std::string, std::string>> exact_pairs;
+    for (auto const& [left, d, right] : exact) {
+      exact_pairs.emplace(left, right);
+    }
+    std::size_t same = 0;
+    for (std::size_t i = 0; i < exact.size(); ++i) {
+      CHECK(std::get<0>(lists[i]) == std::get<0>(exact[i]));
+      CHECK(std::abs(std::get<1>(lists[i]) - std::get<1>(exact[i])) <=
+            1e-5 * std::max(1.0, std::get<1>(exact[i])));
+      same += exact_pairs.count({std::get<0>(lists[i]), std::get<2>(lists[i])});
+    }
+    CHECK(same * 100 >= exact.size() * 99);
+  }
+}

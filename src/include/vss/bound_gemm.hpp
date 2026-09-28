@@ -69,6 +69,69 @@ void bound_filter_int8(int8_t const* x,
                        bound_candidates& out,
                        rmm::cuda_stream_view stream);
 
+/// True when bound_filter_f16 can search vectors of this width.
+bool bound_filter_f16_supports(int64_t dim);
+
+/// The per-row slack a bounded FP16 search adds to its bound; see bound_filter_f16.
+struct float16_slack {
+  float a{0}, b{0}, c{0}, x_max{0};
+};
+
+/// The slack that makes an FP16 distance a certain lower bound on the FP32 one, for rows of
+/// @p dim components whose norms are at most @p x_max.
+float16_slack float16_distance_slack(int64_t dim, float x_max);
+
+/**
+ * @brief bound_filter_int8 for IEEE half vectors, with FP32 row norms of the ORIGINAL vectors.
+ *
+ * The FP16 distance can sit below the FP32 one by at most
+ * slack.a |q| x_max + slack.b (|q| + x_max)^2 + slack.c (|q| + x_max), so a pair passes when its
+ * FP16 distance is <= bound[row] + that: every pair within the bound in FP32 passes, and the
+ * survivors are the candidates exact_distances re-scores. Ids are id_base + j (layout rows).
+ */
+void bound_filter_f16(std::uint16_t const* x,
+                      float const* x_sq,
+                      int64_t n,
+                      int64_t id_base,
+                      std::uint16_t const* probe,
+                      float const* probe_sq,
+                      int64_t const* rows,
+                      int64_t m,
+                      int64_t dim,
+                      float const* bound,
+                      float16_slack const& slack,
+                      bound_candidates& out,
+                      rmm::cuda_stream_view stream);
+
+/**
+ * @brief distances[i] = |probe[r] - x[ids[i]]|^2 in FP32, r = rows[i] (or i / k when @p rows is
+ * null), with x read from pinned host blocks of @p rows_per_block rows (device pointers in
+ * @p blocks). Pairs with ids[i] < 0 are left alone.
+ */
+void exact_distances(float const* probe,
+                     int32_t const* rows,
+                     int64_t k,
+                     int64_t const* ids,
+                     float* distances,
+                     int64_t n_pairs,
+                     float const* const* blocks,
+                     int64_t rows_per_block,
+                     int64_t dim,
+                     rmm::cuda_stream_view stream);
+
+/// bound[r] = the largest of row r's k distances (+inf when any is a miss).
+void row_max_bound(float const* acc_distances,
+                   int64_t n_rows,
+                   int64_t k,
+                   float* bound,
+                   rmm::cuda_stream_view stream);
+
+/// Every one of the n entries becomes a miss: id -1 at +inf.
+void fill_misses(float* distances, int64_t* ids, int64_t n, rmm::cuda_stream_view stream);
+
+/// ids[i] = id_map[ids[i]] for every ids[i] >= 0.
+void map_ids(int64_t* ids, int64_t n, int64_t const* id_map, rmm::cuda_stream_view stream);
+
 /**
  * @brief Merge the first @p n_candidates of @p candidates into a nearest-first [n_rows x k]
  * accumulator and set bound[r] to row r's new k-th distance.

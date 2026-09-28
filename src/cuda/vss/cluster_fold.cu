@@ -179,6 +179,28 @@ __global__ void int8_row_sq_norms_kernel(int8_t const* x, int64_t rows, int64_t 
   }
 }
 
+__global__ void float_row_sq_norms_kernel(
+  float const* x, int64_t rows, int64_t d, float* out, unsigned int* max_bits)
+{
+  auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
+  auto const lane  = static_cast<int64_t>(threadIdx.x % 32);
+  for (int64_t r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32; r < rows; r += warps) {
+    float acc = 0.f;
+    for (int64_t j = lane; j < d; j += 32) {
+      float const v = x[r * d + j];
+      acc           = fmaf(v, v, acc);
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+      acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+      out[r] = acc;
+      // Non-negative floats order as their bit patterns.
+      atomicMax(max_bits, __float_as_uint(acc));
+    }
+  }
+}
+
 __global__ void gather_bytes_kernel(
   uint8_t const* src, int64_t row_bytes, int64_t const* rows, int64_t m, uint8_t* out)
 {
@@ -274,6 +296,19 @@ void int8_row_sq_norms(
   if (rows == 0) { return; }
   auto const grid = static_cast<int>(std::min<int64_t>((rows + 7) / 8, 65535));
   int8_row_sq_norms_kernel<<<grid, kBlock, 0, stream.value()>>>(x, rows, d, out);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void float_row_sq_norms(float const* x,
+                        int64_t rows,
+                        int64_t d,
+                        float* out,
+                        unsigned int* max_bits,
+                        rmm::cuda_stream_view stream)
+{
+  if (rows == 0) { return; }
+  auto const grid = static_cast<int>(std::min<int64_t>((rows + 7) / 8, 65535));
+  float_row_sq_norms_kernel<<<grid, kBlock, 0, stream.value()>>>(x, rows, d, out, max_bits);
   CUDF_CHECK_CUDA(stream.value());
 }
 

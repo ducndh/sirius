@@ -99,6 +99,16 @@ struct cluster_lists {
   /// UINT8 lists only: INT32 [n_rows] |x - 128|^2 per layout row, device-resident, which is what
   /// the int8 search adds to its dot products in place of a per-query norm pass.
   std::unique_ptr<rmm::device_buffer> row_sq;
+  /// FLOAT16 lists only, all three or none: the FP32 rows in layout order, in pinned host blocks
+  /// of exact_rows_per_block rows that the device reads through their mapping (exact_blocks holds
+  /// the device pointers); FP32 [n_rows] |x|^2 of those rows on the device; and the largest row
+  /// norm. A bounded FP16 search filters with the half rows and re-scores what passes against
+  /// these, so its answer is the FP32 one.
+  ::cucascade::memory::fixed_multiple_blocks_allocation exact_vectors;
+  std::int64_t exact_rows_per_block{0};
+  std::unique_ptr<rmm::device_buffer> exact_blocks;
+  std::unique_ptr<rmm::device_buffer> row_sq_f32;
+  float max_row_norm{0};
   /// INT32 [chunk_rows + 1] offsets 0, dim, 2 dim, ... A LIST view of any chunk borrows a
   /// prefix of these, since every list in the column has the same width.
   std::unique_ptr<rmm::device_buffer> list_offsets;
@@ -194,6 +204,14 @@ void int8_row_sq_norms(std::int8_t const* x,
                        std::int64_t d,
                        std::int32_t* out,
                        rmm::cuda_stream_view stream);
+
+/// out[i] = |x_i|^2 per FP32 row; *max_bits is raised to the largest one's bit pattern.
+void float_row_sq_norms(float const* x,
+                        std::int64_t rows,
+                        std::int64_t d,
+                        float* out,
+                        unsigned int* max_bits,
+                        rmm::cuda_stream_view stream);
 
 /// out[i, :] = src[rows[i], :] for rows of @p row_bytes bytes.
 void gather_bytes(void const* src,

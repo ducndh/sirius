@@ -1448,7 +1448,39 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       auto const* v = std::getenv("SIRIUS_VSS_BOUND_GEMM");
       return v == nullptr || std::strcmp(v, "0") != 0;
     }();
-    bool const sqrt_at_end = bounded && metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+    // FLOAT16 lists that kept their FP32 rows get the same two sweeps with the half-precision
+    // GEMM, and an exact answer: sweep 0's nearest-cluster answers are re-scored in FP32 only to
+    // give each row a bound (their largest distance) and then dropped, and sweep 1 searches every
+    // routed cluster, nearest one included, keeping pairs whose FP16 distance is within the bound
+    // plus the FP16 rounding slack. What passes is re-scored in FP32 before it is merged, and ids
+    // stay layout rows until the end, where the re-scoring needs them.
+    bool const f16_bounded = !int8_search && !radius_join && gemm_search_enabled() &&
+                             _lists != nullptr && _lists->encoding == vss::list_encoding::float16 &&
+                             _lists->tier == cucascade::memory::Tier::GPU &&
+                             _lists->exact_vectors != nullptr &&
+                             (metric == cuvs::distance::DistanceType::L2Expanded ||
+                              metric == cuvs::distance::DistanceType::L2SqrtExpanded) &&
+                             vss::bound_filter_f16_supports(dim) && [] {
+                               auto const* v = std::getenv("SIRIUS_VSS_BOUND_GEMM");
+                               return v == nullptr || std::strcmp(v, "0") != 0;
+                             }();
+    bool const any_bounded = bounded || f16_bounded;
+    bool const sqrt_at_end = any_bounded && metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+    std::optional<rmm::device_uvector<std::uint16_t>> probe_f16;
+    std::optional<rmm::device_uvector<float>> probe_sqf;
+    vss::float16_slack f16_slack;
+    if (f16_bounded) {
+      probe_f16.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
+      probe_sqf.emplace(static_cast<std::size_t>(n_left), stream, mr);
+      rmm::device_uvector<unsigned int> probe_max(1, stream, mr);
+      CUDF_CUDA_TRY(cudaMemsetAsync(probe_max.data(), 0, sizeof(unsigned int), stream.value()));
+      vss::narrow_to_float16(queries.data_handle(), n_left * dim, probe_f16->data(), stream);
+      vss::float_row_sq_norms(
+        queries.data_handle(), n_left, dim, probe_sqf->data(), probe_max.data(), stream);
+      f16_slack = vss::float16_distance_slack(dim, _lists->max_row_norm);
+    }
+    auto const* exact_blocks =
+      f16_bounded ? static_cast<float const* const*>(_lists->exact_blocks->data()) : nullptr;
     std::optional<rmm::device_uvector<float>> bound;
     std::optional<vss::bound_candidates> candidates;
     std::int64_t pending = 0, bounded_emitted = 0, bounded_merges = 0, bounded_launches = 0,
@@ -1456,6 +1488,18 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto flush                  = [&] {
       if (pending == 0) { return; }
       ++bounded_merges;
+      if (f16_bounded) {
+        vss::exact_distances(queries.data_handle(),
+                             candidates->rows.data(),
+                             0,
+                             candidates->ids.data(),
+                             candidates->distances.data(),
+                             pending,
+                             exact_blocks,
+                             _lists->exact_rows_per_block,
+                             dim,
+                             stream);
+      }
       vss::merge_bound_candidates(acc_distances->mutable_view().data<float>(),
                                   acc_neighbors->mutable_view().data<std::int64_t>(),
                                   n_left,
@@ -1473,8 +1517,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // overflowed is rolled back to the count before it and replayed a slice at a time, first
     // after the buffered pairs are merged, which tightens the bound, then into a bigger buffer.
     struct bounded_slice {
-      std::int8_t const* x;
-      std::int32_t const* x_sq;
+      void const* x;
+      void const* x_sq;
       std::int64_t n;
       std::int64_t id_base;
       std::int64_t const* id_map;
@@ -1484,8 +1528,24 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     constexpr std::size_t kBoundedGroup = 64;
     std::vector<bounded_slice> group;
     auto launch_bounded = [&](bounded_slice const& sl) {
-      vss::bound_filter_int8(sl.x,
-                             sl.x_sq,
+      if (f16_bounded) {
+        vss::bound_filter_f16(static_cast<std::uint16_t const*>(sl.x),
+                              static_cast<float const*>(sl.x_sq),
+                              sl.n,
+                              sl.id_base,
+                              probe_f16->data(),
+                              probe_sqf->data(),
+                              sl.rows,
+                              sl.m,
+                              dim,
+                              bound->data(),
+                              f16_slack,
+                              *candidates,
+                              stream);
+        return;
+      }
+      vss::bound_filter_int8(static_cast<std::int8_t const*>(sl.x),
+                             static_cast<std::int32_t const*>(sl.x_sq),
                              sl.n,
                              sl.id_base,
                              sl.id_map,
@@ -1539,16 +1599,38 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     };
 
     std::int64_t scanned_pairs = 0;
-    auto prefetched            = needed_chunks.empty() || int8_search
-                                   ? staged_vector_chunk{}
-                                   : _corpus->stage(needed_chunks[0], *mem_space, stage_on);
+    staged_vector_chunk prefetched;
 
-    for (int sweep = 0; sweep < (bounded ? 2 : 1); ++sweep) {
+    for (int sweep = 0; sweep < (any_bounded ? 2 : 1); ++sweep) {
+      // A sweep that reads the lists in place stages nothing.
+      bool const direct = int8_search || (f16_bounded && sweep == 1);
+      prefetched        = needed_chunks.empty() || direct
+                            ? staged_vector_chunk{}
+                            : _corpus->stage(needed_chunks[0], *mem_space, stage_on);
       if (sweep == 1) {
         phase("nearest-cluster sweep");
         bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
-        vss::kth_distance_bound(
-          acc_distances->view().data<float>(), n_left, k_join, bound->data(), stream);
+        if (f16_bounded) {
+          vss::exact_distances(queries.data_handle(),
+                               nullptr,
+                               k_join,
+                               acc_neighbors->view().data<std::int64_t>(),
+                               acc_distances->mutable_view().data<float>(),
+                               n_left * k_join,
+                               exact_blocks,
+                               _lists->exact_rows_per_block,
+                               dim,
+                               stream);
+          vss::row_max_bound(
+            acc_distances->view().data<float>(), n_left, k_join, bound->data(), stream);
+          vss::fill_misses(acc_distances->mutable_view().data<float>(),
+                           acc_neighbors->mutable_view().data<std::int64_t>(),
+                           n_left * k_join,
+                           stream);
+        } else {
+          vss::kth_distance_bound(
+            acc_distances->view().data<float>(), n_left, k_join, bound->data(), stream);
+        }
         candidates.emplace(
           std::max<std::int64_t>(std::int64_t{1} << 22, 4 * n_left * k_join), stream, mr);
       }
@@ -1558,7 +1640,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         auto const chunk_base   = _chunk_row_base[j];
         float const* chunk_data = nullptr;
         std::int64_t chunk_n    = 0;
-        if (int8_search) {
+        if (direct) {
           chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
         } else {
           auto const chunk_view = vss::list_column_as_dataset_view(staged.view, dim);
@@ -1567,12 +1649,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         }
 
         for (auto const& slice : _chunk_cluster_runs[j]) {
-          auto eb = edge_begin[static_cast<std::size_t>(slice.cluster)];
-          auto ee = edge_begin[static_cast<std::size_t>(slice.cluster) + 1];
-          if (bounded) {
-            auto const split       = eb + nearest_edges[static_cast<std::size_t>(slice.cluster)];
-            (sweep == 0 ? ee : eb) = split;
-          }
+          auto eb          = edge_begin[static_cast<std::size_t>(slice.cluster)];
+          auto ee          = edge_begin[static_cast<std::size_t>(slice.cluster) + 1];
+          auto const split = eb + nearest_edges[static_cast<std::size_t>(slice.cluster)];
+          if (bounded) { (sweep == 0 ? ee : eb) = split; }
+          if (f16_bounded && sweep == 0) { ee = split; }
           if (eb == ee) { continue; }
           // The slice was cut from the cluster column's chunk j; this is the first point at
           // which the vector column's chunk j is resident and its row count exactly known. The
@@ -1597,7 +1678,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           // the price of routing rows rather than runs.
           auto const m       = ee - eb;
           auto const* rows_c = routed_rows + eb;
-          if (!int8_search) {
+          if (!direct) {
             vss::gather_rows(queries.data_handle(), dim, rows_c, m, routed_queries.data(), stream);
           }
           auto const queries_view =
@@ -1615,14 +1696,24 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                               : nullptr;
 
           if (sweep == 1) {
-            bounded_slice const sl{
-              static_cast<std::int8_t const*>(_lists->device_vectors->data()) + id_base * dim,
-              static_cast<std::int32_t const*>(_lists->row_sq->data()) + id_base,
-              slice_rows,
-              id_base,
-              id_map,
-              rows_c,
-              m};
+            bounded_slice const sl =
+              f16_bounded
+                ? bounded_slice{static_cast<std::uint16_t const*>(_lists->device_vectors->data()) +
+                                  id_base * dim,
+                                static_cast<float const*>(_lists->row_sq_f32->data()) + id_base,
+                                slice_rows,
+                                id_base,
+                                nullptr,
+                                rows_c,
+                                m}
+                : bounded_slice{
+                    static_cast<std::int8_t const*>(_lists->device_vectors->data()) + id_base * dim,
+                    static_cast<std::int32_t const*>(_lists->row_sq->data()) + id_base,
+                    slice_rows,
+                    id_base,
+                    id_map,
+                    rows_c,
+                    m};
             launch_bounded(sl);
             ++bounded_launches;
             bounded_padded += ((slice_rows + 127) / 128) * ((m + 127) / 128);
@@ -1699,20 +1790,26 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                               m,
                               id_base,
                               stream,
-                              id_map);
+                              f16_bounded ? nullptr : id_map);
         }
 
         // The searches above are issued, not finished. Staging the next needed chunk now runs its
         // H2D while the GPU works on this one.
-        prefetched = (ci + 1 < needed_chunks.size() && !int8_search)
+        prefetched = (ci + 1 < needed_chunks.size() && !direct)
                        ? _corpus->stage(needed_chunks[ci + 1], *mem_space, stage_on)
                        : staged_vector_chunk{};
         release_staged(staged);
       }
     }
-    if (bounded) {
+    if (any_bounded) {
       check_group();
       flush();
+      if (f16_bounded) {
+        vss::map_ids(acc_neighbors->mutable_view().data<std::int64_t>(),
+                     n_left * k_join,
+                     static_cast<std::int64_t const*>(_lists->row_ids->data()),
+                     stream);
+      }
       if (dbg) {
         std::fprintf(stderr,
                      "[vecjoin-phase] bounded: ~%lld pairs passed, %lld merges, %lld launches, "
