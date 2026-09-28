@@ -1,0 +1,7 @@
+self-join 1,000,000 x 1,000,000, k=10, oracle = cupy brute force on 1000 sampled rows
+
+        algo  n_clusters   where   build_s  recall_id  recall_d
+ brute_force           1  device    34.154     0.9997    1.0000
+  nn_descent           1  device     4.895     0.9997    1.0000
+  nn_descent           4    host    10.477     0.9997    1.0000
+      ivf_pq           4    host     ERROR  IndexError: index 9223372036854775807 is out of bounds for axis 0 with s

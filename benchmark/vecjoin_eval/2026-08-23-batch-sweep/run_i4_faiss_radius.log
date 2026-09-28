@@ -1,0 +1,11 @@
+FAISS IndexFlatL2 add 1,000,000 rows: 0.255 s, 64 threads
+
+  probes     eps   faiss_s      pairs  sirius_s  sirius x
+    1000      50    18.263      1,113     0.263     0.01x
+    1000     100    18.216      3,444     0.213     0.01x
+   10000      50    71.521     11,285     1.800     0.03x
+   10000     100    71.542     35,296     1.801     0.03x
+
+per-row top-k reference at the same k the threshold path is forced to use:
+  FAISS-CPU search k=  10, 10k probes:  100.869 s
+  FAISS-CPU search k=1024, 10k probes:  100.947 s

@@ -1,0 +1,167 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@ fit n_clusters=64
+┌────────────┬───────┬────────────┬─────────┐
+│ n_clusters │  dim  │ train_rows │ n_rows  │
+│   int64    │ int64 │   int64    │  int64  │
+├────────────┼───────┼────────────┼─────────┤
+│         64 │   128 │      16384 │ 1000000 │
+└────────────┴───────┴────────────┴─────────┘
+Run Time (s): real 0.092 user 0.061340 sys 0.017708
+@@@ assign+order corpus
+Run Time (s): real 0.233 user 0.147300 sys 0.071522
+Run Time (s): real 1.266 user 6.362992 sys 0.757085
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+Run Time (s): real 0.010 user 0.007871 sys 0.003901
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@warmup discarded
+@@@ approx probes_n=1000 n_probes=1
+Run Time (s): real 0.081 user 0.045570 sys 0.005994
+@@@ approx probes_n=1000 n_probes=2
+Run Time (s): real 0.112 user 0.072029 sys 0.009626
+@@@ approx probes_n=1000 n_probes=4
+Run Time (s): real 0.172 user 0.140038 sys 0.004453
+@@@ approx probes_n=1000 n_probes=8
+Run Time (s): real 0.294 user 0.534411 sys 0.008479
+@@@ approx probes_n=1000 n_probes=16
+Run Time (s): real 0.527 user 0.493358 sys 0.020178
+@@@ exact probes_n=1000
+Run Time (s): real 0.081 user 0.043702 sys 0.004310
+@@@ approx probes_n=10000 n_probes=1
+Run Time (s): real 0.091 user 0.049364 sys 0.009481
+@@@ approx probes_n=10000 n_probes=2
+Run Time (s): real 0.112 user 0.084969 sys 0.002683
+@@@ approx probes_n=10000 n_probes=4
+Run Time (s): real 0.172 user 0.151468 sys 0.004465
+@@@ approx probes_n=10000 n_probes=8
+Run Time (s): real 0.323 user 0.294529 sys 0.007211
+@@@ approx probes_n=10000 n_probes=16
+Run Time (s): real 0.587 user 0.568175 sys 0.019279
+@@@ exact probes_n=10000
+Run Time (s): real 0.324 user 0.308291 sys 0.007747
+@@@ approx probes_n=100000 n_probes=1
+Run Time (s): real 0.142 user 0.118632 sys 0.005695
+@@@ approx probes_n=100000 n_probes=2
+Run Time (s): real 0.244 user 0.219754 sys 0.013875
+@@@ approx probes_n=100000 n_probes=4
+Run Time (s): real 0.446 user 0.429073 sys 0.012089
+@@@ approx probes_n=100000 n_probes=8
+Run Time (s): real 0.831 user 0.833047 sys 0.013105
+@@@ approx probes_n=100000 n_probes=16
+Run Time (s): real 1.600 user 1.611556 sys 0.023711
+@@@ exact probes_n=100000
+Run Time (s): real 2.974 user 3.011819 sys 0.031414
+@@@ approx probes_n=1000000 n_probes=1
+Run Time (s): real 0.729 user 4.777087 sys 0.057171
+@@@ approx probes_n=1000000 n_probes=2
+Run Time (s): real 1.330 user 9.282894 sys 0.050383
+@@@ approx probes_n=1000000 n_probes=4
+Run Time (s): real 2.519 user 18.372819 sys 0.074363
+@@@ approx probes_n=1000000 n_probes=8
+Run Time (s): real 4.904 user 36.676010 sys 0.134874
+@@@ approx probes_n=1000000 n_probes=16
+Run Time (s): real 9.664 user 72.811965 sys 0.233360
+@@@ exact probes_n=1000000
+Run Time (s): real 27.729 user 216.611230 sys 0.355921

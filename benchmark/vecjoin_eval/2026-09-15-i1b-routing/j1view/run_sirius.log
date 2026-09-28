@@ -1,0 +1,47 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@RUN view_10
+Run Time (s): real 0.241 user 0.121630 sys 0.093229
+Run Time (s): real 0.111 user 0.057264 sys 0.023840
+Run Time (s): real 0.101 user 0.057722 sys 0.019416
+@@@RUN ctas_10
+Run Time (s): real 0.262 user 0.541014 sys 0.080937
+Run Time (s): real 0.353 user 0.320366 sys 0.024692
+Run Time (s): real 0.020 user 0.002883 sys 0.001976
+Run Time (s): real 0.080 user 0.044834 sys 0.003952
+@@@RUN view_30
+Run Time (s): real 0.202 user 0.146050 sys 0.026897
+Run Time (s): real 0.201 user 0.143268 sys 0.029607
+Run Time (s): real 0.202 user 0.148204 sys 0.023917
+@@@RUN ctas_30
+Run Time (s): real 1.460 user 1.820899 sys 0.162414
+Run Time (s): real 0.020 user 0.003129 sys 0.000000
+Run Time (s): real 0.020 user 0.014921 sys 0.007830
+Run Time (s): real 0.161 user 0.129144 sys 0.003762
+@@@RUN view_50
+Run Time (s): real 0.282 user 0.230696 sys 0.027471
+Run Time (s): real 0.283 user 0.233863 sys 0.024095
+Run Time (s): real 0.282 user 0.232353 sys 0.025002
+@@@RUN ctas_50
+Run Time (s): real 2.386 user 5.093262 sys 0.244438
+Run Time (s): real 0.010 user 0.003212 sys 0.000323
+Run Time (s): real 0.031 user 0.006988 sys 0.010173
+Run Time (s): real 0.241 user 0.215387 sys 0.001252
+@@@RUN view_90
+Run Time (s): real 0.464 user 0.409441 sys 0.030259
+Run Time (s): real 0.453 user 0.410301 sys 0.020484
+Run Time (s): real 0.454 user 0.410250 sys 0.019906
+@@@RUN ctas_90
+Run Time (s): real 4.097 user 5.287221 sys 0.414236
+Run Time (s): real 0.010 user 0.002257 sys 0.002916
+Run Time (s): real 0.040 user 0.008838 sys 0.022164
+Run Time (s): real 0.413 user 0.387907 sys 0.002350

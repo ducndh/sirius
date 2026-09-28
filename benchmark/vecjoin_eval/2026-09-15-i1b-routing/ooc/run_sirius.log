@@ -1,0 +1,21 @@
+NVIDIA RTX A5000, 8.6, 24564 MiB
+########## Sirius out-of-core, 8 GiB (log: benchmark/vecjoin_eval/2026-08-23-out-of-core/run_8gib.log)
+│ corpus_rows │
+=== TIMED sirius exact streaming, corpus host-pinned (streams to GPU), 8 GiB
+Run Time (s): real 8.006 user 7.973513 sys 0.105627
+┌──────────────┬───────────────┐
+│ recall_at_10 │ rows_returned │
+│    double    │     int64     │
+├──────────────┼───────────────┤
+│          1.0 │        100000 │
+└──────────────┴───────────────┘
+########## Sirius out-of-core, 24 GiB (log: benchmark/vecjoin_eval/2026-08-23-out-of-core/run_24gib.log)
+│ corpus_rows │
+=== TIMED sirius exact streaming, corpus host-pinned (streams to GPU), 24 GiB
+Run Time (s): real 23.856 user 23.860788 sys 0.295443
+┌──────────────┬───────────────┐
+│ recall_at_10 │ rows_returned │
+│    double    │     int64     │
+├──────────────┼───────────────┤
+│          1.0 │        100000 │
+└──────────────┴───────────────┘

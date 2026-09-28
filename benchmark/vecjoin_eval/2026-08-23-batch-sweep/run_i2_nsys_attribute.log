@@ -1,0 +1,13 @@
+241,115 kernel launches in the trace
+
+  #   span_s  kernel_s  busy%  launches  CALLS launch/call  top kernel
+  0    0.150     0.026  17.4%     1,988      0           -  void cutlass_cuvs_cutlass::Kernel (30% of busy)
+  5    0.370     0.338  91.2%       577      7        82.4  ampere_sgemm_128x64_tn (49% of busy)
+  6    0.246     0.068  27.8%     4,239    221        19.2  void raft::matrix::detail::select::warpsort: (43% of busy)
+  7    0.440     0.136  30.9%     8,473    504        16.8  void raft::matrix::detail::select::warpsort: (42% of busy)
+  8    0.796     0.429  53.9%     9,062    511        17.7  ampere_sgemm_128x64_tn (34% of busy)
+  9    0.309     0.293  94.8%       589      7        84.1  ampere_sgemm_128x64_tn (47% of busy)
+ 10    4.784     8.665 181.1%    60,353    560       107.8  void raft::matrix::detail::select::warpsort: (49% of busy)
+ 11    4.763     8.702 182.7%    60,364    560       107.8  void raft::matrix::detail::select::warpsort: (49% of busy)
+ 12   27.301    38.347 140.5%    47,633     56       850.6  ampere_sgemm_128x64_tn (44% of busy)
+ 13   27.634    38.502 139.3%    47,644     56       850.8  ampere_sgemm_128x64_tn (43% of busy)

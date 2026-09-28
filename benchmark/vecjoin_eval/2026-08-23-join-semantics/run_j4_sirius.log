@@ -1,0 +1,17 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@ J4a raw join, 10M pairs materialized to the client (the baseline shape)
+Run Time (s): real 26.928 user 210.082526 sys 0.428211
+@@@ J4b SAME join, aggregated in-query -- 10M pairs never leave the GPU
+Run Time (s): real 27.168 user 207.454467 sys 0.315978
+@@@ J4c grouped aggregate over the join output
+Run Time (s): real 27.359 user 211.510558 sys 0.310169

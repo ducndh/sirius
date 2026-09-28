@@ -1,0 +1,8 @@
+corpus 24 GiB | device 23.5 GiB total, 23.3 GiB free | k=10 n_probes=16
+  direct (whole corpus resident on device): does NOT fit: OutOfMemoryError
+    shard 1: 17,000,000 rows done
+    shard 2: 34,000,000 rows done
+    shard 3: 50,331,648 rows done
+  sharded: 3 shards of 8 GiB
+    h2d 22.34s | build 30.64s | search 3.04s | GPU-side total 56.03s | wall incl. parquet decode 103.12s | recall@10 1.0000
+RESULT cuvs 24 3 22.344 30.640 3.042 56.026 103.125 1.0000

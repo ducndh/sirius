@@ -1,0 +1,10 @@
+search (EXCLUDED from the round trip): 5.257 s for 10,000,000 pairs
+
+round trip the library must pay before SQL can touch the pairs:
+  device->host               0.051 s
+  into DuckDB (Arrow)        0.472 s
+  ROUND TRIP SUBTOTAL        0.523 s
+  then global aggregate      0.017 s
+  then grouped aggregate     0.260 s
+  TOTAL added over search    0.782 s
+RESULT j4 cuvs 5.257 0.051 0.472 0.017 0.260 0.782

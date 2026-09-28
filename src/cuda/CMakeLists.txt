@@ -18,4 +18,10 @@ target_sources(
           scan/strings/uncompressed.cu
           vss/cudf_raft_interop.cu
           vss/brute_force_search.cu
+          vss/bound_gemm.cu
+          vss/brute_force_threshold.cu
+          vss/cluster_fold.cu
+          vss/gemm_topk.cu
+          vss/knn_merge.cu
+          vss/vector_clustering.cu
           vss/ivf_flat_index.cu)

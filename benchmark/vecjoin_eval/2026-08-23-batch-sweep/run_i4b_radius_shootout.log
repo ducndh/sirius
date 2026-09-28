@@ -1,0 +1,21 @@
+corpus 1,000,000 x 128 (488 MB), probes 10,000, eps [100.0, 150.0] (plain L2)
+
+=== eps = 100   (Sirius: 1.794 s)
+  cupy blocked brute force (GPU)           1.299 s  pairs=    20,849     1.38x  no index, no build
+  cuVS pairwise_distance + mask (GPU)      0.345 s  pairs=    20,849     5.21x  no index, no build
+=== eps = 150   (Sirius: REFUSES — k<=1024 cap)
+  cupy blocked brute force (GPU)           0.513 s  pairs=   260,864            no index, no build
+  cuVS pairwise_distance + mask (GPU)      0.343 s  pairs=   260,864            no index, no build
+
+  (cold-start reference: H2D of the 488 MB corpus = 0.135 s, excluded above for every GPU contender)
+
+=== eps = 100  (CPU, 64 threads)
+  FAISS-CPU IndexFlatL2                   65.964 s  pairs=    20,844     0.03x  exact
+  FAISS-CPU IndexIVFFlat nprobe=64         3.567 s  pairs=    20,844     0.50x  APPROX, +28.1s build
+  FAISS-GPU GpuIndexFlatL2                   nan s  pairs=         0            NOT IMPLEMENTED — range_search throws
+=== eps = 150  (CPU, 64 threads)
+  FAISS-CPU IndexFlatL2                   67.704 s  pairs=   260,832            exact
+  FAISS-CPU IndexIVFFlat nprobe=64         3.470 s  pairs=   260,832            APPROX, +28.1s build
+  FAISS-GPU GpuIndexFlatL2                   nan s  pairs=         0            NOT IMPLEMENTED — range_search throws
+
+wrote /var/tmp/vj/x1/radius_shootout.json

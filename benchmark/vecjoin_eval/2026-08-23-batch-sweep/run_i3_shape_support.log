@@ -1,0 +1,14 @@
+library    shape                      status       detail
+----------------------------------------------------------------------------------------------------
+cuVS       A per-probe top-k          YES          recall 1.000
+cuVS       B radius / threshold       NO           no range/radius entry point in cuvs.neighbors (none)
+cuVS       C global top-k             NO           search() returns k per query; a global top-k is a user-side reduction over n_probes*k
+cuVS       D filtered / predicated    YES          bitset prefilter, all hits inside filter=True, recall vs filtered truth 1.000
+cuVS       E many-to-many self-join   YES          all_neighbors.build, 0.597s for 20,000x20,000, recall 0.999 (SELF-JOIN ONLY: one dataset, no separate probe side)
+
+(faiss 1.15.0, get_num_gpus()=0 -> CPU only here)
+FAISS-CPU  A per-probe top-k          YES          recall 1.000
+FAISS-CPU  B radius / threshold       YES          range_search returned 3,176 pairs, brute force says 3,176 (tau=2.2822)
+FAISS-CPU  C global top-k             NO           no API; user reduces over the per-query results
+FAISS-CPU  D filtered / predicated    YES          IDSelectorBatch, all hits inside filter=True
+FAISS-CPU  E many-to-many self-join   PARTIAL      no join API; a user calls search(base) -- 3.52s for 20,000x20,000, exact

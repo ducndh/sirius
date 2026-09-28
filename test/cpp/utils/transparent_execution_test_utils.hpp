@@ -43,6 +43,14 @@ inline duckdb::SiriusContext::compressed_materialization_stats get_compressed_ma
   return get_registered_sirius_context(con)->get_compressed_materialization_stats();
 }
 
+/// Lives here rather than with the vector-join tests because reaching the session's
+/// SiriusContext is what it needs, and that is what this header is for.
+inline duckdb::SiriusContext::vector_join_prune_stats get_vector_join_prune_stats(
+  duckdb::Connection& con)
+{
+  return get_registered_sirius_context(con)->get_vector_join_prune_stats();
+}
+
 inline void require_transparent_execution_delta(
   const duckdb::SiriusContext::transparent_execution_stats& before,
   const duckdb::SiriusContext::transparent_execution_stats& after,

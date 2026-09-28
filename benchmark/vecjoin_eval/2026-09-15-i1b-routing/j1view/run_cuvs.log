@@ -1,0 +1,4 @@
+10 {'export': 0.248, 'h2d': 0.006, 'build': 0.0, 'search': 0.042, 'map_ids': 0.002, 'total': 0.299}
+30 {'export': 0.728, 'h2d': 0.015, 'build': 0.001, 'search': 0.132, 'map_ids': 0.002, 'total': 0.879}
+50 {'export': 1.375, 'h2d': 0.025, 'build': 0.001, 'search': 0.231, 'map_ids': 0.005, 'total': 1.637}
+90 {'export': 2.445, 'h2d': 0.043, 'build': 0.001, 'search': 0.378, 'map_ids': 0.005, 'total': 2.872}

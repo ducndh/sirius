@@ -1,0 +1,64 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+=== fit
+┌────────────┬───────┬────────────┬─────────┐
+│ n_clusters │  dim  │ train_rows │ n_rows  │
+│   int64    │ int64 │   int64    │  int64  │
+├────────────┼───────┼────────────┼─────────┤
+│        256 │   128 │      65536 │ 1000000 │
+└────────────┴───────┴────────────┴─────────┘
+Run Time (s): real 0.101 user 0.084904 sys 0.015517
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+=== exact
+Run Time (s): real 27.251 user 208.028327 sys 0.430618
+=== approx n_probes=1
+Run Time (s): real 0.411 user 1.958537 sys 0.073182
+=== approx n_probes=4
+Run Time (s): real 1.120 user 7.270161 sys 0.132417
+=== approx n_probes=16
+Run Time (s): real 3.852 user 26.820863 sys 0.491921
+=== approx n_probes=64
+Run Time (s): real 14.507 user 104.798515 sys 1.635192
+=== recall vs this engine's own exhaustive run
+┌──────────┬──────────┬─────────────┐
+│ n_probes │   rows   │ recall_at_k │
+│  int32   │  int64   │   double    │
+├──────────┼──────────┼─────────────┤
+│        1 │ 10000000 │      0.5503 │
+│        4 │ 10000000 │       0.677 │
+│       16 │ 10000000 │      0.8759 │
+│       64 │ 10000000 │      0.9921 │
+└──────────┴──────────┴─────────────┘
+
+=== timings (fit, exact, then each n_probes) ===
+fit                          0.101s
+exact                       27.251s
+approx n_probes=1            0.411s   66.30x vs exact
+approx n_probes=4            1.120s   24.33x vs exact
+approx n_probes=16           3.852s    7.07x vs exact
+approx n_probes=64          14.507s    1.88x vs exact

@@ -1,0 +1,11 @@
+self-join 1,000,000 x 1,000,000, k=10, n_lists=1024
+index build: 0.333 s
+exhaustive reference vs brute force on 2000 sampled rows: 0.9989 (ok)
+
+ n_probes   search_s   total_s  recall@10
+        1      0.363     0.695     0.4602
+        4      1.338     1.671     0.7534
+       16      5.148     5.480     0.9458
+       64     21.252    21.585     0.9968
+      256     82.066    82.399     0.9999
+     1024    269.392   269.725     1.0000

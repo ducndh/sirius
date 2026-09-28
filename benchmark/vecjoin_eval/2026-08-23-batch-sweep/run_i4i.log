@@ -1,0 +1,38 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@ GLOBAL 1k probes k=10
+Run Time (s): real 0.081 user 0.057268 sys 0.009026
+@@@ GLOBAL 1k probes k=1000
+Run Time (s): real 0.263 user 0.235651 sys 0.014541
+@@@ GLOBAL 10k probes k=10
+Run Time (s): real 0.335 user 0.312873 sys 0.005977
+@@@ GLOBAL 10k probes k=1000
+Run Time (s): real 1.793 user 1.802835 sys 0.034337
+@@@ PER-ROW 10k probes k=10 for reference
+Run Time (s): real 0.324 user 0.624569 sys 0.008083

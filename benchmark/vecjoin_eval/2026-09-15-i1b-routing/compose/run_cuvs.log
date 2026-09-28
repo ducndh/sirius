@@ -1,0 +1,2 @@
+amortized_corpus_resident {'filter+export_probes': 0.007, 'search': 0.105, 'import+join+aggregate': 0.012, 'total': 0.125}
+one_shot_export_corpus {'export_corpus': 2.508, 'filter+export_probes': 0.007, 'search': 0.105, 'import+join+aggregate': 0.013, 'total': 2.634}

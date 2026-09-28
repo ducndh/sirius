@@ -16,20 +16,16 @@
 
 #pragma once
 
-#include <rmm/cuda_stream.hpp>
-
 #include <cuvs/distance/distance.hpp>
 
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 
 namespace cucascade::memory {
 class memory_reservation_manager;
@@ -38,11 +34,16 @@ class reservation;
 
 namespace sirius::vss {
 
-/// Which cuVS index algorithm a pinned entry holds. Drives how a search
-/// operator down-casts the type-erased index back to its concrete cuVS type.
-/// Only @c ivf_flat is built today; the rest are placeholders.
+/// What a pinned entry holds. Drives how a consumer down-casts the type-erased payload back to
+/// its concrete type; a consumer that finds the wrong kind under a name must refuse rather than
+/// cast. @c kmeans_centroids is not a search index at all -- it is the centroid matrix of a
+/// clustering, held here because it wants the same thing an index does: a name, a GPU
+/// reservation, and session lifetime.
 enum class index_kind : std::uint8_t {
   ivf_flat,
+  kmeans_centroids,
+  /// The cluster-ordered copy of a corpus a clustering was built into (@ref cluster_lists).
+  cluster_lists,
   // ivf_pq,  // not supported yet
   // cagra,  // not supported yet
 };
@@ -51,37 +52,22 @@ enum class index_kind : std::uint8_t {
 /// (type-erased) index payload so the cache can be inspected, logged, and
 /// matched without instantiating any cuVS index type.
 ///
-/// The (@c catalog_name, @c schema_name, @c table_name, @c column_name, @c metric) tuple is
-/// the index's auto-routing identity.
+/// The (@c table_name, @c column_name, @c metric) triple is the index's
+/// auto-routing identity: a search recognizer resolves a query's vector column
+/// to its base (table, column) and matches it against pinned indexes here. The
+/// cache map key (i.e., the CREATE INDEX name) is separate and only used for
+/// management (i.e., drop/replace).
 struct index_metadata {
   index_kind kind{index_kind::ivf_flat};
-  std::string catalog_name;  ///< Resolved catalog the table lives in
-  std::string schema_name;   ///< Resolved schema the table lives in
   std::string table_name;    ///< Base table the index was built on
   std::string column_name;   ///< Vector column the index was built on
   std::int64_t dim{0};       ///< Vector dimensionality
   std::int64_t num_rows{0};  ///< Number of indexed vectors
   std::int64_t n_lists{0};   ///< IVF-Flat inverted-list count (0 if not applicable).
   cuvs::distance::DistanceType metric{cuvs::distance::DistanceType::L2Expanded};
-  std::size_t resident_bytes{
-    0};  ///< Resident GPU bytes the finished index occupies (capacity-accounted)
+  std::size_t reserved_bytes{
+    0};  ///< GPU bytes reserved from the reservation manager to hold this index
 };
-
-/// Build the cache key for an index from its routing identity.
-[[nodiscard]] inline std::string build_ann_index_cache_key(std::string_view catalog,
-                                                           std::string_view schema,
-                                                           std::string_view table,
-                                                           std::string_view column,
-                                                           std::string_view metric)
-{
-  std::string key;
-  for (auto part : {catalog, schema, table, column, metric}) {
-    key += std::to_string(part.size());
-    key += ':';
-    key += part;
-  }
-  return key;
-}
 
 /// Type-erased owner of a cuVS index. The cache stores indexes through
 /// this base so it never has to template over the concrete cuVS index type
@@ -110,22 +96,20 @@ template <class Index>
 }
 
 /// One pinned cuVS index: its metadata, the type-erased index payload, and the
-/// stream the index was built on.
+/// GPU reservation that pins the index's memory.
 ///
-/// The index's device memory is ordinary capacity-accounted GPU memory: it was
-/// charged to a reservation only during the build, which was released once the
-/// build finished. The entry keeps the build stream so the index can be freed on
-/// it when the entry is dropped (unpin or session end). Move-only.
-///
-/// The cache stores entries as @c shared_ptr, and lookups hand back a shared
-/// handle, so a caller that is mid-search keeps the whole entry alive even if it
-/// is dropped or replaced concurrently.
+/// The reservation keeps the index's footprint reserved and accounted in the
+/// reservation manager until the entry is dropped (unpin or session end). The
+/// index's device buffers were allocated through
+/// @c reservation->get_memory_resource(), so Sirius owns every byte and
+/// releasing the reservation frees the index. Move-only (owns unique resources).
 struct pinned_index_entry {
   index_metadata meta;
-  // The index's device buffers were built on this stream and are freed on it
-  // when the index is destroyed. It is declared before the index because members
-  // are destroyed in reverse order, and the index needs to be freed first.
-  rmm::cuda_stream build_stream;
+  /// Declared before @c index so it is destroyed *after* it. The payload's device buffers were
+  /// allocated through this reservation's memory resource, so freeing them once the reservation
+  /// is gone deallocates through a dead resource -- a segfault at session teardown, not at the
+  /// point of misuse.
+  std::unique_ptr<cucascade::memory::reservation> reservation;
   std::unique_ptr<any_cuvs_index> index;
 
   /// Recover the concrete cuVS index, or nullptr if the held index is not of
@@ -146,23 +130,17 @@ struct pinned_index_entry {
 /// pin-table cache) so each future index type can add its own search operator
 /// without touching shared scan code.
 ///
-/// Memory ownership: @ref reserve_index_memory reserves the build's footprint so
-/// the caller can admit it against the GPU budget. The caller attaches that
-/// reservation to the build stream for the build only, so cuVS's allocations are
-/// charged and bounded by it, then releases the reservation. The finished index's
-/// device memory stays as ordinary capacity-accounted GPU memory, and the entry
-/// keeps only the build stream so the index can be freed on it later. Nothing here
-/// ever allocates outside the GPU memory space's allocator.
+/// Memory ownership: GPU memory for an index is taken as an explicit reservation
+/// from the reservation manager via @ref reserve_index_memory; the caller builds
+/// the cuVS index through that reservation's memory resource and hands the
+/// reservation to @ref insert, which stores it on the entry. Nothing here ever
+/// allocates outside Sirius's cucascade reservation manager.
 ///
 /// Lifetime: entries live until @ref erase / @ref clear or session teardown.
-/// There is no eviction or spilling yet (future work). Lookups return a shared
-/// handle to the entry, so the entry (and its index) stays alive for as long as
-/// any caller holds the handle, even if the named entry is erased or replaced in
-/// the meantime.
+/// There is no eviction or spilling yet (future work), so a pointer returned by
+/// @ref find stays valid until the named entry is explicitly removed.
 ///
-/// Thread-safety: all members are guarded by an internal mutex. The mutex only
-/// guards the map itself; the shared handle returned by a lookup is what keeps
-/// the entry alive after the lock is released.
+/// Thread-safety: all members are guarded by an internal mutex.
 class cuvs_index_cache {
  public:
   explicit cuvs_index_cache(cucascade::memory::memory_reservation_manager& reservation_manager);
@@ -173,14 +151,13 @@ class cuvs_index_cache {
   cuvs_index_cache(cuvs_index_cache&&)                 = delete;  // move ctor not allowed
   cuvs_index_cache& operator=(cuvs_index_cache&&)      = delete;  // move assignment not allowed
 
-  /// Reserve @p bytes of GPU memory for building an index. The caller attaches
-  /// this reservation to the build stream so cuVS's allocations are charged and
-  /// bounded by it, then releases it once the index is built.
+  /// Reserve @p bytes of GPU memory for building an index, so cuVS allocates the
+  /// index through Sirius's reservation manager: build the index with
+  /// @c reservation->get_memory_resource() set as the current device resource,
+  /// then move the same reservation into @ref insert to pin it.
   ///
-  /// Non-blocking and pinned to @p preferred_gpu: the index must be reserved on
-  /// the same GPU that holds the table's pinned data. Returns null instead of
-  /// waiting, so the caller can fail cleanly rather than blocking indefinitely
-  /// when the device cannot fit the index.
+  /// Non-blocking, and pinned to @p preferred_gpu: the index must be reserved on
+  /// the same GPU that holds the table's pinned data.
   ///
   /// \param bytes         Estimated GPU footprint of the index to build
   /// \param preferred_gpu Device id that holds the table's data (>= 0); null is
@@ -190,52 +167,36 @@ class cuvs_index_cache {
     std::size_t bytes, int preferred_gpu = -1);
 
   /// Pin a built index under @p name, replacing any existing entry with that
-  /// name. The old entry is unlinked here; its index is freed once no outstanding
-  /// lookup handle still refers to it. Takes ownership of the index payload and
-  /// the stream it was built on (the index is freed on that stream).
+  /// name (its old index + reservation are freed). Takes ownership of both the
+  /// index payload and its reservation.
   void insert(std::string name,
               index_metadata meta,
               std::unique_ptr<any_cuvs_index> index,
-              rmm::cuda_stream build_stream);
+              std::unique_ptr<cucascade::memory::reservation> reservation);
 
   /// Look up a pinned index by its management name, or nullptr if absent. The
-  /// returned handle keeps the entry alive for as long as it is held, even if the
-  /// entry is erased or replaced afterward (no eviction).
-  [[nodiscard]] std::shared_ptr<const pinned_index_entry> find(std::string_view name) const;
+  /// pointer is stable until the entry is erased (no eviction).
+  [[nodiscard]] const pinned_index_entry* find(std::string_view name) const;
 
   /// Find a pinned index by its auto-routing identity, i.e., the first entry whose
-  /// metadata matches (@p catalog, @p schema, @p table, @p column, @p metric).
-  /// Returns nullptr if no pinned index covers that column under that metric.
-  /// Metrics are compared up to canonicalization.
-  [[nodiscard]] std::shared_ptr<const pinned_index_entry> find_by_column(
-    std::string_view catalog,
-    std::string_view schema,
-    std::string_view table,
-    std::string_view column,
-    cuvs::distance::DistanceType metric) const;
+  /// metadata matches (@p table, @p column, @p metric). This is the lookup a
+  /// search recognizer uses to decide whether a query can use ANN. Returns
+  /// nullptr if no pinned index covers that column under that metric.
+  [[nodiscard]] const pinned_index_entry* find_by_column(std::string_view table,
+                                                         std::string_view column,
+                                                         cuvs::distance::DistanceType metric) const;
 
-  /// List all pinned indexes (across metrics) on this column.
-  [[nodiscard]] std::vector<index_metadata> indexes_on_column(std::string_view catalog,
-                                                              std::string_view schema,
-                                                              std::string_view table,
-                                                              std::string_view column) const;
+  /// Remove every entry whose auto-routing identity matches (@p table, @p column,
+  /// @p metric), freeing each index and releasing its reservation.
+  std::size_t erase_by_column(std::string_view table,
+                              std::string_view column,
+                              cuvs::distance::DistanceType metric);
 
   [[nodiscard]] bool contains(std::string_view name) const;
 
-  /// Remove the entry for @p name. Its index and reservation are freed once no
-  /// outstanding lookup handle still refers to it. Returns true iff an entry was
-  /// removed.
+  /// Remove the entry for @p name, freeing its index and releasing its
+  /// reservation. Returns true iff an entry was removed.
   bool erase(std::string_view name);
-
-  /// Remove entries on (@p catalog, @p schema, @p table, @p column). With a
-  /// @p metric, only the entry for that metric is removed (compared up to
-  /// canonicalization); with no metric, every index on the column is removed
-  /// regardless of metric. Returns the number of entries removed.
-  std::size_t erase_by_column(std::string_view catalog,
-                              std::string_view schema,
-                              std::string_view table,
-                              std::string_view column,
-                              std::optional<cuvs::distance::DistanceType> metric = std::nullopt);
 
   /// Drop all pinned indexes.
   void clear();
@@ -245,7 +206,7 @@ class cuvs_index_cache {
  private:
   cucascade::memory::memory_reservation_manager& _reservation_manager;
   mutable std::mutex _mutex;
-  std::unordered_map<std::string, std::shared_ptr<pinned_index_entry>> _entries;
+  std::unordered_map<std::string, pinned_index_entry> _entries;
 };
 
 }  // namespace sirius::vss

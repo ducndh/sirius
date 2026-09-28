@@ -1,0 +1,15 @@
+e0 cuVS brute_force k=65 (exact)    build   0.228 search   0.669 total   0.897 recall 1.0000
+e0 cuVS IVF-Flat 64/8               build   0.435 search   1.164 total   1.599 recall 0.9899
+e0 cuVS CAGRA nn_descent 32/64      build   8.344 search   0.322 total   8.666 recall 0.9787
+e1 cuVS brute_force k=65 (exact)    build   0.001 search   0.420 total   0.421 recall 1.0000
+e1 cuVS IVF-Flat 64/8               build   0.306 search   0.894 total   1.200 recall 0.9900
+e1 cuVS CAGRA nn_descent 32/64      build   8.515 search   0.015 total   8.530 recall 0.9790
+e2 cuVS brute_force k=65 (exact)    build   0.001 search   0.422 total   0.423 recall 1.0000
+e2 cuVS IVF-Flat 64/8               build   0.310 search   0.875 total   1.184 recall 0.9885
+e2 cuVS CAGRA nn_descent 32/64      build   8.382 search   0.015 total   8.397 recall 0.9792
+e3 cuVS brute_force k=65 (exact)    build   0.001 search   0.424 total   0.425 recall 1.0000
+e3 cuVS IVF-Flat 64/8               build   0.308 search   0.868 total   1.175 recall 0.9887
+e3 cuVS CAGRA nn_descent 32/64      build   8.411 search   0.015 total   8.426 recall 0.9792
+e4 cuVS brute_force k=65 (exact)    build   0.001 search   0.426 total   0.427 recall 1.0000
+e4 cuVS IVF-Flat 64/8               build   0.306 search   0.869 total   1.175 recall 0.9881
+e4 cuVS CAGRA nn_descent 32/64      build   8.662 search   0.015 total   8.677 recall 0.9787

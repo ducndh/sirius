@@ -1,0 +1,4 @@
+corpus 48 GiB vs device 39.5 GiB | k=10
+  ivfpq: FAILED OutOfMemoryError: Out of memory allocating 51,539,607,552 bytes (allocated so far: 0 bytes).
+  uvm: RMM managed memory active (corpus may oversubscribe the device)
+  uvm    ivf_flat: build 98.20s search 16.4924s recall@10 1.0000

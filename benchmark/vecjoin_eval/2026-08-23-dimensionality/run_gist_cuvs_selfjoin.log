@@ -1,0 +1,4 @@
+self-join 1,000,000 x 1,000,000 at d=960
+cagra build: 11.14 s
+  cagra itopk=64   search    5.152 s  build+search   16.295 s
+  cagra itopk=128  search    9.960 s  build+search   21.102 s

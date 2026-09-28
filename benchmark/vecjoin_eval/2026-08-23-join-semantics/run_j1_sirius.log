@@ -1,0 +1,29 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@ S1 materialize the filtered corpus (the intermediate result)
+Run Time (s): real 1.226 user 1.671488 sys 0.089125
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+Run Time (s): real 0.020 user 0.003289 sys 0.002378
+@@@ S2 pin it
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+Run Time (s): real 0.031 user 0.006924 sys 0.008027
+@@@ S3 the join itself, exact
+Run Time (s): real 0.415 user 0.172443 sys 0.059203

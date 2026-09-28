@@ -1,0 +1,66 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@ FIT
+┌────────────┬───────┬────────────┬─────────┐
+│ n_clusters │  dim  │ train_rows │ n_rows  │
+│   int64    │ int64 │   int64    │  int64  │
+├────────────┼───────┼────────────┼─────────┤
+│         64 │   960 │      16384 │ 1000000 │
+└────────────┴───────┴────────────┴─────────┘
+Run Time (s): real 0.091 user 0.082952 sys 0.009134
+@@@ MATERIALIZE ORDER BY cluster_id
+Run Time (s): real 10.339 user 37.465770 sys 4.782243
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+@@@ EXACT
+Run Time (s): real 0.263 user 0.202382 sys 0.033509
+@@@ APPROX p1
+Run Time (s): real 0.131 user 0.046756 sys 0.052549
+@@@ APPROX p4
+Run Time (s): real 0.172 user 0.143457 sys 0.006020
+@@@ APPROX p8
+Run Time (s): real 0.313 user 0.261077 sys 0.023110
+@@@ APPROX p16
+Run Time (s): real 0.586 user 0.549129 sys 0.019707
+@@@ RECALL p8 vs packaged ground truth
+┌──────────────┐
+│ recall_at_10 │
+│    double    │
+├──────────────┤
+│       0.7796 │
+└──────────────┘

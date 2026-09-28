@@ -1,0 +1,134 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@EPOCH 0
+@@@STEP a_exact_scan
+Run Time (s): real 0.614 user 0.491274 sys 0.144856
+@@@STEP b_pin
+Run Time (s): real 0.030 user 0.008556 sys 0.020186
+@@@STEP b_exact_pinned
+Run Time (s): real 0.453 user 0.428475 sys 0.003743
+@@@STEP c_fit
+Run Time (s): real 0.071 user 0.048538 sys 0.017143
+@@@STEP c_assign_ctas
+Run Time (s): real 0.151 user 0.093674 sys 0.045770
+Run Time (s): real 0.957 user 5.547894 sys 0.448116
+Run Time (s): real 0.010 user 0.002629 sys 0.003144
+@@@STEP c_pin
+Run Time (s): real 0.040 user 0.010299 sys 0.022110
+@@@STEP c_approx_p8
+Run Time (s): real 0.181 user 0.128353 sys 0.032492
+@@@EPOCH 1
+@@@STEP mutate
+Run Time (s): real 0.050 user 0.032213 sys 0.100276
+[90mWARNING:
+[00m[90mDeprecated lambda arrow (->) detected. Please transition to the new lambda syntax, i.e.., lambda x, i: x + i, before DuckDB's next release.
+Use SET lambda_syntax='ENABLE_SINGLE_ARROW' to revert to the deprecated behavior.
+For more information, see https://duckdb.org/docs/stable/sql/functions/lambda.html.
+
+[00mRun Time (s): real 0.202 user 0.172023 sys 0.022779
+@@@STEP materialize
+Run Time (s): real 0.010 user 0.000000 sys 0.000848
+Run Time (s): real 0.856 user 5.244729 sys 0.416129
+Run Time (s): real 0.080 user 0.070423 sys 0.058637
+@@@STEP a_exact_scan
+Run Time (s): real 0.483 user 0.440792 sys 0.056909
+@@@STEP b_pin
+Run Time (s): real 0.040 user 0.009422 sys 0.024122
+@@@STEP b_exact_pinned
+Run Time (s): real 0.453 user 0.427998 sys 0.005233
+@@@STEP c_fit
+Run Time (s): real 0.040 user 0.034889 sys 0.015809
+@@@STEP c_assign_ctas
+Run Time (s): real 0.121 user 0.100244 sys 0.015416
+Run Time (s): real 0.010 user 0.001148 sys 0.000028
+Run Time (s): real 0.906 user 5.481559 sys 0.354418
+Run Time (s): real 0.010 user 0.004515 sys 0.002264
+@@@STEP c_pin
+Run Time (s): real 0.040 user 0.007775 sys 0.027004
+@@@STEP c_approx_p8
+Run Time (s): real 0.141 user 0.116550 sys 0.001408
+@@@EPOCH 2
+@@@STEP mutate
+Run Time (s): real 0.020 user 0.035913 sys 0.002148
+Run Time (s): real 0.211 user 0.220410 sys 0.014195
+@@@STEP materialize
+Run Time (s): real 0.010 user 0.000728 sys 0.000123
+Run Time (s): real 0.836 user 5.217632 sys 0.240971
+Run Time (s): real 0.182 user 0.178744 sys 0.153704
+@@@STEP a_exact_scan
+Run Time (s): real 0.493 user 0.437060 sys 0.076352
+@@@STEP b_pin
+Run Time (s): real 0.040 user 0.010657 sys 0.024145
+@@@STEP b_exact_pinned
+Run Time (s): real 0.453 user 0.429816 sys 0.004538
+@@@STEP c_fit
+Run Time (s): real 0.051 user 0.032636 sys 0.014121
+@@@STEP c_assign_ctas
+Run Time (s): real 0.130 user 0.102395 sys 0.026081
+Run Time (s): real 0.010 user 0.000900 sys 0.000000
+Run Time (s): real 0.946 user 5.380217 sys 0.442141
+Run Time (s): real 0.010 user 0.006131 sys 0.001182
+@@@STEP c_pin
+Run Time (s): real 0.040 user 0.009807 sys 0.024683
+@@@STEP c_approx_p8
+Run Time (s): real 0.141 user 0.108908 sys 0.006486
+@@@EPOCH 3
+@@@STEP mutate
+Run Time (s): real 0.030 user 0.057053 sys 0.004685
+Run Time (s): real 0.212 user 0.185043 sys 0.019836
+@@@STEP materialize
+Run Time (s): real 0.010 user 0.000895 sys 0.000000
+Run Time (s): real 0.906 user 5.246793 sys 0.487668
+Run Time (s): real 0.081 user 0.066472 sys 0.061447
+@@@STEP a_exact_scan
+Run Time (s): real 0.484 user 0.443800 sys 0.051085
+@@@STEP b_pin
+Run Time (s): real 0.040 user 0.009478 sys 0.023104
+@@@STEP b_exact_pinned
+Run Time (s): real 0.453 user 0.434728 sys 0.002047
+@@@STEP c_fit
+Run Time (s): real 0.040 user 0.069793 sys 0.001116
+@@@STEP c_assign_ctas
+Run Time (s): real 0.121 user 0.099061 sys 0.019339
+Run Time (s): real 0.010 user 0.000000 sys 0.000886
+Run Time (s): real 0.897 user 5.361550 sys 0.404966
+Run Time (s): real 0.010 user 0.005023 sys 0.002162
+@@@STEP c_pin
+Run Time (s): real 0.040 user 0.009102 sys 0.026889
+@@@STEP c_approx_p8
+Run Time (s): real 0.141 user 0.112130 sys 0.004005
+@@@EPOCH 4
+@@@STEP mutate
+Run Time (s): real 0.040 user 0.070428 sys 0.003213
+Run Time (s): real 0.201 user 0.205025 sys 0.013293
+@@@STEP materialize
+Run Time (s): real 0.010 user 0.000848 sys 0.000000
+Run Time (s): real 0.826 user 5.089983 sys 0.348682
+Run Time (s): real 0.131 user 0.131667 sys 0.100443
+@@@STEP a_exact_scan
+Run Time (s): real 0.483 user 0.441247 sys 0.032150
+@@@STEP b_pin
+Run Time (s): real 0.040 user 0.010127 sys 0.023205
+@@@STEP b_exact_pinned
+Run Time (s): real 0.453 user 0.435219 sys 0.002953
+@@@STEP c_fit
+Run Time (s): real 0.040 user 0.032617 sys 0.004468
+@@@STEP c_assign_ctas
+Run Time (s): real 0.121 user 0.098005 sys 0.015000
+Run Time (s): real 0.010 user 0.000723 sys 0.000113
+Run Time (s): real 0.907 user 5.351370 sys 0.351710
+Run Time (s): real 0.020 user 0.003833 sys 0.004371
+@@@STEP c_pin
+Run Time (s): real 0.050 user 0.010150 sys 0.027053
+@@@STEP c_approx_p8
+Run Time (s): real 0.141 user 0.106994 sys 0.002439
+@@@RECALL

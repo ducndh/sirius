@@ -1,0 +1,167 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@FIT c64
+┌────────────┬───────┬────────────┬─────────┐
+│ n_clusters │  dim  │ train_rows │ n_rows  │
+│   int64    │ int64 │   int64    │  int64  │
+├────────────┼───────┼────────────┼─────────┤
+│         64 │   128 │      16384 │ 1000000 │
+└────────────┴───────┴────────────┴─────────┘
+Run Time (s): real 0.061 user 0.041406 sys 0.014075
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@FIT c256
+┌────────────┬───────┬────────────┬─────────┐
+│ n_clusters │  dim  │ train_rows │ n_rows  │
+│   int64    │ int64 │   int64    │  int64  │
+├────────────┼───────┼────────────┼─────────┤
+│        256 │   128 │      65536 │ 1000000 │
+└────────────┴───────┴────────────┴─────────┘
+Run Time (s): real 0.081 user 0.067190 sys 0.003015
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@FIT c1024
+┌────────────┬───────┬────────────┬─────────┐
+│ n_clusters │  dim  │ train_rows │ n_rows  │
+│   int64    │ int64 │   int64    │  int64  │
+├────────────┼───────┼────────────┼─────────┤
+│       1024 │   128 │     262144 │ 1000000 │
+└────────────┴───────┴────────────┴─────────┘
+Run Time (s): real 0.201 user 0.184336 sys 0.009890
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@RUN exact
+Run Time (s): real 0.463 user 0.439143 sys 0.003168
+Run Time (s): real 0.473 user 0.439522 sys 0.013532
+Run Time (s): real 0.463 user 0.440145 sys 0.009940
+@@@RUN c64_p1
+Run Time (s): real 0.131 user 0.074975 sys 0.028032
+Run Time (s): real 0.101 user 0.065698 sys 0.009084
+Run Time (s): real 0.100 user 0.063225 sys 0.009914
+@@@RUN c64_p2
+Run Time (s): real 0.091 user 0.058669 sys 0.005192
+Run Time (s): real 0.101 user 0.068252 sys 0.006848
+Run Time (s): real 0.100 user 0.068621 sys 0.005067
+@@@RUN c64_p4
+Run Time (s): real 0.116 user 0.088760 sys 0.006081
+Run Time (s): real 0.110 user 0.087637 sys 0.000940
+Run Time (s): real 0.111 user 0.082336 sys 0.007452
+@@@RUN c64_p8
+Run Time (s): real 0.191 user 0.116568 sys 0.009710
+Run Time (s): real 0.141 user 0.109506 sys 0.006816
+Run Time (s): real 0.141 user 0.113994 sys 0.003214
+@@@RUN c64_p16
+Run Time (s): real 0.202 user 0.172794 sys 0.012194
+Run Time (s): real 0.201 user 0.176610 sys 0.004158
+Run Time (s): real 0.202 user 0.178948 sys 0.001189
+@@@RUN c64_p32
+Run Time (s): real 0.322 user 0.299214 sys 0.008087
+Run Time (s): real 0.322 user 0.618320 sys 0.004018
+Run Time (s): real 0.323 user 0.302907 sys 0.004152
+@@@RUN c64_p64
+Run Time (s): real 0.594 user 0.572732 sys 0.007073
+Run Time (s): real 0.595 user 0.573580 sys 0.007056
+Run Time (s): real 0.604 user 0.574315 sys 0.005605
+@@@RUN c256_p1
+Run Time (s): real 0.211 user 0.161631 sys 0.015961
+Run Time (s): real 0.202 user 0.170289 sys 0.003206
+Run Time (s): real 0.201 user 0.165885 sys 0.007070
+@@@RUN c256_p2
+Run Time (s): real 0.222 user 0.177999 sys 0.009983
+Run Time (s): real 0.211 user 0.171348 sys 0.008219
+Run Time (s): real 0.202 user 0.171016 sys 0.005077
+@@@RUN c256_p4
+Run Time (s): real 0.211 user 0.176345 sys 0.011020
+Run Time (s): real 0.212 user 0.181973 sys 0.004367
+Run Time (s): real 0.211 user 0.179827 sys 0.004150
+@@@RUN c256_p8
+Run Time (s): real 0.211 user 0.170017 sys 0.009083
+Run Time (s): real 0.222 user 0.185571 sys 0.009234
+Run Time (s): real 0.211 user 0.182673 sys 0.005333
+@@@RUN c256_p16
+Run Time (s): real 0.252 user 0.214842 sys 0.006045
+Run Time (s): real 0.242 user 0.211530 sys 0.004914
+Run Time (s): real 0.242 user 0.204659 sys 0.007130
+@@@RUN c256_p32
+Run Time (s): real 0.282 user 0.244745 sys 0.009132
+Run Time (s): real 0.282 user 0.240848 sys 0.012053
+Run Time (s): real 0.282 user 0.243107 sys 0.008887
+@@@RUN c256_p64
+Run Time (s): real 0.373 user 0.335114 sys 0.008952
+Run Time (s): real 0.372 user 0.336312 sys 0.007157
+Run Time (s): real 0.362 user 0.320586 sys 0.013730
+@@@RUN c256_p128
+Run Time (s): real 0.574 user 0.526759 sys 0.024381
+Run Time (s): real 0.554 user 0.524415 sys 0.010063
+Run Time (s): real 0.554 user 0.522847 sys 0.008978
+@@@RUN c1024_p1
+Run Time (s): real 0.594 user 0.546194 sys 0.024956
+Run Time (s): real 0.564 user 1.064428 sys 0.032145
+Run Time (s): real 0.584 user 0.537749 sys 0.025748
+@@@RUN c1024_p4
+Run Time (s): real 0.614 user 0.559791 sys 0.026359
+Run Time (s): real 0.604 user 0.554842 sys 0.023007
+Run Time (s): real 0.625 user 0.565492 sys 0.032171
+@@@RUN c1024_p16
+Run Time (s): real 0.634 user 0.588749 sys 0.026001
+Run Time (s): real 0.614 user 0.565015 sys 0.025367
+Run Time (s): real 0.624 user 0.579105 sys 0.026118
+@@@RUN c1024_p32
+Run Time (s): real 0.644 user 0.612184 sys 0.013164
+Run Time (s): real 0.625 user 0.582297 sys 0.022037
+Run Time (s): real 0.624 user 0.577648 sys 0.027163
+@@@RUN c1024_p64
+Run Time (s): real 0.665 user 0.618185 sys 0.022103
+Run Time (s): real 0.654 user 0.600720 sys 0.028084
+Run Time (s): real 0.655 user 0.608069 sys 0.022175
+@@@RUN c1024_p128
+Run Time (s): real 0.726 user 0.679042 sys 0.023924
+Run Time (s): real 0.725 user 0.673376 sys 0.027886
+Run Time (s): real 0.725 user 0.676390 sys 0.026651
+@@@RUN c1024_p256
+Run Time (s): real 0.896 user 0.843444 sys 0.031025
+Run Time (s): real 0.876 user 0.833660 sys 0.024256
+Run Time (s): real 0.896 user 0.840613 sys 0.033120
+@@@RECALL

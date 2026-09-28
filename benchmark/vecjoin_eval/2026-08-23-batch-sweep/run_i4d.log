@@ -1,0 +1,109 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@ GLOBAL scale bisect: 32 probes, corpus 10k / 100k / 1M
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+Executor Error: Sirius GPU execution failed: TopN order index out of range (CPU fallback also failed: {"exception_type":"Invalid","exception_message":"sirius_knn_join is an internal rewrite target executed on the GPU; it cannot run on the CPU"})
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+Executor Error: Sirius GPU execution failed: TopN order index out of range (CPU fallback also failed: {"exception_type":"Invalid","exception_message":"sirius_knn_join is an internal rewrite target executed on the GPU; it cannot run on the CPU"})
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+Executor Error: Sirius GPU execution failed: TopN order index out of range (CPU fallback also failed: {"exception_type":"Invalid","exception_message":"sirius_knn_join is an internal rewrite target executed on the GPU; it cannot run on the CPU"})
+@@@ GLOBAL: does the vector DIMENSION matter? corpus 10k, probes 1000
+=============================================
+Error in Sirius GPU execution, fallback to DuckDB
+=============================================
+Executor Error: Sirius GPU execution failed: TopN order index out of range (CPU fallback also failed: {"exception_type":"Invalid","exception_message":"sirius_knn_join is an internal rewrite target executed on the GPU; it cannot run on the CPU"})
+@@@ THRESHOLD timed, 1k probes
+┌─────────┐
+│ t1k_e50 │
+│  int64  │
+├─────────┤
+│    1113 │
+└─────────┘
+Run Time (s): real 0.263 user 0.488830 sys 0.014833
+┌──────────┐
+│ t1k_e100 │
+│  int64   │
+├──────────┤
+│     3445 │
+└──────────┘
+Run Time (s): real 0.213 user 0.198606 sys 0.003791
+@@@ THRESHOLD timed, 10k probes
+┌──────────┐
+│ t10k_e50 │
+│  int64   │
+├──────────┤
+│    11286 │
+└──────────┘
+Run Time (s): real 1.800 user 1.812092 sys 0.029661
+┌───────────┐
+│ t10k_e100 │
+│   int64   │
+├───────────┤
+│     35302 │
+└───────────┘
+Run Time (s): real 1.801 user 1.811471 sys 0.018994
+@@@ per-row top-k at the same k for reference (what the threshold path costs on top)
+┌──────────┐
+│ pr_k1024 │
+│  int64   │
+├──────────┤
+│ 10240000 │
+└──────────┘
+Run Time (s): real 1.791 user 1.806297 sys 0.019009
+┌────────┐
+│ pr_k10 │
+│ int64  │
+├────────┤
+│ 100000 │
+└────────┘
+Run Time (s): real 0.324 user 0.307306 sys 0.005320

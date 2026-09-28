@@ -1,0 +1,159 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@ fit n_clusters=1024
+┌────────────┬───────┬────────────┬─────────┐
+│ n_clusters │  dim  │ train_rows │ n_rows  │
+│   int64    │ int64 │   int64    │  int64  │
+├────────────┼───────┼────────────┼─────────┤
+│       1024 │   128 │     262144 │ 1000000 │
+└────────────┴───────┴────────────┴─────────┘
+Run Time (s): real 0.212 user 0.196114 sys 0.018235
+@@@ assign+order corpus
+Run Time (s): real 0.355 user 0.276755 sys 0.076654
+Run Time (s): real 1.193 user 6.079924 sys 0.511047
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+Run Time (s): real 0.010 user 0.008422 sys 0.001909
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@warmup discarded
+@@@ approx probes_n=1000 n_probes=1
+Run Time (s): real 0.223 user 0.196148 sys 0.019084
+@@@ approx probes_n=1000 n_probes=4
+Run Time (s): real 0.819 user 0.781826 sys 0.038908
+@@@ approx probes_n=1000 n_probes=16
+Run Time (s): real 3.187 user 3.153445 sys 0.109538
+@@@ approx probes_n=1000 n_probes=64
+Run Time (s): real 11.467 user 11.426834 sys 0.302576
+@@@ exact probes_n=1000
+Run Time (s): real 0.071 user 0.039713 sys 0.006186
+@@@ approx probes_n=10000 n_probes=1
+Run Time (s): real 0.304 user 0.280965 sys 0.008711
+@@@ approx probes_n=10000 n_probes=4
+Run Time (s): real 1.154 user 1.118300 sys 0.038104
+@@@ approx probes_n=10000 n_probes=16
+Run Time (s): real 4.503 user 4.454372 sys 0.131214
+@@@ approx probes_n=10000 n_probes=64
+Run Time (s): real 17.821 user 17.850469 sys 0.440506
+@@@ exact probes_n=10000
+Run Time (s): real 0.334 user 0.313525 sys 0.008249
+@@@ approx probes_n=100000 n_probes=1
+Run Time (s): real 0.344 user 0.303526 sys 0.022308
+@@@ approx probes_n=100000 n_probes=4
+Run Time (s): real 1.224 user 1.179060 sys 0.048109
+@@@ approx probes_n=100000 n_probes=16
+Run Time (s): real 4.704 user 4.674006 sys 0.125362
+@@@ approx probes_n=100000 n_probes=64
+Run Time (s): real 18.643 user 18.662130 sys 0.483866
+@@@ exact probes_n=100000
+Run Time (s): real 3.003 user 3.015494 sys 0.040586
+@@@ approx probes_n=1000000 n_probes=1
+Run Time (s): real 0.495 user 1.304844 sys 0.328087
+@@@ approx probes_n=1000000 n_probes=4
+Run Time (s): real 1.538 user 4.149683 sys 1.253301
+@@@ approx probes_n=1000000 n_probes=16
+Run Time (s): real 7.017 user 18.121427 sys 6.790794
+@@@ approx probes_n=1000000 n_probes=64
+Run Time (s): real 20.951 user 55.853451 sys 19.050692
+@@@ exact probes_n=1000000
+Run Time (s): real 27.719 user 217.444571 sys 0.000000

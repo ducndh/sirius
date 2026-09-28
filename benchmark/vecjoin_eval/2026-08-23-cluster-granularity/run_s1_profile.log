@@ -1,0 +1,85 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌────────────┬───────┬────────────┬─────────┐
+│ n_clusters │  dim  │ train_rows │ n_rows  │
+│   int64    │ int64 │   int64    │  int64  │
+├────────────┼───────┼────────────┼─────────┤
+│         64 │   128 │      16384 │ 1000000 │
+└────────────┴───────┴────────────┴─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+@@@ 64 clusters / 8 probes (12.5% of corpus, 8 spans)
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 8 chunks, 71 runs, 0 empty, n_probes=8
+[vecjoin-phase] cluster index             0.002 s
+[vecjoin-phase] assign probe->cluster     0.001 s
+[vecjoin-phase] sort order                0.015 s
+[vecjoin-phase] gather probe vectors      0.000 s
+[vecjoin-phase] labels to host            0.000 s
+[vecjoin] batch: 64 probe runs, 8 of 8 corpus chunks staged, 1334411869 of 10000000000 probe-row x corpus-row pairs scored (13.34%)
+[vecjoin-phase] search+merge runs         0.396 s
+[vecjoin-phase] concat runs               0.000 s
+[vecjoin-phase] scatter to row order      0.000 s
+Run Time (s): real 0.455 user 0.371257 sys 0.074743
+┌────────────┬───────┬────────────┬─────────┐
+│ n_clusters │  dim  │ train_rows │ n_rows  │
+│   int64    │ int64 │   int64    │  int64  │
+├────────────┼───────┼────────────┼─────────┤
+│        256 │   128 │      65536 │ 1000000 │
+└────────────┴───────┴────────────┴─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+@@@ 256 clusters / 32 probes (12.5% of corpus, 32 spans -- SAME bytes, 4x the spans)
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 8 chunks, 263 runs, 0 empty, n_probes=32
+[vecjoin-phase] cluster index             0.004 s
+[vecjoin-phase] assign probe->cluster     0.001 s
+[vecjoin-phase] sort order                0.000 s
+[vecjoin-phase] gather probe vectors      0.000 s
+[vecjoin-phase] labels to host            0.000 s
+[vecjoin] batch: 256 probe runs, 8 of 8 corpus chunks staged, 1301107268 of 10000000000 probe-row x corpus-row pairs scored (13.01%)
+[vecjoin-phase] search+merge runs         2.921 s
+[vecjoin-phase] concat runs               0.000 s
+[vecjoin-phase] scatter to row order      0.000 s
+Run Time (s): real 2.969 user 2.933697 sys 0.073599

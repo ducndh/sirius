@@ -1,0 +1,264 @@
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=1
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 162912819 of 10000000000 probe-row x corpus-row pairs scored (1.63%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=1
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 162912819 of 10000000000 probe-row x corpus-row pairs scored (1.63%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=1
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 162912819 of 10000000000 probe-row x corpus-row pairs scored (1.63%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=1
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 162912819 of 10000000000 probe-row x corpus-row pairs scored (1.63%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=2
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 328885781 of 10000000000 probe-row x corpus-row pairs scored (3.29%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=2
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 328885781 of 10000000000 probe-row x corpus-row pairs scored (3.29%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=2
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 328885781 of 10000000000 probe-row x corpus-row pairs scored (3.29%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=2
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 328885781 of 10000000000 probe-row x corpus-row pairs scored (3.29%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=4
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 654183457 of 10000000000 probe-row x corpus-row pairs scored (6.54%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=4
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 654183457 of 10000000000 probe-row x corpus-row pairs scored (6.54%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=4
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 654183457 of 10000000000 probe-row x corpus-row pairs scored (6.54%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=4
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 654183457 of 10000000000 probe-row x corpus-row pairs scored (6.54%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=8
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 1286095793 of 10000000000 probe-row x corpus-row pairs scored (12.86%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=8
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 1286095793 of 10000000000 probe-row x corpus-row pairs scored (12.86%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=8
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 1286095793 of 10000000000 probe-row x corpus-row pairs scored (12.86%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=8
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 1286095793 of 10000000000 probe-row x corpus-row pairs scored (12.86%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=16
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 2574942928 of 10000000000 probe-row x corpus-row pairs scored (25.75%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=16
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 2574942928 of 10000000000 probe-row x corpus-row pairs scored (25.75%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=16
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 2574942928 of 10000000000 probe-row x corpus-row pairs scored (25.75%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=16
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 2574942928 of 10000000000 probe-row x corpus-row pairs scored (25.75%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=32
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 4982368999 of 10000000000 probe-row x corpus-row pairs scored (49.82%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=32
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 4982368999 of 10000000000 probe-row x corpus-row pairs scored (49.82%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=32
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 4982368999 of 10000000000 probe-row x corpus-row pairs scored (49.82%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=32
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 4982368999 of 10000000000 probe-row x corpus-row pairs scored (49.82%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=64
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 10000000000 of 10000000000 probe-row x corpus-row pairs scored (100.00%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=64
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 10000000000 of 10000000000 probe-row x corpus-row pairs scored (100.00%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=64
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 10000000000 of 10000000000 probe-row x corpus-row pairs scored (100.00%)
+[vecjoin] centroids=f86e27d40fbf1dc9
+[vecjoin] cluster index: 64 clusters over 1000000 rows in 1 chunks, 64 runs, 0 empty, n_probes=64
+[vecjoin] batch: 64 probe runs, 1 of 1 corpus chunks staged, 10000000000 of 10000000000 probe-row x corpus-row pairs scored (100.00%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=1
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 41700705 of 10000000000 probe-row x corpus-row pairs scored (0.42%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=1
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 41700705 of 10000000000 probe-row x corpus-row pairs scored (0.42%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=1
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 41700705 of 10000000000 probe-row x corpus-row pairs scored (0.42%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=1
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 41700705 of 10000000000 probe-row x corpus-row pairs scored (0.42%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=2
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 84143069 of 10000000000 probe-row x corpus-row pairs scored (0.84%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=2
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 84143069 of 10000000000 probe-row x corpus-row pairs scored (0.84%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=2
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 84143069 of 10000000000 probe-row x corpus-row pairs scored (0.84%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=2
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 84143069 of 10000000000 probe-row x corpus-row pairs scored (0.84%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=4
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 167097215 of 10000000000 probe-row x corpus-row pairs scored (1.67%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=4
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 167097215 of 10000000000 probe-row x corpus-row pairs scored (1.67%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=4
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 167097215 of 10000000000 probe-row x corpus-row pairs scored (1.67%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=4
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 167097215 of 10000000000 probe-row x corpus-row pairs scored (1.67%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=8
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 333890277 of 10000000000 probe-row x corpus-row pairs scored (3.34%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=8
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 333890277 of 10000000000 probe-row x corpus-row pairs scored (3.34%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=8
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 333890277 of 10000000000 probe-row x corpus-row pairs scored (3.34%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=8
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 333890277 of 10000000000 probe-row x corpus-row pairs scored (3.34%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=16
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 659200671 of 10000000000 probe-row x corpus-row pairs scored (6.59%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=16
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 659200671 of 10000000000 probe-row x corpus-row pairs scored (6.59%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=16
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 659200671 of 10000000000 probe-row x corpus-row pairs scored (6.59%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=16
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 659200671 of 10000000000 probe-row x corpus-row pairs scored (6.59%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=32
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 1298588697 of 10000000000 probe-row x corpus-row pairs scored (12.99%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=32
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 1298588697 of 10000000000 probe-row x corpus-row pairs scored (12.99%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=32
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 1298588697 of 10000000000 probe-row x corpus-row pairs scored (12.99%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=32
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 1298588697 of 10000000000 probe-row x corpus-row pairs scored (12.99%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=64
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 2547631809 of 10000000000 probe-row x corpus-row pairs scored (25.48%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=64
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 2547631809 of 10000000000 probe-row x corpus-row pairs scored (25.48%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=64
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 2547631809 of 10000000000 probe-row x corpus-row pairs scored (25.48%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=64
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 2547631809 of 10000000000 probe-row x corpus-row pairs scored (25.48%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=128
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 4951697080 of 10000000000 probe-row x corpus-row pairs scored (49.52%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=128
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 4951697080 of 10000000000 probe-row x corpus-row pairs scored (49.52%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=128
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 4951697080 of 10000000000 probe-row x corpus-row pairs scored (49.52%)
+[vecjoin] centroids=feea0ff6ad63df1f
+[vecjoin] cluster index: 256 clusters over 1000000 rows in 1 chunks, 256 runs, 0 empty, n_probes=128
+[vecjoin] batch: 256 probe runs, 1 of 1 corpus chunks staged, 4951697080 of 10000000000 probe-row x corpus-row pairs scored (49.52%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=1
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 10414260 of 10000000000 probe-row x corpus-row pairs scored (0.10%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=1
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 10414260 of 10000000000 probe-row x corpus-row pairs scored (0.10%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=1
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 10414260 of 10000000000 probe-row x corpus-row pairs scored (0.10%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=1
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 10414260 of 10000000000 probe-row x corpus-row pairs scored (0.10%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=4
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 42589411 of 10000000000 probe-row x corpus-row pairs scored (0.43%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=4
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 42589411 of 10000000000 probe-row x corpus-row pairs scored (0.43%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=4
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 42589411 of 10000000000 probe-row x corpus-row pairs scored (0.43%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=4
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 42589411 of 10000000000 probe-row x corpus-row pairs scored (0.43%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=16
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 166295083 of 10000000000 probe-row x corpus-row pairs scored (1.66%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=16
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 166295083 of 10000000000 probe-row x corpus-row pairs scored (1.66%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=16
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 166295083 of 10000000000 probe-row x corpus-row pairs scored (1.66%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=16
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 166295083 of 10000000000 probe-row x corpus-row pairs scored (1.66%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=32
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 328391476 of 10000000000 probe-row x corpus-row pairs scored (3.28%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=32
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 328391476 of 10000000000 probe-row x corpus-row pairs scored (3.28%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=32
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 328391476 of 10000000000 probe-row x corpus-row pairs scored (3.28%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=32
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 328391476 of 10000000000 probe-row x corpus-row pairs scored (3.28%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=64
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 650096330 of 10000000000 probe-row x corpus-row pairs scored (6.50%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=64
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 650096330 of 10000000000 probe-row x corpus-row pairs scored (6.50%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=64
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 650096330 of 10000000000 probe-row x corpus-row pairs scored (6.50%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=64
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 650096330 of 10000000000 probe-row x corpus-row pairs scored (6.50%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=128
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 1281734128 of 10000000000 probe-row x corpus-row pairs scored (12.82%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=128
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 1281734128 of 10000000000 probe-row x corpus-row pairs scored (12.82%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=128
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 1281734128 of 10000000000 probe-row x corpus-row pairs scored (12.82%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=128
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 1281734128 of 10000000000 probe-row x corpus-row pairs scored (12.82%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=256
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 2526920775 of 10000000000 probe-row x corpus-row pairs scored (25.27%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=256
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 2526920775 of 10000000000 probe-row x corpus-row pairs scored (25.27%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=256
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 2526920775 of 10000000000 probe-row x corpus-row pairs scored (25.27%)
+[vecjoin] centroids=8347dec41c6854d9
+[vecjoin] cluster index: 1024 clusters over 1000000 rows in 1 chunks, 1024 runs, 0 empty, n_probes=256
+[vecjoin] batch: 1023 probe runs, 1 of 1 corpus chunks staged, 2526920775 of 10000000000 probe-row x corpus-row pairs scored (25.27%)

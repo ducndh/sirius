@@ -1,0 +1,26 @@
+# base (1000000, 128), queries (10000, 128), gt (10000, 10), k=10
+cuVS brute_force (exact)           build   0.024s  search   0.347s  total   0.371s  recall 0.9993
+cuVS IVF-Flat nlist=64 nprobe=1    build   0.210s  search   0.048s  total   0.259s  recall 0.6200
+cuVS IVF-Flat nlist=64 nprobe=4    build   0.207s  search   0.202s  total   0.409s  recall 0.9352
+cuVS IVF-Flat nlist=64 nprobe=16   build   0.183s  search   0.815s  total   0.999s  recall 0.9990
+cuVS IVF-Flat nlist=64 nprobe=64   build   0.185s  search   3.020s  total   3.205s  recall 0.9993
+cuVS IVF-Flat nlist=1024 nprobe=1  build   0.271s  search   0.005s  total   0.276s  recall 0.3700
+cuVS IVF-Flat nlist=1024 nprobe=4  build   0.261s  search   0.015s  total   0.276s  recall 0.6983
+cuVS IVF-Flat nlist=1024 nprobe=16 build   0.266s  search   0.054s  total   0.320s  recall 0.9317
+cuVS IVF-Flat nlist=1024 nprobe=64 build   0.265s  search   0.209s  total   0.474s  recall 0.9956
+cuVS IVF-Flat nlist=1024 nprobe=256 build   0.264s  search   0.811s  total   1.075s  recall 0.9995
+cuVS CAGRA nn_descent deg=32 itopk=32 build   7.348s  search   0.005s  total   7.353s  recall 0.9227
+cuVS CAGRA nn_descent deg=32 itopk=64 build   7.348s  search   0.008s  total   7.356s  recall 0.9762
+cuVS CAGRA nn_descent deg=32 itopk=128 build   7.348s  search   0.015s  total   7.362s  recall 0.9944
+cuVS CAGRA nn_descent deg=32 itopk=256 build   7.348s  search   0.028s  total   7.375s  recall 0.9987
+cuVS CAGRA nn_descent deg=64 itopk=32 build   8.458s  search   0.009s  total   8.467s  recall 0.9777
+cuVS CAGRA nn_descent deg=64 itopk=64 build   8.458s  search   0.015s  total   8.472s  recall 0.9950
+cuVS CAGRA nn_descent deg=64 itopk=128 build   8.458s  search   0.026s  total   8.484s  recall 0.9987
+cuVS CAGRA nn_descent deg=64 itopk=256 build   8.458s  search   0.048s  total   8.506s  recall 0.9992
+[165232][01:07:20:528972][warning] Self-included ratio is low: 0.08 %. This can lead to poor recall. Consider using a different configuration for the IVF-PQ index, increasing the refinement rate, or using higher-precision data type for LUT/Internal Distance.
+cuVS CAGRA ivf_pq deg=64 itopk=32  build  25.022s  search   0.007s  total  25.029s  recall 0.0008
+cuVS CAGRA ivf_pq deg=64 itopk=64  build  25.022s  search   0.012s  total  25.034s  recall 0.0013
+cuVS CAGRA ivf_pq deg=64 itopk=128 build  25.022s  search   0.019s  total  25.041s  recall 0.0017
+cuVS CAGRA ivf_pq deg=64 itopk=256 build  25.022s  search   0.034s  total  25.056s  recall 0.0024
+
+wrote /var/tmp/vj/pareto/cuvs.json

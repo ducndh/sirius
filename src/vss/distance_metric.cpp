@@ -37,13 +37,16 @@ cuvs::distance::DistanceType ann_distance_type_from_metric(std::string_view metr
                               std::string(metric) + "'");
 }
 
-std::string_view ann_metric_name(cuvs::distance::DistanceType metric)
+cuvs::distance::DistanceType join_selection_distance_type_from_metric(std::string_view metric,
+                                                                      bool exact_unexpanded)
 {
-  switch (metric) {
-    case cuvs::distance::DistanceType::L2SqrtExpanded: return "l2";
-    case cuvs::distance::DistanceType::CosineExpanded: return "cosine";
-    default: return "unknown";
+  if (metric == "l2") {
+    return exact_unexpanded ? cuvs::distance::DistanceType::L2SqrtUnexpanded
+                            : cuvs::distance::DistanceType::L2SqrtExpanded;
   }
+  if (metric == "cosine") { return cuvs::distance::DistanceType::CosineExpanded; }
+  throw std::invalid_argument("join_selection_distance_type_from_metric: unsupported metric '" +
+                              std::string(metric) + "'");
 }
 
 }  // namespace sirius::vss

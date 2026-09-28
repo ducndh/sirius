@@ -1,0 +1,12 @@
+########## selectivity 10%
+  sirius sel=10%  materialize 0.344  checkpoint 0.315  pin 0.021  join 0.192  TOTAL 0.872
+  cuvs   sel=10%  export 0.1  h2d 0.020  build 0.009  search 0.235  TOTAL 0.008  recall 0.491
+########## selectivity 30%
+  sirius sel=30%  materialize 1.732  checkpoint 0.010  pin 0.021  join 0.263  TOTAL 2.026
+  cuvs   sel=30%  export 0.3  h2d 0.073  build 0.109  search 0.353  TOTAL 0.009  recall 1.136
+########## selectivity 50%
+  sirius sel=50%  materialize 2.675  checkpoint 0.021  pin 0.030  join 0.335  TOTAL 3.061
+  cuvs   sel=50%  export 0.5  h2d 0.089  build 0.123  search 0.494  TOTAL 0.010  recall 1.698
+########## selectivity 90%
+  sirius sel=90%  materialize 3.778  checkpoint 0.020  pin 0.041  join 0.456  TOTAL 4.295
+  cuvs   sel=90%  export 0.9  h2d 0.136  build 0.254  search 0.630  TOTAL 0.009  recall 3.232

@@ -1,0 +1,26 @@
+=== shape probe (100 queries)
+┌─────────────┬──────────────────────────────────────┬─────────┬─────────┬─────────┬─────────┐
+│ column_name │             column_type              │  null   │   key   │ default │  extra  │
+│   varchar   │               varchar                │ varchar │ varchar │ varchar │ varchar │
+├─────────────┼──────────────────────────────────────┼─────────┼─────────┼─────────┼─────────┤
+│ score       │ FLOAT                                │ YES     │ NULL    │ NULL    │ NULL    │
+│ left_tbl    │ STRUCT(qid INTEGER, qvec FLOAT[128]) │ YES     │ NULL    │ NULL    │ NULL    │
+│ right_tbl   │ STRUCT(iid INTEGER, ivec FLOAT[128]) │ YES     │ NULL    │ NULL    │ NULL    │
+└─────────────┴──────────────────────────────────────┴─────────┴─────────┴─────────┴─────────┘
+┌──────────────┐
+│ count_star() │
+│    int64     │
+├──────────────┤
+│         1000 │
+└──────────────┘
+=== TIMED vss_join 1k x 1M k=10 (run 1 of 2)
+Run Time (s): real 118.877 user 1057.354553 sys 4.487092
+=== TIMED vss_join 1k x 1M k=10 (run 2 of 2)
+Run Time (s): real 115.931 user 924.685227 sys 4.357721
+=== recall@10 vs packaged ground truth
+┌───────┬───────┬──────────────┐
+│ rows  │ hits  │ recall_at_10 │
+│ int64 │ int64 │    double    │
+├───────┼───────┼──────────────┤
+│ 10000 │  9994 │       0.9994 │
+└───────┴───────┴──────────────┘

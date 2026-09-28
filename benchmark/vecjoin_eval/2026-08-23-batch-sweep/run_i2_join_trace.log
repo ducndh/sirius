@@ -1,0 +1,141 @@
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@ fit n_clusters=64
+┌────────────┬───────┬────────────┬─────────┐
+│ n_clusters │  dim  │ train_rows │ n_rows  │
+│   int64    │ int64 │   int64    │  int64  │
+├────────────┼───────┼────────────┼─────────┤
+│         64 │   128 │      16384 │ 1000000 │
+└────────────┴───────┴────────────┴─────────┘
+Run Time (s): real 0.112 user 0.063078 sys 0.021376
+@@@ assign+order corpus
+Run Time (s): real 0.203 user 0.137314 sys 0.052783
+Run Time (s): real 1.206 user 6.197560 sys 0.624900
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+Run Time (s): real 0.010 user 0.010616 sys 0.001123
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+└─────────┘
+  0 rows 
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+┌─────────┐
+│ Success │
+│ boolean │
+├─────────┤
+│ true    │
+└─────────┘
+@@@warmup discarded
+@@@ approx probes_n=10000 n_probes=8
+Run Time (s): real 0.476 user 0.533295 sys 0.056546
+@@@ exact probes_n=10000
+Run Time (s): real 0.334 user 0.320389 sys 0.008781
+@@@ approx probes_n=1000000 n_probes=8
+Run Time (s): real 4.895 user 36.509862 sys 0.256978
+@@@ exact probes_n=1000000
+Run Time (s): real 27.439 user 214.847081 sys 0.496758
+Collecting data...
+Generating '/tmp/nsys-report-cddd.qdstrm'
+
+[1/1] [0%                          ] vj_join.nsys-rep
+[1/1] [0%                          ] vj_join.nsys-rep
+[1/1] [0%                          ] vj_join.nsys-rep
+[1/1] [0%                          ] vj_join.nsys-rep
+[1/1] [13%                         ] vj_join.nsys-rep
+[1/1] [10%                         ] vj_join.nsys-rep
+[1/1] [==20%                       ] vj_join.nsys-rep
+[1/1] [=17%                        ] vj_join.nsys-rep
+[1/1] [14%                         ] vj_join.nsys-rep
+[1/1] [12%                         ] vj_join.nsys-rep
+[1/1] [11%                         ] vj_join.nsys-rep
+[1/1] [10%                         ] vj_join.nsys-rep
+[1/1] [9%                          ] vj_join.nsys-rep
+[1/1] [8%                          ] vj_join.nsys-rep
+[1/1] [7%                          ] vj_join.nsys-rep
+[1/1] [6%                          ] vj_join.nsys-rep
+[1/1] [5%                          ] vj_join.nsys-rep
+[1/1] [5%                          ] vj_join.nsys-rep
+[1/1] [6%                          ] vj_join.nsys-rep
+[1/1] [7%                          ] vj_join.nsys-rep
+[1/1] [8%                          ] vj_join.nsys-rep
+[1/1] [9%                          ] vj_join.nsys-rep
+[1/1] [10%                         ] vj_join.nsys-rep
+[1/1] [11%                         ] vj_join.nsys-rep
+[1/1] [12%                         ] vj_join.nsys-rep
+[1/1] [13%                         ] vj_join.nsys-rep
+[1/1] [14%                         ] vj_join.nsys-rep
+[1/1] [=15%                        ] vj_join.nsys-rep
+[1/1] [=16%                        ] vj_join.nsys-rep
+[1/1] [=17%                        ] vj_join.nsys-rep
+[1/1] [==18%                       ] vj_join.nsys-rep
+[1/1] [==19%                       ] vj_join.nsys-rep
+[1/1] [==20%                       ] vj_join.nsys-rep
+[1/1] [==21%                       ] vj_join.nsys-rep
+[1/1] [===22%                      ] vj_join.nsys-rep
+[1/1] [===23%                      ] vj_join.nsys-rep
+[1/1] [===24%                      ] vj_join.nsys-rep
+[1/1] [====25%                     ] vj_join.nsys-rep
+[1/1] [====26%                     ] vj_join.nsys-rep
+[1/1] [====27%                     ] vj_join.nsys-rep
+[1/1] [====28%                     ] vj_join.nsys-rep
+[1/1] [=====29%                    ] vj_join.nsys-rep
+[1/1] [=====30%                    ] vj_join.nsys-rep
+[1/1] [=====31%                    ] vj_join.nsys-rep
+[1/1] [=====32%                    ] vj_join.nsys-rep
+[1/1] [======33%                   ] vj_join.nsys-rep
+[1/1] [======34%                   ] vj_join.nsys-rep
+[1/1] [======35%                   ] vj_join.nsys-rep
+[1/1] [=======36%                  ] vj_join.nsys-rep
+[1/1] [=======37%                  ] vj_join.nsys-rep
+[1/1] [=======38%                  ] vj_join.nsys-rep
+[1/1] [=======39%                  ] vj_join.nsys-rep
+[1/1] [========40%                 ] vj_join.nsys-rep
+[1/1] [========41%                 ] vj_join.nsys-rep
+[1/1] [========42%                 ] vj_join.nsys-rep
+[1/1] [=========43%                ] vj_join.nsys-rep
+[1/1] [=========44%                ] vj_join.nsys-rep
+[1/1] [=========45%                ] vj_join.nsys-rep
+[1/1] [=========46%                ] vj_join.nsys-rep
+[1/1] [==========47%               ] vj_join.nsys-rep
+[1/1] [==========48%               ] vj_join.nsys-rep
+[1/1] [==========49%               ] vj_join.nsys-rep
+[1/1] [===========50%              ] vj_join.nsys-rep
+[1/1] [========================100%] vj_join.nsys-rep
+[1/1] [========================100%] vj_join.nsys-rep
+Generated:
+	/var/tmp/vj/vj_join.nsys-rep

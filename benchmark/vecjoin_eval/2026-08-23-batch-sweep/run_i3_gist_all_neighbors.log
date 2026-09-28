@@ -1,0 +1,6 @@
+GIST1M 1,000,000 x 960 (3.58 GiB)
+brute-force truth for 5,000 rows: 4.4 s
+
+        algo   build_s  recall_dist   misses
+  nn_descent     9.855     0.977980    1,101
+ brute_force   270.115     1.000000        0

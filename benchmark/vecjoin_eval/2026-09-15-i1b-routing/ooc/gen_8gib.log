@@ -1,0 +1,13 @@
+corpus 16,777,216 x 128 = 8.0 GiB, 4096 true clusters
+    corpus_8gib.parquet: 2000000/16777216 (1.0 GiB)
+    corpus_8gib.parquet: 4000000/16777216 (1.9 GiB)
+    corpus_8gib.parquet: 6000000/16777216 (2.9 GiB)
+    corpus_8gib.parquet: 8000000/16777216 (3.8 GiB)
+    corpus_8gib.parquet: 10000000/16777216 (4.8 GiB)
+    corpus_8gib.parquet: 12000000/16777216 (5.7 GiB)
+    corpus_8gib.parquet: 14000000/16777216 (6.7 GiB)
+    corpus_8gib.parquet: 16000000/16777216 (7.6 GiB)
+    corpus_8gib.parquet: 16777216/16777216 (8.0 GiB)
+    probe_8gib.parquet: 10000/10000 (0.0 GiB)
+  vectors written in 48.3s
+  probe+gt restored from /home/dnguyen56/vecjoin/data_backup/ooc_gt (same --seed => same vectors)

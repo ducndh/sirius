@@ -1,0 +1,6 @@
+brute-force truth for 20,000 rows: 18.6 s
+
+        algo  n_clusters   where   build_s  recall_dist    misses
+  nn_descent           1  device     4.947     0.999830        34
+  nn_descent           4    host    10.585     0.999940        12
+ brute_force           1  device    34.287     1.000000         0

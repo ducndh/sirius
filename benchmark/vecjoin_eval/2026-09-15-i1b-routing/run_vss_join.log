@@ -1,0 +1,48 @@
+##### duckdb v1.4.4 2026-09-15T11:16:54Z
+=== shape probe (100 queries)
+┌─────────────┬──────────────────────────────────────┬─────────┬─────────┬─────────┬─────────┐
+│ column_name │             column_type              │  null   │   key   │ default │  extra  │
+│   varchar   │               varchar                │ varchar │ varchar │ varchar │ varchar │
+├─────────────┼──────────────────────────────────────┼─────────┼─────────┼─────────┼─────────┤
+│ score       │ FLOAT                                │ YES     │ NULL    │ NULL    │ NULL    │
+│ left_tbl    │ STRUCT(qid INTEGER, qvec FLOAT[128]) │ YES     │ NULL    │ NULL    │ NULL    │
+│ right_tbl   │ STRUCT(iid INTEGER, ivec FLOAT[128]) │ YES     │ NULL    │ NULL    │ NULL    │
+└─────────────┴──────────────────────────────────────┴─────────┴─────────┴─────────┴─────────┘
+┌──────────────┐
+│ count_star() │
+│    int64     │
+├──────────────┤
+│         1000 │
+└──────────────┘
+=== TIMED vss_join 10k x 1M k=10 (run 1 of 2)
+Run Time (s): real 1197.359 user 9360.614670 sys 50.640744
+=== TIMED vss_join 10k x 1M k=10 (run 2 of 2)
+Run Time (s): real 1194.399 user 9420.701084 sys 51.272324
+=== recall@10 vs packaged ground truth
+Binder Error: Alias "hits" referenced in a SELECT clause - but the expression has a subquery. This is not yet supported.
+##### rc=1
+##### duckdb v1.5.4 2026-09-15T12:16:30Z
+=== shape probe (100 queries)
+[90m┌────────────────────────────────────────────────┐[00m[90m
+[00m[90m│                    [00m[1mDescribe[00m[90m                    │[00m[90m
+[00m[90m│                                                │[00m[90m
+[00m[90m│ [00mscore[90m     [00m[90mfloat[00m[90m                                [00m[90m│[00m[90m
+[00m[90m│ [00mleft_tbl[90m  [00m[90mstruct(qid integer, qvec float[128])[00m[90m [00m[90m│[00m[90m
+[00m[90m│ [00mright_tbl[90m [00m[90mstruct(iid integer, ivec float[128])[00m[90m [00m[90m│[00m[90m
+[00m[90m└────────────────────────────────────────────────┘[00m[90m
+[00m┌──────────────┐
+│ count_star() │
+│    int64     │
+├──────────────┤
+│         1000 │
+└──────────────┘
+=== TIMED vss_join 10k x 1M k=10 (run 1 of 2)
+Run Time (s): real 1145.943 user 9126.011896 sys 46.023573
+=== TIMED vss_join 10k x 1M k=10 (run 2 of 2)
+Run Time (s): real 1132.053 user 9020.522106 sys 44.860817
+=== recall@10 vs packaged ground truth
+Binder Error: Alias "hits" referenced in a SELECT clause - but the expression has a subquery. This is not yet supported.
+
+LINE 2:        round(hits::DOUBLE/100000, 5) AS recall_at_10 FROM ans;
+                     ^
+##### rc=1
