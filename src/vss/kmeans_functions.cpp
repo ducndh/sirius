@@ -368,7 +368,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   std::vector<std::int32_t> labels(static_cast<std::size_t>(n_rows));
   // Whether every component is a byte, counted while the chunks are resident anyway: that is
   // what decides if the lists may be stored as UINT8 without changing a single value.
-  bool const check_uint8 = storage != list_storage::float32;
+  bool const check_uint8 = storage == list_storage::automatic || storage == list_storage::uint8;
   rmm::device_uvector<unsigned long long> non_uint8(1, stream, mr);
   CUDF_CUDA_TRY(cudaMemsetAsync(non_uint8.data(), 0, sizeof(unsigned long long), stream.value()));
   {
@@ -418,8 +418,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                         req.column + "' to be an integer in [0, 255]; " +
                                         std::to_string(non_uint8_host) + " are not");
   }
-  auto const encoding =
-    check_uint8 && non_uint8_host == 0 ? list_encoding::uint8 : list_encoding::float32;
+  auto const encoding = storage == list_storage::float16     ? list_encoding::float16
+                        : check_uint8 && non_uint8_host == 0 ? list_encoding::uint8
+                                                             : list_encoding::float32;
 
   // A stable counting sort, split over threads by row range: per-thread histograms, then each
   // thread's start inside each list is the list's start plus the rows earlier threads put
@@ -489,7 +490,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
 
   // Storage. The row map is device-resident on both tiers because the fold reads it per slice;
   // the vectors go to the device when the pin is there and they fit, else to pinned host blocks.
-  auto const elem_bytes = encoding == list_encoding::uint8 ? std::size_t{1} : sizeof(float);
+  auto const elem_bytes = list_encoding_bytes(encoding);
   auto const vec_bytes =
     static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(dim) * elem_bytes;
   auto const row_bytes = static_cast<std::size_t>(n_rows) * sizeof(std::int64_t);
@@ -511,7 +512,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   std::unique_ptr<cucascade::memory::reservation> reservation;
   // FP32 lists live where the pin does; UINT8 ones are a quarter of the corpus and go to the
   // device whenever they fit, which is what takes the corpus stream off the query path.
-  bool on_device = c.pin->tier == cucascade::memory::Tier::GPU || encoding == list_encoding::uint8;
+  bool on_device =
+    c.pin->tier == cucascade::memory::Tier::GPU || encoding != list_encoding::float32;
   if (on_device) {
     reservation = index_cache.reserve_index_memory(
       vec_bytes + row_bytes + row_bytes / 2 + (std::size_t{1} << 24), c.target_gpu);
@@ -541,7 +543,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   std::vector<std::byte*> block_ptrs;
   if (on_device) {
     lists.tier           = cucascade::memory::Tier::GPU;
-    lists.chunk_rows     = encoding == list_encoding::uint8
+    lists.chunk_rows     = encoding != list_encoding::float32
                              ? std::min<std::int64_t>(n_rows, staged_rows)
                              : std::min<std::int64_t>(n_rows, max_list_elements / dim);
     lists.rows_per_block = n_rows;
@@ -640,9 +642,15 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                     stream.value()));
       gather_rows(vectors.data_handle(), dim, order_d.data(), rows, grouped.data(), stream);
       // The copies below read the grouped rows in the list encoding.
+      std::optional<rmm::device_uvector<std::uint16_t>> grouped_f16;
       std::optional<rmm::device_uvector<std::int8_t>> grouped_i8;
       std::optional<rmm::device_uvector<std::int32_t>> grouped_sq;
       auto const* grouped_bytes = reinterpret_cast<std::byte const*>(grouped.data());
+      if (encoding == list_encoding::float16) {
+        grouped_f16.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
+        narrow_to_float16(grouped.data(), rows * dim, grouped_f16->data(), stream);
+        grouped_bytes = reinterpret_cast<std::byte const*>(grouped_f16->data());
+      }
       if (encoding == list_encoding::uint8) {
         grouped_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
         grouped_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
@@ -690,7 +698,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   result.n_rows     = n_rows;
   result.n_clusters = n_clusters;
   result.tier       = on_device ? "gpu" : "host";
-  result.encoding   = encoding == list_encoding::uint8 ? "uint8" : "float32";
+  result.encoding   = encoding == list_encoding::uint8     ? "uint8"
+                      : encoding == list_encoding::float16 ? "float16"
+                                                           : "float32";
   result.min_list   = std::numeric_limits<std::int64_t>::max();
   for (std::int64_t k = 0; k < n_clusters; ++k) {
     auto const size =

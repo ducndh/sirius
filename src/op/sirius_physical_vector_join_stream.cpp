@@ -588,7 +588,7 @@ class cluster_lists_chunk_source : public vector_chunk_source {
   [[nodiscard]] bool is_streaming() const override
   {
     return _lists.tier == cucascade::memory::Tier::HOST ||
-           _lists.encoding == vss::list_encoding::uint8;
+           _lists.encoding != vss::list_encoding::float32;
   }
   [[nodiscard]] std::size_t chunk_rows(std::size_t i) const override
   {
@@ -598,7 +598,7 @@ class cluster_lists_chunk_source : public vector_chunk_source {
   {
     if (!is_streaming()) { return 0; }
     auto const staged_u8 =
-      _lists.tier == cucascade::memory::Tier::HOST && _lists.encoding == vss::list_encoding::uint8
+      _lists.tier == cucascade::memory::Tier::HOST && _lists.encoding != vss::list_encoding::float32
         ? chunk_rows(i) * _lists.row_bytes()
         : 0;
     return chunk_rows(i) * float_row_bytes() + staged_u8;
@@ -610,7 +610,7 @@ class cluster_lists_chunk_source : public vector_chunk_source {
   {
     auto const rows    = static_cast<std::int64_t>(chunk_rows(i));
     auto const first   = static_cast<std::int64_t>(i) * _lists.chunk_rows;
-    bool const narrow  = _lists.encoding == vss::list_encoding::uint8;
+    bool const narrow  = _lists.encoding != vss::list_encoding::float32;
     bool const on_host = _lists.tier == cucascade::memory::Tier::HOST;
     if (!is_streaming()) {
       auto const* data =
@@ -657,10 +657,17 @@ class cluster_lists_chunk_source : public vector_chunk_source {
                static_cast<std::size_t>(first) * _lists.row_bytes();
     }
     if (narrow) {
-      vss::widen_shifted_int8(reinterpret_cast<std::int8_t const*>(stored),
-                              rows * _lists.dim,
-                              static_cast<float*>(buffer->data()),
-                              stream);
+      if (_lists.encoding == vss::list_encoding::float16) {
+        vss::widen_float16(reinterpret_cast<std::uint16_t const*>(stored),
+                           rows * _lists.dim,
+                           static_cast<float*>(buffer->data()),
+                           stream);
+      } else {
+        vss::widen_shifted_int8(reinterpret_cast<std::int8_t const*>(stored),
+                                rows * _lists.dim,
+                                static_cast<float*>(buffer->data()),
+                                stream);
+      }
     }
     // Synchronous like the pin converter: the caller overlaps "host waits on this copy" with
     // the compute it already issued, and the view must be complete before it is searched. It is

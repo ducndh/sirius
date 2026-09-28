@@ -58,7 +58,20 @@ enum class list_encoding : std::uint8_t {
   /// byte-quantized descriptors stored as FLOAT), held as int8 x - 128. A quarter of the memory
   /// and of the transfer, and exact input for an int8 GEMM.
   uint8,
+  /// Two bytes per component, IEEE half. LOSSY (11-bit mantissa), so it is only ever used when
+  /// asked for: half the memory and the transfer of FP32 for float embeddings.
+  float16,
 };
+
+/// Bytes one component takes in @p e.
+[[nodiscard]] inline std::size_t list_encoding_bytes(list_encoding e)
+{
+  switch (e) {
+    case list_encoding::uint8: return 1;
+    case list_encoding::float16: return 2;
+    default: return 4;
+  }
+}
 
 struct cluster_lists {
   const scan_manager::pinned_entry* pin{nullptr};  ///< The pin the lists were built from.
@@ -93,7 +106,7 @@ struct cluster_lists {
   /// Stored bytes per row, in the list encoding.
   [[nodiscard]] std::size_t row_bytes() const
   {
-    return static_cast<std::size_t>(dim) * (encoding == list_encoding::uint8 ? 1 : sizeof(float));
+    return static_cast<std::size_t>(dim) * list_encoding_bytes(encoding);
   }
   [[nodiscard]] std::int64_t num_chunks() const
   {
@@ -117,7 +130,7 @@ struct cluster_lists_result {
 };
 
 /// `storage =>` of the build: FLOAT32 always, UINT8 or fail, or the tightest lossless one.
-enum class list_storage : std::uint8_t { automatic, float32, uint8 };
+enum class list_storage : std::uint8_t { automatic, float32, uint8, float16 };
 
 /**
  * @brief `sirius_kmeans_build_lists(table, column, clustering)`: build @ref cluster_lists for a
@@ -162,6 +175,18 @@ void widen_shifted_int8(std::int8_t const* in,
                         std::int64_t n,
                         float* out,
                         rmm::cuda_stream_view stream);
+
+/// out[i] = in[i] rounded to IEEE half (stored as its 16 bits).
+void narrow_to_float16(float const* in,
+                       std::int64_t n,
+                       std::uint16_t* out,
+                       rmm::cuda_stream_view stream);
+
+/// out[i] = in[i] (IEEE half bits) as FP32.
+void widen_float16(std::uint16_t const* in,
+                   std::int64_t n,
+                   float* out,
+                   rmm::cuda_stream_view stream);
 
 /// |x|^2 per row of shifted int8 rows, exact in int32.
 void int8_row_sq_norms(std::int8_t const* x,

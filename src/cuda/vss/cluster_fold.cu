@@ -19,6 +19,8 @@
 
 #include <cudf/utilities/error.hpp>
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <cstdint>
 
@@ -199,6 +201,22 @@ __global__ void gather_int32_kernel(int32_t const* src,
   }
 }
 
+__global__ void narrow_to_float16_kernel(float const* in, int64_t n, uint16_t* out)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    out[i] = __half_as_ushort(__float2half_rn(in[i]));
+  }
+}
+
+__global__ void widen_float16_kernel(uint16_t const* in, int64_t n, float* out)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    out[i] = __half2float(__ushort_as_half(in[i]));
+  }
+}
+
 __global__ void fill_list_offsets_kernel(int32_t* out, int64_t n, int64_t dim)
 {
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i <= n;
@@ -278,6 +296,20 @@ void gather_int32(
   if (m == 0) { return; }
   gather_int32_kernel<<<std::min(grid_for(m), 65535), kBlock, 0, stream.value()>>>(
     src, rows, m, out);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void narrow_to_float16(float const* in, int64_t n, uint16_t* out, rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  narrow_to_float16_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(in, n, out);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void widen_float16(uint16_t const* in, int64_t n, float* out, rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  widen_float16_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(in, n, out);
   CUDF_CHECK_CUDA(stream.value());
 }
 
