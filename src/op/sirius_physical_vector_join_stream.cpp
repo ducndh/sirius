@@ -1210,6 +1210,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                             ? static_cast<float>(1.0 - _request.eps)
                             : static_cast<float>(_request.eps);
 
+  // Rows the exhaustive fold searched; a corpus with none has nothing to join against.
+  std::int64_t exhaustive_rows_seen = 0;
+
   // The clustered path replaces the whole-corpus fold below. It is a separate branch rather
   // than a predicate inside it because the two iterate different things: the exhaustive fold
   // walks corpus chunks, while this walks (probe run x neighbouring cluster) pairs.
@@ -1533,6 +1536,21 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       chunk = staged_vector_chunk{};
     };
 
+    // Running [n_left x k_join] accumulator, seeded with misses (id -1 at infinite distance) so the
+    // first chunk merges against nothing; a miss can only survive for a row with fewer than k
+    // corpus rows in total.
+    std::unique_ptr<cudf::column> all_rows;
+    if (!radius_join) {
+      cudf::numeric_scalar<std::int64_t> const miss_id(-1, true, stream);
+      cudf::numeric_scalar<float> const miss_distance(
+        std::numeric_limits<float>::infinity(), true, stream);
+      auto const total = static_cast<cudf::size_type>(n_left * k_join);
+      acc_neighbors    = cudf::make_column_from_scalar(miss_id, total, stream, mr);
+      acc_distances    = cudf::make_column_from_scalar(miss_distance, total, stream, mr);
+      cudf::numeric_scalar<std::int64_t> const zero(0, true, stream);
+      cudf::numeric_scalar<std::int64_t> const one(1, true, stream);
+      all_rows = cudf::sequence(static_cast<cudf::size_type>(n_left), zero, one, stream, mr);
+    }
     std::size_t last_edge_bytes = 0;
     for (std::size_t j = 0; j < n_chunks; ++j) {
       // Held for this iteration only; released at the bottom once its compute is ordered,
@@ -1611,15 +1629,6 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         continue;
       }
 
-      // knn_merge_parts requires a uniform k across the parts it merges. Every batch
-      // therefore has to supply k_join candidates; a batch shorter than k_join cannot,
-      // and padding it row-major is not expressible without a dedicated kernel.
-      if (n_chunks > 1 && batch_rows < k_join) {
-        throw std::runtime_error(
-          "[sirius_physical_vector_join_stream] right batch " + std::to_string(j) + " has " +
-          std::to_string(batch_rows) + " rows, fewer than k=" + std::to_string(k_join) +
-          "; repartition the right table so every batch holds at least k rows");
-      }
       auto const k_eff = std::min<std::int64_t>(k_join, batch_rows);
 
       // Expanded L2 and cosine go through the GEMM-ranked search; the unexpanded `exact` mode keeps
@@ -1641,47 +1650,28 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       advance(j + 1);
       release_staged(staged);
 
-      std::unique_ptr<cudf::column> neighbors = std::move(knn.neighbors);
-      auto const chunk_base                   = offset;
+      // Fold in place, the chunk's ids shifted to corpus rows by the fold itself. Every probe row
+      // is in every chunk's answer, so the rows are the identity. Unlike the knn_merge_parts
+      // fold this replaced, a chunk shorter than k simply contributes fewer candidates, and k has
+      // no 1024 ceiling.
+      auto const chunk_base = offset;
       offset += batch_rows;
-      if (chunk_base != 0) {
-        cudf::numeric_scalar<std::int64_t> const off_scalar(chunk_base, true, stream);
-        neighbors = cudf::binary_operation(neighbors->view(),
-                                           off_scalar,
-                                           cudf::binary_operator::ADD,
-                                           cudf::data_type{cudf::type_id::INT64},
-                                           stream,
-                                           mr);
-      }
-
-      if (!acc_neighbors) {
-        acc_neighbors = std::move(neighbors);
-        acc_distances = std::move(knn.distances);
-        continue;
-      }
-
-      // Fold: stack accumulator and this batch part-major and merge them back down to
-      // k_join. This is knn_merge_parts with n_parts = 2 -- the same kernel the split
-      // design called once over every partial, applied incrementally instead.
-      auto const stacked_distances = cudf::concatenate(
-        std::vector<cudf::column_view>{acc_distances->view(), knn.distances->view()}, stream, mr);
-      auto const stacked_neighbors = cudf::concatenate(
-        std::vector<cudf::column_view>{acc_neighbors->view(), neighbors->view()}, stream, mr);
-
-      auto merged   = vss::knn_merge_parts_topk(res,
-                                              stacked_distances->view(),
-                                              stacked_neighbors->view(),
-                                              n_left,
-                                              /*n_parts=*/2,
-                                              k_join,
-                                              stream,
-                                              mr);
-      acc_neighbors = std::move(merged.neighbors);
-      acc_distances = std::move(merged.distances);
+      exhaustive_rows_seen += batch_rows;
+      vss::fold_topk_rows(acc_distances->mutable_view().data<float>(),
+                          acc_neighbors->mutable_view().data<std::int64_t>(),
+                          k_join,
+                          knn.distances->view().data<float>(),
+                          knn.neighbors->view().data<std::int64_t>(),
+                          knn.k,
+                          k_eff,
+                          all_rows->view().data<std::int64_t>(),
+                          n_left,
+                          chunk_base,
+                          stream);
     }
   }
 
-  if (!acc_neighbors && !radius_join) {
+  if (!radius_join && (!acc_neighbors || (_centroids == nullptr && exhaustive_rows_seen == 0))) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_stream] right table produced no rows to join against");
   }

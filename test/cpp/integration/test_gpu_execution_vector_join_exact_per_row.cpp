@@ -26,6 +26,7 @@
 #include <utils/gpu_execution_fixture.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -1487,4 +1488,58 @@ TEST_CASE_METHOD(VectorJoinFixture,
 
   run_ok("SELECT * FROM unpin_table('g_corpus');");
   run_ok("SELECT * FROM unpin_table('g_probe');");
+}
+
+// -----------------------------------------------------------------------------
+// Global top-k past the 1024 that knn_merge_parts capped the fold at: the answer is the k
+// nearest pairs overall, held to DuckDB's ORDER BY ... LIMIT over the cross product.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - global top-k above 1024 matches ORDER BY LIMIT",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE gk_corpus (id INTEGER, vec FLOAT[8]);");
+  run_ok(
+    "INSERT INTO gk_corpus SELECT i, list_transform(range(8), lambda d: "
+    "((hash(i * 100 + d) % 1000)::FLOAT / 1000.0))::FLOAT[8] FROM range(5000) t(i);");
+  run_ok("CREATE TABLE gk_probe (id INTEGER, vec FLOAT[8]);");
+  run_ok(
+    "INSERT INTO gk_probe SELECT i, list_transform(range(8), lambda d: "
+    "((hash(i * 100 + d + 999999) % 1000)::FLOAT / 1000.0))::FLOAT[8] FROM range(40) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'gk_probe',  tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'gk_corpus', tier => 'gpu', format => 'duckdb');");
+
+  con->Query("SET gpu_execution = false;");
+  auto const reference = ok_rows(*con,
+                                 "SELECT d FROM (SELECT array_distance(p.vec, c.vec) AS d "
+                                 "FROM gk_probe p, gk_corpus c ORDER BY d LIMIT 2000);");
+  con->Query("SET gpu_execution = true;");
+
+  run_ok(
+    "CREATE TABLE gk_out AS SELECT distance FROM sirius_knn_join('gk_probe','vec','gk_corpus',"
+    "'vec', search_mode => 'exact-gemm', metric => 'l2', join_mode => 'global', k => 2000);");
+  con->Query("SET gpu_execution = false;");
+  auto const joined = ok_rows(*con, "SELECT distance FROM gk_out;");
+  con->Query("SET gpu_execution = true;");
+  REQUIRE(joined.size() == 2000);
+  REQUIRE(reference.size() == 2000);
+  // Rank by rank the same distances, to FP32 rounding of the expanded metric. Compared as
+  // numbers: the string rows sort lexically, which is numeric order here (all 0.x).
+  std::vector<double> got, want;
+  for (auto const& r : joined) {
+    got.push_back(std::stod(r.at(0)));
+  }
+  for (auto const& r : reference) {
+    want.push_back(std::stod(r.at(0)));
+  }
+  std::sort(got.begin(), got.end());
+  std::sort(want.begin(), want.end());
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    INFO("rank " << i << ": sirius " << got[i] << " duckdb " << want[i]);
+    REQUIRE(std::abs(got[i] - want[i]) < 1e-4);
+  }
+
+  run_ok("SELECT * FROM unpin_table('gk_corpus');");
+  run_ok("SELECT * FROM unpin_table('gk_probe');");
 }
