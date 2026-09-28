@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <concepts>
+#include <cstdint>
 #include <memory>
 #include <optional>
 
@@ -54,6 +55,13 @@ class interruptible_mpmc {
 
   // Atomic flag to manage the shutdown state
   std::atomic<bool> _is_active{true};
+
+  // interrupt() wakes blocked consumers by enqueueing one null token per thread parked in pop();
+  // every read skips tokens, and _wake_tokens counts the ones still queued so is_empty() ignores
+  // them. Without the tokens a consumer only saw the flag when its 10 ms timed wait ran out, and
+  // stopping the three executors at the end of every query cost ~30 ms.
+  std::atomic<int> _waiters{0};
+  std::atomic<std::int64_t> _wake_tokens{0};
 
  public:
   interruptible_mpmc() = default;
@@ -90,9 +98,17 @@ class interruptible_mpmc {
   pointer_type pop()
   {
     pointer_type item = nullptr;
-    while (_is_active.load(std::memory_order_relaxed)) {
-      if (queue.wait_dequeue_timed(item, 10000)) { return std::move(item); }
+    _waiters.fetch_add(1);
+    while (_is_active.load()) {
+      if (queue.wait_dequeue_timed(item, 10000)) {
+        if (item) {
+          _waiters.fetch_sub(1);
+          return std::move(item);
+        }
+        _wake_tokens.fetch_sub(1);
+      }
     }
+    _waiters.fetch_sub(1);
     return nullptr;
   }
 
@@ -103,21 +119,33 @@ class interruptible_mpmc {
   pointer_type try_pop()
   {
     pointer_type item = nullptr;
-    if (queue.try_dequeue(item)) { return std::move(item); }
+    while (queue.try_dequeue(item)) {
+      if (item) { return std::move(item); }
+      _wake_tokens.fetch_sub(1);
+    }
     return nullptr;
   }
 
   /**
    * Interrupts the queue.
    * \brief Sets the active flag to false.
-   * Consumer threads will see this flag on their next loop cycle (max 10ms delay).
+   * Consumers parked in pop() are woken by a null token each and return nullptr.
    */
-  void interrupt() { _is_active.store(false); }
+  void interrupt()
+  {
+    _is_active.store(false);
+    for (int n = _waiters.load(); n > 0; --n) {
+      _wake_tokens.fetch_add(1);
+      queue.enqueue(nullptr);
+    }
+  }
 
   void drain()
   {
     pointer_type item = nullptr;
-    while (queue.try_dequeue(item)) {}
+    while (queue.try_dequeue(item)) {
+      if (!item) { _wake_tokens.fetch_sub(1); }
+    }
   }
 
   /**
@@ -127,7 +155,10 @@ class interruptible_mpmc {
    * transiently over- or under-count in the presence of concurrent producers
    * and consumers. Safe for assertions in quiescent states (e.g. after drain).
    */
-  [[nodiscard]] bool is_empty() const noexcept { return queue.size_approx() == 0; }
+  [[nodiscard]] bool is_empty() const noexcept
+  {
+    return static_cast<std::int64_t>(queue.size_approx()) <= _wake_tokens.load();
+  }
 
   /**
    * Resets the queue state to active (useful for restarting workers).
