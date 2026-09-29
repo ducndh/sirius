@@ -1400,6 +1400,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
     kept_left.size(),
     kept_right.size(),
     score_read);
+  req.score_read           = score_read;
   req.left.output_columns  = std::move(kept_left);
   req.right.output_columns = std::move(kept_right);
 

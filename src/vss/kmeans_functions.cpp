@@ -674,7 +674,12 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     static_cast<std::int32_t*>(lists.list_offsets->data()), lists.chunk_rows, dim, persistent);
   persistent.synchronize();
 
-  std::optional<rmm::device_uvector<unsigned int>> code_error_bits;
+  std::optional<rmm::device_uvector<unsigned int>> code_error_bits, half_error_bits;
+  if (encoding == list_encoding::float16 && lists.exact_vectors) {
+    half_error_bits.emplace(1, stream, mr);
+    CUDF_CUDA_TRY(
+      cudaMemsetAsync(half_error_bits->data(), 0, sizeof(unsigned int), stream.value()));
+  }
   if (encoding == list_encoding::int8) {
     lists.code_scale  = code_scale;
     lists.code_offset = std::make_unique<rmm::device_buffer>(
@@ -766,8 +771,22 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       std::optional<rmm::device_uvector<float>> grouped_sqf;
       if (lists.exact_vectors) {
         grouped_sqf.emplace(static_cast<std::size_t>(rows), stream, mr);
-        float_row_sq_norms(
-          grouped.data(), rows, dim, grouped_sqf->data(), max_norm_bits->data(), stream);
+        if (grouped_f16) {
+          // The FP16 search compares rounded rows, so it needs their norms and how far each is
+          // from the row it stands for.
+          half_rows_norms(grouped.data(),
+                          grouped_f16->data(),
+                          rows,
+                          dim,
+                          grouped_sqf->data(),
+                          nullptr,
+                          half_error_bits->data(),
+                          max_norm_bits->data(),
+                          stream);
+        } else {
+          float_row_sq_norms(
+            grouped.data(), rows, dim, grouped_sqf->data(), max_norm_bits->data(), stream);
+        }
         auto const exact_row_bytes = static_cast<std::size_t>(dim) * sizeof(float);
         for (auto const& g : runs) {
           CUDF_CUDA_TRY(cudaMemcpyAsync(static_cast<float*>(lists.row_sq_f32->data()) + g.dest,
@@ -868,6 +887,11 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     }
   }
 
+  if (half_error_bits) {
+    unsigned int bits = 0;
+    CUDF_CUDA_TRY(cudaMemcpy(&bits, half_error_bits->data(), sizeof(bits), cudaMemcpyDeviceToHost));
+    std::memcpy(&lists.half_error, &bits, sizeof(bits));
+  }
   if (code_error_bits) {
     unsigned int bits = 0;
     CUDF_CUDA_TRY(cudaMemcpy(&bits, code_error_bits->data(), sizeof(bits), cudaMemcpyDeviceToHost));

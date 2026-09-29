@@ -553,7 +553,9 @@ __global__ void exact_distances_kernel(float const* __restrict__ probe,
                                        int64_t n_pairs,
                                        float const* const* __restrict__ blocks,
                                        int64_t rows_per_block,
-                                       int d)
+                                       int d,
+                                       float const* __restrict__ certain_below,
+                                       float certain_value)
 {
   int const lane = threadIdx.x % 32;
   for (int64_t i = (blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x) / 32; i < n_pairs;
@@ -561,6 +563,15 @@ __global__ void exact_distances_kernel(float const* __restrict__ probe,
     auto const id = ids[i];
     if (id < 0) { continue; }
     auto const row = rows != nullptr ? static_cast<int64_t>(rows[i]) : i / k;
+    if (certain_below != nullptr) {
+      // Lane 0 decides for the warp, so no lane can read the value it overwrites.
+      int certain = lane == 0 && distances[i] <= certain_below[row];
+      certain     = __shfl_sync(0xffffffffu, certain, 0);
+      if (certain) {
+        if (lane == 0) { distances[i] = certain_value; }
+        continue;
+      }
+    }
     float const* q = probe + row * d;
     float const* x = blocks[id / rows_per_block] + (id % rows_per_block) * d;
     float s        = 0.f;
@@ -798,23 +809,6 @@ void bound_filter_int8(int8_t const* x,
 
 bool bound_filter_f16_supports(int64_t dim) { return dim > 0 && dim % 16 == 0; }
 
-float16_slack float16_distance_slack(int64_t dim, float x_max)
-{
-  // |fl16(v) - v| <= u |v| + 2^-25 (half's subnormal spacing / 2), u = 2^-11. For the dot of two
-  // rounded vectors that is (2u + u^2) |q||x| + 2^-25 sqrt(d) (1 + u) (|q| + |x|); the FP32
-  // accumulation adds at most d 2^-23 |q||x| more (twice the textbook bound, since the tensor
-  // cores' accumulation order is unspecified), and the distance takes -2 dot. The FP32 norms and
-  // the two additions add (d + 3) 2^-24 (|q| + |x|)^2. Everything is then doubled for margin.
-  constexpr double u = 1.0 / 2048.0;
-  auto const dd      = static_cast<double>(dim);
-  float16_slack s;
-  s.a     = static_cast<float>(2.0 * 2.0 * ((2.0 * u + u * u) + dd * std::ldexp(1.0, -23)));
-  s.b     = static_cast<float>(2.0 * (dd + 3.0) * std::ldexp(1.0, -24));
-  s.c     = static_cast<float>(2.0 * 2.0 * std::ldexp(1.0, -25) * std::sqrt(dd) * (1.0 + u));
-  s.x_max = x_max;
-  return s;
-}
-
 void bound_filter_f16(std::uint16_t const* x,
                       float const* x_sq,
                       int64_t n,
@@ -883,14 +877,25 @@ void exact_distances(float const* probe,
                      float const* const* blocks,
                      int64_t rows_per_block,
                      int64_t dim,
-                     rmm::cuda_stream_view stream)
+                     rmm::cuda_stream_view stream,
+                     float const* certain_below,
+                     float certain_value)
 {
   if (n_pairs == 0) { return; }
   auto const warps_per_block = 8;
   auto const grid            = static_cast<int>(
     std::clamp<int64_t>((n_pairs + warps_per_block - 1) / warps_per_block, 1, 65535));
-  exact_distances_kernel<<<grid, warps_per_block * 32, 0, stream.value()>>>(
-    probe, rows, k, ids, distances, n_pairs, blocks, rows_per_block, static_cast<int>(dim));
+  exact_distances_kernel<<<grid, warps_per_block * 32, 0, stream.value()>>>(probe,
+                                                                            rows,
+                                                                            k,
+                                                                            ids,
+                                                                            distances,
+                                                                            n_pairs,
+                                                                            blocks,
+                                                                            rows_per_block,
+                                                                            static_cast<int>(dim),
+                                                                            certain_below,
+                                                                            certain_value);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

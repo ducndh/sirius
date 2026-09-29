@@ -1108,6 +1108,25 @@ TEST_CASE_METHOD(
       CHECK(lists.size() < exact.size());
     }
   }
+
+  // With the distance unread, a pair the float16 filter already proves inside the radius keeps
+  // that verdict instead of being re-scored. The proof leaves a margin far wider than FP32
+  // rounding, so the pairs are exactly the re-scored search's.
+  auto const all_probes =
+    "search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 16";
+  std::set<std::pair<std::string, std::string>> scored, unread;
+  for (auto const& [pair, d] : fetch(all_probes)) {
+    scored.insert(pair);
+  }
+  for (auto const& r : ok_rows(*con,
+                               "SELECT left_id, right_id FROM sirius_knn_join('" + prefix +
+                                 "_probe','vec','" + prefix +
+                                 "_corpus','vec', metric => 'l2', join_mode => 'threshold', "
+                                 "eps => " +
+                                 std::to_string(eps) + ", " + all_probes + ");")) {
+    unread.emplace(r.at(0), r.at(1));
+  }
+  CHECK(unread == scored);
 }
 
 namespace {
@@ -1341,6 +1360,18 @@ TEST_CASE_METHOD(KMeansFixture,
   auto const exact = fetch(eps + "search_mode => 'exact-gemm'");
   REQUIRE(exact.size() > 50);
   same(fetch(eps + approx), exact);
+  // With the distance unread, pairs the codes already prove inside the radius skip the re-score.
+  auto const pairs = [&](const std::string& columns) {
+    std::set<std::pair<std::string, std::string>> out;
+    for (auto const& r :
+         ok_rows(*con,
+                 "SELECT " + columns + " FROM sirius_knn_join('" + prefix + "_probe','vec','" +
+                   prefix + "_corpus','vec', metric => 'l2', " + eps + approx + ");")) {
+      out.emplace(r.at(0), r.at(1));
+    }
+    return out;
+  };
+  CHECK(pairs("left_id, right_id") == pairs("left_id, right_id, distance"));
   // One probe still re-scores: with a single cluster the answer is the exact one inside it.
   CHECK(fetch("k => 5, search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 1")
           .size() == 50 * 5);

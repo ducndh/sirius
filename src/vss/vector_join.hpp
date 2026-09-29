@@ -89,6 +89,9 @@ struct vector_join_request {
   std::int64_t dim{0};         ///< vector dimensionality
   double eps{0.0};             ///< distance/similarity threshold
   vector_join_output_type output_type{vector_join_output_type::distance};
+  /// Whether anything reads the score. Set by the planner from the columns the query reads; a
+  /// threshold join that no one reads the distance of only has to decide membership.
+  bool score_read{true};
   /// Take the corpus from a child scan materialized by the build phase instead of from a
   /// pinned catalog table. Temporary A/B switch (`build_source => 'scan'`) while the build
   /// phase is verified against the pin path; the SQL surface that replaces it is the

@@ -306,7 +306,8 @@ __global__ void int8_code_limit_kernel(float const* bound,
                                        float code_error,
                                        float scale,
                                        int64_t n,
-                                       float* limit)
+                                       float* limit,
+                                       bool lower)
 {
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
@@ -315,8 +316,81 @@ __global__ void int8_code_limit_kernel(float const* bound,
       limit[i] = INFINITY;
       continue;
     }
+    if (lower) {
+      float const reach = (sqrtf(fmaxf(b, 0.f)) - probe_error[i] - code_error) / scale;
+      limit[i]          = reach > 0.f ? reach * reach * (1.f - 1e-6f) : -INFINITY;
+      continue;
+    }
     float const reach = (sqrtf(fmaxf(b, 0.f)) + probe_error[i] + code_error) / scale;
     limit[i]          = reach * reach * (1.f + 1e-6f);
+  }
+}
+
+// |half(x)|^2 per row, with the row's rounding error |x - half(x)|: to row_error[r] and/or into
+// *max_error_bits, and the largest |half(x)| into *max_norm_bits (all non-negative floats' bits).
+__global__ void half_rows_norms_kernel(float const* x,
+                                       uint16_t const* h,
+                                       int64_t rows,
+                                       int64_t d,
+                                       float* sq,
+                                       float* row_error,
+                                       unsigned* max_error_bits,
+                                       unsigned* max_norm_bits)
+{
+  auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
+  auto const lane  = static_cast<int64_t>(threadIdx.x % 32);
+  for (int64_t r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32; r < rows; r += warps) {
+    float acc = 0.f, err = 0.f;
+    for (int64_t j = lane; j < d; j += 32) {
+      float const v = __half2float(__ushort_as_half(h[r * d + j]));
+      float const e = x[r * d + j] - v;
+      acc           = fmaf(v, v, acc);
+      err           = fmaf(e, e, err);
+    }
+    for (int o = 16; o > 0; o /= 2) {
+      acc += __shfl_xor_sync(0xffffffffu, acc, o);
+      err += __shfl_xor_sync(0xffffffffu, err, o);
+    }
+    if (lane == 0) {
+      sq[r]         = acc;
+      float const e = sqrtf(err) * (1.f + 1e-6f);
+      if (row_error != nullptr) { row_error[r] = e; }
+      if (max_error_bits != nullptr) { atomicMax(max_error_bits, __float_as_uint(e)); }
+      if (max_norm_bits != nullptr) { atomicMax(max_norm_bits, __float_as_uint(sqrtf(acc))); }
+    }
+  }
+}
+
+// FP16 rows are compared as |half(q)|^2 + |half(x)|^2 - 2 half(q).half(x) in FP32; that is the
+// squared distance of the rounded pair up to the FP32 sums' error, at most
+// 2 d 2^-24 (|half(q)| + max |half(x)|)^2 (twice the textbook bound: the tensor cores' order is
+// unspecified). The rounded pair is within e_q + e_x of the true one by the triangle inequality.
+__global__ void float16_bound_limit_kernel(float const* bound,
+                                           float const* probe_sq,
+                                           float const* probe_error,
+                                           float row_error,
+                                           float row_norm,
+                                           int64_t d,
+                                           int64_t n,
+                                           float* limit,
+                                           bool lower)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    float const b = bound[i];
+    if (!(b < INFINITY)) {
+      limit[i] = INFINITY;
+      continue;
+    }
+    float const norms = sqrtf(probe_sq[i]) + row_norm;
+    float const sums  = 2.f * static_cast<float>(d) * 5.9604645e-8f * norms * norms;
+    if (lower) {
+      float const reach = sqrtf(fmaxf(b, 0.f)) - probe_error[i] - row_error;
+      limit[i]          = reach > 0.f ? (reach * reach - sums) * (1.f - 1e-6f) : -INFINITY;
+      continue;
+    }
+    float const reach = sqrtf(fmaxf(b, 0.f)) + probe_error[i] + row_error;
+    limit[i]          = (reach * reach + sums) * (1.f + 1e-6f);
   }
 }
 
@@ -475,12 +549,48 @@ void int8_code_limit(float const* bound,
                      float scale,
                      int64_t n,
                      float* limit,
-                     rmm::cuda_stream_view stream)
+                     rmm::cuda_stream_view stream,
+                     bool lower)
 {
   if (n == 0) { return; }
   auto const grid = std::min(grid_for(n), 65535);
   int8_code_limit_kernel<<<grid, kBlock, 0, stream.value()>>>(
-    bound, probe_error, code_error, scale, n, limit);
+    bound, probe_error, code_error, scale, n, limit, lower);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void half_rows_norms(float const* x,
+                     uint16_t const* h,
+                     int64_t rows,
+                     int64_t d,
+                     float* sq,
+                     float* row_error,
+                     unsigned int* max_error_bits,
+                     unsigned int* max_norm_bits,
+                     rmm::cuda_stream_view stream)
+{
+  if (rows == 0) { return; }
+  auto const grid = static_cast<int>(std::min<int64_t>((rows + 7) / 8, 65535));
+  half_rows_norms_kernel<<<grid, 256, 0, stream.value()>>>(
+    x, h, rows, d, sq, row_error, max_error_bits, max_norm_bits);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void float16_bound_limit(float const* bound,
+                         float const* probe_sq,
+                         float const* probe_error,
+                         float row_error,
+                         float row_norm,
+                         int64_t d,
+                         int64_t n,
+                         float* limit,
+                         rmm::cuda_stream_view stream,
+                         bool lower)
+{
+  if (n == 0) { return; }
+  auto const grid = std::min(grid_for(n), 65535);
+  float16_bound_limit_kernel<<<grid, kBlock, 0, stream.value()>>>(
+    bound, probe_sq, probe_error, row_error, row_norm, d, n, limit, lower);
   CUDF_CHECK_CUDA(stream.value());
 }
 

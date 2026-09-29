@@ -115,6 +115,9 @@ struct cluster_lists {
   std::unique_ptr<rmm::device_buffer> exact_blocks;
   std::unique_ptr<rmm::device_buffer> row_sq_f32;
   float max_row_norm{0};
+  /// FLOAT16 lists: the largest |x - half(x)| over all rows (row_sq_f32 then holds |half(x)|^2
+  /// and max_row_norm the largest |half(x)|).
+  float half_error{0};
   /// INT8 lists only: FP32 [dim] offset and the one scale the codes were made with, on the
   /// device, and the largest |x - (offset + scale * code)| over all rows.
   std::unique_ptr<rmm::device_buffer> code_offset;
@@ -238,14 +241,44 @@ void quantize_rows_int8(float const* x,
 
 /// The code-space bound an int8 search filters with: a pair within squared distance bound[r] in
 /// FP32 has its code distance within ((sqrt(bound[r]) + probe_error[r] + code_error) / scale)^2,
-/// since each side's decoded vector is within its error of the original.
+/// since each side's decoded vector is within its error of the original. With @p lower, the
+/// opposite: the largest code distance that proves a pair is within bound[r] (-inf when none).
 void int8_code_limit(float const* bound,
                      float const* probe_error,
                      float code_error,
                      float scale,
                      std::int64_t n,
                      float* limit,
+                     rmm::cuda_stream_view stream,
+                     bool lower = false);
+
+/// |half(x)|^2 per row of FP32 rows @p x and their half-rounded copy @p h, with each row's
+/// rounding error |x - half(x)| to row_error[i] and/or into *max_error_bits, and the largest
+/// |half(x)| into *max_norm_bits, for whichever are given (non-negative floats' bits).
+void half_rows_norms(float const* x,
+                     std::uint16_t const* h,
+                     std::int64_t rows,
+                     std::int64_t d,
+                     float* sq,
+                     float* row_error,
+                     unsigned int* max_error_bits,
+                     unsigned int* max_norm_bits,
                      rmm::cuda_stream_view stream);
+
+/// The bound an FP16 search filters with: a pair within squared distance bound[r] in FP32 has
+/// its FP16-computed distance within (sqrt(bound[r]) + probe_error[r] + row_error)^2 plus the
+/// FP32 sums' error for norms up to sqrt(probe_sq[r]) and @p row_norm. With @p lower, the largest
+/// FP16-computed distance that proves a pair is within bound[r] (-inf when none).
+void float16_bound_limit(float const* bound,
+                         float const* probe_sq,
+                         float const* probe_error,
+                         float row_error,
+                         float row_norm,
+                         std::int64_t d,
+                         std::int64_t n,
+                         float* limit,
+                         rmm::cuda_stream_view stream,
+                         bool lower = false);
 
 /// |x|^2 per row of shifted int8 rows, exact in int32.
 void int8_row_sq_norms(std::int8_t const* x,

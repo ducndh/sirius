@@ -39,9 +39,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -209,7 +211,15 @@ cluster_assignment assign_to_centroids(raft::device_resources const& res,
       "n_probes/max_probes");
   }
 
-  auto knn = brute_force_knn(res, centers, queries, depth, metric, mr);
+  // One GEMM and one selection, like the join's own searches: cuVS brute force at so small a
+  // depth runs a fused SIMT kernel instead, which took ~0.26 s to route 180k rows to 2 of 1024
+  // centroids (SIRIUS_VSS_GEMM_TOPK=0 keeps cuVS, as for the join).
+  auto const use_gemm = [&] {
+    auto const* v = std::getenv("SIRIUS_VSS_GEMM_TOPK");
+    return (v == nullptr || std::string_view{v} != "0") && gemm_search_supports(metric);
+  }();
+  auto knn = use_gemm ? gemm_topk(res, centers, queries, depth, metric, mr)
+                      : brute_force_knn(res, centers, queries, depth, metric, mr);
 
   auto const total = static_cast<cudf::size_type>(edges);
   cudf::numeric_scalar<std::int32_t> const zero(0, true, stream);

@@ -77,17 +77,14 @@ struct float16_slack {
   float a{0}, b{0}, c{0}, x_max{0};
 };
 
-/// The slack that makes an FP16 distance a certain lower bound on the FP32 one, for rows of
-/// @p dim components whose norms are at most @p x_max.
-float16_slack float16_distance_slack(int64_t dim, float x_max);
-
 /**
- * @brief bound_filter_int8 for IEEE half vectors, with FP32 row norms of the ORIGINAL vectors.
+ * @brief bound_filter_int8 for IEEE half vectors, with FP32 norms @p x_sq / @p probe_sq of the
+ * half-rounded rows.
  *
- * The FP16 distance can sit below the FP32 one by at most
- * slack.a |q| x_max + slack.b (|q| + x_max)^2 + slack.c (|q| + x_max), so a pair passes when its
- * FP16 distance is <= bound[row] + that: every pair within the bound in FP32 passes, and the
- * survivors are the candidates exact_distances re-scores. Ids are id_base + j (layout rows).
+ * A pair passes when its distance, computed from the half rows, is <= bound[row] plus
+ * slack.a |q| x_max + slack.b (|q| + x_max)^2 + slack.c (|q| + x_max). Callers pass a bound that
+ * already covers the rounding (float16_bound_limit) and a zero slack; what passes are the
+ * candidates exact_distances re-scores. Ids are id_base + j (layout rows).
  */
 void bound_filter_f16(std::uint16_t const* x,
                       float const* x_sq,
@@ -107,6 +104,9 @@ void bound_filter_f16(std::uint16_t const* x,
  * @brief distances[i] = |probe[r] - x[ids[i]]|^2 in FP32, r = rows[i] (or i / k when @p rows is
  * null), with x read from pinned host blocks of @p rows_per_block rows (device pointers in
  * @p blocks). Pairs with ids[i] < 0 are left alone.
+ * With @p certain_below, a pair whose current distance is <= certain_below[its row] -- a filter
+ * distance already proven to be within the caller's limit -- is not re-scored but set to
+ * @p certain_value.
  */
 void exact_distances(float const* probe,
                      int32_t const* rows,
@@ -117,7 +117,9 @@ void exact_distances(float const* probe,
                      float const* const* blocks,
                      int64_t rows_per_block,
                      int64_t dim,
-                     rmm::cuda_stream_view stream);
+                     rmm::cuda_stream_view stream,
+                     float const* certain_below = nullptr,
+                     float certain_value        = 0.f);
 
 /// bound[r] = the largest of row r's k distances (+inf when any is a miss).
 void row_max_bound(float const* acc_distances,
