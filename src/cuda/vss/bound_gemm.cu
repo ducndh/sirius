@@ -137,6 +137,9 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
   __shared__ int64_t tile_rows[kTileM];
   __shared__ float tile_qsq[kTileM];
   __shared__ float tile_limit[kTileM];
+  // The tile's corpus norms, read coalesced up front rather than eight scattered loads a lane at
+  // the end, where nothing hides them.
+  __shared__ typename mma_traits<T>::norm tile_xsq[kTileN];
 
   int const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   int const wm = warp / 4, wn = warp % 4;
@@ -159,7 +162,9 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
     q0                 = (local % m_tiles) * kTileM;
     x0                 = (local / m_tiles) * kTileN;
   }
+  static_assert(kTileM == kTileN, "the setup loop fills both tiles' per-row values");
   for (int r = threadIdx.x; r < kTileM; r += blockDim.x) {
+    tile_xsq[r]       = x0 + r < n ? x_sq[x0 + r] : 0;
     int64_t const row = q0 + r < m ? rows[q0 + r] : -1;
     tile_rows[r]      = row;
     if (row >= 0) {
@@ -229,29 +234,51 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
     unsigned col_ok = 0;
 #pragma unroll
     for (int c = 0; c < 8; ++c) {
-      int64_t const xj = x0 + wn * 32 + (c >> 2) * 16 + 8 * ((c & 3) >> 1) + 2 * q + (c & 1);
-      bool const ok    = xj < n;
-      col_ok |= ok ? (1u << c) : 0u;
-      xs[c] = ok ? x_sq[xj] : 0;
+      int const col = wn * 32 + (c >> 2) * 16 + 8 * ((c & 3) >> 1) + 2 * q + (c & 1);
+      col_ok |= x0 + col < n ? (1u << c) : 0u;
+      xs[c] = tile_xsq[col];
     }
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       int const r0         = wm * 64 + i * 16 + g;
       float const qs[2]    = {tile_qsq[r0], tile_qsq[r0 + 8]};
       float const limit[2] = {tile_limit[r0], tile_limit[r0 + 8]};
+      // A pair's distance is only formed again for a survivor, where it is written out.
+      auto distance = [&](int h, int c, typename mma_traits<T>::accumulator a) {
+        if constexpr (sizeof(T) == 1) {
+          return static_cast<float>(static_cast<int32_t>(qs[h]) + xs[c] - 2 * a);
+        } else {
+          return qs[h] + xs[c] - 2.f * a;
+        }
+      };
+      // INT8: qs + xs - 2 acc is an integer below 2^24, so it is <= limit exactly when it is <=
+      // floor(limit), i.e. when acc >= ceil((qs - floor(limit) + xs) / 2) -- one integer compare
+      // per pair against a threshold per (row, column), +inf for a column past the slice.
+      int32_t base[2] = {0, 0};
+      if constexpr (sizeof(T) == 1) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          auto const l = limit[h] >= 1e9f    ? 1000000000
+                         : limit[h] <= -1e9f ? -1000000000
+                                             : static_cast<int32_t>(floorf(limit[h]));
+          base[h]      = static_cast<int32_t>(qs[h]) - l;
+        }
+      }
 #pragma unroll
       for (int j = 0; j < 2; ++j) {
-        float dist[8];
         unsigned keep = 0;
 #pragma unroll
         for (int t = 0; t < 8; ++t) {
           int const h = (t >> 1) & 1, c = j * 4 + ((t >> 2) << 1) + (t & 1);
+          bool pass;
           if constexpr (sizeof(T) == 1) {
-            dist[t] = static_cast<float>(static_cast<int32_t>(qs[h]) + xs[c] - 2 * acc[i][j].x[t]);
+            int32_t const threshold =
+              ((col_ok >> c) & 1u) ? (base[h] + xs[c] + 1) >> 1 : 0x7fffffff;
+            pass = acc[i][j].x[t] >= threshold;
           } else {
-            dist[t] = qs[h] + xs[c] - 2.f * acc[i][j].x[t];
+            pass = ((col_ok >> c) & 1u) && distance(h, c, acc[i][j].x[t]) <= limit[h];
           }
-          keep |= (((col_ok >> c) & 1u) && dist[t] <= limit[h]) ? (1u << t) : 0u;
+          keep |= pass ? (1u << t) : 0u;
         }
         if (!__any_sync(0xffffffffu, keep != 0)) { continue; }
         // One atomic for the warp: an inclusive scan of the lanes' survivor counts places each.
@@ -269,10 +296,11 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
         for (int t = 0; t < 8; ++t) {
           if (((keep >> t) & 1u) == 0) { continue; }
           if (p < capacity) {
+            int const h = (t >> 1) & 1, c = j * 4 + ((t >> 2) << 1) + (t & 1);
             int64_t const xj = x0 + wn * 32 + j * 16 + 8 * (t >> 2) + 2 * q + (t & 1);
-            out_rows[p]      = static_cast<int32_t>(tile_rows[r0 + 8 * ((t >> 1) & 1)]);
+            out_rows[p]      = static_cast<int32_t>(tile_rows[r0 + 8 * h]);
             out_ids[p]       = id_map != nullptr ? id_map[xj] : id_base + xj;
-            out_d[p]         = dist[t];
+            out_d[p]         = distance(h, c, acc[i][j].x[t]);
           }
           ++p;
         }
