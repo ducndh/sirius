@@ -378,6 +378,17 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   bool const check_uint8 = storage == list_storage::automatic || storage == list_storage::uint8;
   rmm::device_uvector<unsigned long long> non_uint8(1, stream, mr);
   CUDF_CUDA_TRY(cudaMemsetAsync(non_uint8.data(), 0, sizeof(unsigned long long), stream.value()));
+  // INT8 codes need each component's range over every row, taken while the chunks are resident.
+  bool const want_int8 = storage == list_storage::int8;
+  std::optional<rmm::device_uvector<unsigned int>> col_min, col_max;
+  if (want_int8) {
+    col_min.emplace(static_cast<std::size_t>(dim), stream, mr);
+    col_max.emplace(static_cast<std::size_t>(dim), stream, mr);
+    CUDF_CUDA_TRY(cudaMemsetAsync(
+      col_min->data(), 0xff, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.value()));
+    CUDF_CUDA_TRY(cudaMemsetAsync(
+      col_max->data(), 0, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.value()));
+  }
   {
     std::int64_t base = 0;
     for (std::size_t i = 0; i < n_chunks; ++i) {
@@ -396,6 +407,14 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                         rows * dim,
                         non_uint8.data(),
                         stream);
+      }
+      if (want_int8) {
+        column_min_max(list_column_as_dataset_view(staged.view, dim).data_handle(),
+                       rows,
+                       dim,
+                       col_min->data(),
+                       col_max->data(),
+                       stream);
       }
       CUDF_CUDA_TRY(cudaMemcpyAsync(labels.data() + base,
                                     chunk_labels.data(),
@@ -426,8 +445,37 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                         std::to_string(non_uint8_host) + " are not");
   }
   auto const encoding = storage == list_storage::float16     ? list_encoding::float16
+                        : want_int8                          ? list_encoding::int8
                         : check_uint8 && non_uint8_host == 0 ? list_encoding::uint8
                                                              : list_encoding::float32;
+  // INT8 codes: each component centered on the middle of its range, one scale sized so the
+  // widest component's range fills [-127, 127]. A single scale keeps code dot products
+  // proportional to FP32 ones, which is what lets the int8 GEMM filter.
+  std::vector<float> code_offset_host;
+  float code_scale = 0.f;
+  if (want_int8) {
+    std::vector<unsigned int> lo(static_cast<std::size_t>(dim)), hi(static_cast<std::size_t>(dim));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(lo.data(),
+                                  col_min->data(),
+                                  lo.size() * sizeof(unsigned int),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(hi.data(),
+                                  col_max->data(),
+                                  hi.size() * sizeof(unsigned int),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    stream.synchronize();
+    code_offset_host.resize(static_cast<std::size_t>(dim));
+    float half_range = 0.f;
+    for (std::size_t j = 0; j < lo.size(); ++j) {
+      auto const a        = decode_ordered_float(lo[j]);
+      auto const b        = decode_ordered_float(hi[j]);
+      code_offset_host[j] = 0.5f * (a + b);
+      half_range          = std::max(half_range, 0.5f * (b - a));
+    }
+    code_scale = half_range > 0.f ? half_range / 127.f : 1.f;
+  }
 
   // A stable counting sort, split over threads by row range: per-thread histograms, then each
   // thread's start inside each list is the list's start plus the rows earlier threads put
@@ -573,7 +621,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     }
   }
   lists.row_ids = std::make_unique<rmm::device_buffer>(row_bytes, persistent, persistent_mr);
-  if (encoding == list_encoding::uint8) {
+  if (encoding == list_encoding::uint8 || encoding == list_encoding::int8) {
     lists.row_sq = std::make_unique<rmm::device_buffer>(
       static_cast<std::size_t>(n_rows) * sizeof(std::int32_t), persistent, persistent_mr);
   }
@@ -583,7 +631,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   std::optional<rmm::device_uvector<unsigned int>> max_norm_bits;
   auto const exact_rows_per_block =
     static_cast<std::int64_t>(block_bytes / (static_cast<std::size_t>(dim) * sizeof(float)));
-  if (encoding == list_encoding::float16 && host_mr != nullptr && exact_rows_per_block > 0) {
+  if ((encoding == list_encoding::float16 || encoding == list_encoding::int8) &&
+      host_mr != nullptr && exact_rows_per_block > 0) {
     auto const n_blocks = (n_rows + exact_rows_per_block - 1) / exact_rows_per_block;
     try {
       lists.exact_vectors =
@@ -624,6 +673,22 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   fill_list_offsets(
     static_cast<std::int32_t*>(lists.list_offsets->data()), lists.chunk_rows, dim, persistent);
   persistent.synchronize();
+
+  std::optional<rmm::device_uvector<unsigned int>> code_error_bits;
+  if (encoding == list_encoding::int8) {
+    lists.code_scale  = code_scale;
+    lists.code_offset = std::make_unique<rmm::device_buffer>(
+      code_offset_host.size() * sizeof(float), persistent, persistent_mr);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(lists.code_offset->data(),
+                                  code_offset_host.data(),
+                                  code_offset_host.size() * sizeof(float),
+                                  cudaMemcpyHostToDevice,
+                                  persistent.value()));
+    code_error_bits.emplace(1, stream, mr);
+    CUDF_CUDA_TRY(
+      cudaMemsetAsync(code_error_bits->data(), 0, sizeof(unsigned int), stream.value()));
+    persistent.synchronize();
+  }
 
   phase("allocate");
 
@@ -726,6 +791,28 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
           }
         }
       }
+      if (encoding == list_encoding::int8) {
+        grouped_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
+        grouped_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
+        quantize_rows_int8(grouped.data(),
+                           rows,
+                           dim,
+                           static_cast<float const*>(lists.code_offset->data()),
+                           lists.code_scale,
+                           grouped_i8->data(),
+                           nullptr,
+                           code_error_bits->data(),
+                           stream);
+        int8_row_sq_norms(grouped_i8->data(), rows, dim, grouped_sq->data(), stream);
+        grouped_bytes = reinterpret_cast<std::byte const*>(grouped_i8->data());
+        for (auto const& g : runs) {
+          CUDF_CUDA_TRY(cudaMemcpyAsync(static_cast<std::int32_t*>(lists.row_sq->data()) + g.dest,
+                                        grouped_sq->data() + g.first,
+                                        static_cast<std::size_t>(g.rows) * sizeof(std::int32_t),
+                                        cudaMemcpyDeviceToDevice,
+                                        stream.value()));
+        }
+      }
       if (encoding == list_encoding::uint8) {
         grouped_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
         grouped_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
@@ -774,11 +861,17 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     lists.max_row_norm = std::sqrt(max_sq);
     // A component past half's range would have become infinity; a norm this large is the only
     // way to have one.
-    if (!(lists.max_row_norm < 65504.f)) {
+    if (encoding == list_encoding::float16 && !(lists.max_row_norm < 65504.f)) {
       throw duckdb::InvalidInputException(fn + ": a row norm of " +
                                           std::to_string(lists.max_row_norm) +
                                           " is outside float16's range; use storage => 'float32'");
     }
+  }
+
+  if (code_error_bits) {
+    unsigned int bits = 0;
+    CUDF_CUDA_TRY(cudaMemcpy(&bits, code_error_bits->data(), sizeof(bits), cudaMemcpyDeviceToHost));
+    std::memcpy(&lists.code_error, &bits, sizeof(bits));
   }
 
   phase("pass 2 scatter");
@@ -789,6 +882,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   result.tier       = on_device ? "gpu" : "host";
   result.encoding   = encoding == list_encoding::uint8     ? "uint8"
                       : encoding == list_encoding::float16 ? "float16"
+                      : encoding == list_encoding::int8    ? "int8"
                                                            : "float32";
   result.min_list   = std::numeric_limits<std::int64_t>::max();
   for (std::int64_t k = 0; k < n_clusters; ++k) {

@@ -1461,16 +1461,28 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // straight from the stored bytes: no chunk is widened, the row norms were
     // computed at build time, and every dot product is exact. Only the probe is converted, once.
     // A radius join has only the bounded form of that search.
+    bool const l2 = metric == cuvs::distance::DistanceType::L2Expanded ||
+                    metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+    // INT8 codes are only ever answered by the bounded search below, which filters with them and
+    // re-scores what passes in FP32; decoded on their own they would give approximate distances.
+    bool const codes_int8 = _lists != nullptr && _lists->encoding == vss::list_encoding::int8;
+    if (codes_int8 &&
+        !(gemm_search_enabled() && bound_gemm_enabled && l2 && _lists->exact_vectors != nullptr &&
+          _lists->row_sq != nullptr && vss::bound_filter_int8_supports(dim))) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] int8 cluster lists answer only l2 joins through the "
+        "bounded search (vector width a multiple of 16, at most 256, and the FP32 rows kept); "
+        "rebuild the lists with storage => 'float16' or 'float32'");
+    }
     bool int8_search =
       gemm_search_enabled() && _lists != nullptr &&
       (!radius_join || (bound_gemm_enabled && vss::bound_filter_int8_supports(dim))) &&
-      _lists->encoding == vss::list_encoding::uint8 && _lists->row_sq != nullptr &&
-      (metric == cuvs::distance::DistanceType::L2Expanded ||
-       metric == cuvs::distance::DistanceType::L2SqrtExpanded) &&
-      dim % 4 == 0;
+      (_lists->encoding == vss::list_encoding::uint8 || codes_int8) && _lists->row_sq != nullptr &&
+      l2 && dim % 4 == 0;
     std::optional<rmm::device_uvector<std::int8_t>> probe_i8, routed_i8;
     std::optional<rmm::device_uvector<std::int32_t>> probe_sq, routed_sq;
-    if (int8_search) {
+    std::optional<rmm::device_uvector<float>> probe_code_error;
+    if (int8_search && !codes_int8) {
       rmm::device_uvector<unsigned long long> non_bytes(1, stream, mr);
       CUDF_CUDA_TRY(
         cudaMemsetAsync(non_bytes.data(), 0, sizeof(unsigned long long), stream.value()));
@@ -1489,7 +1501,21 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       probe_sq.emplace(static_cast<std::size_t>(n_left), stream, mr);
       routed_i8.emplace(static_cast<std::size_t>(max_routed * dim), stream, mr);
       routed_sq.emplace(static_cast<std::size_t>(max_routed), stream, mr);
-      vss::narrow_to_shifted_int8(queries.data_handle(), n_left * dim, probe_i8->data(), stream);
+      if (codes_int8) {
+        // The probe gets the lists' codes too, and its own exact coding error per row.
+        probe_code_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
+        vss::quantize_rows_int8(queries.data_handle(),
+                                n_left,
+                                dim,
+                                static_cast<float const*>(_lists->code_offset->data()),
+                                _lists->code_scale,
+                                probe_i8->data(),
+                                probe_code_error->data(),
+                                nullptr,
+                                stream);
+      } else {
+        vss::narrow_to_shifted_int8(queries.data_handle(), n_left * dim, probe_i8->data(), stream);
+      }
       vss::int8_row_sq_norms(probe_i8->data(), n_left, dim, probe_sq->data(), stream);
     }
 
@@ -1499,7 +1525,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // memory. Distances stay squared until the end, where the bound is compared.
     // A radius join is the same search with the radius as every row's bound, in one sweep: there
     // is no k-th distance to seed, and a pair under the bound is final when found.
-    bool const bounded = int8_search && (n_probes > 1 || radius_join) &&
+    bool const bounded = int8_search && (n_probes > 1 || radius_join || codes_int8) &&
                          vss::bound_filter_int8_supports(dim) && bound_gemm_enabled;
     // FLOAT16 lists that kept their FP32 rows get the same two sweeps with the half-precision
     // GEMM, and an exact answer: sweep 0's nearest-cluster answers are re-scored in FP32 only to
@@ -1514,6 +1540,22 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                               metric == cuvs::distance::DistanceType::L2SqrtExpanded) &&
                              vss::bound_filter_f16_supports(dim) && bound_gemm_enabled;
     bool const any_bounded = bounded || f16_bounded;
+    // FP16 and INT8 lists filter with inexact distances: their bounded search keeps layout rows as
+    // ids, re-scores every candidate in FP32 from the kept rows, and searches the nearest cluster
+    // again in sweep 1 (sweep 0 only seeds the bound). INT8 filters in code space, under a
+    // per-row limit derived from the FP32 bound and both sides' coding errors.
+    bool const rescore = f16_bounded || codes_int8;
+    std::optional<rmm::device_uvector<float>> code_limit;
+    auto refresh_code_limit = [&](float const* bound_rows) {
+      if (!codes_int8) { return; }
+      vss::int8_code_limit(bound_rows,
+                           probe_code_error->data(),
+                           _lists->code_error,
+                           _lists->code_scale,
+                           n_left,
+                           code_limit->data(),
+                           stream);
+    };
     bool const sqrt_at_end = any_bounded && metric == cuvs::distance::DistanceType::L2SqrtExpanded;
     std::optional<rmm::device_uvector<std::uint16_t>> probe_f16;
     std::optional<rmm::device_uvector<float>> probe_sqf;
@@ -1529,7 +1571,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       f16_slack = vss::float16_distance_slack(dim, _lists->max_row_norm);
     }
     auto const* exact_blocks =
-      f16_bounded ? static_cast<float const* const*>(_lists->exact_blocks->data()) : nullptr;
+      rescore ? static_cast<float const* const*>(_lists->exact_blocks->data()) : nullptr;
     std::optional<rmm::device_uvector<float>> bound;
     std::optional<vss::bound_candidates> candidates;
     std::int64_t pending = 0, bounded_emitted = 0, bounded_merges = 0, bounded_launches = 0,
@@ -1540,7 +1582,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto flush = [&] {
       if (pending == 0) { return; }
       ++bounded_merges;
-      if (f16_bounded) {
+      if (rescore) {
         vss::exact_distances(queries.data_handle(),
                              candidates->rows.data(),
                              0,
@@ -1559,7 +1601,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           *candidates,
           pending,
           radius_bound,
-          f16_bounded ? static_cast<std::int64_t const*>(_lists->row_ids->data()) : nullptr,
+          rescore ? static_cast<std::int64_t const*>(_lists->row_ids->data()) : nullptr,
           sqrt_at_end,
           stream,
           mr);
@@ -1585,6 +1627,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                   bound->data(),
                                   stream,
                                   mr);
+      refresh_code_limit(bound->data());
       CUDF_CUDA_TRY(
         cudaMemsetAsync(candidates->count.data(), 0, sizeof(unsigned long long), stream.value()));
       pending = 0;
@@ -1630,7 +1673,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                              sl.rows,
                              sl.m,
                              dim,
-                             bound->data(),
+                             codes_int8 ? code_limit->data() : bound->data(),
                              *candidates,
                              stream);
     };
@@ -1781,7 +1824,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
         if (radius_join) {
           vss::fill_bound(bound->data(), n_left, radius_bound, stream);
-        } else if (f16_bounded) {
+        } else if (rescore) {
           vss::exact_distances(queries.data_handle(),
                                nullptr,
                                k_join,
@@ -1801,6 +1844,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         } else {
           vss::kth_distance_bound(
             acc_distances->view().data<float>(), n_left, k_join, bound->data(), stream);
+        }
+        if (codes_int8) {
+          code_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
+          refresh_code_limit(bound->data());
         }
         // A radius join's buffer only has to amortize the flush that appends it to the result.
         candidates.emplace(radius_join
@@ -1843,8 +1890,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           auto eb          = edge_begin[static_cast<std::size_t>(slice.cluster)];
           auto ee          = edge_begin[static_cast<std::size_t>(slice.cluster) + 1];
           auto const split = eb + nearest_edges[static_cast<std::size_t>(slice.cluster)];
-          if (bounded && !radius_join) { (sweep == 0 ? ee : eb) = split; }
-          if (f16_bounded && sweep == 0) { ee = split; }
+          if (bounded && !radius_join && !rescore) { (sweep == 0 ? ee : eb) = split; }
+          if (rescore && sweep == 0) { ee = split; }
           if (eb == ee) { continue; }
           // The slice was cut from the cluster column's chunk j; this is the first point at
           // which the vector column's chunk j is resident and its row count exactly known. The
@@ -1900,7 +1947,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                 static_cast<std::int32_t const*>(_lists->row_sq->data()) + id_base,
                                 slice_rows,
                                 id_base,
-                                id_map,
+                                rescore ? nullptr : id_map,
                                 rows_c,
                                 m};
             launch_bounded(sl);
@@ -1979,7 +2026,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                               m,
                               id_base,
                               stream,
-                              f16_bounded ? nullptr : id_map);
+                              rescore ? nullptr : id_map);
         }
 
         // The searches above are issued, not finished. Staging the next needed chunk now runs its
@@ -1999,7 +2046,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     if (any_bounded) {
       check_group();
       flush();
-      if (f16_bounded && !radius_join) {
+      if (rescore && !radius_join) {
         vss::map_ids(acc_neighbors->mutable_view().data<std::int64_t>(),
                      n_left * k_join,
                      static_cast<std::int64_t const*>(_lists->row_ids->data()),

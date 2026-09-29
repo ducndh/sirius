@@ -2640,10 +2640,12 @@ static unique_ptr<FunctionData> SiriusKMeansBuildListsBind(ClientContext& contex
         result->storage = sirius::vss::list_storage::uint8;
       } else if (v == "float16") {
         result->storage = sirius::vss::list_storage::float16;
+      } else if (v == "int8") {
+        result->storage = sirius::vss::list_storage::int8;
       } else {
         throw BinderException(
-          "sirius_kmeans_build_lists: storage must be 'auto', 'float32', 'uint8' or "
-          "'float16', got '" +
+          "sirius_kmeans_build_lists: storage must be 'auto', 'float32', 'uint8', 'float16' or "
+          "'int8', got '" +
           v + "'");
       }
     } else if (key == "tier") {

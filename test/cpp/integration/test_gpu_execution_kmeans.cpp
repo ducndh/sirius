@@ -1294,3 +1294,54 @@ TEST_CASE_METHOD(KMeansFixture,
   // The GEMM and DuckDB round differently, so a near-tie may swap which row is k-th.
   CHECK(same * 100 >= want.size() * 98);
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "int8 cluster lists still give the exact join's answer",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // Values in [0, 1) at 1/1000 steps, which 8-bit codes cannot hold: the lists keep codes, and
+  // probing every cluster must still give back the FP32 answer, because the search only filters
+  // with the codes (under a bound covering both sides' coding error) and re-scores what passes
+  // against the FP32 rows. On both tiers, for top-k and for a radius.
+  auto const tier   = GENERATE(std::string("gpu"), std::string("host"));
+  auto const prefix = "kmq_" + tier;
+  create_lists_tables(*this, prefix, tier);
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => 16);");
+  auto built = query_ok(*con,
+                        "SELECT encoding FROM sirius_kmeans_build_lists('" + prefix +
+                          "_corpus','vec','" + prefix + "_c', storage => 'int8');");
+  CHECK(built->GetValue(0, 0).ToString() == "int8");
+
+  auto const fetch = [&](const std::string& mode) {
+    std::vector<std::pair<std::string, double>> out;
+    for (auto const& r :
+         ok_rows(*con,
+                 "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_probe','vec','" +
+                   prefix + "_corpus','vec', metric => 'l2', " + mode + ");")) {
+      out.emplace_back(r.at(0), std::stod(r.at(1)));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+  auto const same = [](auto const& a, auto const& b) {
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      CHECK(a[i].first == b[i].first);
+      CHECK(std::abs(a[i].second - b[i].second) <= 1e-5 * std::max(1.0, b[i].second));
+    }
+  };
+  auto const approx = "search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 16";
+  for (auto const k : {5, 50}) {
+    auto const kk = "k => " + std::to_string(k) + ", ";
+    same(fetch(kk + approx), fetch(kk + "search_mode => 'exact-gemm'"));
+  }
+  auto const eps = "join_mode => 'threshold', eps => " +
+                   radius_between(fetch("k => 10, search_mode => 'exact-gemm'"), 2) + ", ";
+  auto const exact = fetch(eps + "search_mode => 'exact-gemm'");
+  REQUIRE(exact.size() > 50);
+  same(fetch(eps + approx), exact);
+  // One probe still re-scores: with a single cluster the answer is the exact one inside it.
+  CHECK(fetch("k => 5, search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 1")
+          .size() == 50 * 5);
+}

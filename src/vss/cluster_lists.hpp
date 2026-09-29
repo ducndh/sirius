@@ -61,13 +61,19 @@ enum class list_encoding : std::uint8_t {
   /// Two bytes per component, IEEE half. LOSSY (11-bit mantissa), so it is only ever used when
   /// asked for: half the memory and the transfer of FP32 for float embeddings.
   float16,
+  /// One byte per component, scalar-quantized FP32: code = round((x - offset) / scale), with a
+  /// per-component offset and one scale, so an int8 dot product of two codes is the FP32 one up
+  /// to that scale. LOSSY, only used when asked for, and only searched by the bounded search,
+  /// which filters with the codes under a proven error bound and re-scores what passes in FP32.
+  int8,
 };
 
 /// Bytes one component takes in @p e.
 [[nodiscard]] inline std::size_t list_encoding_bytes(list_encoding e)
 {
   switch (e) {
-    case list_encoding::uint8: return 1;
+    case list_encoding::uint8:
+    case list_encoding::int8: return 1;
     case list_encoding::float16: return 2;
     default: return 4;
   }
@@ -109,6 +115,11 @@ struct cluster_lists {
   std::unique_ptr<rmm::device_buffer> exact_blocks;
   std::unique_ptr<rmm::device_buffer> row_sq_f32;
   float max_row_norm{0};
+  /// INT8 lists only: FP32 [dim] offset and the one scale the codes were made with, on the
+  /// device, and the largest |x - (offset + scale * code)| over all rows.
+  std::unique_ptr<rmm::device_buffer> code_offset;
+  float code_scale{0};
+  float code_error{0};
   /// INT32 [chunk_rows + 1] offsets 0, dim, 2 dim, ... A LIST view of any chunk borrows a
   /// prefix of these, since every list in the column has the same width.
   std::unique_ptr<rmm::device_buffer> list_offsets;
@@ -140,7 +151,7 @@ struct cluster_lists_result {
 };
 
 /// `storage =>` of the build: FLOAT32 always, UINT8 or fail, or the tightest lossless one.
-enum class list_storage : std::uint8_t { automatic, float32, uint8, float16 };
+enum class list_storage : std::uint8_t { automatic, float32, uint8, float16, int8 };
 
 /**
  * @brief `sirius_kmeans_build_lists(table, column, clustering)`: build @ref cluster_lists for a
@@ -199,6 +210,42 @@ void widen_float16(std::uint16_t const* in,
                    std::int64_t n,
                    float* out,
                    rmm::cuda_stream_view stream);
+
+/// Raises max_bits[j] / lowers min_bits[j] to the largest / smallest component j over @p rows rows
+/// of @p d floats; the bits are order-preserving encodings (see decode_ordered_float).
+void column_min_max(float const* x,
+                    std::int64_t rows,
+                    std::int64_t d,
+                    unsigned int* min_bits,
+                    unsigned int* max_bits,
+                    rmm::cuda_stream_view stream);
+
+/// The float an order-preserving encoding from column_min_max stands for.
+float decode_ordered_float(unsigned int bits);
+
+/// out = clamp(round((x - offset) / scale), -127, 127) per component. Each row's error
+/// |x - (offset + scale * out)| goes to row_error[i] when it is given, and raises *max_error_bits
+/// (a non-negative float's bits) when that is given.
+void quantize_rows_int8(float const* x,
+                        std::int64_t rows,
+                        std::int64_t d,
+                        float const* offset,
+                        float scale,
+                        std::int8_t* out,
+                        float* row_error,
+                        unsigned int* max_error_bits,
+                        rmm::cuda_stream_view stream);
+
+/// The code-space bound an int8 search filters with: a pair within squared distance bound[r] in
+/// FP32 has its code distance within ((sqrt(bound[r]) + probe_error[r] + code_error) / scale)^2,
+/// since each side's decoded vector is within its error of the original.
+void int8_code_limit(float const* bound,
+                     float const* probe_error,
+                     float code_error,
+                     float scale,
+                     std::int64_t n,
+                     float* limit,
+                     rmm::cuda_stream_view stream);
 
 /// |x|^2 per row of shifted int8 rows, exact in int32.
 void int8_row_sq_norms(std::int8_t const* x,

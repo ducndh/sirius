@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 
 namespace sirius::vss {
 
@@ -239,6 +240,86 @@ __global__ void widen_float16_kernel(uint16_t const* in, int64_t n, float* out)
   }
 }
 
+// Order-preserving float <-> uint encoding, so atomicMin/atomicMax on the bits order the floats.
+__device__ __forceinline__ unsigned int ordered_bits(float f)
+{
+  auto const b = __float_as_uint(f);
+  return (b & 0x80000000u) != 0 ? ~b : (b | 0x80000000u);
+}
+
+// One thread per component, a block per span of rows: one atomic per (block, component).
+__global__ void column_min_max_kernel(
+  float const* x, int64_t rows, int64_t d, int64_t rows_per_block, unsigned* min_b, unsigned* max_b)
+{
+  auto const r0 = static_cast<int64_t>(blockIdx.x) * rows_per_block;
+  auto const r1 = min(rows, r0 + rows_per_block);
+  for (int64_t j = threadIdx.x; j < d; j += blockDim.x) {
+    float lo = INFINITY, hi = -INFINITY;
+    for (int64_t r = r0; r < r1; ++r) {
+      float const v = x[r * d + j];
+      lo            = fminf(lo, v);
+      hi            = fmaxf(hi, v);
+    }
+    if (r1 > r0) {
+      atomicMin(min_b + j, ordered_bits(lo));
+      atomicMax(max_b + j, ordered_bits(hi));
+    }
+  }
+}
+
+// One warp per row.
+__global__ void quantize_rows_int8_kernel(float const* x,
+                                          int64_t rows,
+                                          int64_t d,
+                                          float const* offset,
+                                          float scale,
+                                          int8_t* out,
+                                          float* row_error,
+                                          unsigned* max_error_bits)
+{
+  auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
+  auto const lane  = static_cast<int64_t>(threadIdx.x % 32);
+  float const inv  = 1.f / scale;
+  for (int64_t r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32; r < rows; r += warps) {
+    float err = 0.f;
+    for (int64_t j = lane; j < d; j += 32) {
+      float const v  = x[r * d + j];
+      float const q  = fminf(fmaxf(rintf((v - offset[j]) * inv), -127.f), 127.f);
+      out[r * d + j] = static_cast<int8_t>(q);
+      float const e  = v - fmaf(scale, q, offset[j]);
+      err            = fmaf(e, e, err);
+    }
+    for (int o = 16; o > 0; o /= 2) {
+      err += __shfl_xor_sync(0xffffffffu, err, o);
+    }
+    if (lane == 0) {
+      // Rounded up by a relative 1e-6 so the float sum cannot understate the error it bounds.
+      float const e = sqrtf(err) * (1.f + 1e-6f);
+      if (row_error != nullptr) { row_error[r] = e; }
+      if (max_error_bits != nullptr) { atomicMax(max_error_bits, __float_as_uint(e)); }
+    }
+  }
+}
+
+__global__ void int8_code_limit_kernel(float const* bound,
+                                       float const* probe_error,
+                                       float code_error,
+                                       float scale,
+                                       int64_t n,
+                                       float* limit)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    float const b = bound[i];
+    if (!(b < INFINITY)) {
+      limit[i] = INFINITY;
+      continue;
+    }
+    float const reach = (sqrtf(fmaxf(b, 0.f)) + probe_error[i] + code_error) / scale;
+    limit[i]          = reach * reach * (1.f + 1e-6f);
+  }
+}
+
 __global__ void fill_list_offsets_kernel(int32_t* out, int64_t n, int64_t dim)
 {
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i <= n;
@@ -345,6 +426,61 @@ void widen_float16(uint16_t const* in, int64_t n, float* out, rmm::cuda_stream_v
 {
   if (n == 0) { return; }
   widen_float16_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(in, n, out);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void column_min_max(float const* x,
+                    int64_t rows,
+                    int64_t d,
+                    unsigned int* min_bits,
+                    unsigned int* max_bits,
+                    rmm::cuda_stream_view stream)
+{
+  if (rows == 0) { return; }
+  constexpr int64_t kRowsPerBlock = 4096;
+  auto const blocks               = static_cast<int>((rows + kRowsPerBlock - 1) / kRowsPerBlock);
+  column_min_max_kernel<<<blocks, 128, 0, stream.value()>>>(
+    x, rows, d, kRowsPerBlock, min_bits, max_bits);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+float decode_ordered_float(unsigned int bits)
+{
+  unsigned int const b = (bits & 0x80000000u) != 0 ? (bits & 0x7fffffffu) : ~bits;
+  float f;
+  std::memcpy(&f, &b, sizeof(f));
+  return f;
+}
+
+void quantize_rows_int8(float const* x,
+                        int64_t rows,
+                        int64_t d,
+                        float const* offset,
+                        float scale,
+                        int8_t* out,
+                        float* row_error,
+                        unsigned int* max_error_bits,
+                        rmm::cuda_stream_view stream)
+{
+  if (rows == 0) { return; }
+  auto const grid = static_cast<int>(std::min<int64_t>((rows + 7) / 8, 65535));
+  quantize_rows_int8_kernel<<<grid, 256, 0, stream.value()>>>(
+    x, rows, d, offset, scale, out, row_error, max_error_bits);
+  CUDF_CHECK_CUDA(stream.value());
+}
+
+void int8_code_limit(float const* bound,
+                     float const* probe_error,
+                     float code_error,
+                     float scale,
+                     int64_t n,
+                     float* limit,
+                     rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  auto const grid = std::min(grid_for(n), 65535);
+  int8_code_limit_kernel<<<grid, kBlock, 0, stream.value()>>>(
+    bound, probe_error, code_error, scale, n, limit);
   CUDF_CHECK_CUDA(stream.value());
 }
 

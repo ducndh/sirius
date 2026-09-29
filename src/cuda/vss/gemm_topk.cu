@@ -520,6 +520,58 @@ threshold_join_result gemm_threshold(raft::device_resources const& res,
                                static_cast<int64_t>(size)};
 }
 
+// scores[j * ldc + i] = x_i . q_j for i < rows, j < cols (int8 in, exact int32 out), on the tensor
+// cores. cuBLAS finds no int8 kernel for some shapes -- e.g. 110,904 rows x 17..40 columns at
+// d = 96, while 110,904 x 16 and 200,000 x 40 run -- so a NOT_SUPPORTED product is re-issued in
+// column slices of at most 16, and a slice cuBLAS still refuses in two row halves (multiples of 4).
+static cublasStatus_t int8_gemm_tn(cublasHandle_t handle,
+                                   std::int8_t const* x,
+                                   std::int8_t const* q,
+                                   int32_t* scores,
+                                   int64_t rows,
+                                   int64_t cols,
+                                   int64_t d,
+                                   int ldc)
+{
+  int32_t const alpha = 1;
+  int32_t const beta  = 0;
+  auto const status   = cublasGemmEx(handle,
+                                   CUBLAS_OP_T,
+                                   CUBLAS_OP_N,
+                                   static_cast<int>(rows),
+                                   static_cast<int>(cols),
+                                   static_cast<int>(d),
+                                   &alpha,
+                                   x,
+                                   CUDA_R_8I,
+                                   static_cast<int>(d),
+                                   q,
+                                   CUDA_R_8I,
+                                   static_cast<int>(d),
+                                   &beta,
+                                   scores,
+                                   CUDA_R_32I,
+                                   ldc,
+                                   CUBLAS_COMPUTE_32I,
+                                   CUBLAS_GEMM_DEFAULT);
+  if (status != CUBLAS_STATUS_NOT_SUPPORTED) { return status; }
+  if (cols > 16) {
+    for (int64_t c0 = 0; c0 < cols; c0 += 16) {
+      auto const st = int8_gemm_tn(
+        handle, x, q + c0 * d, scores + c0 * ldc, rows, std::min<int64_t>(16, cols - c0), d, ldc);
+      if (st != CUBLAS_STATUS_SUCCESS) { return st; }
+    }
+    return CUBLAS_STATUS_SUCCESS;
+  }
+  if (rows >= 8) {
+    auto const half = rows / 8 * 4;
+    auto const st   = int8_gemm_tn(handle, x, q, scores, half, cols, d, ldc);
+    if (st != CUBLAS_STATUS_SUCCESS) { return st; }
+    return int8_gemm_tn(handle, x + half * d, q, scores + half, rows - half, cols, d, ldc);
+  }
+  return status;
+}
+
 knn_result gemm_int8_topk(raft::device_resources const& res,
                           std::int8_t const* x,
                           std::int32_t const* x_sq,
@@ -555,8 +607,6 @@ knn_result gemm_int8_topk(raft::device_resources const& res,
   auto handle = raft::resource::get_cublas_handle(res);
   CUDF_EXPECTS(cublasSetStream(handle, stream.value()) == CUBLAS_STATUS_SUCCESS,
                "gemm_int8_topk: cublasSetStream failed");
-  int32_t const alpha = 1;
-  int32_t const beta  = 0;
   for (int64_t q0 = 0; q0 < m; q0 += tile_rows) {
     auto const t = std::min(tile_rows, m - q0);
     // Same TN layout as the FP32 search: scores^T[n x t] = x^T * q_tile^T, on the int8 tensor
@@ -564,25 +614,8 @@ knn_result gemm_int8_topk(raft::device_resources const& res,
     // The int8 GEMM wants its row count a multiple of 4 (NOT_SUPPORTED otherwise), so it runs over
     // ldc corpus rows: the up-to-3 past the slice are the next slice's, or the slack the lists keep
     // at their end, and their scores are masked to +inf below.
-    auto const status = cublasGemmEx(handle,
-                                     CUBLAS_OP_T,
-                                     CUBLAS_OP_N,
-                                     static_cast<int>(ldc),
-                                     static_cast<int>(t),
-                                     static_cast<int>(d),
-                                     &alpha,
-                                     x,
-                                     CUDA_R_8I,
-                                     static_cast<int>(d),
-                                     q + q0 * d,
-                                     CUDA_R_8I,
-                                     static_cast<int>(d),
-                                     &beta,
-                                     scores.data(),
-                                     CUDA_R_32I,
-                                     static_cast<int>(ldc),
-                                     CUBLAS_COMPUTE_32I,
-                                     CUBLAS_GEMM_DEFAULT);
+    auto const status =
+      int8_gemm_tn(handle, x, q + q0 * d, scores.data(), ldc, t, d, static_cast<int>(ldc));
     CUDF_EXPECTS(status == CUBLAS_STATUS_SUCCESS,
                  "gemm_int8_topk: cublasGemmEx failed with status " + std::to_string(status));
     dim3 const grid(
