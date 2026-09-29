@@ -61,6 +61,11 @@ struct vector_join_side {
   /// A VIEW (named subquery) rather than a base table; only valid on a scanned corpus side.
   /// The planner binds and streams it, and nothing looks for a pin.
   bool is_view{false};
+  /// The side is a relation the join takes as a child plan (the probe of sirius_knn_join_rel, or
+  /// a corpus the plain-SQL rewrite built), so there is no table behind it: its columns are
+  /// @c relation_columns, positionally, and @c column / @c output_columns name among them.
+  bool from_relation{false};
+  std::vector<std::string> relation_columns;
 };
 
 /// `column <op> constant` on a corpus column, taken from a filter over the join's output that
@@ -104,6 +109,9 @@ struct vector_join_request {
   /// filtering the corpus first gives the same pairs as filtering the join's output: a
   /// threshold join, whose pairs are independent of every other corpus row.
   std::vector<corpus_predicate> right_predicates;
+  /// The probe relation replaces a scalar subquery (the plain-SQL rewrite unwrapped it), so it
+  /// must hold exactly one row, as the subquery had to.
+  bool probe_scalar{false};
 };
 
 struct SiriusVectorJoinBindData : public duckdb::TableFunctionData {

@@ -346,6 +346,8 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   std::size_t _max_chunk_bytes{0};
   std::size_t _max_probe_chunk_bytes{0};
   std::size_t _num_left{0};
+  /// Probe rows in total, counted only when the probe stands in for a scalar subquery.
+  std::size_t _scalar_probe_rows{0};
   std::size_t _next_left{0};
 };
 

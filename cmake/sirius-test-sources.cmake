@@ -79,6 +79,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_aggregate_filter.cpp
     test/cpp/integration/test_gpu_execution_kmeans.cpp
     test/cpp/integration/test_gpu_execution_vector_join_exact_per_row.cpp
+    test/cpp/integration/test_gpu_execution_vector_join_sql_rewrite.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp

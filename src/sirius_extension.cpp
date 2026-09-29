@@ -122,6 +122,7 @@ extern "C" int cudaProfilerStop();
 #include "vss/kmeans_functions.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_join_binding.hpp"
+#include "vss/vector_join_rewrite.hpp"
 #include "vss/vector_search.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
@@ -3318,7 +3319,16 @@ static void SiriusPreOptimizeVectorJoin(OptimizerExtensionInput& input,
 static void SiriusPostOptimizeVectorJoin(OptimizerExtensionInput& input,
                                          unique_ptr<LogicalOperator>& plan)
 {
-  if (plan) { stamp_vector_join_cardinality(input.context, *plan); }
+  if (!plan) { return; }
+  // Plain-SQL vector joins become the operator only for a plan Sirius is about to run: never on a
+  // CPU replan (fallback or an internal query), which has to stay a plan DuckDB can execute.
+  auto sirius_ctx = input.context.registered_state->Get<SiriusContext>("sirius_state");
+  auto conn_state = get_sirius_connection_state(input.context);
+  if (sirius_ctx && sirius_ctx->is_initialized() && conn_state &&
+      !conn_state->is_internal_query_active() && !conn_state->is_cpu_fallback_active()) {
+    sirius::vss::rewrite_plain_sql_vector_joins(input.context, input.optimizer.binder, plan);
+  }
+  stamp_vector_join_cardinality(input.context, *plan);
 }
 
 static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
@@ -3574,6 +3584,10 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   // before the corpus's output columns are concatenated, which is where the cost is.
   vector_join.projection_pushdown     = true;
   vector_join.pushdown_complex_filter = SiriusVectorJoinPushdownFilter;
+  // A copied plan (validation, prepared re-execution) carries the request instead of re-binding,
+  // which would lose everything the bind or the plain-SQL rewrite decided beyond the arguments.
+  vector_join.SetSerializeCallback(sirius::vss::serialize_vector_join_bind_data);
+  vector_join.SetDeserializeCallback(sirius::vss::deserialize_vector_join_bind_data);
   CreateTableFunctionInfo vector_join_info(vector_join);
   catalog.CreateTableFunction(transaction, vector_join_info);
 
@@ -3593,6 +3607,8 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join_rel.projection_pushdown     = true;
   vector_join_rel.pushdown_complex_filter = SiriusVectorJoinPushdownFilter;
   vector_join_rel.in_out_function         = SiriusVectorJoinInOutFunction;
+  vector_join_rel.SetSerializeCallback(sirius::vss::serialize_vector_join_bind_data);
+  vector_join_rel.SetDeserializeCallback(sirius::vss::deserialize_vector_join_bind_data);
   CreateTableFunctionInfo vector_join_rel_info(vector_join_rel);
   catalog.CreateTableFunction(transaction, vector_join_rel_info);
 

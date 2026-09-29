@@ -1229,8 +1229,12 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   if (!op.children.empty() && !bind_data_probe.probe_is_relation) {
     throw duckdb::NotImplementedException("sirius_knn_join does not take table inputs");
   }
-  if (op.children.size() > 1) {
-    throw duckdb::NotImplementedException("sirius_knn_join_rel takes at most one input relation");
+  auto const expected_children = static_cast<std::size_t>(bind_data_probe.probe_is_relation) +
+                                 static_cast<std::size_t>(bind_data_probe.req.right.from_relation);
+  if (op.children.size() != expected_children) {
+    throw duckdb::NotImplementedException(
+      "sirius_knn_join: expected " + std::to_string(expected_children) + " input relations, got " +
+      std::to_string(op.children.size()));
   }
   op.ResolveOperatorTypes();
 
@@ -1415,23 +1419,26 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   // The relational surface hands us the probe already bound and optimized -- filters pushed
   // into its scan, projections trimmed -- so it is planned as-is and only reordered into the
   // layout the fold expects: vector column first, then the columns the join emits.
-  std::optional<duckdb::unique_ptr<sirius::op::sirius_physical_operator>> probe_child;
-  if (!op.children.empty()) {
-    // ColumnBindingResolver stops at a LOGICAL_GET and does not descend into its children, so
-    // the subquery still carries column bindings rather than positional references when the
-    // main plan's pass is done. DuckDB resolves it separately for exactly this reason -- its
-    // own plan_get calls ResolveAndPlan on the child -- and so must this.
+  // A side given as a child relation: resolve its bindings (ColumnBindingResolver stops at a
+  // LOGICAL_GET and does not descend into its children, which is why DuckDB's own plan_get calls
+  // ResolveAndPlan on the child -- and so must this), plan it, and project it to the
+  // [vector, outputs...] layout a scanned side has.
+  auto plan_relation_side = [&](duckdb::LogicalOperator& child,
+                                const sirius::vss::vector_join_side& side,
+                                const duckdb::vector<duckdb::string>& fallback_names) {
     duckdb::ColumnBindingResolver child_resolver;
-    child_resolver.VisitOperator(*op.children[0]);
-    duckdb::vector<duckdb::LogicalType> child_types = op.children[0]->types;
-    auto planned                                    = create_plan(*op.children[0]);
+    child_resolver.VisitOperator(child);
+    duckdb::vector<duckdb::LogicalType> child_types = child.types;
+    auto planned                                    = create_plan(child);
 
     auto index_of = [&](const std::string& col) -> std::size_t {
-      auto const& names = op.input_table_names;
+      auto const& names = side.relation_columns.empty()
+                            ? std::vector<std::string>(fallback_names.begin(), fallback_names.end())
+                            : side.relation_columns;
       for (std::size_t i = 0; i < names.size(); ++i) {
         if (names[i] == col) { return i; }
       }
-      throw duckdb::InternalException("sirius_knn_join_rel: probe column '" + col +
+      throw duckdb::InternalException("sirius_knn_join: column '" + col +
                                       "' vanished between bind and plan");
     };
 
@@ -1441,20 +1448,29 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       types.push_back(child_types[idx]);
       exprs.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_types[idx], idx));
     };
-    add(index_of(req.left.column));
-    for (auto const& col : req.left.output_columns) {
+    add(index_of(side.column));
+    for (auto const& col : side.output_columns) {
       add(index_of(col));
     }
-    probe_child = push_projection(std::move(planned),
-                                  sirius::from_duckdb_vec(types),
-                                  translate_expressions(std::move(exprs)),
-                                  op.children[0]->estimated_cardinality);
+    return push_projection(std::move(planned),
+                           sirius::from_duckdb_vec(types),
+                           translate_expressions(std::move(exprs)),
+                           child.estimated_cardinality);
+  };
+
+  std::optional<duckdb::unique_ptr<sirius::op::sirius_physical_operator>> probe_child;
+  std::optional<duckdb::unique_ptr<sirius::op::sirius_physical_operator>> corpus_child;
+  if (bind_data.probe_is_relation) {
+    probe_child = plan_relation_side(*op.children[0], req.left, op.input_table_names);
+  }
+  if (req.right.from_relation) {
+    corpus_child = plan_relation_side(*op.children.back(), req.right, {});
   }
 
   // With a relational probe the bind could not know the row count, so the cardinality callback
   // declined and DuckDB fell back to the child's estimate -- the join's input, not its output.
   // The child's estimate is in hand here, so the k is applied where it can be.
-  if (probe_child.has_value()) {
+  if (probe_child.has_value() && !req.right.from_relation) {
     auto const child_rows = static_cast<std::size_t>(op.children[0]->estimated_cardinality);
     auto const k          = static_cast<std::size_t>(std::max<std::int64_t>(req.k, 0));
     op.estimated_cardinality =
@@ -1502,8 +1518,9 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       // batches it searches. Anything else -- a second scan, a pin behind the scan -- would be
       // a different row order than the one the build side's snapshot fixed.
       stream_op->children.push_back(
-        req.right.is_view ? make_view_side(req.right, req.build_cluster_column)
-                          : make_side_scan(context, req.right, req.build_cluster_column));
+        corpus_child.has_value() ? std::move(*corpus_child)
+        : req.right.is_view      ? make_view_side(req.right, req.build_cluster_column)
+                                 : make_side_scan(context, req.right, req.build_cluster_column));
     }
     join_stage = std::move(stream_op);
   } else {

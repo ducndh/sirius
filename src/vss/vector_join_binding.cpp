@@ -19,6 +19,8 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -202,7 +204,9 @@ std::int64_t resolve_relational_probe_side(const duckdb::vector<duckdb::LogicalT
                                            duckdb::vector<duckdb::LogicalType>& out_types,
                                            duckdb::vector<duckdb::string>& out_names)
 {
-  side.column = column_arg;
+  side.column           = column_arg;
+  side.from_relation    = true;
+  side.relation_columns = std::vector<std::string>(input_names.begin(), input_names.end());
   // catalog/schema/table stay empty: there is no table behind this side, and every path that
   // would look one up is the pinned path, which this side never takes.
 
@@ -269,6 +273,125 @@ std::vector<std::string> parse_output_columns(const duckdb::Value& v, const std:
                                   " cannot be empty; omit it to default to the pinned columns");
   }
   return out;
+}
+
+namespace {
+
+duckdb::vector<std::string> to_duckdb_strings(const std::vector<std::string>& v)
+{
+  return duckdb::vector<std::string>(v.begin(), v.end());
+}
+
+std::vector<std::string> from_duckdb_strings(const duckdb::vector<std::string>& v)
+{
+  return std::vector<std::string>(v.begin(), v.end());
+}
+
+void write_side(duckdb::Serializer& s, duckdb::field_id_t base, const vector_join_side& side)
+{
+  s.WriteProperty(base + 0, "catalog", side.catalog);
+  s.WriteProperty(base + 1, "schema", side.schema);
+  s.WriteProperty(base + 2, "table", side.table);
+  s.WriteProperty(base + 3, "column", side.column);
+  s.WriteProperty(base + 4, "output_columns", to_duckdb_strings(side.output_columns));
+  s.WriteProperty(base + 5, "is_view", side.is_view);
+  s.WriteProperty(base + 6, "from_relation", side.from_relation);
+  s.WriteProperty(base + 7, "relation_columns", to_duckdb_strings(side.relation_columns));
+}
+
+vector_join_side read_side(duckdb::Deserializer& d, duckdb::field_id_t base)
+{
+  vector_join_side side;
+  side.catalog = d.ReadProperty<std::string>(base + 0, "catalog");
+  side.schema  = d.ReadProperty<std::string>(base + 1, "schema");
+  side.table   = d.ReadProperty<std::string>(base + 2, "table");
+  side.column  = d.ReadProperty<std::string>(base + 3, "column");
+  side.output_columns =
+    from_duckdb_strings(d.ReadProperty<duckdb::vector<std::string>>(base + 4, "output_columns"));
+  side.is_view       = d.ReadProperty<bool>(base + 5, "is_view");
+  side.from_relation = d.ReadProperty<bool>(base + 6, "from_relation");
+  side.relation_columns =
+    from_duckdb_strings(d.ReadProperty<duckdb::vector<std::string>>(base + 7, "relation_columns"));
+  return side;
+}
+
+}  // namespace
+
+void serialize_vector_join_bind_data(duckdb::Serializer& serializer,
+                                     const duckdb::optional_ptr<duckdb::FunctionData> bind_data,
+                                     const duckdb::TableFunction& /*function*/)
+{
+  auto const& data = bind_data->Cast<SiriusVectorJoinBindData>();
+  auto const& req  = data.req;
+  write_side(serializer, 100, req.left);
+  write_side(serializer, 110, req.right);
+  serializer.WriteProperty(120, "mode", static_cast<std::uint8_t>(req.mode));
+  serializer.WriteProperty(121, "metric", req.metric);
+  serializer.WriteProperty(122, "search_mode", static_cast<std::uint8_t>(req.search_mode));
+  serializer.WriteProperty(123, "k", req.k);
+  serializer.WriteProperty(124, "n_clusters", req.n_clusters);
+  serializer.WriteProperty(125, "n_probes", req.n_probes);
+  serializer.WriteProperty(126, "dim", req.dim);
+  serializer.WriteProperty(127, "eps", req.eps);
+  serializer.WriteProperty(128, "output_type", static_cast<std::uint8_t>(req.output_type));
+  serializer.WriteProperty(129, "build_from_scan", req.build_from_scan);
+  serializer.WriteProperty(130, "probe_from_scan", req.probe_from_scan);
+  serializer.WriteProperty(131, "clustering", req.clustering);
+  serializer.WriteProperty(132, "build_cluster_column", req.build_cluster_column);
+  duckdb::vector<std::string> pred_columns;
+  duckdb::vector<std::uint8_t> pred_ops;
+  duckdb::vector<duckdb::Value> pred_values;
+  for (auto const& p : req.right_predicates) {
+    pred_columns.push_back(p.column);
+    pred_ops.push_back(static_cast<std::uint8_t>(p.cmp));
+    pred_values.push_back(p.value);
+  }
+  serializer.WriteProperty(133, "predicate_columns", pred_columns);
+  serializer.WriteProperty(134, "predicate_ops", pred_ops);
+  serializer.WriteProperty(135, "predicate_values", pred_values);
+  serializer.WriteProperty(136, "probe_scalar", req.probe_scalar);
+  serializer.WriteProperty(140, "left_rows", data.left_rows);
+  serializer.WriteProperty(141, "right_rows", data.right_rows);
+  serializer.WriteProperty(142, "probe_is_relation", data.probe_is_relation);
+}
+
+duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
+  duckdb::Deserializer& deserializer, duckdb::TableFunction& /*function*/)
+{
+  auto result = duckdb::make_uniq<SiriusVectorJoinBindData>();
+  auto& req   = result->req;
+  req.left    = read_side(deserializer, 100);
+  req.right   = read_side(deserializer, 110);
+  req.mode    = static_cast<vector_join_mode>(deserializer.ReadProperty<std::uint8_t>(120, "mode"));
+  req.metric  = deserializer.ReadProperty<std::string>(121, "metric");
+  req.search_mode = static_cast<vector_join_search_mode>(
+    deserializer.ReadProperty<std::uint8_t>(122, "search_mode"));
+  req.k           = deserializer.ReadProperty<std::int64_t>(123, "k");
+  req.n_clusters  = deserializer.ReadProperty<std::int64_t>(124, "n_clusters");
+  req.n_probes    = deserializer.ReadProperty<std::int64_t>(125, "n_probes");
+  req.dim         = deserializer.ReadProperty<std::int64_t>(126, "dim");
+  req.eps         = deserializer.ReadProperty<double>(127, "eps");
+  req.output_type = static_cast<vector_join_output_type>(
+    deserializer.ReadProperty<std::uint8_t>(128, "output_type"));
+  req.build_from_scan      = deserializer.ReadProperty<bool>(129, "build_from_scan");
+  req.probe_from_scan      = deserializer.ReadProperty<bool>(130, "probe_from_scan");
+  req.clustering           = deserializer.ReadProperty<std::string>(131, "clustering");
+  req.build_cluster_column = deserializer.ReadProperty<std::string>(132, "build_cluster_column");
+  auto const pred_columns =
+    deserializer.ReadProperty<duckdb::vector<std::string>>(133, "predicate_columns");
+  auto const pred_ops =
+    deserializer.ReadProperty<duckdb::vector<std::uint8_t>>(134, "predicate_ops");
+  auto const pred_values =
+    deserializer.ReadProperty<duckdb::vector<duckdb::Value>>(135, "predicate_values");
+  for (std::size_t i = 0; i < pred_columns.size(); ++i) {
+    req.right_predicates.push_back(
+      {pred_columns[i], static_cast<corpus_predicate::op>(pred_ops[i]), pred_values[i]});
+  }
+  req.probe_scalar          = deserializer.ReadProperty<bool>(136, "probe_scalar");
+  result->left_rows         = deserializer.ReadProperty<std::uint64_t>(140, "left_rows");
+  result->right_rows        = deserializer.ReadProperty<std::uint64_t>(141, "right_rows");
+  result->probe_is_relation = deserializer.ReadProperty<bool>(142, "probe_is_relation");
+  return std::move(result);
 }
 
 }  // namespace sirius::vss

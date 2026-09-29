@@ -928,6 +928,14 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
   }
 
   _num_left = _probe->num_chunks();
+  // A probe that stood in for a scalar subquery keeps the subquery's contract: one row. Counted
+  // here, raised in execute(), where an exception becomes the query's error.
+  if (_request.probe_scalar) {
+    _scalar_probe_rows = 0;
+    for (std::size_t i = 0; i < _num_left; ++i) {
+      _scalar_probe_rows += _probe->chunk_rows(i);
+    }
+  }
   if (_probe->is_streaming()) {
     for (std::size_t i = 0; i < _num_left; ++i) {
       _max_probe_chunk_bytes = std::max(_max_probe_chunk_bytes, _probe->chunk_bytes(i));
@@ -1218,7 +1226,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
 
   auto const left_idx = join_in->left_idx();
   auto const dim      = _request.dim;
-  auto const mr       = mem_space->get_default_allocator();
+  if (_request.probe_scalar && _scalar_probe_rows != 1) {
+    throw std::runtime_error(
+      _scalar_probe_rows > 1
+        ? "More than one row returned by a subquery used as an expression - scalar subqueries can "
+          "only return a single row."
+        : "sirius vector join: the scalar subquery giving the query vector returned no rows");
+  }
+  auto const mr = mem_space->get_default_allocator();
 
   // Held for the whole task: every corpus chunk is searched against this probe chunk. Staged
   // on the compute stream, so its eventual free is already ordered behind the searches that

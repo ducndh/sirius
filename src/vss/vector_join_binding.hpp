@@ -16,8 +16,9 @@
 
 #pragma once
 
-#include "vss/vector_join.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/bound_statement.hpp"
+#include "vss/vector_join.hpp"
 
 #include <cstdint>
 #include <string>
@@ -29,6 +30,16 @@ class SiriusContext;
 }  // namespace duckdb
 
 namespace sirius::vss {
+
+/// TableFunction serialize callback for the vector-join table functions: the whole request,
+/// so a copied plan keeps what the bind (or the plain-SQL rewrite) decided instead of re-binding.
+void serialize_vector_join_bind_data(duckdb::Serializer& serializer,
+                                     const duckdb::optional_ptr<duckdb::FunctionData> bind_data,
+                                     const duckdb::TableFunction& function);
+
+/// The matching deserialize callback.
+duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
+  duckdb::Deserializer& deserializer, duckdb::TableFunction& function);
 
 /// Resolve one join side (left or right) at bind time, returning its vector dimensionality
 /// and, through @p out_num_rows, its row count.
@@ -58,14 +69,13 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
 /// Resolve the probe side of the relational surface against the input relation's schema
 /// instead of the catalog. There is no table to pin and no pin to restrict the columns, so the
 /// relation's own columns are what can be emitted.
-std::int64_t resolve_relational_probe_side(
-  const duckdb::vector<duckdb::LogicalType>& input_types,
-  const duckdb::vector<duckdb::string>& input_names,
-  const std::string& column_arg,
-  const std::vector<std::string>& out_cols,
-  vector_join_side& side,
-  duckdb::vector<duckdb::LogicalType>& out_types,
-  duckdb::vector<duckdb::string>& out_names);
+std::int64_t resolve_relational_probe_side(const duckdb::vector<duckdb::LogicalType>& input_types,
+                                           const duckdb::vector<duckdb::string>& input_names,
+                                           const std::string& column_arg,
+                                           const std::vector<std::string>& out_cols,
+                                           vector_join_side& side,
+                                           duckdb::vector<duckdb::LogicalType>& out_types,
+                                           duckdb::vector<duckdb::string>& out_names);
 
 /// Pull a LIST(VARCHAR) named parameter into a string vector; throws if empty.
 std::vector<std::string> parse_output_columns(const duckdb::Value& v, const std::string& key);
