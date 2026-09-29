@@ -22,6 +22,8 @@
 
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
+#include <cub/device/device_select.cuh>
+#include <thrust/iterator/counting_iterator.h>
 
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -351,6 +353,40 @@ __global__ void sqrt_kernel(float* d, int64_t n)
   }
 }
 
+__global__ void fill_kernel(float* d, int64_t n, float value)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    d[i] = value;
+  }
+}
+
+struct within_distance {
+  float const* distances;
+  float max_distance;
+  __device__ bool operator()(int64_t i) const { return distances[i] <= max_distance; }
+};
+
+__global__ void take_kernel(int64_t const* picked,
+                            int64_t n,
+                            int32_t const* rows,
+                            int64_t const* ids,
+                            float const* distances,
+                            int64_t const* id_map,
+                            bool take_sqrt,
+                            int32_t* out_rows,
+                            int64_t* out_ids,
+                            float* out_d)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const src = picked[i];
+    out_rows[i]    = rows[src];
+    out_ids[i]     = id_map != nullptr ? id_map[ids[src]] : ids[src];
+    out_d[i]       = take_sqrt ? sqrtf(fmaxf(distances[src], 0.f)) : distances[src];
+  }
+}
+
 int grid_for(int64_t n) { return static_cast<int>(std::clamp<int64_t>((n + 255) / 256, 1, 65535)); }
 
 }  // namespace
@@ -612,6 +648,63 @@ void sqrt_in_place(float* d, int64_t n, rmm::cuda_stream_view stream)
   if (n == 0) { return; }
   sqrt_kernel<<<grid_for(n), 256, 0, stream.value()>>>(d, n);
   CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+void fill_bound(float* bound, int64_t n, float value, rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  fill_kernel<<<grid_for(n), 256, 0, stream.value()>>>(bound, n, value);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+radius_pairs take_within(bound_candidates const& candidates,
+                         int64_t n_candidates,
+                         float max_distance,
+                         int64_t const* id_map,
+                         bool take_sqrt,
+                         rmm::cuda_stream_view stream,
+                         rmm::device_async_resource_ref mr)
+{
+  radius_pairs out{rmm::device_uvector<int32_t>(0, stream, mr),
+                   rmm::device_uvector<int64_t>(0, stream, mr),
+                   rmm::device_uvector<float>(0, stream, mr)};
+  if (n_candidates == 0) { return out; }
+  rmm::device_uvector<int64_t> picked(n_candidates, stream, mr);
+  rmm::device_uvector<int64_t> n_picked(1, stream, mr);
+  thrust::counting_iterator<int64_t> const all(0);
+  within_distance const keep{candidates.distances.data(), max_distance};
+  std::size_t temp_bytes = 0;
+  CUDF_CUDA_TRY(cub::DeviceSelect::If(
+    nullptr, temp_bytes, all, picked.data(), n_picked.data(), n_candidates, keep, stream.value()));
+  rmm::device_buffer temp(temp_bytes, stream, mr);
+  CUDF_CUDA_TRY(cub::DeviceSelect::If(temp.data(),
+                                      temp_bytes,
+                                      all,
+                                      picked.data(),
+                                      n_picked.data(),
+                                      n_candidates,
+                                      keep,
+                                      stream.value()));
+  int64_t n = 0;
+  CUDF_CUDA_TRY(
+    cudaMemcpyAsync(&n, n_picked.data(), sizeof(n), cudaMemcpyDeviceToHost, stream.value()));
+  stream.synchronize();
+  if (n == 0) { return out; }
+  out.rows.resize(n, stream);
+  out.ids.resize(n, stream);
+  out.distances.resize(n, stream);
+  take_kernel<<<grid_for(n), 256, 0, stream.value()>>>(picked.data(),
+                                                       n,
+                                                       candidates.rows.data(),
+                                                       candidates.ids.data(),
+                                                       candidates.distances.data(),
+                                                       id_map,
+                                                       take_sqrt,
+                                                       out.rows.data(),
+                                                       out.ids.data(),
+                                                       out.distances.data());
+  CUDF_CUDA_TRY(cudaGetLastError());
+  return out;
 }
 
 }  // namespace sirius::vss

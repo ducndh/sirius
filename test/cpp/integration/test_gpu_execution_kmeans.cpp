@@ -1039,3 +1039,71 @@ TEST_CASE_METHOD(KMeansFixture,
     CHECK(same * 100 >= exact.size() * 99);
   }
 }
+
+TEST_CASE_METHOD(
+  KMeansFixture,
+  "a threshold join over UINT8 and float16 cluster lists gives the exact join's pairs",
+  "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // The lists search the radius with the bounded tensor-core GEMM: UINT8 rows are scored exactly,
+  // float16 rows only filter and what passes is re-scored in FP32 and held to the radius again.
+  // Probing every cluster must then return the exact join's pairs, and fewer probes a subset.
+  auto const bytes  = GENERATE(true, false);
+  auto const prefix = std::string(bytes ? "kmr_u8" : "kmr_f16");
+  create_lists_tables(*this, prefix, bytes ? "gpu" : "host", bytes);
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => 16);");
+  auto built =
+    query_ok(*con,
+             "SELECT encoding FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" +
+               prefix + "_c', storage => '" + (bytes ? "uint8" : "float16") + "');");
+  CHECK(built->GetValue(0, 0).ToString() == (bytes ? "uint8" : "float16"));
+
+  // A radius around the median 10th-nearest distance: some rows have many pairs, some none.
+  std::vector<double> tenth;
+  for (auto const& r :
+       ok_rows(*con,
+               "SELECT max(distance) FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
+                 "_corpus','vec', metric => 'l2', k => 10, "
+                 "search_mode => 'exact-gemm') GROUP BY left_id;")) {
+    tenth.push_back(std::stod(r.at(0)));
+  }
+  std::sort(tenth.begin(), tenth.end());
+  auto const eps = tenth.at(tenth.size() / 2);
+
+  auto const fetch = [&](const std::string& extra) {
+    std::map<std::pair<std::string, std::string>, double> out;
+    for (auto const& r : ok_rows(*con,
+                                 "SELECT left_id, right_id, distance FROM sirius_knn_join('" +
+                                   prefix + "_probe','vec','" + prefix +
+                                   "_corpus','vec', metric => 'l2', join_mode => 'threshold', "
+                                   "eps => " +
+                                   std::to_string(eps) + ", " + extra + ");")) {
+      out[{r.at(0), r.at(1)}] = std::stod(r.at(2));
+    }
+    return out;
+  };
+  auto const exact = fetch("search_mode => 'exact-gemm'");
+  REQUIRE(exact.size() > 50);
+  // A pair only one side keeps must sit on the radius, where the two searches' roundings differ.
+  auto const on_radius = [&](double d) { return std::abs(d - eps) <= 1e-4 * eps; };
+  for (auto const probes : {16, 2}) {
+    auto const lists = fetch("search_mode => 'approx', clustering => '" + prefix +
+                             "_c', n_probes => " + std::to_string(probes));
+    for (auto const& [pair, d] : lists) {
+      auto const it = exact.find(pair);
+      if (it == exact.end()) {
+        CHECK(on_radius(d));
+        continue;
+      }
+      CHECK(std::abs(d - it->second) <= 1e-5 * std::max(1.0, it->second));
+    }
+    if (probes == 16) {
+      for (auto const& [pair, d] : exact) {
+        if (lists.count(pair) == 0) { CHECK(on_radius(d)); }
+      }
+    } else {
+      CHECK(lists.size() < exact.size());
+    }
+  }
+}

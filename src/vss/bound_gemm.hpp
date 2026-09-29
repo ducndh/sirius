@@ -159,4 +159,27 @@ void kth_distance_bound(float const* acc_distances,
 /// d[i] = sqrt(d[i]) for i in [0, n).
 void sqrt_in_place(float* d, int64_t n, rmm::cuda_stream_view stream);
 
+/// bound[i] = value for i in [0, n): the fixed radius a threshold join searches with.
+void fill_bound(float* bound, int64_t n, float value, rmm::cuda_stream_view stream);
+
+/// The pairs a radius join keeps from a candidate buffer, in buffer order.
+struct radius_pairs {
+  rmm::device_uvector<int32_t> rows;
+  rmm::device_uvector<int64_t> ids;
+  rmm::device_uvector<float> distances;
+};
+
+/**
+ * @brief The first @p n_candidates of @p candidates whose distance is <= @p max_distance, with
+ * ids mapped through @p id_map when it is given and distances square-rooted when @p take_sqrt.
+ * Blocks until the count is known, so the result is sized exactly.
+ */
+radius_pairs take_within(bound_candidates const& candidates,
+                         int64_t n_candidates,
+                         float max_distance,
+                         int64_t const* id_map,
+                         bool take_sqrt,
+                         rmm::cuda_stream_view stream,
+                         rmm::device_async_resource_ref mr);
+
 }  // namespace sirius::vss
