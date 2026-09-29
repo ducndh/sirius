@@ -29,10 +29,13 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <type_traits>
 
 namespace sirius::vss {
@@ -69,6 +72,28 @@ struct slack_terms {
   float a{0}, b{0}, c{0}, x_max{0};
 };
 
+// Many slices in one launch: block b belongs to the slice s with prefix[s] <= b < prefix[s + 1],
+// and is that slice's (b - prefix[s])-th block. A null table means a single-slice launch.
+struct group_view {
+  bound_slice const* slices{nullptr};
+  int64_t const* prefix{nullptr};
+  int n_slices{0};
+};
+
+__device__ inline int find_slice(group_view const& g, int64_t b)
+{
+  int lo = 0, hi = g.n_slices;
+  while (hi - lo > 1) {
+    int const mid = (lo + hi) / 2;
+    if (g.prefix[mid] <= b) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
 // Two blocks per SM: under separable compilation ptxas otherwise spends 177 registers on this
 // kernel and runs one block per SM, 1.5x slower.
 //
@@ -97,7 +122,8 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
                       int64_t* out_ids,
                       float* out_d,
                       unsigned long long* count,
-                      unsigned long long capacity)
+                      unsigned long long capacity,
+                      group_view group)
 {
 #if __CUDA_ARCH__ >= 720
   using namespace nvcuda;
@@ -114,8 +140,24 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
 
   int const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   int const wm = warp / 4, wn = warp % 4;
-  int64_t const q0 = static_cast<int64_t>(blockIdx.x) * kTileM;
-  int64_t const x0 = static_cast<int64_t>(blockIdx.y) * kTileN;
+  int64_t q0 = static_cast<int64_t>(blockIdx.x) * kTileM;
+  int64_t x0 = static_cast<int64_t>(blockIdx.y) * kTileN;
+  if (group.slices != nullptr) {
+    auto const b       = static_cast<int64_t>(blockIdx.x);
+    auto const si      = find_slice(group, b);
+    auto const& sl     = group.slices[si];
+    x                  = static_cast<T const*>(sl.x);
+    x_sq               = static_cast<typename mma_traits<T>::norm const*>(sl.x_sq);
+    n                  = sl.n;
+    id_base            = sl.id_base;
+    id_map             = sl.id_map;
+    rows               = sl.rows;
+    m                  = sl.m;
+    auto const local   = b - group.prefix[si];
+    auto const m_tiles = (m + kTileM - 1) / kTileM;
+    q0                 = (local % m_tiles) * kTileM;
+    x0                 = (local / m_tiles) * kTileN;
+  }
   for (int r = threadIdx.x; r < kTileM; r += blockDim.x) {
     int64_t const row = q0 + r < m ? rows[q0 + r] : -1;
     tile_rows[r]      = row;
@@ -358,9 +400,26 @@ __global__ void __launch_bounds__(kSmallThreads)
                             int64_t* out_ids,
                             float* out_d,
                             unsigned long long* count,
-                            unsigned long long capacity)
+                            unsigned long long capacity,
+                            group_view group)
 {
   constexpr bool kInt8 = sizeof(T) == 1;
+  // A grouped launch gives each block one kSmallThreads-row stretch of one slice.
+  auto j_first = static_cast<int64_t>(blockIdx.x) * blockDim.x;
+  auto j_step  = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  if (group.slices != nullptr) {
+    auto const si  = find_slice(group, blockIdx.x);
+    auto const& sl = group.slices[si];
+    x              = static_cast<T const*>(sl.x);
+    x_sq           = static_cast<typename mma_traits<T>::norm const*>(sl.x_sq);
+    n              = sl.n;
+    id_base        = sl.id_base;
+    id_map         = sl.id_map;
+    rows           = sl.rows;
+    m              = static_cast<int>(sl.m);
+    j_first        = (static_cast<int64_t>(blockIdx.x) - group.prefix[si]) * blockDim.x;
+    j_step         = n;
+  }
   // Probe components: int8 packed four to a word for __dp4a, FP16 widened to FP32.
   using Q                = std::conditional_t<kInt8, int, float>;
   constexpr int kPerWord = kInt8 ? 4 : 1;
@@ -396,8 +455,7 @@ __global__ void __launch_bounds__(kSmallThreads)
   __syncthreads();
 
   int const lane = threadIdx.x % 32;
-  for (int64_t j0 = static_cast<int64_t>(blockIdx.x) * blockDim.x; j0 < n;
-       j0 += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+  for (int64_t j0 = j_first; j0 < n; j0 += j_step) {
     int64_t const j = j0 + threadIdx.x;
     bool const live = j < n;
     typename mma_traits<T>::accumulator acc[M];
@@ -526,7 +584,8 @@ bool launch_small(T const* x,
       out.ids.data(),
       out.distances.data(),
       out.count.data(),
-      static_cast<unsigned long long>(out.capacity()));
+      static_cast<unsigned long long>(out.capacity()),
+      group_view{});
   };
   if (m <= 1) {
     go(bound_filter_small_kernel<T, 1>);
@@ -673,7 +732,8 @@ __global__ void merge_take_kernel(int64_t const* sorted_order,
     }
     acc_d[i] = d;
     acc_n[i] = id;
-    if (i - r * k == k - 1) { bound[r] = d; }
+    // A row still short of k is not unbounded: the bound it searched under still holds.
+    if (i - r * k == k - 1) { bound[r] = fminf(bound[r], d); }
   }
 }
 
@@ -803,8 +863,123 @@ void bound_filter_int8(int8_t const* x,
                                                    out.ids.data(),
                                                    out.distances.data(),
                                                    out.count.data(),
-                                                   static_cast<unsigned long long>(out.capacity()));
+                                                   static_cast<unsigned long long>(out.capacity()),
+                                                   group_view{});
   CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+void bound_filter_group(std::vector<bound_slice> const& slices,
+                        bool f16,
+                        void const* probe,
+                        void const* probe_sq,
+                        int64_t dim,
+                        float const* bound,
+                        bound_candidates& out,
+                        rmm::cuda_stream_view stream,
+                        rmm::device_async_resource_ref mr)
+{
+  // Classes 0..4 go to the few-rows kernel with M = 1, 2, 4, 8, 16 probe rows; class 5 to tiles.
+  std::array<std::vector<bound_slice>, 6> classes;
+  bool const small_ok = dim <= kSmallMaxDim;
+  for (auto const& sl : slices) {
+    if (sl.n == 0 || sl.m == 0) { continue; }
+    std::size_t c = 5;
+    if (small_ok && sl.m <= small_m_limit()) {
+      c = sl.m <= 1 ? 0 : sl.m <= 2 ? 1 : sl.m <= 4 ? 2 : sl.m <= 8 ? 3 : 4;
+    }
+    classes[c].push_back(sl);
+  }
+  // The slice table and each slice's first block, copied beside each other; freed on the stream
+  // once the launch that reads them is done.
+  auto launch = [&](std::vector<bound_slice> const& v, bool tile, auto&& go) {
+    if (v.empty()) { return; }
+    std::vector<int64_t> prefix(v.size() + 1, 0);
+    for (std::size_t i = 0; i < v.size(); ++i) {
+      auto const blocks = tile ? ((v[i].m + kTileM - 1) / kTileM) * ((v[i].n + kTileN - 1) / kTileN)
+                               : (v[i].n + kSmallThreads - 1) / kSmallThreads;
+      prefix[i + 1]     = prefix[i] + blocks;
+    }
+    CUDF_EXPECTS(prefix.back() <= std::numeric_limits<int>::max(),
+                 "bound_filter_group: too many blocks for one launch");
+    auto const table_bytes = v.size() * sizeof(bound_slice);
+    rmm::device_buffer table(table_bytes + prefix.size() * sizeof(int64_t), stream, mr);
+    auto* device_prefix =
+      reinterpret_cast<int64_t*>(static_cast<std::byte*>(table.data()) + table_bytes);
+    CUDF_CUDA_TRY(
+      cudaMemcpyAsync(table.data(), v.data(), table_bytes, cudaMemcpyHostToDevice, stream.value()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(device_prefix,
+                                  prefix.data(),
+                                  prefix.size() * sizeof(int64_t),
+                                  cudaMemcpyHostToDevice,
+                                  stream.value()));
+    go(static_cast<unsigned>(prefix.back()),
+       group_view{
+         static_cast<bound_slice const*>(table.data()), device_prefix, static_cast<int>(v.size())});
+    CUDF_CUDA_TRY(cudaGetLastError());
+  };
+  auto run = [&](auto element) {
+    using T         = decltype(element);
+    using N         = typename mma_traits<T>::norm;
+    auto const* p   = static_cast<T const*>(probe);
+    auto const* psq = static_cast<N const*>(probe_sq);
+    auto small      = [&](std::size_t c, auto kernel) {
+      launch(classes[c], false, [&](unsigned blocks, group_view g) {
+        kernel<<<blocks, kSmallThreads, 0, stream.value()>>>(
+          nullptr,
+          nullptr,
+          0,
+          0,
+          nullptr,
+          p,
+          psq,
+          nullptr,
+          0,
+          static_cast<int>(dim),
+          bound,
+          slack_terms{},
+          out.rows.data(),
+          out.ids.data(),
+          out.distances.data(),
+          out.count.data(),
+          static_cast<unsigned long long>(out.capacity()),
+          g);
+      });
+    };
+    small(0, bound_filter_small_kernel<T, 1>);
+    small(1, bound_filter_small_kernel<T, 2>);
+    small(2, bound_filter_small_kernel<T, 4>);
+    small(3, bound_filter_small_kernel<T, 8>);
+    small(4, bound_filter_small_kernel<T, 16>);
+    auto const kernel = accumulator_layout_is_m16n8<typename mma_traits<T>::accumulator>()
+                          ? bound_filter_kernel<T, true>
+                          : bound_filter_kernel<T, false>;
+    launch(classes[5], true, [&](unsigned blocks, group_view g) {
+      kernel<<<blocks, kWarps * 32, 0, stream.value()>>>(
+        nullptr,
+        nullptr,
+        0,
+        0,
+        nullptr,
+        p,
+        psq,
+        nullptr,
+        0,
+        static_cast<int>(dim),
+        bound,
+        slack_terms{},
+        out.rows.data(),
+        out.ids.data(),
+        out.distances.data(),
+        out.count.data(),
+        static_cast<unsigned long long>(out.capacity()),
+        g);
+    });
+  };
+  if (f16) {
+    run(__half{});
+  } else {
+    run(int8_t{});
+  }
 }
 
 bool bound_filter_f16_supports(int64_t dim) { return dim > 0 && dim % 16 == 0; }
@@ -864,7 +1039,8 @@ void bound_filter_f16(std::uint16_t const* x,
     out.ids.data(),
     out.distances.data(),
     out.count.data(),
-    static_cast<unsigned long long>(out.capacity()));
+    static_cast<unsigned long long>(out.capacity()),
+    group_view{});
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
@@ -1047,6 +1223,96 @@ __global__ void normalize_rows_kernel(float const* x, int64_t n, int64_t dim, fl
 }
 
 }  // namespace
+
+namespace {
+
+constexpr int kSeedWarps = 8;
+
+// One warp per probe row: its sample's distances go to shared memory, then k rounds of a warp
+// argmin take the k smallest; the last one taken is the bound.
+__global__ void __launch_bounds__(kSeedWarps * 32)
+  seed_bound_int8_kernel(int8_t const* __restrict__ x,
+                         int32_t const* __restrict__ x_sq,
+                         int8_t const* __restrict__ probe,
+                         int32_t const* __restrict__ probe_sq,
+                         int64_t const* __restrict__ first,
+                         int32_t const* __restrict__ count,
+                         int64_t n,
+                         int d,
+                         int k,
+                         float* __restrict__ bound)
+{
+  __shared__ float s_d[kSeedWarps][kSeedSample];
+  int const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  float* my       = s_d[warp];
+  int const words = d / 4;
+  for (int64_t r = static_cast<int64_t>(blockIdx.x) * kSeedWarps + warp; r < n;
+       r += static_cast<int64_t>(gridDim.x) * kSeedWarps) {
+    int const cnt = count[r];
+    if (cnt < k) {
+      if (lane == 0) { bound[r] = __int_as_float(0x7f800000); }
+      continue;
+    }
+    auto const* q = reinterpret_cast<int const*>(probe + r * d);
+    for (int i = lane; i < cnt; i += 32) {
+      auto const row = first[r] + i;
+      auto const* xr = reinterpret_cast<int const*>(x + row * d);
+      int dot        = 0;
+      for (int w = 0; w < words; ++w) {
+        dot = __dp4a(xr[w], q[w], dot);
+      }
+      my[i] = static_cast<float>(probe_sq[r] + x_sq[row] - 2 * dot);
+    }
+    __syncwarp();
+    float kth = 0.f;
+    for (int t = 0; t < k; ++t) {
+      float best = __int_as_float(0x7f800000);
+      int at     = -1;
+      for (int i = lane; i < cnt; i += 32) {
+        if (my[i] < best) {
+          best = my[i];
+          at   = i;
+        }
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o /= 2) {
+        float const ob = __shfl_xor_sync(0xffffffffu, best, o);
+        int const oa   = __shfl_xor_sync(0xffffffffu, at, o);
+        if (ob < best || (ob == best && oa > at)) {
+          best = ob;
+          at   = oa;
+        }
+      }
+      kth = best;
+      if (lane == 0 && at >= 0) { my[at] = __int_as_float(0x7f800000); }
+      __syncwarp();
+    }
+    if (lane == 0) { bound[r] = kth; }
+    __syncwarp();
+  }
+}
+
+}  // namespace
+
+void seed_bound_int8(int8_t const* x,
+                     int32_t const* x_sq,
+                     int8_t const* probe,
+                     int32_t const* probe_sq,
+                     int64_t const* first,
+                     int32_t const* count,
+                     int64_t n,
+                     int64_t dim,
+                     int k,
+                     float* bound,
+                     rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  auto const grid =
+    static_cast<int>(std::clamp<int64_t>((n + kSeedWarps - 1) / kSeedWarps, 1, 65535));
+  seed_bound_int8_kernel<<<grid, kSeedWarps * 32, 0, stream.value()>>>(
+    x, x_sq, probe, probe_sq, first, count, n, static_cast<int>(dim), k, bound);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
 
 void scale_in_place(float* d, int64_t n, float factor, rmm::cuda_stream_view stream)
 {

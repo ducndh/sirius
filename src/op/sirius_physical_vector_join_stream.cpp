@@ -1603,6 +1603,16 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     };
     bool const sqrt_at_end =
       any_bounded && search_metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+    // Lossless UINT8 lists on the device run sweep 0 -- each row's nearest cluster, which only sets
+    // the bounded sweep's starting bound -- as a bounded search too, a few grouped launches instead
+    // of a GEMM and a selection per cluster. Its own bound is the k-th smallest distance to the
+    // first kSeedSample rows of that cluster, which are corpus rows; what passes is merged, and the
+    // exact k-th of the nearest cluster bounds sweep 1 as before. SIRIUS_VSS_SEED=0 keeps the GEMM.
+    bool const seed = bounded && !radius_join && !rescore &&
+                      _lists->tier == cucascade::memory::Tier::GPU && k_join <= 64 && [] {
+                        auto const* v = std::getenv("SIRIUS_VSS_SEED");
+                        return v == nullptr || std::string_view{v} != "0";
+                      }();
     if (f16_bounded) {
       // The probe is rounded like the rows, with its rounded norms and its own rounding error.
       probe_f16.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
@@ -1700,16 +1710,17 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // The buffer's fill is read back once per group of slices, not per slice: a group that
     // overflowed is rolled back to the count before it and replayed a slice at a time, first
     // after the buffered pairs are merged, which tightens the bound, then into a bigger buffer.
-    struct bounded_slice {
-      void const* x;
-      void const* x_sq;
-      std::int64_t n;
-      std::int64_t id_base;
-      std::int64_t const* id_map;
-      std::int64_t const* rows;
-      std::int64_t m;
-    };
-    constexpr std::size_t kBoundedGroup = 64;
+    using bounded_slice = vss::bound_slice;
+    // With the lists on the device every slice's rows stay put, so a group's slices are launched
+    // together, a few grouped launches in place of one per slice. Host-tier lists are staged a
+    // chunk at a time and released as the sweep moves on, so there each slice launches at once.
+    // SIRIUS_VSS_GROUP=0 launches each slice on its own.
+    bool const group_launch =
+      _lists != nullptr && _lists->tier == cucascade::memory::Tier::GPU && [] {
+        auto const* v = std::getenv("SIRIUS_VSS_GROUP");
+        return v == nullptr || std::string_view{v} != "0";
+      }();
+    std::size_t const kBoundedGroup = group_launch ? 256 : 64;
     std::vector<bounded_slice> group;
     auto launch_bounded = [&](bounded_slice const& sl) {
       if (f16_bounded) {
@@ -1756,6 +1767,19 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     };
     auto check_group = [&] {
       if (group.empty()) { return; }
+      if (group_launch) {
+        vss::bound_filter_group(group,
+                                f16_bounded,
+                                f16_bounded ? static_cast<void const*>(probe_f16->data())
+                                            : static_cast<void const*>(probe_i8->data()),
+                                f16_bounded ? static_cast<void const*>(probe_sqf->data())
+                                            : static_cast<void const*>(probe_sq->data()),
+                                dim,
+                                f16_bounded || codes_int8 ? code_limit->data() : bound->data(),
+                                *candidates,
+                                stream,
+                                mr);
+      }
       auto total = read_count();
       if (total > candidates->capacity()) {
         rollback();
@@ -1854,6 +1878,40 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       }
     };
 
+    auto seed_bound = [&] {
+      std::vector<std::int64_t> first(static_cast<std::size_t>(n_left));
+      std::vector<std::int32_t> count(static_cast<std::size_t>(n_left));
+      for (std::int64_t r = 0; r < n_left; ++r) {
+        auto const c = static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]);
+        auto const lo                      = _lists->offsets[c];
+        first[static_cast<std::size_t>(r)] = lo;
+        count[static_cast<std::size_t>(r)] = static_cast<std::int32_t>(
+          std::min<std::int64_t>(vss::kSeedSample, _lists->offsets[c + 1] - lo));
+      }
+      rmm::device_uvector<std::int64_t> first_d(first.size(), stream, mr);
+      rmm::device_uvector<std::int32_t> count_d(count.size(), stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(first_d.data(),
+                                    first.data(),
+                                    first.size() * sizeof(std::int64_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.value()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(count_d.data(),
+                                    count.data(),
+                                    count.size() * sizeof(std::int32_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.value()));
+      vss::seed_bound_int8(static_cast<std::int8_t const*>(_lists->device_vectors->data()),
+                           static_cast<std::int32_t const*>(_lists->row_sq->data()),
+                           probe_i8->data(),
+                           probe_sq->data(),
+                           first_d.data(),
+                           count_d.data(),
+                           n_left,
+                           dim,
+                           static_cast<int>(k_join),
+                           bound->data(),
+                           stream);
+    };
     for (int sweep = radius_join && any_bounded ? 1 : 0; sweep < (any_bounded ? 2 : 1); ++sweep) {
       if (sweep == 1 && !kept.empty()) {
         for (auto const& entry : kept) {
@@ -1883,7 +1941,17 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         return direct ? staged_vector_chunk{} : _corpus->stage(j, *mem_space, stage_on);
       };
       prefetched = chunks.empty() ? staged_vector_chunk{} : stage_next(chunks[0]);
+      if (sweep == 0 && seed) {
+        bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
+        seed_bound();
+        candidates.emplace(
+          std::max<std::int64_t>(std::int64_t{1} << 22, 4 * n_left * k_join), stream, mr);
+      }
       if (sweep == 1) {
+        if (seed) {
+          check_group();
+          flush();
+        }
         phase("nearest-cluster sweep");
         bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
         if (radius_join) {
@@ -2002,7 +2070,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             _lists != nullptr ? static_cast<const std::int64_t*>(_lists->row_ids->data()) + id_base
                               : nullptr;
 
-          if (sweep == 1) {
+          if (sweep == 1 || seed) {
             bounded_slice const sl =
               f16_bounded
                 ? bounded_slice{reinterpret_cast<std::uint16_t const*>(compact) + slice.begin * dim,
@@ -2019,7 +2087,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                 rescore ? nullptr : id_map,
                                 rows_c,
                                 m};
-            launch_bounded(sl);
+            if (!group_launch) { launch_bounded(sl); }
             ++bounded_launches;
             bounded_padded += ((slice_rows + 127) / 128) * ((m + 127) / 128);
             group.push_back(sl);

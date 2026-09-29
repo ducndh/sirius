@@ -21,6 +21,7 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cstdint>
+#include <vector>
 
 // A GEMM whose epilogue keeps only the pairs under a per-row bound. A ranked search that writes
 // every score and then selects from them moves m x n x 12 bytes for m x k answers; with a bound
@@ -68,6 +69,34 @@ void bound_filter_int8(int8_t const* x,
                        float const* bound,
                        bound_candidates& out,
                        rmm::cuda_stream_view stream);
+
+/// One slice of a grouped bounded search: probe rows @p rows (@p m of them) against @p n corpus
+/// rows starting at @p x, with norms @p x_sq and ids id_base + j (or id_map[j]).
+struct bound_slice {
+  void const* x;
+  void const* x_sq;
+  int64_t n;
+  int64_t id_base;
+  int64_t const* id_map;
+  int64_t const* rows;
+  int64_t m;
+};
+
+/**
+ * @brief bound_filter_int8 (or, with @p f16, bound_filter_f16 with no slack) over many slices in
+ * a handful of launches -- one per kernel shape -- instead of one per slice: a batch of few probe
+ * rows spread over many clusters makes thousands of slices, each too small to amortize a launch.
+ * Every slice's buffers must stay valid until the launches complete.
+ */
+void bound_filter_group(std::vector<bound_slice> const& slices,
+                        bool f16,
+                        void const* probe,
+                        void const* probe_sq,
+                        int64_t dim,
+                        float const* bound,
+                        bound_candidates& out,
+                        rmm::cuda_stream_view stream,
+                        rmm::device_async_resource_ref mr);
 
 /// True when bound_filter_f16 can search vectors of this width.
 bool bound_filter_f16_supports(int64_t dim);
@@ -136,7 +165,7 @@ void map_ids(int64_t* ids, int64_t n, int64_t const* id_map, rmm::cuda_stream_vi
 
 /**
  * @brief Merge the first @p n_candidates of @p candidates into a nearest-first [n_rows x k]
- * accumulator and set bound[r] to row r's new k-th distance.
+ * accumulator and lower bound[r] to row r's new k-th distance where that is smaller.
  *
  * On equal distances an accumulator entry ranks before a candidate, the order fold_topk_rows
  * gives. A candidate must not repeat a pair already in the accumulator.
@@ -160,6 +189,27 @@ void kth_distance_bound(float const* acc_distances,
 
 /// d[i] = sqrt(d[i]) for i in [0, n).
 void sqrt_in_place(float* d, int64_t n, rmm::cuda_stream_view stream);
+
+/// Most sample rows seed_bound_int8 reads per probe row.
+constexpr int kSeedSample = 1024;
+
+/**
+ * @brief bound[r] = the k-th smallest exact distance from probe row r to the count[r] UINT8 rows
+ * (stored shifted to int8, norms @p x_sq) starting at layout row first[r]: an upper bound on row
+ * r's k-th nearest distance over any corpus holding those rows. +inf when count[r] < k.
+ * count[r] <= kSeedSample.
+ */
+void seed_bound_int8(int8_t const* x,
+                     int32_t const* x_sq,
+                     int8_t const* probe,
+                     int32_t const* probe_sq,
+                     int64_t const* first,
+                     int32_t const* count,
+                     int64_t n,
+                     int64_t dim,
+                     int k,
+                     float* bound,
+                     rmm::cuda_stream_view stream);
 
 /// d[i] *= factor for i in [0, n).
 void scale_in_place(float* d, int64_t n, float factor, rmm::cuda_stream_view stream);
