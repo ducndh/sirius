@@ -1547,7 +1547,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // memory. Distances stay squared until the end, where the bound is compared.
     // A radius join is the same search with the radius as every row's bound, in one sweep: there
     // is no k-th distance to seed, and a pair under the bound is final when found.
-    bool const bounded = int8_search && (n_probes > 1 || radius_join || codes_int8) &&
+    // Lossless UINT8 lists on the device can seed sweep 0 (below), which makes even one probe a
+    // bounded search.
+    bool const seedable = int8_search && !codes_int8 && !radius_join &&
+                          _lists->tier == cucascade::memory::Tier::GPU && k_join <= 64 && [] {
+                            auto const* v = std::getenv("SIRIUS_VSS_SEED");
+                            return v == nullptr || std::string_view{v} != "0";
+                          }();
+    bool const bounded = int8_search && (n_probes > 1 || radius_join || codes_int8 || seedable) &&
                          vss::bound_filter_int8_supports(dim) && bound_gemm_enabled;
     // FLOAT16 lists that kept their FP32 rows get the same two sweeps with the half-precision
     // GEMM, and an exact answer: sweep 0's nearest-cluster answers are re-scored in FP32 only to
@@ -1608,11 +1615,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // of a GEMM and a selection per cluster. Its own bound is the k-th smallest distance to the
     // first kSeedSample rows of that cluster, which are corpus rows; what passes is merged, and the
     // exact k-th of the nearest cluster bounds sweep 1 as before. SIRIUS_VSS_SEED=0 keeps the GEMM.
-    bool const seed = bounded && !radius_join && !rescore &&
-                      _lists->tier == cucascade::memory::Tier::GPU && k_join <= 64 && [] {
-                        auto const* v = std::getenv("SIRIUS_VSS_SEED");
-                        return v == nullptr || std::string_view{v} != "0";
-                      }();
+    bool const seed = bounded && seedable && !rescore;
     if (f16_bounded) {
       // The probe is rounded like the rows, with its rounded norms and its own rounding error.
       probe_f16.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);

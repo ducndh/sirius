@@ -1429,3 +1429,46 @@ TEST_CASE_METHOD(KMeansFixture,
                  "_corpus','vec', metric => 'l2', k => 5, " + approx + ");",
                "metric => 'cosine'");
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "a seeded sweep over UINT8 lists gives what the GEMM sweep gives",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // Device-resident UINT8 lists search each row's nearest cluster with the bounded kernel under a
+  // bound taken from a sample of that cluster, even at one probe. SIRIUS_VSS_SEED=0 searches it
+  // with a GEMM and a selection instead; the two must agree whatever the probe count and k.
+  create_lists_tables(*this, "kmseed", "gpu", true);
+  run_ok(
+    "SELECT * FROM sirius_kmeans_fit('kmseed_corpus','vec', name => 'kmseed_c', n_clusters => "
+    "16);");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('kmseed_corpus','vec','kmseed_c', storage => "
+    "'uint8');");
+  auto const fetch = [&](const std::string& args) {
+    std::vector<std::pair<std::string, double>> out;
+    for (auto const& r : ok_rows(
+           *con,
+           "SELECT left_id, distance FROM sirius_knn_join('kmseed_probe','vec','kmseed_corpus',"
+           "'vec', metric => 'l2', search_mode => 'approx', clustering => 'kmseed_c', " +
+             args + ");")) {
+      out.emplace_back(r.at(0), std::stod(r.at(1)));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+  for (auto const probes : {1, 4}) {
+    for (auto const k : {1, 10}) {
+      auto const args   = "n_probes => " + std::to_string(probes) + ", k => " + std::to_string(k);
+      auto const seeded = fetch(args);
+      ::setenv("SIRIUS_VSS_SEED", "0", 1);
+      auto const gemm = fetch(args);
+      ::unsetenv("SIRIUS_VSS_SEED");
+      REQUIRE(seeded.size() == gemm.size());
+      REQUIRE(seeded.size() == static_cast<std::size_t>(50 * k));
+      for (std::size_t i = 0; i < seeded.size(); ++i) {
+        CHECK(seeded[i].first == gemm[i].first);
+        CHECK(seeded[i].second == gemm[i].second);
+      }
+    }
+  }
+}

@@ -108,6 +108,13 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
                                                      rmm::cuda_stream_view stream,
                                                      ::cucascade::memory::memory_space& space);
 
+  /// The same from a HOST-tier pin, read in place on the host for a few scattered rows: staging
+  /// copies whole chunks, and a small answer over a large corpus touches every chunk. Null when
+  /// it does not apply -- too many rows, or a column that is not fixed-width or has nulls.
+  std::unique_ptr<cudf::table> gather_right_on_host(cudf::column_view neighbors,
+                                                    rmm::cuda_stream_view stream,
+                                                    ::cucascade::memory::memory_space& space);
+
   /// The probe output columns as per-batch views in the probe side's snapshot order, which is
   /// the order the join stage numbered its output partitions by. Probe-scan path only.
   std::vector<std::vector<cudf::column_view>> probe_side_output_views(

@@ -36,6 +36,8 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/traits.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/error.hpp>
 
@@ -50,8 +52,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -319,9 +323,106 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
   _initialized = true;
 }
 
+std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::gather_right_on_host(
+  cudf::column_view neighbors, rmm::cuda_stream_view stream, cucascade::memory::memory_space& space)
+{
+  // Random reads of pinned host memory, one per value: cheap for thousands, slower than copying
+  // chunks in for millions.
+  constexpr std::size_t kMaxValues = std::size_t{1} << 18;
+  auto const n                     = static_cast<std::size_t>(neighbors.size());
+  auto const& names                = _right_pin->cache_info.column_names();
+  if (n * _request.right.output_columns.size() > kMaxValues) { return nullptr; }
+
+  // Each output column's metadata in every chunk, if all are fixed-width without nulls.
+  struct chunk_column {
+    cucascade::memory::host_table_allocation const* table;
+    cucascade::memory::column_metadata const* meta;
+  };
+  std::vector<std::vector<chunk_column>> columns;
+  std::vector<cudf::data_type> types;
+  for (auto const& name : _request.right.output_columns) {
+    auto const it = std::find(names.begin(), names.end(), name);
+    if (it == names.end()) { return nullptr; }
+    auto const col = static_cast<std::size_t>(std::distance(names.begin(), it));
+    std::vector<chunk_column> per_chunk;
+    std::optional<cudf::data_type> type;
+    for (auto const& chunk : _right_pin->host_chunks) {
+      auto const* host = dynamic_cast<cucascade::host_data_representation const*>(chunk.get());
+      if (host == nullptr) { return nullptr; }
+      auto const& table = host->get_host_table();
+      if (!table || col >= table->columns.size()) { return nullptr; }
+      auto const& meta = table->columns[col];
+      cudf::data_type const t{static_cast<cudf::type_id>(meta.type_id)};
+      if (!cudf::is_fixed_width(t) || cudf::is_fixed_point(t) || !meta.has_data ||
+          !meta.children.empty() || meta.null_count != 0 || (type && *type != t)) {
+        return nullptr;
+      }
+      type = t;
+      per_chunk.push_back({table.get(), &meta});
+    }
+    if (!type) { return nullptr; }
+    columns.push_back(std::move(per_chunk));
+    types.push_back(*type);
+  }
+
+  std::vector<std::int64_t> rows(n);
+  if (n > 0) {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(rows.data(),
+                                  neighbors.data<std::int64_t>(),
+                                  n * sizeof(std::int64_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    stream.synchronize();
+  }
+  // Each row's chunk and its row within it.
+  std::vector<std::pair<std::size_t, std::int64_t>> where(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    auto const c = static_cast<std::size_t>(
+      std::upper_bound(_right_chunk_ends.begin(), _right_chunk_ends.end(), rows[i]) -
+      _right_chunk_ends.begin());
+    if (rows[i] < 0 || c >= _right_chunk_ends.size()) { return nullptr; }
+    where[i] = {c, rows[i] - (c == 0 ? 0 : _right_chunk_ends[c - 1])};
+  }
+
+  auto const mr = space.get_default_allocator();
+  std::vector<std::unique_ptr<cudf::column>> out;
+  std::vector<std::byte> values;
+  for (std::size_t k = 0; k < columns.size(); ++k) {
+    auto const width = static_cast<std::size_t>(cudf::size_of(types[k]));
+    values.resize(n * width);
+    for (std::size_t i = 0; i < n; ++i) {
+      auto const& [c, local] = where[i];
+      auto const& cc         = columns[k][c];
+      auto const& blocks     = *cc.table->allocation;
+      // Buffers start 8-byte aligned in blocks that are a multiple of 8, so a value never
+      // straddles two blocks.
+      auto const byte = cc.meta->data_offset + static_cast<std::size_t>(local) * width;
+      std::memcpy(values.data() + i * width,
+                  blocks.at(byte / blocks.block_size()).data() + byte % blocks.block_size(),
+                  width);
+    }
+    auto column = cudf::make_fixed_width_column(
+      types[k], static_cast<cudf::size_type>(n), cudf::mask_state::UNALLOCATED, stream, mr);
+    if (n > 0) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(column->mutable_view().head(),
+                                    values.data(),
+                                    values.size(),
+                                    cudaMemcpyHostToDevice,
+                                    stream.value()));
+      // The next column reuses the host buffer.
+      stream.synchronize();
+    }
+    out.push_back(std::move(column));
+  }
+  return std::make_unique<cudf::table>(std::move(out));
+}
+
 std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::gather_right_from_pin(
   cudf::column_view neighbors, rmm::cuda_stream_view stream, cucascade::memory::memory_space& space)
 {
+  if (_right_pin->tier != cucascade::memory::Tier::GPU) {
+    if (auto on_host = gather_right_on_host(neighbors, stream, space)) { return on_host; }
+  }
   auto const mr       = space.get_default_allocator();
   auto const n_chunks = static_cast<cudf::size_type>(_right_chunk_ends.size());
 
