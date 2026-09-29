@@ -25,13 +25,17 @@
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/search.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <rmm/error.hpp>
 
@@ -45,6 +49,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <stdexcept>
@@ -281,45 +286,127 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
     }
   }
 
-  // Right output columns concatenated once across batches, so a global right id
-  // gathers straight into row i. Small columns (not the vectors), so cheap.
-  auto const mr = space.get_default_allocator();
-  std::vector<std::unique_ptr<cudf::column>> right_cols;
-  right_cols.reserve(right.output_columns.size());
+  // Build path: the corpus output columns concatenated once, so a global right id gathers
+  // straight into row i. Pinned corpus: only where its chunks end is recorded here, and each
+  // partition stages just the chunks its neighbours fall in -- a 100M-row corpus would otherwise
+  // copy its whole id column in for a 10-row answer.
   if (_build_side) {
-    right_cols = build_side_output_columns(right.output_columns.size(), stream, space);
-  } else {
-    for (auto const& name : right.output_columns) {
-      auto staged = vss::stage_pinned_column(*right_pin, name, space, stream, batch_telemetry());
-      right_cols.push_back(cudf::concatenate(staged.views, stream, mr));
-    }
-  }
-  _right_output_concat = std::make_unique<cudf::table>(std::move(right_cols));
-  {
-    std::function<std::size_t(cudf::column_view const&)> col_bytes =
-      [&](cudf::column_view const& c) -> std::size_t {
-      if (c.num_children() > 0) {
-        std::size_t total = 0;
-        for (cudf::size_type i = 0; i < c.num_children(); ++i) {
-          total += col_bytes(c.child(i));
-        }
-        return total;
+    _right_output_concat = std::make_unique<cudf::table>(
+      build_side_output_columns(right.output_columns.size(), stream, space));
+  } else if (!right.output_columns.empty()) {
+    _right_pin         = right_pin;
+    auto const& column = right.output_columns.front();
+    std::int64_t end   = 0;
+    if (right_pin->tier == cucascade::memory::Tier::GPU) {
+      for (auto const& v : vss::pinned_column_chunk_views(*right_pin, column, space)) {
+        end += v.size();
+        _right_chunk_ends.push_back(end);
       }
-      return static_cast<std::size_t>(c.size()) * cudf::size_of(c.type());
-    };
-    std::size_t concat_bytes = 0;
-    for (auto const& c : _right_output_concat->view()) {
-      concat_bytes += col_bytes(c);
+    } else {
+      for (auto const& chunk : right_pin->host_chunks) {
+        auto const* host = dynamic_cast<cucascade::host_data_representation const*>(chunk.get());
+        if (host == nullptr) {
+          throw std::runtime_error("[sirius_physical_vector_join_materialize] column '" + column +
+                                   "' is pinned with host compression, which staging cannot "
+                                   "slice");
+        }
+        end += host->get_host_table()->columns.front().num_rows;
+        _right_chunk_ends.push_back(end);
+      }
     }
-    // The quantity projection pushdown exists to shrink: this is resident for the whole query
-    // and scales with the corpus, not with the result.
-    SIRIUS_LOG_DEBUG("[vector_join] corpus output concat: {} columns, {} rows, ~{} bytes",
-                     _right_output_concat->num_columns(),
-                     _right_output_concat->num_rows(),
-                     concat_bytes);
   }
 
   _initialized = true;
+}
+
+std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::gather_right_from_pin(
+  cudf::column_view neighbors, rmm::cuda_stream_view stream, cucascade::memory::memory_space& space)
+{
+  auto const mr       = space.get_default_allocator();
+  auto const n_chunks = static_cast<cudf::size_type>(_right_chunk_ends.size());
+
+  // Each neighbour's chunk is the first whose end lies past it.
+  auto ends = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, n_chunks, cudf::mask_state::UNALLOCATED, stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(ends->mutable_view().data<std::int64_t>(),
+                                _right_chunk_ends.data(),
+                                _right_chunk_ends.size() * sizeof(std::int64_t),
+                                cudaMemcpyHostToDevice,
+                                stream.value()));
+  auto const chunk_of   = cudf::upper_bound(cudf::table_view{{ends->view()}},
+                                          cudf::table_view{{neighbors}},
+                                            {cudf::order::ASCENDING},
+                                            {cudf::null_order::BEFORE},
+                                          stream,
+                                          mr);
+  auto const needed_col = cudf::distinct(cudf::table_view{{chunk_of->view()}},
+                                         {0},
+                                         cudf::duplicate_keep_option::KEEP_ANY,
+                                         cudf::null_equality::EQUAL,
+                                         cudf::nan_equality::ALL_EQUAL,
+                                         stream,
+                                         mr);
+  auto const n_needed   = needed_col->num_rows();
+  std::vector<cudf::size_type> needed(static_cast<std::size_t>(n_needed));
+  if (n_needed > 0) {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(needed.data(),
+                                  needed_col->view().column(0).data<cudf::size_type>(),
+                                  needed.size() * sizeof(cudf::size_type),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.value()));
+    stream.synchronize();
+  }
+  std::sort(needed.begin(), needed.end());
+  // No neighbours still needs typed columns to gather nothing from.
+  if (needed.empty() && n_chunks > 0) { needed.push_back(0); }
+
+  // A neighbour's row in the concatenation of the needed chunks is its pin row plus its chunk's
+  // shift: the chunk's place in the concatenation less its place in the pin.
+  std::vector<std::int64_t> shift(static_cast<std::size_t>(n_chunks), 0);
+  std::int64_t placed = 0;
+  for (auto const c : needed) {
+    auto const begin = c == 0 ? 0 : _right_chunk_ends[static_cast<std::size_t>(c) - 1];
+    shift[static_cast<std::size_t>(c)] = placed - begin;
+    placed += _right_chunk_ends[static_cast<std::size_t>(c)] - begin;
+  }
+  auto shifts = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, n_chunks, cudf::mask_state::UNALLOCATED, stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(shifts->mutable_view().data<std::int64_t>(),
+                                shift.data(),
+                                shift.size() * sizeof(std::int64_t),
+                                cudaMemcpyHostToDevice,
+                                stream.value()));
+  auto const shift_of = cudf::gather(cudf::table_view{{shifts->view()}},
+                                     chunk_of->view(),
+                                     cudf::out_of_bounds_policy::DONT_CHECK,
+                                     stream,
+                                     mr);
+  auto const rows     = cudf::binary_operation(neighbors,
+                                           shift_of->view().column(0),
+                                           cudf::binary_operator::ADD,
+                                           cudf::data_type{cudf::type_id::INT64},
+                                           stream,
+                                           mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  for (auto const& name : _request.right.output_columns) {
+    std::vector<vss::staged_pinned_chunk> staged;
+    std::vector<cudf::column_view> views;
+    for (auto const c : needed) {
+      staged.push_back(vss::stage_pinned_column_chunk(
+        *_right_pin, name, static_cast<std::size_t>(c), space, stream, batch_telemetry()));
+      views.push_back(staged.back().view);
+    }
+    auto concat   = views.size() == 1 ? std::make_unique<cudf::column>(views.front(), stream, mr)
+                                      : cudf::concatenate(views, stream, mr);
+    auto gathered = cudf::gather(cudf::table_view{{concat->view()}},
+                                 rows->view(),
+                                 cudf::out_of_bounds_policy::DONT_CHECK,
+                                 stream,
+                                 mr);
+    columns.push_back(std::move(gathered->release().front()));
+  }
+  return std::make_unique<cudf::table>(std::move(columns));
 }
 
 std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::get_next_task_input_data()
@@ -410,7 +497,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
 
   // Right columns gathered by the global neighbor id.
   std::unique_ptr<cudf::table> right_gathered;
-  if (_right_output_concat->num_columns() > 0) {
+  if (_right_pin != nullptr) {
+    right_gathered = gather_right_from_pin(neighbor_view, stream, *space);
+  } else if (_right_output_concat && _right_output_concat->num_columns() > 0) {
     right_gathered = cudf::gather(_right_output_concat->view(),
                                   neighbor_view,
                                   cudf::out_of_bounds_policy::DONT_CHECK,

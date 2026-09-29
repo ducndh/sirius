@@ -102,6 +102,12 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
     rmm::cuda_stream_view stream,
     ::cucascade::memory::memory_space& space);
 
+  /// The corpus output columns at @p neighbors (pin rows), from only the pin chunks those rows fall
+  /// in: an answer of n x k rows reads n x k chunks at most, not the whole column.
+  std::unique_ptr<cudf::table> gather_right_from_pin(cudf::column_view neighbors,
+                                                     rmm::cuda_stream_view stream,
+                                                     ::cucascade::memory::memory_space& space);
+
   /// The probe output columns as per-batch views in the probe side's snapshot order, which is
   /// the order the join stage numbered its output partitions by. Probe-scan path only.
   std::vector<std::vector<cudf::column_view>> probe_side_output_views(
@@ -131,8 +137,11 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
   std::vector<::cucascade::read_only_data_batch> _probe_readers;
   std::vector<std::shared_ptr<::cucascade::data_batch>> _probe_restaged;
   std::vector<std::shared_ptr<::cucascade::memory::reservation>> _probe_reservations;
-  //! Right output columns concatenated across batches; row i == global right id i.
+  //! Build path: right output columns concatenated across batches; row i == global right id i.
   std::unique_ptr<cudf::table> _right_output_concat;
+  //! Pinned corpus: the pin, and where each of its chunks ends in pin row space.
+  const sirius::scan_manager::pinned_entry* _right_pin{nullptr};
+  std::vector<std::int64_t> _right_chunk_ends;
 };
 
 }  // namespace sirius::op

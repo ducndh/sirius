@@ -1230,3 +1230,67 @@ TEST_CASE_METHOD(
   REQUIRE(exact.size() > 10);
   same(fetch(eps + approx), exact);
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "corpus output columns are gathered from each neighbour's own row",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // The join reads a corpus output column only from the pin chunks its neighbours fall in. At
+  // ~1 KB a row this corpus pins as more than one chunk, and the probes are copies of rows near
+  // its end, so each one's nearest neighbour is itself and k => 1 touches the last chunk alone.
+  // Every column must come from the neighbour's own row (tag is a function of id), and k => 5 must
+  // be DuckDB's own top-k -- not another Sirius search, which would share this gather.
+  auto const tier   = GENERATE(std::string("gpu"), std::string("host"));
+  auto const prefix = "kmo_" + tier;
+  run_ok("CREATE TABLE " + prefix + "_corpus AS SELECT i::INTEGER AS id, i * 7 + 3 AS tag, " +
+         "list_transform(range(256), lambda d: ((hash(i * 1000 + d) % 1000)::FLOAT / 1000.0))" +
+         "::FLOAT[256] AS vec FROM range(240000) t(i);");
+  run_ok("CREATE TABLE " + prefix + "_probe AS SELECT id, vec FROM " + prefix +
+         "_corpus WHERE id >= 220000 AND id % 2000 = 7;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix + "_corpus', tier => '" + tier +
+         "', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_probe', tier => 'gpu', format => "
+         "'duckdb');");
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => 16);");
+  run_ok("SELECT * FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" + prefix +
+         "_c');");
+
+  auto const join = [&](int k) {
+    return ok_rows(*con,
+                   "SELECT left_id, right_id, right_tag FROM sirius_knn_join('" + prefix +
+                     "_probe','vec','" + prefix + "_corpus','vec', metric => 'l2', k => " +
+                     std::to_string(k) + ", search_mode => 'approx', clustering => '" + prefix +
+                     "_c', n_probes => 16, left_output_columns => ['id'], "
+                     "right_output_columns => ['id', 'tag']);");
+  };
+  auto const nearest = join(1);
+  REQUIRE(nearest.size() == 10);
+  for (auto const& r : nearest) {
+    CHECK(r.at(1) == r.at(0));
+    CHECK(std::stoll(r.at(2)) == std::stoll(r.at(1)) * 7 + 3);
+  }
+
+  auto const got = join(5);
+  REQUIRE(got.size() == 10 * 5);
+  std::set<std::pair<std::string, std::string>> got_pairs;
+  for (auto const& r : got) {
+    CHECK(std::stoll(r.at(2)) == std::stoll(r.at(1)) * 7 + 3);
+    got_pairs.emplace(r.at(0), r.at(1));
+  }
+  con->Query("SET gpu_execution = false;");
+  auto const want =
+    ok_rows(*con,
+            "SELECT p.id, n.id FROM " + prefix + "_probe p, LATERAL (SELECT c.id FROM " + prefix +
+              "_corpus c ORDER BY array_distance(p.vec, c.vec) LIMIT 5) n;");
+  con->Query("SET gpu_execution = true;");
+  REQUIRE(want.size() == got.size());
+  std::size_t same = 0;
+  for (auto const& r : want) {
+    same += got_pairs.count({r.at(0), r.at(1)});
+  }
+  // The GEMM and DuckDB round differently, so a near-tie may swap which row is k-th.
+  CHECK(same * 100 >= want.size() * 98);
+}
