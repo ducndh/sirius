@@ -104,7 +104,7 @@ __device__ inline int find_slice(group_view const& g, int64_t b)
 // row g + 8 ((t >> 1) & 1), column 8 (t >> 2) + 2 q + (t & 1), g = lane / 4, q = lane % 4 -- the
 // mma m16n8 layout WMMA uses on sm_80+, which accumulator_layout_is_m16n8 checks on the device.
 // Otherwise each fragment goes through shared memory, whatever its layout.
-template <class T, bool kRegisterEpilogue>
+template <class T, bool kRegisterEpilogue, bool kGrouped = false>
 __global__ void __launch_bounds__(kWarps * 32, 2)
   bound_filter_kernel(T const* __restrict__ x,
                       typename mma_traits<T>::norm const* __restrict__ x_sq,
@@ -142,7 +142,8 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
   int const wm = warp / 4, wn = warp % 4;
   int64_t q0 = static_cast<int64_t>(blockIdx.x) * kTileM;
   int64_t x0 = static_cast<int64_t>(blockIdx.y) * kTileN;
-  if (group.slices != nullptr) {
+  // A separate instantiation, so a single-slice launch carries none of this in its registers.
+  if constexpr (kGrouped) {
     auto const b       = static_cast<int64_t>(blockIdx.x);
     auto const si      = find_slice(group, b);
     auto const& sl     = group.slices[si];
@@ -382,7 +383,7 @@ bool accumulator_layout_is_m16n8()
 constexpr int kSmallThreads = 256;
 constexpr int kSmallMaxDim  = 256;
 
-template <class T, int M>
+template <class T, int M, bool kGrouped = false>
 __global__ void __launch_bounds__(kSmallThreads)
   bound_filter_small_kernel(T const* __restrict__ x,
                             typename mma_traits<T>::norm const* __restrict__ x_sq,
@@ -407,7 +408,7 @@ __global__ void __launch_bounds__(kSmallThreads)
   // A grouped launch gives each block one kSmallThreads-row stretch of one slice.
   auto j_first = static_cast<int64_t>(blockIdx.x) * blockDim.x;
   auto j_step  = static_cast<int64_t>(gridDim.x) * blockDim.x;
-  if (group.slices != nullptr) {
+  if constexpr (kGrouped) {
     auto const si  = find_slice(group, blockIdx.x);
     auto const& sl = group.slices[si];
     x              = static_cast<T const*>(sl.x);
@@ -945,14 +946,14 @@ void bound_filter_group(std::vector<bound_slice> const& slices,
           g);
       });
     };
-    small(0, bound_filter_small_kernel<T, 1>);
-    small(1, bound_filter_small_kernel<T, 2>);
-    small(2, bound_filter_small_kernel<T, 4>);
-    small(3, bound_filter_small_kernel<T, 8>);
-    small(4, bound_filter_small_kernel<T, 16>);
+    small(0, bound_filter_small_kernel<T, 1, true>);
+    small(1, bound_filter_small_kernel<T, 2, true>);
+    small(2, bound_filter_small_kernel<T, 4, true>);
+    small(3, bound_filter_small_kernel<T, 8, true>);
+    small(4, bound_filter_small_kernel<T, 16, true>);
     auto const kernel = accumulator_layout_is_m16n8<typename mma_traits<T>::accumulator>()
-                          ? bound_filter_kernel<T, true>
-                          : bound_filter_kernel<T, false>;
+                          ? bound_filter_kernel<T, true, true>
+                          : bound_filter_kernel<T, false, true>;
     launch(classes[5], true, [&](unsigned blocks, group_view g) {
       kernel<<<blocks, kWarps * 32, 0, stream.value()>>>(
         nullptr,

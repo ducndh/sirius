@@ -1714,9 +1714,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // overflowed is rolled back to the count before it and replayed a slice at a time, first
     // after the buffered pairs are merged, which tightens the bound, then into a bigger buffer.
     using bounded_slice = vss::bound_slice;
-    // With the lists on the device every slice's rows stay put, so a group's slices are launched
-    // together, a few grouped launches in place of one per slice. Host-tier lists are staged a
-    // chunk at a time and released as the sweep moves on, so there each slice launches at once.
+    // With the lists on the device every slice's rows stay put, so a group's slices of one probe
+    // tile at most are launched together, a few grouped launches in place of one per slice. A
+    // slice of more probe rows launches alone, where its corpus tiles stay in L2 across its probe
+    // tiles. Host-tier lists are staged a chunk at a time and released as the sweep moves on, so
+    // there each slice launches at once.
     // SIRIUS_VSS_GROUP=0 launches each slice on its own.
     bool const group_launch =
       _lists != nullptr && _lists->tier == cucascade::memory::Tier::GPU && [] {
@@ -1724,7 +1726,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         return v == nullptr || std::string_view{v} != "0";
       }();
     std::size_t const kBoundedGroup = group_launch ? 256 : 64;
-    std::vector<bounded_slice> group;
+    std::vector<bounded_slice> group, deferred;
     auto launch_bounded = [&](bounded_slice const& sl) {
       if (f16_bounded) {
         vss::bound_filter_f16(static_cast<std::uint16_t const*>(sl.x),
@@ -1770,8 +1772,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     };
     auto check_group = [&] {
       if (group.empty()) { return; }
-      if (group_launch) {
-        vss::bound_filter_group(group,
+      if (!deferred.empty()) {
+        vss::bound_filter_group(deferred,
                                 f16_bounded,
                                 f16_bounded ? static_cast<void const*>(probe_f16->data())
                                             : static_cast<void const*>(probe_i8->data()),
@@ -1782,6 +1784,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                 *candidates,
                                 stream,
                                 mr);
+        deferred.clear();
       }
       auto total = read_count();
       if (total > candidates->capacity()) {
@@ -2090,7 +2093,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                 rescore ? nullptr : id_map,
                                 rows_c,
                                 m};
-            if (!group_launch) { launch_bounded(sl); }
+            if (group_launch && m <= 128) {
+              deferred.push_back(sl);
+            } else {
+              launch_bounded(sl);
+            }
             ++bounded_launches;
             bounded_padded += ((slice_rows + 127) / 128) * ((m + 127) / 128);
             group.push_back(sl);
