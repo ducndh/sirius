@@ -367,10 +367,6 @@ class rewriter {
     // One pattern per pass: a rewrite moves subtrees, so the search restarts from the root.
     while (rewrites < 16 && try_one(_root)) {
       ++rewrites;
-      // The rewritten node lays its columns out differently from what it replaced, so position-
-      // based projection maps above it are stale. They only prune; bindings stay valid without
-      // them.
-      clear_projection_maps(*_root);
     }
     if (rewrites > 0) { resolve_types_bottom_up(*_root); }
     if (rewrites > 0 && std::getenv("SIRIUS_VSS_REWRITE_DUMP") != nullptr) {
@@ -380,24 +376,71 @@ class rewriter {
   }
 
  private:
-  static void clear_projection_maps(LogicalOperator& op)
+  /// A projection a rewrite installed in place of the operator it replaced.
+  struct installed_projection {
+    duckdb::idx_t index;
+    LogicalOperator* op;
+  };
+
+  /// Installs @p replacement in @p slot under a projection that emits the replaced operator's
+  /// columns in their original positions, so everything above that reads columns by position --
+  /// projection maps, and the scans of a CTE or a delim join the operator fed -- reads what it
+  /// read before. @p exprs has one expression per column of the replaced operator, over
+  /// @p replacement's outputs; a null one, for a column nothing reads, becomes a typed NULL.
+  installed_projection install(unique_ptr<LogicalOperator>& slot,
+                               unique_ptr<LogicalOperator> replacement,
+                               duckdb::vector<unique_ptr<Expression>> exprs)
   {
-    if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
-      op.Cast<duckdb::LogicalFilter>().projection_map.clear();
-    } else if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-               op.type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
-               op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
-               op.type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
-      op.Cast<duckdb::LogicalJoin>().left_projection_map.clear();
-      op.Cast<duckdb::LogicalJoin>().right_projection_map.clear();
+    for (std::size_t i = 0; i < exprs.size(); ++i) {
+      if (!exprs[i]) {
+        exprs[i] =
+          duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value(_slot_types[i]));
+      }
     }
-    for (auto& child : op.children) {
-      if (child) { clear_projection_maps(*child); }
+    auto const index = _binder.GenerateTableIndex();
+    auto proj        = duckdb::make_uniq<duckdb::LogicalProjection>(index, std::move(exprs));
+    proj->children.push_back(std::move(replacement));
+    proj->ResolveOperatorTypes();
+    auto* op = proj.get();
+    slot     = std::move(proj);
+    return {index, op};
+  }
+
+  /// Points the column references above @p p at it instead of at the replaced operator.
+  void remap_above(const installed_projection& p)
+  {
+    duckdb::ColumnBindingReplacer replacer;
+    replacer.stop_operator = p.op;
+    for (std::size_t i = 0; i < _slot_bindings.size(); ++i) {
+      replacer.replacement_bindings.emplace_back(
+        _slot_bindings[i], ColumnBinding{p.index, i}, p.op->types[i]);
     }
+    replacer.VisitOperator(*_root);
+  }
+
+  /// Where @p b sat in the replaced operator's output, if it was there.
+  std::optional<std::size_t> slot_position(const ColumnBinding& b) const
+  {
+    for (std::size_t i = 0; i < _slot_bindings.size(); ++i) {
+      if (_slot_bindings[i] == b) { return i; }
+    }
+    return std::nullopt;
   }
 
   bool try_one(unique_ptr<LogicalOperator>& slot)
   {
+    // What the operator a rewrite may replace emits, taken before the rewrite takes it apart.
+    switch (slot->type) {
+      case LogicalOperatorType::LOGICAL_ANY_JOIN:
+      case LogicalOperatorType::LOGICAL_FILTER:
+      case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+      case LogicalOperatorType::LOGICAL_TOP_N:
+      case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+        _slot_bindings = slot->GetColumnBindings();
+        _slot_types    = slot->types;
+        break;
+      default: break;
+    }
     // Top-down: a top-k or threshold shape above a cross product has to claim it before the
     // cross product alone would be read as an unbounded all-pairs join.
     bool const rewritten = [&] {
@@ -494,19 +537,6 @@ class rewriter {
                       vector_join_mode::threshold,
                       /*probe_scalar=*/true)) {
         return false;
-      }
-      auto& proj = slot->Cast<duckdb::LogicalProjection>();
-      auto& get  = proj.children[0]->Cast<duckdb::LogicalGet>();
-      proj.expressions.push_back(duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-        duckdb::LogicalType::FLOAT, ColumnBinding{get.table_index, get.returned_types.size() - 1}));
-      proj.ResolveOperatorTypes();
-      ColumnBinding const score{proj.table_index, proj.expressions.size() - 1};
-      bool mapped = true;
-      for_each_expression_outside(*_root, &proj, [&](unique_ptr<Expression>& e) {
-        mapped = mapped && replace_distance_calls(_context, e, pair->a, pair->b, pair->kind, score);
-      });
-      if (!mapped) {
-        throw duckdb::InternalException("sirius vector-join rewrite: distance call left unmapped");
       }
       return true;
     }
@@ -827,6 +857,9 @@ class rewriter {
     for_each_expression_outside(
       *_root, cross_slot.get(), [&](unique_ptr<Expression>& e) { collect_bindings(*e, used); });
 
+    // The cross product is what the join replaces, not the top-N above it.
+    _slot_bindings    = cross_slot->GetColumnBindings();
+    _slot_types       = cross_slot->types;
     auto probe        = std::move(cross_slot->children[pi]);
     auto corpus       = std::move(cross_slot->children[1 - pi]);
     auto probe_vec_in = probe_vec;
@@ -851,10 +884,6 @@ class rewriter {
       passthrough.push_back(b);
       cols.push_back({false, b, call->kind});
     }
-    auto* top_ptr = slot.get();
-    (void)top_ptr;
-    auto const score_kind = call->kind;
-    auto const pair_a = call->a, pair_b = call->b;
     if (!build_topk(cross_slot,
                     std::move(probe),
                     std::move(corpus),
@@ -868,20 +897,6 @@ class rewriter {
                     vector_join_mode::global_top_k,
                     scalar)) {
       return false;
-    }
-    // Distance calls above now read the score, which the projection over the join passes up as
-    // its last column (operators above a projection see only its outputs).
-    auto& proj = cross_slot->Cast<duckdb::LogicalProjection>();
-    auto& get  = proj.children[0]->Cast<duckdb::LogicalGet>();
-    proj.expressions.push_back(duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-      duckdb::LogicalType::FLOAT, ColumnBinding{get.table_index, get.returned_types.size() - 1}));
-    proj.ResolveOperatorTypes();
-    ColumnBinding const score{proj.table_index, proj.expressions.size() - 1};
-    for_each_expression_outside(*_root, &proj, [&](unique_ptr<Expression>& e) {
-      ok = ok && replace_distance_calls(_context, e, pair_a, pair_b, score_kind, score);
-    });
-    if (!ok) {
-      throw duckdb::InternalException("sirius vector-join rewrite: distance call left unmapped");
     }
     return true;
   }
@@ -1069,47 +1084,54 @@ class rewriter {
     get->ResolveOperatorTypes();
     auto* get_ptr = get.get();
 
-    // A projection above the join reproduces the delim join's columns the plan reads: probe
-    // columns pass through, subquery columns become corpus columns or the score.
-    auto const proj_index = _binder.GenerateTableIndex();
-    duckdb::vector<unique_ptr<Expression>> exprs;
-    std::vector<std::pair<ColumnBinding, std::size_t>> remap;
-    for (auto const& [b, pos] : probe_pos) {
-      remap.emplace_back(b, exprs.size());
-      exprs.push_back(duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-        returned_types[pos], ColumnBinding{table_index, pos}));
-    }
+    // The replaced operator's columns keep their positions: probe columns pass through, subquery
+    // columns become corpus columns or the score, and one of the pair's vectors -- which only
+    // distance calls above read -- carries the score those calls read from now on.
     ColumnBinding const score{table_index, score_pos};
-    for (std::size_t j = 0; j < sub_bindings.size(); ++j) {
-      if (!used.count(sub_bindings[j])) { continue; }
+    duckdb::vector<unique_ptr<Expression>> exprs;
+    std::optional<std::size_t> score_at;
+    for (auto const& b : _slot_bindings) {
       unique_ptr<Expression> e;
-      if (sub_cols[j].is_score) {
-        e = score_expression(_context, sub_cols[j].kind, call.kind, score);
-        if (!e) { return false; }
-      } else {
-        auto const c = static_cast<std::size_t>(
-          std::find(corpus_cols.begin(), corpus_cols.end(), sub_cols[j].corpus_col) -
-          corpus_cols.begin());
-        auto const pos = right_base + c;
-        e              = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(returned_types[pos],
-                                                                ColumnBinding{table_index, pos});
+      auto const in_probe = std::find_if(
+        probe_pos.begin(), probe_pos.end(), [&](auto const& bp) { return bp.first == b; });
+      auto const j = static_cast<std::size_t>(
+        std::find(sub_bindings.begin(), sub_bindings.end(), b) - sub_bindings.begin());
+      if (b == call.a || b == call.b) {
+        e = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(duckdb::LogicalType::FLOAT, score);
+        if (!score_at) { score_at = exprs.size(); }
+      } else if (in_probe != probe_pos.end()) {
+        e = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+          returned_types[in_probe->second], ColumnBinding{table_index, in_probe->second});
+      } else if (j < sub_bindings.size() && used.count(b)) {
+        if (sub_cols[j].is_score) {
+          e = score_expression(_context, sub_cols[j].kind, call.kind, score);
+          if (!e) { return false; }
+        } else {
+          auto const c = static_cast<std::size_t>(
+            std::find(corpus_cols.begin(), corpus_cols.end(), sub_cols[j].corpus_col) -
+            corpus_cols.begin());
+          auto const pos = right_base + c;
+          e              = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(returned_types[pos],
+                                                                  ColumnBinding{table_index, pos});
+        }
+      } else if (used.count(b)) {
+        throw duckdb::InternalException(
+          "sirius vector-join rewrite: a column read above is not an output of the join");
       }
-      remap.emplace_back(sub_bindings[j], exprs.size());
       exprs.push_back(std::move(e));
     }
-    auto proj = duckdb::make_uniq<duckdb::LogicalProjection>(proj_index, std::move(exprs));
-    proj->children.push_back(std::move(get));
-    proj->ResolveOperatorTypes();
-    auto* proj_ptr = proj.get();
-    slot           = std::move(proj);
-
-    duckdb::ColumnBindingReplacer replacer;
-    replacer.stop_operator = proj_ptr;
-    for (auto const& [old_binding, pos] : remap) {
-      replacer.replacement_bindings.emplace_back(old_binding, ColumnBinding{proj_index, pos});
+    auto const p = install(slot, std::move(get), std::move(exprs));
+    if (score_at) {
+      bool ok = true;
+      for_each_expression_outside(*_root, p.op, [&](unique_ptr<Expression>& e) {
+        ok = ok && replace_distance_calls(
+                     _context, e, call.a, call.b, call.kind, ColumnBinding{p.index, *score_at});
+      });
+      if (!ok) {
+        throw duckdb::InternalException("sirius vector-join rewrite: distance call left unmapped");
+      }
     }
-    replacer.VisitOperator(*_root);
-    (void)get_ptr;
+    remap_above(p);
     SIRIUS_LOG_INFO("[vector_join_rewrite] {} {} rewritten to sirius_knn_join_rel ({})",
                     cos ? "cosine" : "l2",
                     mode == vector_join_mode::per_row_top_k  ? "LATERAL top-" + std::to_string(k)
@@ -1254,6 +1276,64 @@ class rewriter {
       if (i != picked) { check(*conjuncts[i]); }
     }
     return ok;
+  }
+
+  /// The threshold forms' last step. Inside @p replacement (the residual filter, and the corpus
+  /// subtree when the join sits in place of its scan) the old columns and distance calls are read
+  /// from the join directly. Above it, each column the replaced operator emitted keeps its
+  /// position: an output of the join, a column still produced by the corpus subtree, or -- for one
+  /// of the pair's vectors, which only distance calls read -- the score, which those calls then
+  /// read.
+  void finish_threshold(unique_ptr<LogicalOperator>& slot,
+                        unique_ptr<LogicalOperator> replacement,
+                        LogicalOperator* get,
+                        const std::vector<std::pair<ColumnBinding, std::size_t>>& remap,
+                        const ColumnBinding& score,
+                        const distance_call& call,
+                        const duckdb::column_binding_set_t& used)
+  {
+    auto const& get_types = get->Cast<duckdb::LogicalGet>().returned_types;
+    bool ok               = true;
+    for_each_expression_outside(*replacement, get, [&](unique_ptr<Expression>& e) {
+      ok = ok && replace_distance_calls(_context, e, call.a, call.b, call.kind, score);
+    });
+    duckdb::ColumnBindingReplacer inner;
+    inner.stop_operator = get;
+    for (auto const& [old_binding, pos] : remap) {
+      inner.replacement_bindings.emplace_back(old_binding, ColumnBinding{score.table_index, pos});
+    }
+    inner.VisitOperator(*replacement);
+
+    duckdb::vector<unique_ptr<Expression>> exprs;
+    std::optional<std::size_t> score_at;
+    for (std::size_t i = 0; i < _slot_bindings.size(); ++i) {
+      auto const& b = _slot_bindings[i];
+      auto const it =
+        std::find_if(remap.begin(), remap.end(), [&](auto const& r) { return r.first == b; });
+      unique_ptr<Expression> e;
+      if (b == call.a || b == call.b) {
+        e = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(duckdb::LogicalType::FLOAT, score);
+        if (!score_at) { score_at = i; }
+      } else if (it != remap.end()) {
+        e = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+          get_types[it->second], ColumnBinding{score.table_index, it->second});
+      } else if (used.count(b)) {
+        e = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(_slot_types[i], b);
+      }
+      exprs.push_back(std::move(e));
+    }
+    auto const p = install(slot, std::move(replacement), std::move(exprs));
+    if (score_at) {
+      for_each_expression_outside(*_root, p.op, [&](unique_ptr<Expression>& e) {
+        ok = ok && replace_distance_calls(
+                     _context, e, call.a, call.b, call.kind, ColumnBinding{p.index, *score_at});
+      });
+    }
+    if (!ok) {
+      // validate_above ruled this out; a failure here means a shape it did not anticipate.
+      throw duckdb::InternalException("sirius vector-join rewrite: distance call left unmapped");
+    }
+    remap_above(p);
   }
 
   bool build(unique_ptr<LogicalOperator>& slot,
@@ -1405,24 +1485,7 @@ class rewriter {
       filter->children.push_back(std::move(replacement));
       replacement = std::move(filter);
     }
-    slot = std::move(replacement);
-
-    // Distance calls above the join (and in the residual) read the score instead.
-    bool ok = true;
-    for_each_expression_outside(*_root, get_ptr, [&](unique_ptr<Expression>& e) {
-      ok =
-        ok && replace_distance_calls(_context, e, pred.call.a, pred.call.b, pred.call.kind, score);
-    });
-    if (!ok) {
-      // validate_above ruled this out; a failure here means a shape it did not anticipate.
-      throw duckdb::InternalException("sirius vector-join rewrite: distance call left unmapped");
-    }
-    duckdb::ColumnBindingReplacer replacer;
-    replacer.stop_operator = get_ptr;
-    for (auto const& [old_binding, pos] : remap) {
-      replacer.replacement_bindings.emplace_back(old_binding, ColumnBinding{table_index, pos});
-    }
-    replacer.VisitOperator(*_root);
+    finish_threshold(slot, std::move(replacement), get_ptr, remap, score, pred.call, used);
     SIRIUS_LOG_INFO(
       "[vector_join_rewrite] {} threshold join rewritten to sirius_knn_join_rel "
       "(probe ~{} rows, corpus ~{} rows)",
@@ -1690,22 +1753,7 @@ class rewriter {
       filter->children.push_back(std::move(replacement));
       replacement = std::move(filter);
     }
-    slot = std::move(replacement);
-
-    bool ok = true;
-    for_each_expression_outside(*_root, get_ptr, [&](unique_ptr<Expression>& e) {
-      ok =
-        ok && replace_distance_calls(_context, e, pred.call.a, pred.call.b, pred.call.kind, score);
-    });
-    if (!ok) {
-      throw duckdb::InternalException("sirius vector-join rewrite: distance call left unmapped");
-    }
-    duckdb::ColumnBindingReplacer replacer;
-    replacer.stop_operator = get_ptr;
-    for (auto const& [old_binding, pos] : remap) {
-      replacer.replacement_bindings.emplace_back(old_binding, ColumnBinding{table_index, pos});
-    }
-    replacer.VisitOperator(*_root);
+    finish_threshold(slot, std::move(replacement), get_ptr, remap, score, pred.call, used);
     SIRIUS_LOG_INFO(
       "[vector_join_rewrite] {} threshold join rewritten vector-first over pinned '{}' "
       "(probe ~{} rows)",
@@ -1728,9 +1776,42 @@ class rewriter {
   duckdb::ClientContext& _context;
   duckdb::Binder& _binder;
   unique_ptr<LogicalOperator>& _root;
+  /// The columns and types of the operator try_one last handed to a pattern.
+  duckdb::vector<ColumnBinding> _slot_bindings;
+  duckdb::vector<duckdb::LogicalType> _slot_types;
 };
 
 }  // namespace
+
+namespace {
+
+bool expression_has_vector_distance(Expression& e)
+{
+  if (e.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION) {
+    auto const& name = e.Cast<duckdb::BoundFunctionExpression>().function.name;
+    if (name == "array_distance" || name == "array_cosine_similarity" ||
+        name == "array_cosine_distance") {
+      return true;
+    }
+  }
+  bool found = false;
+  duckdb::ExpressionIterator::EnumerateChildren(
+    e, [&](Expression& child) { found = found || expression_has_vector_distance(child); });
+  return found;
+}
+
+}  // namespace
+
+bool plan_has_vector_distance(LogicalOperator& plan)
+{
+  bool found = false;
+  duckdb::LogicalOperatorVisitor::EnumerateExpressions(
+    plan, [&](unique_ptr<Expression>* e) { found = found || expression_has_vector_distance(**e); });
+  for (auto& child : plan.children) {
+    found = found || (child && plan_has_vector_distance(*child));
+  }
+  return found;
+}
 
 std::size_t rewrite_plain_sql_vector_joins(duckdb::ClientContext& context,
                                            duckdb::Binder& binder,

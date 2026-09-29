@@ -3334,8 +3334,31 @@ static void SiriusPostOptimizeVectorJoin(OptimizerExtensionInput& input,
   auto sirius_ctx = input.context.registered_state->Get<SiriusContext>("sirius_state");
   auto conn_state = get_sirius_connection_state(input.context);
   if (sirius_ctx && sirius_ctx->is_initialized() && conn_state &&
-      !conn_state->is_internal_query_active() && !conn_state->is_cpu_fallback_active()) {
-    sirius::vss::rewrite_plain_sql_vector_joins(input.context, input.optimizer.binder, plan);
+      !conn_state->is_internal_query_active() && !conn_state->is_cpu_fallback_active() &&
+      sirius::vss::plan_has_vector_distance(*plan)) {
+    // A rewritten plan has no CPU form, so it stands only if Sirius will plan the rest of the
+    // query as well; otherwise DuckDB's own plan is put back and runs as it always did.
+    unique_ptr<LogicalOperator> original;
+    try {
+      original = sirius::transparent::copy_logical_plan(*plan, input.context);
+    } catch (std::exception&) {
+      original = nullptr;
+    }
+    if (original && sirius::vss::rewrite_plain_sql_vector_joins(
+                      input.context, input.optimizer.binder, plan) > 0) {
+      try {
+        sirius::planner::sirius_physical_plan_generator planner(input.context);
+        (void)planner.create_plan(sirius::transparent::copy_logical_plan(*plan, input.context));
+      } catch (InterruptException&) {
+        throw;
+      } catch (std::exception& e) {
+        SIRIUS_LOG_INFO(
+          "[vector_join_rewrite] kept DuckDB's plan: Sirius would not run the rest "
+          "of it ({})",
+          e.what());
+        plan = std::move(original);
+      }
+    }
   }
   stamp_vector_join_cardinality(input.context, *plan);
 }

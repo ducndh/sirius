@@ -215,3 +215,39 @@ TEST_CASE_METHOD(SqlRewriteFixture,
                                "WHERE array_distance(p.vec, c.vec) <= 0.6;");
   REQUIRE(got == expected);
 }
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a top-k rewritten under a correlated subquery keeps DuckDB's answer",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  SqlRewriteTables tables(*this);
+  // Vec-H q2's shape, scaled down: the top-k joins beside a correlated subquery that repeats the
+  // outer join, under a filter that prunes columns by position. The rewritten operator emits the
+  // columns the top-k did, in the same positions, so nothing above it is re-laid out.
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT r.id, k.name, c.cat, r.d FROM sr_cats k, sr_corpus c, (SELECT id, array_distance(vec, "
+    "(SELECT vec FROM sr_one)) AS d FROM sr_corpus ORDER BY d LIMIT 40) r WHERE k.cat = c.cat AND "
+    "c.id = r.id AND length(k.name) >= 2 AND c.id >= (SELECT min(c2.id) FROM sr_cats k2, sr_corpus "
+    "c2 WHERE k2.cat = c2.cat AND length(k2.name) >= 2 AND c2.cat = c.cat) ORDER BY r.d, r.id;");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a vector join in a plan Sirius declines elsewhere still runs on DuckDB",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  SqlRewriteTables tables(*this);
+  // The correlated scalar subquery plans as a SINGLE join, which the GPU does not run. The
+  // rewritten join has no CPU form, so the rewrite must be undone and DuckDB answer as usual.
+  auto const sql =
+    "SELECT r.id, k.name, r.d FROM sr_cats k, (SELECT id, cat, array_distance(vec, (SELECT vec "
+    "FROM "
+    "sr_one)) AS d FROM sr_corpus ORDER BY d LIMIT 40) r WHERE k.cat = r.cat AND r.id = (SELECT "
+    "min(c2.id) FROM sr_corpus c2 WHERE c2.cat = k.cat AND c2.id >= r.id) ORDER BY r.d, r.id;";
+  con->Query("SET gpu_execution = false;");
+  auto const expected = sorted_rows(*con, sql);
+  con->Query("SET gpu_execution = true;");
+  auto const got = sorted_rows(*con, sql);
+  REQUIRE(got.size() == expected.size());
+  REQUIRE(rows_match(got, expected));
+}

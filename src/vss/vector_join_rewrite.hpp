@@ -47,4 +47,7 @@ std::size_t rewrite_plain_sql_vector_joins(duckdb::ClientContext& context,
                                            duckdb::Binder& binder,
                                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
 
+/// Whether @p plan computes a vector distance anywhere: the only plans the rewrite can change.
+bool plan_has_vector_distance(duckdb::LogicalOperator& plan);
+
 }  // namespace sirius::vss
