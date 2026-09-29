@@ -17,14 +17,12 @@
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_states.hpp"
+#include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
-#include "duckdb/execution/column_binding_resolver.hpp"
-#include "duckdb/function/table/table_scan.hpp"
-#include "duckdb/main/attached_database.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -66,15 +64,13 @@
 #include "vss/vector_join_binding.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
-#include <unordered_map>
-#include <cstdlib>
-#include <memory>
-#include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -1190,11 +1186,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::make_view_side(const sirius::vss::vector_join_side& side,
                                                const std::string& extra_column)
 {
-  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  duckdb::unique_ptr<duckdb::SiriusContext::InternalQueryGuard> guard;
-  if (sirius_ctx) {
-    guard = duckdb::make_uniq<duckdb::SiriusContext::InternalQueryGuard>(*sirius_ctx);
-  }
+  duckdb::SiriusContext::InternalQueryGuard guard(context);
   auto bound  = sirius::vss::bind_view_select(context, side);
   auto binder = duckdb::Binder::CreateBinder(context);
   duckdb::Optimizer optimizer(*binder, context);

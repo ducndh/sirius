@@ -137,8 +137,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_select::get_next_task
 // Execution
 //===----------------------------------------------------------------------===//
 std::unique_ptr<operator_data> sirius_physical_vector_join_select::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream_ref)
 {
+  rmm::cuda_stream_view stream{stream_ref};
   nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_select::execute"};
 
   auto const* join_in = dynamic_cast<const vector_join_input*>(&input_data);
@@ -210,10 +211,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_select::execute(
 // Sink: route each partial to the merge partition for its left batch
 //===----------------------------------------------------------------------===//
 void sirius_physical_vector_join_select::sink(const operator_data& output_data,
-                                              rmm::cuda_stream_view /*stream*/)
+                                              ::cuda::stream_ref /*stream*/)
 {
   auto const& part         = dynamic_cast<const partitioned_operator_data&>(output_data);
-  auto const partition_idx = part.get_partition_idx();
+  auto const partition_idx = part.get_partition_idx().value_or(0);
   for (auto& batch : part.get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
       auto* consumer =

@@ -55,7 +55,7 @@ class vector_join_input : public operator_data {
   /// prepare_for_processing() saves a pointer to the GPU memory the task may use.
   /// execute() reads it via get_gpu_memory_space() and builds its output there.
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                              rmm::cuda_stream_view /*stream*/) override
+                              ::cuda::stream_ref /*stream*/) override
   {
     _gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   }
@@ -128,11 +128,11 @@ class sirius_physical_vector_join_select : public sirius_physical_operator {
   // -----------------------------
   /// Runs brute_force_knn on this task's pair and returns the partial top-k batch.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   /// Routes each partial to the merge stage's partition = its left batch index,
   /// so a left batch's per-right-batch partials group together (mirrors PARTITION).
-  void sink(const operator_data& output_data, rmm::cuda_stream_view stream) override;
+  void sink(const operator_data& output_data, ::cuda::stream_ref stream) override;
 
   /// Peak GPU memory estimate for the reservation when there's no run history.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(

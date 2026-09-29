@@ -21,12 +21,12 @@
 #include "vss/vector_join.hpp"
 #include "vss/vector_join_materialized_side.hpp"
 
-#include <cucascade/data/data_batch.hpp>
-#include <cucascade/memory/memory_reservation.hpp>
-
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/table/table.hpp>
+
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -82,7 +82,7 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
 
   /// Gathers the left/right output columns for one left batch's top-k and emits the final rows.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;

@@ -20,6 +20,7 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
+#include <optional>
 #include <utility>
 
 namespace sirius::vss {
@@ -51,8 +52,6 @@ cuvs_index_cache::cuvs_index_cache(
 {
 }
 
-// Out-of-line so pinned_index_entry's reservation (a forward-declared type in
-// the header) is destroyed here, where cucascade::memory::reservation is complete.
 cuvs_index_cache::~cuvs_index_cache() = default;
 
 std::unique_ptr<cucascade::memory::reservation> cuvs_index_cache::reserve_index_memory(
@@ -70,50 +69,88 @@ std::unique_ptr<cucascade::memory::reservation> cuvs_index_cache::reserve_index_
 void cuvs_index_cache::insert(std::string name,
                               index_metadata meta,
                               std::unique_ptr<any_cuvs_index> index,
-                              std::unique_ptr<cucascade::memory::reservation> reservation)
+                              rmm::cuda_stream build_stream)
 {
-  pinned_index_entry entry;
-  entry.meta        = std::move(meta);
-  entry.index       = std::move(index);
-  entry.reservation = std::move(reservation);
+  auto entry          = std::make_shared<pinned_index_entry>();
+  entry->meta         = std::move(meta);
+  entry->build_stream = std::move(build_stream);
+  entry->index        = std::move(index);
 
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   _entries[std::move(name)] = std::move(entry);
 }
 
-const pinned_index_entry* cuvs_index_cache::find(std::string_view name) const
+std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find(std::string_view name) const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   auto it = _entries.find(std::string(name));
-  return it == _entries.end() ? nullptr : &it->second;
+  return it == _entries.end() ? nullptr : it->second;
 }
 
-const pinned_index_entry* cuvs_index_cache::find_by_column(
-  std::string_view table, std::string_view column, cuvs::distance::DistanceType metric) const
+std::shared_ptr<const pinned_index_entry> cuvs_index_cache::find_by_column(
+  std::string_view catalog,
+  std::string_view schema,
+  std::string_view table,
+  std::string_view column,
+  cuvs::distance::DistanceType metric) const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   auto const wanted = canonical_metric(metric);
   for (auto const& kv : _entries) {
     auto const& entry = kv.second;
-    if (entry.meta.table_name == table && entry.meta.column_name == column &&
-        canonical_metric(entry.meta.metric) == wanted) {
-      return &entry;
+    if (entry->meta.catalog_name == catalog && entry->meta.schema_name == schema &&
+        entry->meta.table_name == table && entry->meta.column_name == column &&
+        canonical_metric(entry->meta.metric) == wanted) {
+      return entry;
     }
   }
   return nullptr;
 }
 
-std::size_t cuvs_index_cache::erase_by_column(std::string_view table,
-                                              std::string_view column,
-                                              cuvs::distance::DistanceType metric)
+std::vector<index_metadata> cuvs_index_cache::indexes_on_column(std::string_view catalog,
+                                                                std::string_view schema,
+                                                                std::string_view table,
+                                                                std::string_view column) const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
-  auto const wanted   = canonical_metric(metric);
+  std::scoped_lock lock(_mutex);
+  std::vector<index_metadata> out;
+  for (auto const& kv : _entries) {
+    auto const& meta = kv.second->meta;
+    if (meta.catalog_name == catalog && meta.schema_name == schema && meta.table_name == table &&
+        meta.column_name == column) {
+      out.push_back(meta);
+    }
+  }
+  return out;
+}
+
+bool cuvs_index_cache::contains(std::string_view name) const
+{
+  std::scoped_lock lock(_mutex);
+  return _entries.contains(std::string(name));
+}
+
+bool cuvs_index_cache::erase(std::string_view name)
+{
+  std::scoped_lock lock(_mutex);
+  return _entries.erase(std::string(name)) > 0;
+}
+
+std::size_t cuvs_index_cache::erase_by_column(std::string_view catalog,
+                                              std::string_view schema,
+                                              std::string_view table,
+                                              std::string_view column,
+                                              std::optional<cuvs::distance::DistanceType> metric)
+{
+  std::scoped_lock lock(_mutex);
+  // With a metric, match that one canonically; with none, match every metric.
+  std::optional<cuvs::distance::DistanceType> const wanted =
+    metric ? std::optional{canonical_metric(*metric)} : std::nullopt;
   std::size_t removed = 0;
   for (auto it = _entries.begin(); it != _entries.end();) {
-    auto const& meta = it->second.meta;
-    if (meta.table_name == table && meta.column_name == column &&
-        canonical_metric(meta.metric) == wanted) {
+    auto const& meta = it->second->meta;
+    if (meta.catalog_name == catalog && meta.schema_name == schema && meta.table_name == table &&
+        meta.column_name == column && (!wanted || canonical_metric(meta.metric) == *wanted)) {
       it = _entries.erase(it);
       ++removed;
     } else {
@@ -123,27 +160,15 @@ std::size_t cuvs_index_cache::erase_by_column(std::string_view table,
   return removed;
 }
 
-bool cuvs_index_cache::contains(std::string_view name) const
-{
-  std::lock_guard<std::mutex> lock(_mutex);
-  return _entries.contains(std::string(name));
-}
-
-bool cuvs_index_cache::erase(std::string_view name)
-{
-  std::lock_guard<std::mutex> lock(_mutex);
-  return _entries.erase(std::string(name)) > 0;
-}
-
 void cuvs_index_cache::clear()
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   _entries.clear();
 }
 
 std::size_t cuvs_index_cache::size() const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
+  std::scoped_lock lock(_mutex);
   return _entries.size();
 }
 

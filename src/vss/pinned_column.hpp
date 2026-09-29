@@ -16,7 +16,6 @@
 
 #pragma once
 
-// staged_pinned_chunk holds a column_view by value, which a forward declaration cannot satisfy.
 #include <cudf/column/column_view.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -35,27 +34,34 @@ class column_view;
 }  // namespace cudf
 namespace cucascade::memory {
 class memory_space;
-class reservation;
 }  // namespace cucascade::memory
-namespace sirius::scan_manager {
-struct pinned_entry;
-}  // namespace sirius::scan_manager
 namespace cucascade {
 class data_batch;
+namespace memory {
+class reservation;
+}  // namespace memory
 }  // namespace cucascade
 namespace sirius::telemetry {
 struct batch_telemetry_info;
 }  // namespace sirius::telemetry
 
+namespace sirius::scan_manager {
+struct pinned_entry;
+}  // namespace sirius::scan_manager
+
 namespace sirius::vss {
 
-/**
- * @brief Device-resident views over a pinned column, whatever tier the pin lives on.
- *
- * For a GPU-tier pin the views alias the pinned chunks and @c owners is empty. For a
- * HOST-tier pin each chunk is copied device-side and @c owners / @c reservations keep those
- * copies alive; dropping this struct releases them.
- */
+/// Return the pinned column's GPU chunks as column_views in pin order, without
+/// concatenating them. Every chunk must live on @p space's device. The views
+/// borrow the pinned chunks, so @p pin must outlive their use.
+///
+/// @throws internal_exception if @p column_name is absent, or any chunk resides
+///         on a different GPU than @p space.
+[[nodiscard]] std::vector<cudf::column_view> pinned_column_chunk_views(
+  const scan_manager::pinned_entry& pin,
+  const std::string& column_name,
+  cucascade::memory::memory_space& space);
+
 struct staged_pinned_column {
   std::vector<cudf::column_view> views;
   std::vector<std::shared_ptr<::cucascade::data_batch>> owners;
@@ -71,6 +77,7 @@ struct staged_pinned_chunk {
   std::shared_ptr<::cucascade::memory::reservation> reservation;
 };
 
+/// Chunks the pinned column is stored in, on either tier.
 /// Chunks the pinned column is stored in, on either tier.
 [[nodiscard]] std::size_t pinned_column_chunk_count(const scan_manager::pinned_entry& pin,
                                                     const std::string& column_name);
@@ -100,17 +107,6 @@ staged_pinned_column stage_pinned_column(const scan_manager::pinned_entry& pin,
                                          ::cucascade::memory::memory_space& gpu_space,
                                          rmm::cuda_stream_view stream,
                                          const telemetry::batch_telemetry_info& telemetry_info);
-
-/// Return the pinned column's GPU chunks as column_views in pin order, without
-/// concatenating them. Every chunk must live on @p space's device. The views
-/// borrow the pinned chunks, so @p pin must outlive their use.
-///
-/// @throws internal_exception if @p column_name is absent, or any chunk resides
-///         on a different GPU than @p space.
-[[nodiscard]] std::vector<cudf::column_view> pinned_column_chunk_views(
-  const scan_manager::pinned_entry& pin,
-  const std::string& column_name,
-  cucascade::memory::memory_space& space);
 
 /// The GPU memory space a pinned entry's chunks reside on (its first non-null
 /// per-chunk space). The pinned_entry's top-level `memory_space` is not reliably

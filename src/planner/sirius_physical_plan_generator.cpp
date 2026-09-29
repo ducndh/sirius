@@ -15,7 +15,6 @@
  */
 
 #include "planner/sirius_physical_plan_generator.hpp"
-#include "vss/sirius_physical_vector_join_stream.hpp"
 
 #include "config.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -71,6 +70,7 @@
 #include "planner/sirius_plan_projection_utils.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
+#include "vss/sirius_physical_vector_join_stream.hpp"
 
 #include <cudf/cudf_utils.hpp>
 
@@ -763,16 +763,18 @@ void wrap_dense_count_join(sirius::op::sirius_physical_operator& dense_count_op,
 //! the probe first and the corpus second, so the children follow wrap_join's probe / build
 //! order; a side still read from its pin contributes no child.
 void wrap_vector_join(sirius::op::sirius_physical_operator& join_op,
-                      const sirius::operator_params& op_params)
+                      const sirius::operator_params& op_params,
+                      duckdb::SiriusContext* compressed_materialization_observer)
 {
-  auto const& req =
-    join_op.Cast<sirius::op::sirius_physical_vector_join_stream>().request();
+  auto const& req       = join_op.Cast<sirius::op::sirius_physical_vector_join_stream>().request();
   std::size_t child_idx = 0;
   if (req.probe_from_scan) {
-    wrap_join_child(join_op, child_idx++, /*is_build=*/false, op_params);
+    wrap_join_child(
+      join_op, child_idx++, /*is_build=*/false, op_params, compressed_materialization_observer);
   }
   if (req.build_from_scan) {
-    wrap_join_child(join_op, child_idx++, /*is_build=*/true, op_params);
+    wrap_join_child(
+      join_op, child_idx++, /*is_build=*/true, op_params, compressed_materialization_observer);
   }
 }
 
@@ -977,7 +979,7 @@ void insert_gpu_pipeline_operators_recursive(
       break;
     case sirius::op::SiriusPhysicalOperatorType::UNION: wrap_union(*slot); break;
     case sirius::op::SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM:
-      wrap_vector_join(*slot, op_params);
+      wrap_vector_join(*slot, op_params, compressed_materialization_observer);
       break;
     case sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN:
     case sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN:

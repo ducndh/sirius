@@ -71,12 +71,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::get_nex
 }
 
 std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream_ref)
 {
+  rmm::cuda_stream_view stream{stream_ref};
   nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_reduce_local::execute"};
 
   auto const& input         = dynamic_cast<const partitioned_operator_data&>(input_data);
-  auto const partition_idx  = input.get_partition_idx();
+  auto const partition_idx  = input.get_partition_idx().value_or(0);
   auto const& input_batches = input.get_read_only_batches();
 
   cucascade::memory::memory_space* space = nullptr;
@@ -144,10 +145,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
 }
 
 void sirius_physical_vector_join_reduce_local::sink(const operator_data& output_data,
-                                                    rmm::cuda_stream_view /*stream*/)
+                                                    ::cuda::stream_ref /*stream*/)
 {
   auto const& part         = dynamic_cast<const partitioned_operator_data&>(output_data);
-  auto const partition_idx = part.get_partition_idx();
+  auto const partition_idx = part.get_partition_idx().value_or(0);
   for (auto& batch : part.get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
       auto* consumer =

@@ -159,7 +159,7 @@ class vector_join_stream_input : public operator_data {
   [[nodiscard]] operator_data_type get_type() const override { return operator_data_type::BASE; }
 
   void prepare_for_processing(const ::cucascade::memory::memory_space* requested_memory_space,
-                              rmm::cuda_stream_view /*stream*/) override
+                              ::cuda::stream_ref /*stream*/) override
   {
     _gpu_memory_space = const_cast<::cucascade::memory::memory_space*>(requested_memory_space);
   }
@@ -242,6 +242,10 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   // -----------------------------
   bool is_source() const override { return true; }
 
+  //! The build-side CONCAT feeds the corpus into the "build" port; everything else is the probe.
+  [[nodiscard]] std::string_view input_port_for(
+    sirius_physical_operator const& producer) const override;
+
   std::optional<task_creation_hint> get_next_task_hint() override;
   [[nodiscard]] bool all_ports_empty() override;
   std::unique_ptr<operator_data> get_next_task_input_data() override;
@@ -252,10 +256,10 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// Streams every right batch through this left batch's running top-k fold and
   /// returns the finished `[n_left * k]` result.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   /// Routes the finished result to the materialize stage under its left batch index.
-  void sink(const operator_data& output_data, rmm::cuda_stream_view stream) override;
+  void sink(const operator_data& output_data, ::cuda::stream_ref stream) override;
 
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;

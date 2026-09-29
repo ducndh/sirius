@@ -57,11 +57,11 @@ class sirius_physical_vector_join_reduce_local
 
   /// knn_merge_parts the drained partials into the left batch's per-row top-k.
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                         rmm::cuda_stream_view stream) override;
+                                         ::cuda::stream_ref stream) override;
 
   /// Routes the merged result to the materialize stage's partition = its left
   /// batch index, so materialize can gather that batch's left columns.
-  void sink(const operator_data& output_data, rmm::cuda_stream_view stream) override;
+  void sink(const operator_data& output_data, ::cuda::stream_ref stream) override;
 
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(
     const input_stats& stats) const override;

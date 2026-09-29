@@ -19,23 +19,20 @@
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
+#include "sirius/exception.hpp"
+
+#include <cudf/column/column.hpp>
+#include <cudf/column/column_view.hpp>
+#include <cudf/table/table_view.hpp>
 
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
-
-#include <cudf/table/table_view.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <algorithm>
 #include <array>
-#include "sirius/exception.hpp"
-
-#include <cudf/column/column.hpp>
-#include <cudf/column/column_view.hpp>
-
-#include <cucascade/memory/memory_space.hpp>
-
 #include <cstddef>
 #include <vector>
 
@@ -64,14 +61,6 @@ std::vector<cudf::column_view> pinned_column_chunk_views(const scan_manager::pin
   return views;
 }
 
-cucascade::memory::memory_space& pinned_entry_gpu_space(const scan_manager::pinned_entry& pin)
-{
-  for (auto* space : pin.chunk_memory_spaces) {
-    if (space != nullptr) { return *space; }
-  }
-  throw internal_exception("VSS: pinned table has no GPU-resident chunk (host-tier pin?)");
-}
-
 std::size_t pinned_column_chunk_count(const scan_manager::pinned_entry& pin,
                                       const std::string& column_name)
 {
@@ -83,13 +72,12 @@ std::size_t pinned_column_chunk_count(const scan_manager::pinned_entry& pin,
   return it->second.size();
 }
 
-staged_pinned_chunk stage_pinned_column_chunk(
-  const scan_manager::pinned_entry& pin,
-  const std::string& column_name,
-  std::size_t chunk_index,
-  cucascade::memory::memory_space& gpu_space,
-  rmm::cuda_stream_view stream,
-  const telemetry::batch_telemetry_info& telemetry_info)
+staged_pinned_chunk stage_pinned_column_chunk(const scan_manager::pinned_entry& pin,
+                                              const std::string& column_name,
+                                              std::size_t chunk_index,
+                                              cucascade::memory::memory_space& gpu_space,
+                                              rmm::cuda_stream_view stream,
+                                              const telemetry::batch_telemetry_info& telemetry_info)
 {
   if (pin.tier != cucascade::memory::Tier::HOST) {
     auto const views = pinned_column_chunk_views(pin, column_name, gpu_space);
@@ -111,8 +99,13 @@ staged_pinned_chunk stage_pinned_column_chunk(
   }
   auto const& chunk = pin.host_chunks[chunk_index];
   if (!chunk) { throw internal_exception("VSS: host-tier pinned chunk is null"); }
+  auto const* host = dynamic_cast<cucascade::host_data_representation const*>(chunk.get());
+  if (host == nullptr) {
+    throw internal_exception("VSS: column '" + column_name +
+                             "' is pinned with host compression, which staging cannot slice");
+  }
 
-  auto data_rep    = chunk->slice(cols);
+  auto data_rep    = host->slice(cols);
   auto const bytes = data_rep->get_size_in_bytes();
   std::shared_ptr<cucascade::memory::reservation> reservation{
     gpu_space.make_reservation_or_null(bytes)};
@@ -159,6 +152,14 @@ staged_pinned_column stage_pinned_column(const scan_manager::pinned_entry& pin,
     out.reservations.push_back(std::move(staged.reservation));
   }
   return out;
+}
+
+cucascade::memory::memory_space& pinned_entry_gpu_space(const scan_manager::pinned_entry& pin)
+{
+  for (auto* space : pin.chunk_memory_spaces) {
+    if (space != nullptr) { return *space; }
+  }
+  throw internal_exception("VSS: pinned table has no GPU-resident chunk (host-tier pin?)");
 }
 
 }  // namespace sirius::vss

@@ -1480,7 +1480,13 @@ RebindQueryInfo SiriusContext::splice_gpu_child_under_sink(ClientContext& contex
   auto& root      = prepared.physical_plan->Root();
   auto const card = root.children[0].get().estimated_cardinality;
   auto& sirius_op = prepared.physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(
-    std::move(child), std::string{}, child_types, std::move(child_names), nullptr, plan_reads_s3, card);
+    std::move(child),
+    std::string{},
+    child_types,
+    std::move(child_names),
+    nullptr,
+    plan_reads_s3,
+    card);
   root.children[0] = sirius_op;
   record_transparent_rebind_success();
   SIRIUS_LOG_INFO("Transparent execution: GPU operator spliced under a CPU sink");
@@ -1537,7 +1543,6 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
                               prepared.statement_type == StatementType::COPY_STATEMENT ||
                               prepared.statement_type == StatementType::INSERT_STATEMENT;
   if (prepared.statement_type != StatementType::SELECT_STATEMENT && !sink_statement) {
-    captured_logical_plan_.reset();
     return RebindQueryInfo::DO_NOT_REBIND;
   }
   // Try to capture the SQL string while the active query context is alive —

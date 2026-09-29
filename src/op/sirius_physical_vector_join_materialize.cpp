@@ -21,6 +21,7 @@
 #include "log/logging.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "vss/pinned_column.hpp"
+#include "vss/vector_search_internal.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column.hpp>
@@ -341,12 +342,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::get_next
 }
 
 std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream_ref)
 {
+  rmm::cuda_stream_view stream{stream_ref};
   nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_materialize::execute"};
 
   auto const& input         = dynamic_cast<const partitioned_operator_data&>(input_data);
-  auto const partition_idx  = input.get_partition_idx();  // = left batch index
+  auto const partition_idx  = input.get_partition_idx().value_or(0);  // = left batch index
   auto const& input_batches = input.get_read_only_batches();
 
   cucascade::memory::memory_space* space = nullptr;
@@ -450,6 +452,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
     }
   }
   out_cols.push_back(std::move(score));
+  // Output columns gathered from a pin keep the pin's storage type, which compressed
+  // materialization may have narrowed; the operator declares the native types, so the carriers
+  // are widened back before anything downstream reduces over them.
+  sirius::vss::restore_native_carriers(
+    out_cols, std::vector<sirius::logical_type>(types.begin(), types.end()), stream, mr);
   auto out_table = std::make_unique<cudf::table>(std::move(out_cols));
 
   auto batch = sirius::make_data_batch(std::move(out_table), *space, stream, batch_telemetry());

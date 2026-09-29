@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -48,6 +49,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <raft/core/device_resources.hpp>
 
@@ -81,6 +83,20 @@
 namespace sirius::op {
 
 namespace {
+
+/// A host-tier pin chunk as the uncompressed host table the corpus stream slices and sizes. A
+/// compressed pin chunk has no per-column size to stage by, so it is refused with what to change.
+cucascade::host_data_representation const& uncompressed_host_chunk(
+  cucascade::idata_representation const& chunk)
+{
+  auto const* host = dynamic_cast<cucascade::host_data_representation const*>(&chunk);
+  if (host == nullptr) {
+    throw std::runtime_error(
+      "[sirius_physical_vector_join_stream] the corpus is pinned with host compression, which "
+      "the vector join cannot stream; pin it with compression => false");
+  }
+  return *host;
+}
 
 /// GPU-tier pin: every chunk is already device-resident, so staging hands back a view.
 class gpu_pinned_chunk_source : public vector_chunk_source {
@@ -141,7 +157,7 @@ class host_pinned_chunk_source : public vector_chunk_source {
   [[nodiscard]] std::size_t chunk_bytes(std::size_t i) const override
   {
     auto const& chunk = _pin.host_chunks.at(i);
-    return chunk ? chunk->column_size(_column_index) : 0;
+    return chunk ? uncompressed_host_chunk(*chunk).column_size(_column_index) : 0;
   }
   [[nodiscard]] std::size_t chunk_rows(std::size_t i) const override
   {
@@ -161,7 +177,7 @@ class host_pinned_chunk_source : public vector_chunk_source {
     // Slice to the vector column alone: the rest of the pinned table is dead weight on
     // the wire and this copy is the operator's bandwidth budget.
     std::array<std::size_t, 1> const cols{_column_index};
-    auto data_rep    = chunk->slice(cols);
+    auto data_rep    = uncompressed_host_chunk(*chunk).slice(cols);
     auto const bytes = data_rep->get_size_in_bytes();
 
     // Draw the staged copy from the task's budget. A null reservation means the chunk does
@@ -888,7 +904,10 @@ void sirius_physical_vector_join_stream::ensure_initialized_locked()
     if (it != names.end()) {
       auto const col = static_cast<std::size_t>(std::distance(names.begin(), it));
       for (auto const& chunk : right_pin->host_chunks) {
-        if (chunk) { _max_chunk_bytes = std::max(_max_chunk_bytes, chunk->column_size(col)); }
+        if (chunk) {
+          _max_chunk_bytes =
+            std::max(_max_chunk_bytes, uncompressed_host_chunk(*chunk).column_size(col));
+        }
       }
     }
   } else {
@@ -1060,10 +1079,21 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
         *pin, _request.build_cluster_column, j, space, stream, batch_telemetry());
       labels_view = staged_pin.view;
     }
+    // A pin may store the ids narrowed (compressed materialization keeps the narrowest integer
+    // type that holds them), so any integer width is widened back rather than refused.
+    std::unique_ptr<cudf::column> widened_labels;
     if (labels_view.type().id() != cudf::type_id::INT32) {
-      throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column '" +
-                               _request.build_cluster_column +
-                               "' must be INTEGER; sirius_kmeans_assign emits cluster_id that way");
+      if (!cudf::is_integral(labels_view.type())) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column '" +
+                                 _request.build_cluster_column +
+                                 "' must be an integer; sirius_kmeans_assign emits cluster_id "
+                                 "as INTEGER");
+      }
+      widened_labels = cudf::cast(labels_view,
+                                  cudf::data_type{cudf::type_id::INT32},
+                                  stream,
+                                  cudf::get_current_device_resource_ref());
+      labels_view    = widened_labels->view();
     }
     auto const rows = static_cast<std::size_t>(labels_view.size());
     if (rows == 0) { continue; }
@@ -1168,8 +1198,9 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
 }
 
 std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
-  const operator_data& input_data, rmm::cuda_stream_view stream)
+  const operator_data& input_data, ::cuda::stream_ref stream_ref)
 {
+  rmm::cuda_stream_view stream{stream_ref};
   nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_stream::execute"};
 
   auto const* join_in = dynamic_cast<const vector_join_stream_input*>(&input_data);
@@ -2111,10 +2142,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
 // Sink
 //===----------------------------------------------------------------------===//
 void sirius_physical_vector_join_stream::sink(const operator_data& output_data,
-                                              rmm::cuda_stream_view /*stream*/)
+                                              ::cuda::stream_ref /*stream*/)
 {
   auto const& part         = dynamic_cast<const partitioned_operator_data&>(output_data);
-  auto const partition_idx = part.get_partition_idx();
+  auto const partition_idx = part.get_partition_idx().value_or(0);
   for (auto& batch : part.get_data_batches()) {
     for (auto& next_port_info : next_port_after_sink) {
       auto* consumer =
@@ -2184,6 +2215,15 @@ std::size_t sirius_physical_vector_join_stream::no_history_peak_memory_estimate(
 {
   // As in the split design, cuVS's on-demand search scratch is not modelled here.
   return std::max<std::size_t>(stats.bytes, std::size_t{1} << 20);
+}
+
+std::string_view sirius_physical_vector_join_stream::input_port_for(
+  sirius_physical_operator const& producer) const
+{
+  if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
+    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+  }
+  return sirius_physical_operator::input_port_for(producer);
 }
 
 std::string sirius_physical_vector_join_stream::params_to_string() const

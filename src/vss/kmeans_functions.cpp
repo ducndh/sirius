@@ -106,9 +106,9 @@ kmeans_context resolve_context(duckdb::SiriusContext& ctx,
 /// that is not a clustering.
 const pinned_index_entry* find_clustering_entry(duckdb::SiriusContext& ctx, const std::string& name)
 {
-  const auto* entry = ctx.get_cuvs_index_cache().find(name);
+  auto const entry = ctx.get_cuvs_index_cache().find(name);
   if (entry == nullptr || entry->meta.kind != index_kind::kmeans_centroids) { return nullptr; }
-  return entry;
+  return entry.get();
 }
 
 /// The lists live beside their clustering under a derived name, so re-fitting the clustering
@@ -163,7 +163,11 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
                                         std::to_string(n_clusters) + " centroids: need ~" +
                                         std::to_string(footprint >> 20) + " MiB");
   }
-  auto const mr = reservation->get_memory_resource();
+  // The reservation is the admission check for the training footprint; the centroids themselves
+  // are ordinary GPU memory the cache entry owns, so they are drawn from the space, not from it.
+  auto const reserved_bytes = reservation->size();
+  reservation.reset();
+  auto const mr = c.space->get_default_allocator();
 
   telemetry::batch_telemetry_info const telemetry_info{};
   auto const n_chunks = pinned_column_chunk_count(*c.pin, req.column);
@@ -206,8 +210,6 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
     spec.metric          = metric;
     centroids            = train_centroids(views, req.dim, spec, stream, mr);
   }
-  reservation->shrink_to_fit();
-
   index_metadata meta;
   meta.kind           = index_kind::kmeans_centroids;
   meta.table_name     = req.table;
@@ -216,9 +218,10 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
   meta.num_rows       = n_rows;
   meta.n_lists        = n_clusters;
   meta.metric         = metric;
-  meta.reserved_bytes = reservation->size();
+  meta.resident_bytes = static_cast<std::size_t>(centroids->size()) * sizeof(float);
+  (void)reserved_bytes;
   index_cache.insert(
-    req.name, std::move(meta), make_cuvs_index(std::move(centroids)), std::move(reservation));
+    req.name, std::move(meta), make_cuvs_index(std::move(centroids)), rmm::cuda_stream{});
 
   return kmeans_fit_result{n_clusters, req.dim, sampled, n_rows};
 }
@@ -300,7 +303,7 @@ std::unique_ptr<cucascade::host_data_representation> run_kmeans_assign(
 
 const cluster_lists* find_cluster_lists(duckdb::SiriusContext& ctx, const std::string& clustering)
 {
-  const auto* entry = ctx.get_cuvs_index_cache().find(lists_key(clustering));
+  auto const entry = ctx.get_cuvs_index_cache().find(lists_key(clustering));
   if (entry == nullptr || entry->meta.kind != index_kind::cluster_lists) { return nullptr; }
   return entry->index_as<cluster_lists>();
 }
@@ -802,11 +805,11 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   meta.num_rows       = n_rows;
   meta.n_lists        = n_clusters;
   meta.metric         = entry->meta.metric;
-  meta.reserved_bytes = reserved_bytes;
+  meta.resident_bytes = reserved_bytes;
   index_cache.insert(lists_key(req.clustering),
                      std::move(meta),
                      make_cuvs_index(std::move(lists)),
-                     std::move(reservation));
+                     rmm::cuda_stream{});
   return result;
 }
 

@@ -92,6 +92,11 @@ extern "C" int cudaProfilerStop();
 #endif
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/connection_manager.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
 #include "late_mat/pin_uniqueness.hpp"
@@ -110,18 +115,14 @@ extern "C" int cudaProfilerStop();
 #include "sirius_sql_rewrite.hpp"
 #include "telemetry/nvtx_injection.hpp"
 #include "util/segfault_backtrace.hpp"
+#include "vss/cluster_lists.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/ivf_flat_index.hpp"
-#include "vss/pinned_column.hpp"
-#include "vss/vector_search.hpp"
-#include "vss/cluster_lists.hpp"
 #include "vss/kmeans_functions.hpp"
+#include "vss/pinned_column.hpp"
 #include "vss/vector_join_binding.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
-#include "duckdb/planner/expression/bound_comparison_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
+#include "vss/vector_search.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -3594,7 +3595,6 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join_rel.in_out_function         = SiriusVectorJoinInOutFunction;
   CreateTableFunctionInfo vector_join_rel_info(vector_join_rel);
   catalog.CreateTableFunction(transaction, vector_join_rel_info);
-
 
   // Drop and rebuild the prefetching caches — a benchmark that wants each
   // iteration to pay its own IO has no other way to get a cold cache.
