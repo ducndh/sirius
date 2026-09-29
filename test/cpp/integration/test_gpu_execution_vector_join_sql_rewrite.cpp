@@ -110,8 +110,8 @@ class SqlRewriteTables {
     };
     f.run_ok("CREATE TABLE sr_corpus AS SELECT i::INTEGER AS id, (i % 20)::INTEGER AS cat, " +
              vec("0") + " AS vec FROM range(20000) t(i);");
-    f.run_ok("CREATE TABLE sr_probe AS SELECT i::INTEGER AS id, " + vec("77777777") +
-             " AS vec FROM range(30) t(i);");
+    f.run_ok("CREATE TABLE sr_probe AS SELECT i::INTEGER AS id, (i % 20)::INTEGER AS cat, " +
+             vec("77777777") + " AS vec FROM range(30) t(i);");
     f.run_ok("CREATE TABLE sr_one AS SELECT 0::INTEGER AS id, " + vec("55555555") +
              " AS vec FROM range(1) t(i);");
     f.run_ok(
@@ -165,6 +165,39 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     *con,
     "SELECT p.id, c.id, k.name FROM sr_probe p, sr_corpus c, sr_cats k WHERE c.cat = k.cat AND "
     "k.cat < 5 AND array_cosine_similarity(p.vec, c.vec) >= 0.7;");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "plain-SQL threshold join under a <> join condition runs as the vector join",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  SqlRewriteTables tables(*this);
+  // DuckDB makes `p.cat <> c.cat` the join and the similarity a filter above it; the join keeps
+  // nearly every pair, so it becomes a filter over the vector join. `c.cat < 10` is pushed into
+  // the corpus scan, and from there into the operator.
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT p.id, c.id FROM sr_probe p JOIN sr_corpus c ON array_cosine_similarity(p.vec, c.vec) "
+    ">= 0.7 WHERE p.cat <> c.cat AND c.cat < 10;");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "LATERAL top-k with a join DuckDB moved into it runs as the per-row vector join",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  SqlRewriteTables tables(*this);
+  // DuckDB's join order puts the join with sr_cats inside the LATERAL's subquery side.
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT k.name, count(*), round(avg(n.d), 4) FROM sr_probe p, LATERAL (SELECT c.cat, "
+    "array_distance(p.vec, c.vec) AS d FROM sr_corpus c ORDER BY d LIMIT 5) n JOIN sr_cats k ON "
+    "n.cat = k.cat WHERE k.cat <> 3 GROUP BY k.name;");
+  // A join on a probe column pushed in makes the LATERAL correlated on that column too.
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT p.id, k.name, n.id FROM sr_probe p, LATERAL (SELECT c.id, c.cat, "
+    "array_cosine_similarity(p.vec, c.vec) AS s FROM sr_corpus c ORDER BY s DESC LIMIT 4) n JOIN "
+    "sr_cats k ON k.cat = p.cat WHERE n.cat <> p.cat;");
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,

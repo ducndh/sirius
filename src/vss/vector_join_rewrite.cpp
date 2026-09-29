@@ -37,6 +37,8 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
@@ -56,6 +58,7 @@
 #include "vss/vector_join_binding.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -298,14 +301,29 @@ struct lifted_relation {
   std::size_t probe_child{0};
 };
 
-/// Find a CROSS_PRODUCT under @p slot (through operators without projection maps) with the
-/// binding @p probe_vec on exactly one side and @p corpus_vec on the other.
+/// An inner join on `<>` conditions alone. It keeps nearly every pair, so under a threshold it is
+/// the cross product with its conditions as filters -- unlike an equality or range join, which
+/// can be far more selective than the vector join that would replace it.
+bool is_inequality_join(const LogicalOperator& op)
+{
+  if (op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) { return false; }
+  auto const& join = op.Cast<duckdb::LogicalComparisonJoin>();
+  if (join.join_type != duckdb::JoinType::INNER || join.conditions.empty()) { return false; }
+  return std::all_of(join.conditions.begin(), join.conditions.end(), [](auto const& c) {
+    return c.comparison == ExpressionType::COMPARE_NOTEQUAL ||
+           c.comparison == ExpressionType::COMPARE_DISTINCT_FROM;
+  });
+}
+
+/// Find a CROSS_PRODUCT (or an inequality join) under @p slot, through operators without
+/// projection maps, with the binding @p probe_vec on exactly one side and @p corpus_vec on the
+/// other.
 std::optional<lifted_relation> find_crossed_relation(unique_ptr<LogicalOperator>& slot,
                                                      const ColumnBinding& probe_vec,
                                                      const ColumnBinding& corpus_vec)
 {
   auto& op = *slot;
-  if (op.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+  if (op.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT || is_inequality_join(op)) {
     for (std::size_t side = 0; side < 2; ++side) {
       if (has_binding(*op.children[side], probe_vec) &&
           has_binding(*op.children[1 - side], corpus_vec)) {
@@ -376,6 +394,15 @@ class rewriter {
   }
 
  private:
+  /// What a column of the replaced operator becomes: the score, a corpus column, or -- for a
+  /// LATERAL correlated on more than its vector -- a probe column.
+  struct join_col {
+    bool is_score;
+    ColumnBinding corpus_col;
+    distance_kind kind;
+    ColumnBinding probe_col{};
+  };
+
   /// A projection a rewrite installed in place of the operator it replaced.
   struct installed_projection {
     duckdb::idx_t index;
@@ -511,13 +538,8 @@ class rewriter {
       auto corpus = std::move(cross.children[1 - pi]);
       probe->ResolveOperatorTypes();
       corpus->ResolveOperatorTypes();
-      struct own_col {
-        bool is_score;
-        ColumnBinding corpus_col;
-        distance_kind kind;
-      };
       duckdb::vector<ColumnBinding> passthrough;
-      std::vector<own_col> cols;
+      std::vector<join_col> cols;
       for (auto const& b : corpus->GetColumnBindings()) {
         if (used.count(b) && b != corpus_vec) {
           passthrough.push_back(b);
@@ -574,6 +596,105 @@ class rewriter {
     return copy;
   }
 
+  /// DuckDB's join order can push an inner join or a filter from above a LATERAL into its subquery
+  /// side: DELIM_JOIN(probe, JOIN(lateral, t)). When none of them reads the probe, the same rows
+  /// come from JOIN(DELIM_JOIN(probe, lateral), t), where the LATERAL is again the delim join's
+  /// whole subquery side. Moves them there, under a projection that keeps the delim join's column
+  /// layout, and leaves the LATERAL itself to the next pass.
+  bool hoist_out_of_lateral(unique_ptr<LogicalOperator>& slot, std::size_t sub_child)
+  {
+    auto& dj = *slot;
+    duckdb::column_binding_set_t probe_set;
+    for (auto const& b : dj.children[1 - sub_child]->GetColumnBindings()) {
+      probe_set.insert(b);
+    }
+    std::function<bool(LogicalOperator&)> has_delim_get = [&](LogicalOperator& op) {
+      if (op.type == LogicalOperatorType::LOGICAL_DELIM_GET) { return true; }
+      return std::any_of(
+        op.children.begin(), op.children.end(), [&](auto& c) { return c && has_delim_get(*c); });
+    };
+    unique_ptr<LogicalOperator>* at = &dj.children[sub_child];
+    std::vector<LogicalOperator*> path_ops;
+    while (true) {
+      auto& op         = **at;
+      std::size_t next = 0;
+      if (op.type == LogicalOperatorType::LOGICAL_FILTER && op.children.size() == 1) {
+        next = 0;
+      } else if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+                 op.Cast<duckdb::LogicalComparisonJoin>().join_type == duckdb::JoinType::INNER) {
+        bool const in0 = has_delim_get(*op.children[0]);
+        if (in0 == has_delim_get(*op.children[1])) { return false; }
+        next = in0 ? 0 : 1;
+      } else {
+        break;
+      }
+      bool reads_probe = false;
+      duckdb::LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression>* e) {
+        duckdb::column_binding_set_t reads;
+        collect_bindings(**e, reads);
+        for (auto const& b : reads) {
+          if (probe_set.count(b)) { reads_probe = true; }
+        }
+      });
+      if (reads_probe) { return false; }
+      path_ops.push_back(&op);
+      at = &op.children[next];
+    }
+    if (at == &dj.children[sub_child]) { return false; }
+    auto const* top = at->get();
+    while (top->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+      top = top->children[0].get();
+    }
+    if (top->type != LogicalOperatorType::LOGICAL_UNNEST) { return false; }
+
+    // Projection maps select child columns by position, and every child on the path changes
+    // shape. They only prune, and the projection installed above restores the delim join's
+    // columns by binding, so they are dropped on the path. The delim join itself keeps exactly
+    // what that projection and the moved operators read: an unread vector left in its output
+    // would need a NULL of the vector's type as a placeholder, which the GPU cannot build.
+    duckdb::column_binding_set_t needed(_slot_bindings.begin(), _slot_bindings.end());
+    for (auto* op : path_ops) {
+      duckdb::LogicalOperatorVisitor::EnumerateExpressions(
+        *op, [&](unique_ptr<Expression>* e) { collect_bindings(**e, needed); });
+    }
+    std::array<duckdb::vector<duckdb::idx_t>, 2> maps;
+    for (std::size_t side = 0; side < 2; ++side) {
+      auto const binds =
+        side == sub_child ? (*at)->GetColumnBindings() : dj.children[side]->GetColumnBindings();
+      for (std::size_t i = 0; i < binds.size(); ++i) {
+        if (needed.count(binds[i])) { maps[side].push_back(i); }
+      }
+      if (maps[side].empty()) { return false; }
+      if (maps[side].size() == binds.size()) { maps[side].clear(); }
+    }
+    for (auto* op : path_ops) {
+      if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
+        op->Cast<duckdb::LogicalFilter>().projection_map.clear();
+      } else {
+        op->Cast<duckdb::LogicalJoin>().left_projection_map.clear();
+        op->Cast<duckdb::LogicalJoin>().right_projection_map.clear();
+      }
+    }
+    auto& dj_join                = dj.Cast<duckdb::LogicalJoin>();
+    dj_join.left_projection_map  = std::move(maps[0]);
+    dj_join.right_projection_map = std::move(maps[1]);
+    auto lateral                 = std::move(*at);
+    auto path                    = std::move(dj.children[sub_child]);
+    dj.children[sub_child]       = std::move(lateral);
+    *at                          = std::move(slot);
+    slot                         = std::move(path);
+    resolve_types_bottom_up(*slot);
+    duckdb::vector<unique_ptr<Expression>> exprs;
+    for (std::size_t i = 0; i < _slot_bindings.size(); ++i) {
+      exprs.push_back(
+        duckdb::make_uniq<duckdb::BoundColumnRefExpression>(_slot_types[i], _slot_bindings[i]));
+    }
+    auto hoisted = std::move(slot);
+    remap_above(install(slot, std::move(hoisted), std::move(exprs)));
+    SIRIUS_LOG_DEBUG("[vector_join_rewrite] moved a join/filter out of a LATERAL's subquery side");
+    return true;
+  }
+
   /// `probe, LATERAL (SELECT ... FROM corpus ORDER BY distance(probe.v, corpus.v) LIMIT k)`, as
   /// DuckDB decorrelates it: DELIM_JOIN(probe, PROJECTION* <- UNNEST <- AGGREGATE[arg_min(
   /// struct_pack(fields), distance, k) GROUP BY v] <- PROJECTION* <- CROSS(corpus, DELIM_GET)).
@@ -587,16 +708,23 @@ class rewriter {
     auto& dj = slot->Cast<duckdb::LogicalComparisonJoin>();
     // A projection map only selects which child columns the join passes up; the replacement
     // projection emits exactly the columns the plan above reads, so it does not matter here.
-    if (dj.join_type != duckdb::JoinType::INNER || dj.conditions.size() != 1 ||
-        dj.duplicate_eliminated_columns.size() != 1 || dj.children.size() != 2) {
+    // The LATERAL is correlated on the probe vector and possibly on other probe columns too.
+    if (dj.join_type != duckdb::JoinType::INNER || dj.duplicate_eliminated_columns.empty() ||
+        dj.conditions.size() != dj.duplicate_eliminated_columns.size() || dj.children.size() != 2) {
       return decline(1);
     }
-    auto const& delim = *dj.duplicate_eliminated_columns[0];
-    if (delim.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) { return decline(2); }
-    auto const probe_vec = delim.Cast<duckdb::BoundColumnRefExpression>().binding;
-    std::size_t pi       = 2;
+    std::vector<ColumnBinding> delim_cols;
+    for (auto const& e : dj.duplicate_eliminated_columns) {
+      if (e->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) { return decline(2); }
+      delim_cols.push_back(e->Cast<duckdb::BoundColumnRefExpression>().binding);
+    }
+    std::size_t pi = 2;
     for (std::size_t c = 0; c < 2; ++c) {
-      if (has_binding(*dj.children[c], probe_vec)) { pi = c; }
+      if (std::all_of(delim_cols.begin(), delim_cols.end(), [&](auto const& b) {
+            return has_binding(*dj.children[c], b);
+          })) {
+        pi = c;
+      }
     }
     if (pi == 2) { return decline(3); }
     auto& sub_slot = dj.children[1 - pi];
@@ -609,13 +737,14 @@ class rewriter {
       cur = cur->children[0].get();
     }
     if (cur->type != LogicalOperatorType::LOGICAL_UNNEST || cur->expressions.size() != 1) {
-      return decline(4);
+      return hoist_out_of_lateral(slot, 1 - pi) || decline(4);
     }
     auto& unnest = cur->Cast<duckdb::LogicalUnnest>();
     auto* agg_op = unnest.children[0].get();
     if (agg_op->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) { return decline(5); }
     auto& agg = agg_op->Cast<duckdb::LogicalAggregate>();
-    if (agg.groups.size() != 1 || agg.expressions.size() != 1 || agg.grouping_sets.size() > 1) {
+    if (agg.groups.size() != delim_cols.size() || agg.expressions.size() != 1 ||
+        agg.grouping_sets.size() > 1) {
       return decline(6);
     }
     auto const& aggr     = agg.expressions[0]->Cast<duckdb::BoundAggregateExpression>();
@@ -649,19 +778,35 @@ class rewriter {
       if (cross.children[c]->type == LogicalOperatorType::LOGICAL_DELIM_GET) { dgi = c; }
     }
     if (dgi == 2) { return decline(10); }
+    // The delim get emits the correlated columns in the delim join's order.
     auto const delim_bindings = cross.children[dgi]->GetColumnBindings();
-    if (delim_bindings.size() != 1) { return decline(11); }
-    auto const delim_vec = delim_bindings[0];
+    if (delim_bindings.size() != delim_cols.size()) { return decline(11); }
 
     auto const ordering = inline_projections(*aggr.children[1], below);
     auto const call     = as_distance_call(*ordering);
-    if (!call || !(call->a == delim_vec || call->b == delim_vec)) { return decline(12); }
+    auto const vec_at   = [&](const ColumnBinding& b) {
+      return static_cast<std::size_t>(std::find(delim_bindings.begin(), delim_bindings.end(), b) -
+                                      delim_bindings.begin());
+    };
+    if (!call) { return decline(12); }
+    auto const vi = std::min(vec_at(call->a), vec_at(call->b));
+    if (vi >= delim_bindings.size()) { return decline(12); }
+    auto const delim_vec  = delim_bindings[vi];
+    auto const probe_vec  = delim_cols[vi];
     auto const corpus_vec = call->a == delim_vec ? call->b : call->a;
     if ((call->kind == distance_kind::cosine_similarity) != descending) { return decline(13); }
-    auto const group = inline_projections(*agg.groups[0], below);
-    if (group->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
-        group->Cast<duckdb::BoundColumnRefExpression>().binding != delim_vec) {
-      return decline(14);
+    // The aggregate groups by exactly the correlated columns; group g is delim column
+    // group_delim[g], which the probe has as delim_cols[group_delim[g]].
+    std::vector<std::size_t> group_delim;
+    for (auto const& g : agg.groups) {
+      auto const group = inline_projections(*g, below);
+      if (group->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) { return decline(14); }
+      auto const at = vec_at(group->Cast<duckdb::BoundColumnRefExpression>().binding);
+      if (at >= delim_bindings.size() ||
+          std::find(group_delim.begin(), group_delim.end(), at) != group_delim.end()) {
+        return decline(14);
+      }
+      group_delim.push_back(at);
     }
     auto const& kexpr = *aggr.children[2];
     if (kexpr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) { return decline(15); }
@@ -702,12 +847,7 @@ class rewriter {
 
     // What each column the subquery emits is, in terms of the unnested struct.
     auto const sub_bindings = sub_slot->GetColumnBindings();
-    struct sub_col {
-      bool is_score;
-      ColumnBinding corpus_col;
-      distance_kind kind;
-    };
-    std::vector<sub_col> sub_cols;
+    std::vector<join_col> sub_cols;
     for (auto const& b : sub_bindings) {
       duckdb::BoundColumnRefExpression ref(duckdb::LogicalType::ANY, b);
       auto e = inline_projections(ref, above);
@@ -723,8 +863,17 @@ class rewriter {
         }
         continue;
       }
+      if (e->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+        // A group column is the probe's own value of that correlated column (the vector
+        // included); the whole struct is only fine if nothing reads it.
+        auto const& b = e->Cast<duckdb::BoundColumnRefExpression>().binding;
+        if (b.table_index == agg.group_index && b.column_index < group_delim.size()) {
+          sub_cols.push_back(
+            {false, ColumnBinding{}, call->kind, delim_cols[group_delim[b.column_index]]});
+          continue;
+        }
+      }
       if (e->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
-        // The group column (the probe vector) or the whole struct: only fine if nothing reads it.
         sub_cols.push_back({false, ColumnBinding{}, call->kind});
         continue;
       }
@@ -752,11 +901,11 @@ class rewriter {
       *_root, slot.get(), [&](unique_ptr<Expression>& e) { collect_bindings(*e, used); });
     for (std::size_t j = 0; j < sub_bindings.size(); ++j) {
       if (used.count(sub_bindings[j]) && !sub_cols[j].is_score &&
-          sub_cols[j].corpus_col.table_index == duckdb::DConstants::INVALID_INDEX) {
+          sub_cols[j].corpus_col.table_index == duckdb::DConstants::INVALID_INDEX &&
+          sub_cols[j].probe_col.table_index == duckdb::DConstants::INVALID_INDEX) {
         return decline(21);  // the probe vector or the raw struct is read above
       }
     }
-    if (used.count(probe_vec)) { return decline(22); }
 
     auto probe  = std::move(dj.children[pi]);
     auto corpus = std::move(corpus_slot);
@@ -873,13 +1022,8 @@ class rewriter {
       if (used.count(b) && b != corpus_vec) { corpus_cols.push_back(b); }
     }
     // Reuse the top-k builder: every used corpus column is "emitted by the subquery" as itself.
-    struct own_col {
-      bool is_score;
-      ColumnBinding corpus_col;
-      distance_kind kind;
-    };
     duckdb::vector<ColumnBinding> passthrough;
-    std::vector<own_col> cols;
+    std::vector<join_col> cols;
     for (auto const& b : corpus_cols) {
       passthrough.push_back(b);
       cols.push_back({false, b, call->kind});
@@ -901,7 +1045,6 @@ class rewriter {
     return true;
   }
 
-  template <class SubCol>
   bool build_topk(unique_ptr<LogicalOperator>& slot,
                   unique_ptr<LogicalOperator> probe,
                   unique_ptr<LogicalOperator> corpus,
@@ -910,7 +1053,7 @@ class rewriter {
                   const distance_call& call,
                   std::int64_t k,
                   const duckdb::vector<ColumnBinding>& sub_bindings,
-                  const std::vector<SubCol>& sub_cols,
+                  const std::vector<join_col>& sub_cols,
                   const duckdb::column_binding_set_t& used,
                   vector_join_mode mode = vector_join_mode::per_row_top_k,
                   bool probe_scalar     = false)
@@ -939,15 +1082,29 @@ class rewriter {
     duckdb::vector<std::string> returned_names;
     std::vector<std::pair<ColumnBinding, std::size_t>> probe_pos;  // probe binding -> output pos
 
+    // Probe columns read above, directly or as the subquery's copy of a correlated column.
+    auto emit = used;
+    for (std::size_t j = 0; j < sub_bindings.size(); ++j) {
+      if (used.count(sub_bindings[j]) &&
+          sub_cols[j].probe_col.table_index != duckdb::DConstants::INVALID_INDEX) {
+        emit.insert(sub_cols[j].probe_col);
+      }
+    }
+    // The probe vector is emitted only when something above reads it other than through a
+    // distance call on the pair, which reads the score instead.
+    bool vector_out = reads_vectors_raw_anywhere(slot.get(), probe_vec, corpus_vec);
+    for (std::size_t j = 0; j < sub_bindings.size(); ++j) {
+      vector_out =
+        vector_out || (used.count(sub_bindings[j]) && sub_cols[j].probe_col == probe_vec);
+    }
     req.left.from_relation = true;
     for (std::size_t i = 0; i < probe_bindings.size(); ++i) {
       auto const name = "p" + std::to_string(i);
       req.left.relation_columns.push_back(name);
-      if (probe_bindings[i] == probe_vec) {
-        req.left.column = name;
+      if (probe_bindings[i] == probe_vec) { req.left.column = name; }
+      if (!emit.count(probe_bindings[i]) || (probe_bindings[i] == probe_vec && !vector_out)) {
         continue;
       }
-      if (!used.count(probe_bindings[i])) { continue; }
       req.left.output_columns.push_back(name);
       probe_pos.emplace_back(probe_bindings[i], returned_types.size());
       returned_types.push_back(probe->types[i]);
@@ -958,7 +1115,10 @@ class rewriter {
     // Corpus columns the subquery emits and something above reads.
     std::vector<ColumnBinding> corpus_cols;
     for (std::size_t j = 0; j < sub_bindings.size(); ++j) {
-      if (!used.count(sub_bindings[j]) || sub_cols[j].is_score) { continue; }
+      if (!used.count(sub_bindings[j]) || sub_cols[j].is_score ||
+          sub_cols[j].probe_col.table_index != duckdb::DConstants::INVALID_INDEX) {
+        continue;
+      }
       if (std::find(corpus_cols.begin(), corpus_cols.end(), sub_cols[j].corpus_col) ==
           corpus_cols.end()) {
         corpus_cols.push_back(sub_cols[j].corpus_col);
@@ -1103,7 +1263,17 @@ class rewriter {
         e = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
           returned_types[in_probe->second], ColumnBinding{table_index, in_probe->second});
       } else if (j < sub_bindings.size() && used.count(b)) {
-        if (sub_cols[j].is_score) {
+        auto const as_probe = std::find_if(probe_pos.begin(), probe_pos.end(), [&](auto const& bp) {
+          return bp.first == sub_cols[j].probe_col;
+        });
+        if (sub_cols[j].probe_col.table_index != duckdb::DConstants::INVALID_INDEX) {
+          if (as_probe == probe_pos.end()) {
+            throw duckdb::InternalException(
+              "sirius vector-join rewrite: a correlated probe column is not an output of the join");
+          }
+          e = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+            returned_types[as_probe->second], ColumnBinding{table_index, as_probe->second});
+        } else if (sub_cols[j].is_score) {
           e = score_expression(_context, sub_cols[j].kind, call.kind, score);
           if (!e) { return false; }
         } else {
@@ -1191,8 +1361,10 @@ class rewriter {
 
   bool try_filter(unique_ptr<LogicalOperator>& slot)
   {
+    // A projection map only selects which columns the filter passes up; the replacement emits
+    // exactly those, by binding.
     auto& filter = slot->Cast<duckdb::LogicalFilter>();
-    if (!filter.projection_map.empty() || filter.children.size() != 1) { return false; }
+    if (filter.children.size() != 1) { return false; }
     std::vector<unique_ptr<Expression>> conjuncts;
     for (auto& e : filter.expressions) {
       split_conjunction(e->Copy(), conjuncts);
@@ -1215,7 +1387,8 @@ class rewriter {
     auto const pred = *as_threshold(*conjuncts[*idx]);
 
     // The lifted relation must feed nothing inside the tree but the cross product, or removing it
-    // from the tree would strand a reference.
+    // from the tree would strand a reference. An inequality join's own conditions do read it;
+    // they move above the join with the other conjuncts.
     auto& cross       = **lifted->cross_slot;
     auto& probe_rel   = *cross.children[lifted->probe_child];
     auto const pbinds = probe_rel.GetColumnBindings();
@@ -1223,15 +1396,30 @@ class rewriter {
     for (auto const& b : pbinds) {
       probe_bindings.insert(b);
     }
-    bool stranded = false;
-    for_each_expression_outside(*tree, &probe_rel, [&](unique_ptr<Expression>& e) {
-      duckdb::column_binding_set_t used;
-      collect_bindings(*e, used);
-      for (auto const& b : used) {
-        if (probe_bindings.count(b)) { stranded = true; }
+    bool stranded                               = false;
+    std::function<void(LogicalOperator&)> visit = [&](LogicalOperator& op) {
+      if (&op == &probe_rel) { return; }
+      if (&op != &cross) {
+        duckdb::LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression>* e) {
+          duckdb::column_binding_set_t used;
+          collect_bindings(**e, used);
+          for (auto const& b : used) {
+            if (probe_bindings.count(b)) { stranded = true; }
+          }
+        });
       }
-    });
+      for (auto& child : op.children) {
+        if (child) { visit(*child); }
+      }
+    };
+    visit(*tree);
     if (stranded) { return false; }
+    if (cross.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+      for (auto const& c : cross.Cast<duckdb::LogicalComparisonJoin>().conditions) {
+        conjuncts.push_back(duckdb::make_uniq<duckdb::BoundComparisonExpression>(
+          c.comparison, c.left->Copy(), c.right->Copy()));
+      }
+    }
     if (!validate_above(slot.get(), conjuncts, *idx, pred)) { return false; }
 
     auto probe          = std::move(cross.children[lifted->probe_child]);
@@ -1716,15 +1904,42 @@ class rewriter {
     auto* get_ptr = get.get();
 
     unique_ptr<LogicalOperator> in_place = std::move(get);
-    if (!pushed_by_name.empty()) {
-      auto filter = duckdb::make_uniq<duckdb::LogicalFilter>();
-      for (auto const& [name, table_filter] : pushed_by_name) {
-        auto const j = static_cast<std::size_t>(
-          std::find(right_out.begin(), right_out.end(), name) - right_out.begin());
-        duckdb::BoundColumnRefExpression column(right_types[j],
-                                                ColumnBinding{table_index, right_base + j});
-        filter->expressions.push_back(table_filter->ToExpression(column));
+    // A constant comparison the operator evaluates itself, masking the corpus before the search
+    // (as for the table function's own pushdown); anything else filters the join's output.
+    auto device_filter = [&](const duckdb::TableFilter& f, const duckdb::LogicalType& column) {
+      auto comparable = [](const duckdb::LogicalType& t) {
+        return (t.IsIntegral() && t.id() != duckdb::LogicalTypeId::HUGEINT &&
+                t.id() != duckdb::LogicalTypeId::UHUGEINT) ||
+               t.id() == duckdb::LogicalTypeId::FLOAT || t.id() == duckdb::LogicalTypeId::DOUBLE ||
+               t.id() == duckdb::LogicalTypeId::BOOLEAN || t.id() == duckdb::LogicalTypeId::VARCHAR;
+      };
+      auto constant_ok = [&](const duckdb::TableFilter& c) {
+        if (c.filter_type != duckdb::TableFilterType::CONSTANT_COMPARISON) { return false; }
+        auto const& value = c.Cast<duckdb::ConstantFilter>().constant;
+        return !value.IsNull() && comparable(value.type());
+      };
+      if (!comparable(column)) { return false; }
+      if (f.filter_type == duckdb::TableFilterType::CONJUNCTION_AND) {
+        auto const& children = f.Cast<duckdb::ConjunctionAndFilter>().child_filters;
+        return std::all_of(
+          children.begin(), children.end(), [&](auto const& c) { return constant_ok(*c); });
       }
+      return constant_ok(f);
+    };
+    auto filter = duckdb::make_uniq<duckdb::LogicalFilter>();
+    for (auto const& [name, table_filter] : pushed_by_name) {
+      auto const j = static_cast<std::size_t>(std::find(right_out.begin(), right_out.end(), name) -
+                                              right_out.begin());
+      if (device_filter(*table_filter, right_types[j])) {
+        get_ptr->table_filters.PushFilter(duckdb::ColumnIndex(right_base + j),
+                                          table_filter->Copy());
+        continue;
+      }
+      duckdb::BoundColumnRefExpression column(right_types[j],
+                                              ColumnBinding{table_index, right_base + j});
+      filter->expressions.push_back(table_filter->ToExpression(column));
+    }
+    if (!filter->expressions.empty()) {
       filter->children.push_back(std::move(in_place));
       filter->ResolveOperatorTypes();
       in_place = std::move(filter);
