@@ -225,6 +225,13 @@ class cuvs_index_cache {
                                                               std::string_view table,
                                                               std::string_view column) const;
 
+  /// The names of the entries on this column of the given kind.
+  [[nodiscard]] std::vector<std::string> names_on_column(std::string_view catalog,
+                                                         std::string_view schema,
+                                                         std::string_view table,
+                                                         std::string_view column,
+                                                         index_kind kind) const;
+
   [[nodiscard]] bool contains(std::string_view name) const;
 
   /// Remove the entry for @p name. Its index and reservation are freed once no

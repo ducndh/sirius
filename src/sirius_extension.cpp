@@ -2605,6 +2605,7 @@ struct KMeansBuildListsData : public TableFunctionData {
   sirius::vss::kmeans_assign_request req;
   sirius::vss::list_storage storage{sirius::vss::list_storage::automatic};
   bool host_tier = false;
+  bool unit_rows = false;
   bool finished  = false;
 };
 
@@ -2655,6 +2656,13 @@ static unique_ptr<FunctionData> SiriusKMeansBuildListsBind(ClientContext& contex
                               v + "'");
       }
       result->host_tier = v == "host";
+    } else if (key == "metric") {
+      auto const v = StringUtil::Lower(kv.second.ToString());
+      if (v != "l2" && v != "cosine") {
+        throw BinderException("sirius_kmeans_build_lists: metric must be 'l2' or 'cosine', got '" +
+                              v + "'");
+      }
+      result->unit_rows = v == "cosine";
     }
   }
   req.dim      = ResolveVectorColumn(context,
@@ -2690,8 +2698,8 @@ static void SiriusKMeansBuildListsFunction(ClientContext& context,
     throw InvalidInputException(
       "sirius_kmeans_build_lists requires the Sirius context to be initialized");
   }
-  auto const built =
-    sirius::vss::run_kmeans_build_lists(*sirius_ctx, data.req, data.storage, data.host_tier);
+  auto const built = sirius::vss::run_kmeans_build_lists(
+    *sirius_ctx, data.req, data.storage, data.host_tier, data.unit_rows);
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BIGINT(built.n_rows));
   output.SetValue(1, 0, Value::BIGINT(built.n_clusters));
@@ -3562,6 +3570,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
     SiriusKMeansBuildListsBind);
   kmeans_build_lists.named_parameters["schema_name"] = LogicalType::VARCHAR;
   kmeans_build_lists.named_parameters["storage"]     = LogicalType::VARCHAR;
+  kmeans_build_lists.named_parameters["metric"]      = LogicalType::VARCHAR;
   kmeans_build_lists.named_parameters["tier"]        = LogicalType::VARCHAR;
   CreateTableFunctionInfo kmeans_build_lists_info(kmeans_build_lists);
   catalog.CreateTableFunction(transaction, kmeans_build_lists_info);

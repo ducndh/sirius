@@ -54,6 +54,7 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
+#include "vss/cluster_lists.hpp"
 #include "vss/vector_join.hpp"
 #include "vss/vector_join_binding.hpp"
 
@@ -594,6 +595,35 @@ class rewriter {
     duckdb::ExpressionIterator::EnumerateChildren(
       *copy, [&](unique_ptr<Expression>& child) { child = inline_projections(*child, projs); });
     return copy;
+  }
+
+  /// Searches a pinned corpus through its cluster lists, every cluster probed, when it has lists
+  /// that answer exactly: the same answer, from fewer bytes and on tensor cores, like an index the
+  /// optimizer picks. SIRIUS_VSS_REWRITE_LISTS=0 keeps the exact GEMM.
+  bool use_exact_lists(vector_join_request& req,
+                       duckdb::TableCatalogEntry& table,
+                       const std::string& column,
+                       std::uint64_t rows)
+  {
+    auto const* env = std::getenv("SIRIUS_VSS_REWRITE_LISTS");
+    if (env != nullptr && std::strcmp(env, "0") == 0) { return false; }
+    auto sirius_ctx = _context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (!sirius_ctx) { return false; }
+    auto const choice = find_exact_lists(*sirius_ctx,
+                                         table.ParentCatalog().GetName(),
+                                         table.ParentSchema().name,
+                                         table.name,
+                                         column,
+                                         req.metric == "cosine",
+                                         static_cast<std::int64_t>(rows));
+    if (!choice) { return false; }
+    req.search_mode = vector_join_search_mode::approx;
+    req.clustering  = choice->clustering;
+    req.n_probes    = choice->n_clusters;
+    SIRIUS_LOG_INFO("[vector_join_rewrite] searching '{}' through the lists of clustering '{}'",
+                    table.name,
+                    choice->clustering);
+    return true;
   }
 
   /// DuckDB's join order can push an inner join or a filter from above a LATERAL into its subquery
@@ -1185,6 +1215,7 @@ class rewriter {
               returned_names.push_back(rn[j]);
             }
             pinned = true;
+            use_exact_lists(req, *table, *name_of(corpus_vec), right_rows);
           } catch (std::exception& e) {
             SIRIUS_LOG_DEBUG("[vector_join_rewrite] top-k pinned corpus declined: {}", e.what());
           }
@@ -1905,8 +1936,12 @@ class rewriter {
 
     unique_ptr<LogicalOperator> in_place = std::move(get);
     // A constant comparison the operator evaluates itself, masking the corpus before the search
-    // (as for the table function's own pushdown); anything else filters the join's output.
+    // (as for the table function's own pushdown); anything else filters the join's output, and so
+    // does everything when the search goes through the lists, which take no corpus predicates.
+    bool const via_lists = use_exact_lists(
+      get_ptr->bind_data->Cast<SiriusVectorJoinBindData>().req, *table, *vec_name, right_rows);
     auto device_filter = [&](const duckdb::TableFilter& f, const duckdb::LogicalType& column) {
+      if (via_lists) { return false; }
       auto comparable = [](const duckdb::LogicalType& t) {
         return (t.IsIntegral() && t.id() != duckdb::LogicalTypeId::HUGEINT &&
                 t.id() != duckdb::LogicalTypeId::UHUGEINT) ||

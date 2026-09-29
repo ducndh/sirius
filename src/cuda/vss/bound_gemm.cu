@@ -1014,6 +1014,56 @@ void kth_distance_bound(
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
+namespace {
+
+__global__ void scale_kernel(float* d, int64_t n, float factor)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    d[i] *= factor;
+  }
+}
+
+__global__ void normalize_rows_kernel(float const* x, int64_t n, int64_t dim, float* out)
+{
+  int const lane   = threadIdx.x % 32;
+  auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
+  for (int64_t r = (blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x) / 32; r < n;
+       r += warps) {
+    float s = 0.f;
+    for (int64_t c = lane; c < dim; c += 32) {
+      float const v = x[r * dim + c];
+      s             = fmaf(v, v, s);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o /= 2) {
+      s += __shfl_xor_sync(0xffffffffu, s, o);
+    }
+    float const inv = s > 0.f ? rsqrtf(s) : 0.f;
+    for (int64_t c = lane; c < dim; c += 32) {
+      out[r * dim + c] = x[r * dim + c] * inv;
+    }
+  }
+}
+
+}  // namespace
+
+void scale_in_place(float* d, int64_t n, float factor, rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  scale_kernel<<<grid_for(n), 256, 0, stream.value()>>>(d, n, factor);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+void normalize_rows(
+  float const* x, int64_t n, int64_t dim, float* out, rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  auto const grid = static_cast<int>(std::clamp<int64_t>((n + 7) / 8, 1, 65535));
+  normalize_rows_kernel<<<grid, 256, 0, stream.value()>>>(x, n, dim, out);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
 void sqrt_in_place(float* d, int64_t n, rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }

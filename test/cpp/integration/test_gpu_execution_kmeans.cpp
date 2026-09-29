@@ -1376,3 +1376,56 @@ TEST_CASE_METHOD(KMeansFixture,
   CHECK(fetch("k => 5, search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 1")
           .size() == 50 * 5);
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "cosine lists of unit rows give the exact cosine join's answer",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // metric => 'cosine' keeps every row divided by its norm, so the bounded float16 search runs a
+  // cosine join as L2 over unit vectors and re-scores in FP32. Probing every cluster must give
+  // the exact cosine join's answer, top-k and threshold, on both tiers; an l2 join over those
+  // lists would rank by the wrong distance and is refused.
+  auto const tier   = GENERATE(std::string("gpu"), std::string("host"));
+  auto const prefix = "kmcos_" + tier;
+  create_lists_tables(*this, prefix, tier);
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => 16);");
+  auto built =
+    query_ok(*con,
+             "SELECT encoding FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" +
+               prefix + "_c', storage => 'float16', metric => 'cosine');");
+  CHECK(built->GetValue(0, 0).ToString() == "float16");
+
+  auto const fetch = [&](const std::string& mode) {
+    std::vector<std::pair<std::string, double>> out;
+    for (auto const& r :
+         ok_rows(*con,
+                 "SELECT left_id, similarity FROM sirius_knn_join('" + prefix + "_probe','vec','" +
+                   prefix + "_corpus','vec', metric => 'cosine', " + mode + ");")) {
+      out.emplace_back(r.at(0), std::stod(r.at(1)));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+  auto const same = [](auto const& a, auto const& b) {
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      CHECK(a[i].first == b[i].first);
+      CHECK(std::abs(a[i].second - b[i].second) <= 1e-5);
+    }
+  };
+  auto const approx = "search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 16";
+  for (auto const k : {5, 50}) {
+    auto const kk = "k => " + std::to_string(k) + ", ";
+    same(fetch(kk + approx), fetch(kk + "search_mode => 'exact-gemm'"));
+  }
+  auto const eps = "join_mode => 'threshold', eps => " +
+                   radius_between(fetch("k => 10, search_mode => 'exact-gemm'"), 2) + ", ";
+  auto const exact = fetch(eps + "search_mode => 'exact-gemm'");
+  REQUIRE(exact.size() > 50);
+  same(fetch(eps + approx), exact);
+  expect_error(*con,
+               "SELECT count(*) FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
+                 "_corpus','vec', metric => 'l2', k => 5, " + approx + ");",
+               "metric => 'cosine'");
+}

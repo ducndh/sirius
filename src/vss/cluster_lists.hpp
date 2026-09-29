@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -118,6 +119,9 @@ struct cluster_lists {
   /// FLOAT16 lists: the largest |x - half(x)| over all rows (row_sq_f32 then holds |half(x)|^2
   /// and max_row_norm the largest |half(x)|).
   float half_error{0};
+  /// Built with metric => 'cosine': every row (and its kept FP32 copy) divided by its norm, so a
+  /// cosine join searches them as L2 over unit vectors, where |q - x|^2 = 2 (1 - cos).
+  bool unit_rows{false};
   /// INT8 lists only: FP32 [dim] offset and the one scale the codes were made with, on the
   /// device, and the largest |x - (offset + scale * code)| over all rows.
   std::unique_ptr<rmm::device_buffer> code_offset;
@@ -166,11 +170,31 @@ enum class list_storage : std::uint8_t { automatic, float32, uint8, float16, int
 cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                             const kmeans_assign_request& req,
                                             list_storage storage = list_storage::automatic,
-                                            bool host_tier       = false);
+                                            bool host_tier       = false,
+                                            bool unit_rows       = false);
 
 /// The lists built for @p clustering, or nullptr when there are none.
 [[nodiscard]] const cluster_lists* find_cluster_lists(duckdb::SiriusContext& ctx,
                                                       const std::string& clustering);
+
+/// A clustering whose lists answer a join exactly once every cluster is probed.
+struct exact_lists_choice {
+  std::string clustering;
+  std::int64_t n_clusters{0};
+};
+
+/// A clustering of (@p catalog, @p schema, @p table, @p column) whose lists hold all @p n_rows
+/// rows and answer exactly when every cluster is probed: FLOAT32 or UINT8 rows, or FLOAT16 rows
+/// searched with the bounded GEMM and re-scored from the kept FP32 rows. Lists of unit rows
+/// answer cosine joins and only those; INT8 codes are left out (their search refuses too many
+/// shapes to pick them unasked). Nullopt when there is none.
+[[nodiscard]] std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
+                                                                 const std::string& catalog,
+                                                                 const std::string& schema,
+                                                                 const std::string& table,
+                                                                 const std::string& column,
+                                                                 bool cosine,
+                                                                 std::int64_t n_rows);
 
 /// Drop the lists built for @p clustering, if any; a re-fit makes them stale.
 void erase_cluster_lists(duckdb::SiriusContext& ctx, const std::string& clustering);

@@ -20,6 +20,7 @@
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 #include "telemetry/data_batch_probe.hpp"
+#include "vss/bound_gemm.hpp"
 #include "vss/cluster_fold.hpp"
 #include "vss/cluster_lists.hpp"
 #include "vss/cudf_raft_interop.hpp"
@@ -213,6 +214,8 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
   }
   index_metadata meta;
   meta.kind           = index_kind::kmeans_centroids;
+  meta.catalog_name   = req.catalog;
+  meta.schema_name    = req.schema;
   meta.table_name     = req.table;
   meta.column_name    = req.column;
   meta.dim            = req.dim;
@@ -309,6 +312,30 @@ const cluster_lists* find_cluster_lists(duckdb::SiriusContext& ctx, const std::s
   return entry->index_as<cluster_lists>();
 }
 
+std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
+                                                   const std::string& catalog,
+                                                   const std::string& schema,
+                                                   const std::string& table,
+                                                   const std::string& column,
+                                                   bool cosine,
+                                                   std::int64_t n_rows)
+{
+  for (auto const& name : ctx.get_cuvs_index_cache().names_on_column(
+         catalog, schema, table, column, index_kind::kmeans_centroids)) {
+    auto const* lists = find_cluster_lists(ctx, name);
+    if (lists == nullptr || lists->n_rows != n_rows || lists->unit_rows != cosine) { continue; }
+    bool const exact = lists->encoding == list_encoding::float32 ||
+                       lists->encoding == list_encoding::uint8 ||
+                       (lists->encoding == list_encoding::float16 && lists->exact_vectors &&
+                        bound_filter_f16_supports(lists->dim));
+    if (!exact) { continue; }
+    auto const entry = find_clustering_entry(ctx, name);
+    if (entry == nullptr) { continue; }
+    return exact_lists_choice{name, entry->meta.n_lists};
+  }
+  return std::nullopt;
+}
+
 void erase_cluster_lists(duckdb::SiriusContext& ctx, const std::string& clustering)
 {
   ctx.get_cuvs_index_cache().erase(lists_key(clustering));
@@ -317,10 +344,15 @@ void erase_cluster_lists(duckdb::SiriusContext& ctx, const std::string& clusteri
 cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                             const kmeans_assign_request& req,
                                             list_storage storage,
-                                            bool host_tier)
+                                            bool host_tier,
+                                            bool unit_rows)
 {
   static const std::string fn = "sirius_kmeans_build_lists";
-  auto const c                = resolve_context(ctx, fn, req.catalog, req.schema, req.table);
+  if (unit_rows && (storage == list_storage::uint8 || storage == list_storage::int8)) {
+    throw duckdb::InvalidInputException(
+      fn + ": metric => 'cosine' stores unit rows, which need storage => 'float16' or 'float32'");
+  }
+  auto const c = resolve_context(ctx, fn, req.catalog, req.schema, req.table);
   device_context_guard device_guard{c.target_gpu};
   // The lists outlive this call in the index cache, and a device_buffer frees on the stream it
   // was allocated on, so the persistent buffers use the default stream (as the fit's centroids
@@ -375,7 +407,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   std::vector<std::int32_t> labels(static_cast<std::size_t>(n_rows));
   // Whether every component is a byte, counted while the chunks are resident anyway: that is
   // what decides if the lists may be stored as UINT8 without changing a single value.
-  bool const check_uint8 = storage == list_storage::automatic || storage == list_storage::uint8;
+  bool const check_uint8 =
+    !unit_rows && (storage == list_storage::automatic || storage == list_storage::uint8);
   rmm::device_uvector<unsigned long long> non_uint8(1, stream, mr);
   CUDF_CUDA_TRY(cudaMemsetAsync(non_uint8.data(), 0, sizeof(unsigned long long), stream.value()));
   // INT8 codes need each component's range over every row, taken while the chunks are resident.
@@ -594,7 +627,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   reservation.reset();
   auto const persistent_mr = c.space->get_default_allocator();
 
-  lists.encoding = encoding;
+  lists.encoding  = encoding;
+  lists.unit_rows = unit_rows;
   std::vector<std::byte*> block_ptrs;
   if (on_device) {
     lists.tier           = cucascade::memory::Tier::GPU;
@@ -758,6 +792,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                     cudaMemcpyHostToDevice,
                                     stream.value()));
       gather_rows(vectors.data_handle(), dim, order_d.data(), rows, grouped.data(), stream);
+      if (unit_rows) { normalize_rows(grouped.data(), rows, dim, grouped.data(), stream); }
       // The copies below read the grouped rows in the list encoding.
       std::optional<rmm::device_uvector<std::uint16_t>> grouped_f16;
       std::optional<rmm::device_uvector<std::int8_t>> grouped_i8;

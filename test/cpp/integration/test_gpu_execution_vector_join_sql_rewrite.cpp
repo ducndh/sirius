@@ -296,3 +296,35 @@ TEST_CASE_METHOD(SqlRewriteFixture,
   REQUIRE(got.size() == expected.size());
   REQUIRE(rows_match(got, expected));
 }
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "plain SQL searches through cluster lists that answer exactly",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  SqlRewriteTables tables(*this);
+  // FLOAT32 lists (these values are not bytes) answer exactly once every cluster is probed, so
+  // the rewritten joins search through them: the prune statistics, which only the clustered
+  // search records, move, and the answers stay DuckDB's. The lists hold rows as they are, not
+  // unit rows, so a cosine join keeps the exact GEMM.
+  run_ok("SELECT * FROM sirius_kmeans_fit('sr_corpus','vec', name => 'sr_c', n_clusters => 8);");
+  run_ok("SELECT * FROM sirius_kmeans_build_lists('sr_corpus','vec','sr_c');");
+  auto const before = sirius::test::get_vector_join_prune_stats(*con);
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT p.id, n.id, n.d FROM sr_probe p, LATERAL (SELECT c.id, "
+    "array_distance(p.vec, c.vec) AS d FROM sr_corpus c ORDER BY d LIMIT 7) n;");
+  auto const topk = sirius::test::get_vector_join_prune_stats(*con);
+  CHECK(topk.pairs_exhaustive > before.pairs_exhaustive);
+  CHECK(topk.pairs_scored - before.pairs_scored == topk.pairs_exhaustive - before.pairs_exhaustive);
+  require_gpu_matches_duckdb(*con,
+                             "SELECT p.id, c.id FROM sr_probe p, sr_corpus c "
+                             "WHERE array_distance(p.vec, c.vec) <= 0.9;");
+  auto const radius = sirius::test::get_vector_join_prune_stats(*con);
+  CHECK(radius.pairs_exhaustive > topk.pairs_exhaustive);
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT p.id, n.id FROM sr_probe p, LATERAL (SELECT c.id, array_cosine_similarity(p.vec, "
+    "c.vec) AS s FROM sr_corpus c ORDER BY s DESC LIMIT 4) n;");
+  CHECK(sirius::test::get_vector_join_prune_stats(*con).pairs_exhaustive ==
+        radius.pairs_exhaustive);
+}

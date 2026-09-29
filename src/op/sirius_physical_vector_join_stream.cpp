@@ -1297,6 +1297,27 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     ensure_cluster_index(*mem_space, stream, mr);
     phase("cluster index");
 
+    // Lists of unit rows answer a cosine join as L2 over unit vectors, |q - x|^2 = 2 (1 - cos):
+    // the probe rows are normalized too, the radius doubled, and the distances halved at the end.
+    // Routing below keeps the join's metric; it only picks clusters.
+    bool const unit_cosine = _lists != nullptr && _lists->unit_rows;
+    if (unit_cosine && _request.metric != "cosine") {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] cluster lists built with metric => 'cosine' hold "
+        "unit rows and answer only cosine joins; rebuild them without it for an " +
+        _request.metric + " join");
+    }
+    auto const search_metric = unit_cosine ? cuvs::distance::DistanceType::L2Expanded : metric;
+    auto const search_radius = unit_cosine ? 2.f * radius_eps : radius_eps;
+    std::optional<rmm::device_uvector<float>> unit_probe;
+    if (unit_cosine) {
+      unit_probe.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
+      vss::normalize_rows(queries.data_handle(), n_left, dim, unit_probe->data(), stream);
+    }
+    auto const search_queries = unit_cosine ? raft::make_device_matrix_view<const float, int64_t>(
+                                                unit_probe->data(), n_left, dim)
+                                            : queries;
+
     auto const n_probes = std::clamp<std::int64_t>(_request.n_probes, 1, _n_clusters);
 
     // Each probe row picks its own n_probes nearest centroids, the way an IVF index routes a
@@ -1461,8 +1482,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // straight from the stored bytes: no chunk is widened, the row norms were
     // computed at build time, and every dot product is exact. Only the probe is converted, once.
     // A radius join has only the bounded form of that search.
-    bool const l2 = metric == cuvs::distance::DistanceType::L2Expanded ||
-                    metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+    bool const l2 = search_metric == cuvs::distance::DistanceType::L2Expanded ||
+                    search_metric == cuvs::distance::DistanceType::L2SqrtExpanded;
     // INT8 codes are only ever answered by the bounded search below, which filters with them and
     // re-scores what passes in FP32; decoded on their own they would give approximate distances.
     bool const codes_int8 = _lists != nullptr && _lists->encoding == vss::list_encoding::int8;
@@ -1486,7 +1507,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       rmm::device_uvector<unsigned long long> non_bytes(1, stream, mr);
       CUDF_CUDA_TRY(
         cudaMemsetAsync(non_bytes.data(), 0, sizeof(unsigned long long), stream.value()));
-      vss::count_non_uint8(queries.data_handle(), n_left * dim, non_bytes.data(), stream);
+      vss::count_non_uint8(search_queries.data_handle(), n_left * dim, non_bytes.data(), stream);
       unsigned long long non_bytes_host = 0;
       CUDF_CUDA_TRY(cudaMemcpyAsync(&non_bytes_host,
                                     non_bytes.data(),
@@ -1504,7 +1525,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       if (codes_int8) {
         // The probe gets the lists' codes too, and its own exact coding error per row.
         probe_code_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
-        vss::quantize_rows_int8(queries.data_handle(),
+        vss::quantize_rows_int8(search_queries.data_handle(),
                                 n_left,
                                 dim,
                                 static_cast<float const*>(_lists->code_offset->data()),
@@ -1514,7 +1535,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                 nullptr,
                                 stream);
       } else {
-        vss::narrow_to_shifted_int8(queries.data_handle(), n_left * dim, probe_i8->data(), stream);
+        vss::narrow_to_shifted_int8(
+          search_queries.data_handle(), n_left * dim, probe_i8->data(), stream);
       }
       vss::int8_row_sq_norms(probe_i8->data(), n_left, dim, probe_sq->data(), stream);
     }
@@ -1536,8 +1558,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     bool const f16_bounded = !int8_search && gemm_search_enabled() && _lists != nullptr &&
                              _lists->encoding == vss::list_encoding::float16 &&
                              _lists->exact_vectors != nullptr &&
-                             (metric == cuvs::distance::DistanceType::L2Expanded ||
-                              metric == cuvs::distance::DistanceType::L2SqrtExpanded) &&
+                             (search_metric == cuvs::distance::DistanceType::L2Expanded ||
+                              search_metric == cuvs::distance::DistanceType::L2SqrtExpanded) &&
                              vss::bound_filter_f16_supports(dim) && bound_gemm_enabled;
     bool const any_bounded = bounded || f16_bounded;
     // FP16 and INT8 lists filter with inexact distances: their bounded search keeps layout rows as
@@ -1579,14 +1601,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto refresh_code_limit = [&](float const* bound_rows) {
       code_limits(bound_rows, code_limit->data(), false);
     };
-    bool const sqrt_at_end = any_bounded && metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+    bool const sqrt_at_end =
+      any_bounded && search_metric == cuvs::distance::DistanceType::L2SqrtExpanded;
     if (f16_bounded) {
       // The probe is rounded like the rows, with its rounded norms and its own rounding error.
       probe_f16.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
       probe_sqf.emplace(static_cast<std::size_t>(n_left), stream, mr);
       probe_half_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
-      vss::narrow_to_float16(queries.data_handle(), n_left * dim, probe_f16->data(), stream);
-      vss::half_rows_norms(queries.data_handle(),
+      vss::narrow_to_float16(search_queries.data_handle(), n_left * dim, probe_f16->data(), stream);
+      vss::half_rows_norms(search_queries.data_handle(),
                            probe_f16->data(),
                            n_left,
                            dim,
@@ -1603,8 +1626,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     std::int64_t pending = 0, bounded_emitted = 0, bounded_merges = 0, bounded_launches = 0,
                  bounded_padded = 0;
     // The kernels compare squared distances.
-    auto const radius_bound =
-      metric == cuvs::distance::DistanceType::L2SqrtExpanded ? radius_eps * radius_eps : radius_eps;
+    auto const radius_bound = search_metric == cuvs::distance::DistanceType::L2SqrtExpanded
+                                ? search_radius * search_radius
+                                : search_radius;
     // Debug only (they synchronize): time spent re-scoring candidates and taking/merging them.
     double rescore_seconds = 0, take_seconds = 0;
     auto debug_mark = [&] {
@@ -1618,7 +1642,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       bounded_emitted += pending;
       auto const t0 = debug_mark();
       if (rescore) {
-        vss::exact_distances(queries.data_handle(),
+        vss::exact_distances(search_queries.data_handle(),
                              candidates->rows.data(),
                              0,
                              candidates->ids.data(),
@@ -1865,7 +1889,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         if (radius_join) {
           vss::fill_bound(bound->data(), n_left, radius_bound, stream);
         } else if (rescore) {
-          vss::exact_distances(queries.data_handle(),
+          vss::exact_distances(search_queries.data_handle(),
                                nullptr,
                                k_join,
                                acc_neighbors->view().data<std::int64_t>(),
@@ -1961,7 +1985,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           auto const m       = ee - eb;
           auto const* rows_c = routed_rows + eb;
           if (!direct) {
-            vss::gather_rows(queries.data_handle(), dim, rows_c, m, routed_queries.data(), stream);
+            vss::gather_rows(
+              search_queries.data_handle(), dim, rows_c, m, routed_queries.data(), stream);
           }
           auto const queries_view =
             raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
@@ -2006,7 +2031,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             // Same construction as the exhaustive radius path: a slice's in-range pairs are
             // final when produced, so they are appended, never folded, and there is no k. The
             // kernel numbers query rows within the gathered matrix; rows_c maps them back.
-            auto edges = threshold_search(res, slice_view, queries_view, radius_eps, metric, mr);
+            auto edges =
+              threshold_search(res, slice_view, queries_view, search_radius, search_metric, mr);
             if (edges.n_edges > 0) {
               auto left = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
                                                     static_cast<cudf::size_type>(edges.n_edges),
@@ -2044,14 +2070,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                 m,
                 dim,
                 k_eff,
-                metric == cuvs::distance::DistanceType::L2SqrtExpanded && !bounded,
+                search_metric == cuvs::distance::DistanceType::L2SqrtExpanded && !bounded,
                 mr);
             }
-            return gemm_search_enabled() && vss::gemm_search_supports(metric)
-                     ? vss::gemm_topk(res, slice_view, queries_view, k_eff, metric, mr)
+            return gemm_search_enabled() && vss::gemm_search_supports(search_metric)
+                     ? vss::gemm_topk(res, slice_view, queries_view, k_eff, search_metric, mr)
                      : vss::brute_force_knn_untrimmed(
                          res,
-                         vss::brute_force_build(res, slice_view, metric),
+                         vss::brute_force_build(res, slice_view, search_metric),
                          queries_view,
                          k_eff,
                          mr);
@@ -2109,6 +2135,16 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       }
       if (sqrt_at_end && !radius_join) {
         vss::sqrt_in_place(acc_distances->mutable_view().data<float>(), n_left * k_join, stream);
+      }
+    }
+    if (unit_cosine) {
+      if (radius_join) {
+        for (auto& part : radius_distances) {
+          vss::scale_in_place(part->mutable_view().data<float>(), part->size(), 0.5f, stream);
+        }
+      } else {
+        vss::scale_in_place(
+          acc_distances->mutable_view().data<float>(), n_left * k_join, 0.5f, stream);
       }
     }
 

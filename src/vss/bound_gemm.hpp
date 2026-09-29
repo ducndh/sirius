@@ -161,6 +161,14 @@ void kth_distance_bound(float const* acc_distances,
 /// d[i] = sqrt(d[i]) for i in [0, n).
 void sqrt_in_place(float* d, int64_t n, rmm::cuda_stream_view stream);
 
+/// d[i] *= factor for i in [0, n).
+void scale_in_place(float* d, int64_t n, float factor, rmm::cuda_stream_view stream);
+
+/// Each of the @p n rows of @p x (@p dim components) divided by its L2 norm, into @p out (which
+/// may be @p x). A zero row stays zero.
+void normalize_rows(
+  float const* x, int64_t n, int64_t dim, float* out, rmm::cuda_stream_view stream);
+
 /// bound[i] = value for i in [0, n): the fixed radius a threshold join searches with.
 void fill_bound(float* bound, int64_t n, float value, rmm::cuda_stream_view stream);
 
