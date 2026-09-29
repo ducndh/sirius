@@ -21,6 +21,8 @@
  *        CPU -- and return what DuckDB returns for the same statement.
  */
 
+#include "duckdb/main/config.hpp"
+
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -29,6 +31,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -94,6 +97,13 @@ class SqlRewriteTables {
  public:
   explicit SqlRewriteTables(SqlRewriteFixture& f) : _f(f)
   {
+    // The database's optimizer mask is shared, and an earlier test in a full run can leave it
+    // cleared; compressed materialization then wraps small-range columns in functions the GPU
+    // plan does not translate, and the queries here run on DuckDB instead. Pin the mask Sirius
+    // publishes at load while these tables exist.
+    auto& disabled  = duckdb::DBConfig::GetConfig(*f.con->context).options.disabled_optimizers;
+    _saved_disabled = disabled;
+    disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
     auto const vec = [](const std::string& seed) {
       return "list_transform(range(8), lambda d: ((hash(i * 100 + d + " + seed +
              ") % 2000)::FLOAT / 1000.0 - 1.0))::FLOAT[8]";
@@ -117,10 +127,12 @@ class SqlRewriteTables {
     for (auto const* t : {"sr_corpus", "sr_probe", "sr_one", "sr_cats"}) {
       _f.con->Query(std::string("SELECT * FROM unpin_table('") + t + "');");
     }
+    duckdb::DBConfig::GetConfig(*_f.con->context).options.disabled_optimizers = _saved_disabled;
   }
 
  private:
   SqlRewriteFixture& _f;
+  std::set<duckdb::OptimizerType> _saved_disabled;
 };
 
 TEST_CASE_METHOD(SqlRewriteFixture,
