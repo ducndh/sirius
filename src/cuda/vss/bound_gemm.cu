@@ -31,6 +31,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <type_traits>
 
 namespace sirius::vss {
 
@@ -212,6 +214,216 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
     }
   }
 #endif
+}
+
+// A few probe rows against a slice: with m this small a 128 x 128 tile is almost all padding and
+// the search is bound by reading the slice, so each thread takes one corpus row, streams it with
+// 16-byte loads and scores it against every probe row held in shared memory. Same bound, same
+// append, same error model (exact int8 dots; FP16 products summed in FP32).
+constexpr int kSmallThreads = 256;
+constexpr int kSmallMaxDim  = 256;
+
+template <class T, int M>
+__global__ void __launch_bounds__(kSmallThreads)
+  bound_filter_small_kernel(T const* __restrict__ x,
+                            typename mma_traits<T>::norm const* __restrict__ x_sq,
+                            int64_t n,
+                            int64_t id_base,
+                            int64_t const* __restrict__ id_map,
+                            T const* __restrict__ probe,
+                            typename mma_traits<T>::norm const* __restrict__ probe_sq,
+                            int64_t const* __restrict__ rows,
+                            int m,
+                            int d,
+                            float const* __restrict__ bound,
+                            slack_terms slack,
+                            int32_t* out_rows,
+                            int64_t* out_ids,
+                            float* out_d,
+                            unsigned long long* count,
+                            unsigned long long capacity)
+{
+  constexpr bool kInt8 = sizeof(T) == 1;
+  // Probe components: int8 packed four to a word for __dp4a, FP16 widened to FP32.
+  using Q                = std::conditional_t<kInt8, int, float>;
+  constexpr int kPerWord = kInt8 ? 4 : 1;
+  __shared__ __align__(16) Q s_probe[M][kSmallMaxDim / kPerWord];
+  __shared__ int64_t s_rows[M];
+  __shared__ float s_qsq[M];
+  __shared__ float s_limit[M];
+
+  int const words = d / kPerWord;
+  for (int e = threadIdx.x; e < M * words; e += blockDim.x) {
+    int const p = e / words, w = e % words;
+    Q v = 0;
+    if (p < m) {
+      auto const row = rows[p];
+      if constexpr (kInt8) {
+        v = reinterpret_cast<int const*>(probe + row * d)[w];
+      } else {
+        v = __half2float(probe[row * d + w]);
+      }
+    }
+    s_probe[p][w] = v;
+  }
+  for (int p = threadIdx.x; p < M; p += blockDim.x) {
+    s_rows[p] = p < m ? rows[p] : -1;
+    if (p < m) {
+      auto const qsq = static_cast<float>(probe_sq[rows[p]]);
+      auto const qn  = sqrtf(qsq);
+      s_qsq[p]       = qsq;
+      s_limit[p]     = bound[rows[p]] + slack.a * qn * slack.x_max +
+                   slack.b * (qn + slack.x_max) * (qn + slack.x_max) + slack.c * (qn + slack.x_max);
+    }
+  }
+  __syncthreads();
+
+  int const lane = threadIdx.x % 32;
+  for (int64_t j0 = static_cast<int64_t>(blockIdx.x) * blockDim.x; j0 < n;
+       j0 += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    int64_t const j = j0 + threadIdx.x;
+    bool const live = j < n;
+    typename mma_traits<T>::accumulator acc[M];
+#pragma unroll
+    for (int p = 0; p < M; ++p) {
+      acc[p] = 0;
+    }
+    if (live) {
+      auto const* xr = reinterpret_cast<int4 const*>(x + j * d);
+      // The probe side is read from shared memory 16 bytes at a time: one load per probe row
+      // per 16 bytes of the corpus row, not one per component.
+      for (int c = 0; c < d / (16 / static_cast<int>(sizeof(T))); ++c) {
+        int4 const v = __ldg(xr + c);
+        if constexpr (kInt8) {
+#pragma unroll
+          for (int p = 0; p < M; ++p) {
+            int4 const q = *reinterpret_cast<int4 const*>(&s_probe[p][c * 4]);
+            acc[p]       = __dp4a(v.x, q.x, acc[p]);
+            acc[p]       = __dp4a(v.y, q.y, acc[p]);
+            acc[p]       = __dp4a(v.z, q.z, acc[p]);
+            acc[p]       = __dp4a(v.w, q.w, acc[p]);
+          }
+        } else {
+          __half2 const* h = reinterpret_cast<__half2 const*>(&v);
+          float f[8];
+#pragma unroll
+          for (int t = 0; t < 4; ++t) {
+            float2 const g = __half22float2(h[t]);
+            f[2 * t]       = g.x;
+            f[2 * t + 1]   = g.y;
+          }
+#pragma unroll
+          for (int p = 0; p < M; ++p) {
+            float4 const q0 = *reinterpret_cast<float4 const*>(&s_probe[p][c * 8]);
+            float4 const q1 = *reinterpret_cast<float4 const*>(&s_probe[p][c * 8 + 4]);
+            acc[p]          = fmaf(f[0], q0.x, acc[p]);
+            acc[p]          = fmaf(f[1], q0.y, acc[p]);
+            acc[p]          = fmaf(f[2], q0.z, acc[p]);
+            acc[p]          = fmaf(f[3], q0.w, acc[p]);
+            acc[p]          = fmaf(f[4], q1.x, acc[p]);
+            acc[p]          = fmaf(f[5], q1.y, acc[p]);
+            acc[p]          = fmaf(f[6], q1.z, acc[p]);
+            acc[p]          = fmaf(f[7], q1.w, acc[p]);
+          }
+        }
+      }
+    }
+    auto const xsq = live ? x_sq[j] : 0;
+#pragma unroll
+    for (int p = 0; p < M; ++p) {
+      bool keep  = false;
+      float dist = 0.f;
+      if (live && p < m) {
+        if constexpr (kInt8) {
+          dist = static_cast<float>(static_cast<int32_t>(s_qsq[p]) + xsq - 2 * acc[p]);
+        } else {
+          dist = s_qsq[p] + xsq - 2.f * acc[p];
+        }
+        keep = dist <= s_limit[p];
+      }
+      unsigned const mask = __ballot_sync(0xffffffffu, keep);
+      if (mask != 0) {
+        int const leader        = __ffs(mask) - 1;
+        unsigned long long base = 0;
+        if (lane == leader) {
+          base = atomicAdd(count, static_cast<unsigned long long>(__popc(mask)));
+        }
+        base = __shfl_sync(0xffffffffu, base, leader);
+        if (keep) {
+          auto const q = base + __popc(mask & ((1u << lane) - 1));
+          if (q < capacity) {
+            out_rows[q] = static_cast<int32_t>(s_rows[p]);
+            out_ids[q]  = id_map != nullptr ? id_map[j] : id_base + j;
+            out_d[q]    = dist;
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Probe-row counts up to this go to bound_filter_small_kernel (SIRIUS_VSS_SMALL_M overrides).
+int small_m_limit()
+{
+  static int const limit = [] {
+    auto const* v = std::getenv("SIRIUS_VSS_SMALL_M");
+    return v == nullptr ? 16 : std::clamp(std::atoi(v), 0, 16);
+  }();
+  return limit;
+}
+
+template <class T>
+bool launch_small(T const* x,
+                  typename mma_traits<T>::norm const* x_sq,
+                  int64_t n,
+                  int64_t id_base,
+                  int64_t const* id_map,
+                  T const* probe,
+                  typename mma_traits<T>::norm const* probe_sq,
+                  int64_t const* rows,
+                  int64_t m,
+                  int64_t dim,
+                  float const* bound,
+                  slack_terms slack,
+                  bound_candidates& out,
+                  rmm::cuda_stream_view stream)
+{
+  if (m > small_m_limit() || dim > kSmallMaxDim) { return false; }
+  auto const grid =
+    static_cast<unsigned>(std::clamp<int64_t>((n + kSmallThreads - 1) / kSmallThreads, 1, 65535));
+  auto go = [&](auto kernel) {
+    kernel<<<grid, kSmallThreads, 0, stream.value()>>>(
+      x,
+      x_sq,
+      n,
+      id_base,
+      id_map,
+      probe,
+      probe_sq,
+      rows,
+      static_cast<int>(m),
+      static_cast<int>(dim),
+      bound,
+      slack,
+      out.rows.data(),
+      out.ids.data(),
+      out.distances.data(),
+      out.count.data(),
+      static_cast<unsigned long long>(out.capacity()));
+  };
+  if (m <= 1) {
+    go(bound_filter_small_kernel<T, 1>);
+  } else if (m <= 2) {
+    go(bound_filter_small_kernel<T, 2>);
+  } else if (m <= 4) {
+    go(bound_filter_small_kernel<T, 4>);
+  } else if (m <= 8) {
+    go(bound_filter_small_kernel<T, 8>);
+  } else {
+    go(bound_filter_small_kernel<T, 16>);
+  }
+  CUDF_CUDA_TRY(cudaGetLastError());
+  return true;
 }
 
 // One warp per pair: the exact FP32 squared distance between probe row rows[i] (or i / k when
@@ -425,6 +637,22 @@ void bound_filter_int8(int8_t const* x,
 {
   if (n == 0 || m == 0) { return; }
   CUDF_EXPECTS(bound_filter_int8_supports(dim), "bound_filter_int8: unsupported vector width");
+  if (launch_small(x,
+                   x_sq,
+                   n,
+                   id_base,
+                   id_map,
+                   probe,
+                   probe_sq,
+                   rows,
+                   m,
+                   dim,
+                   bound,
+                   slack_terms{},
+                   out,
+                   stream)) {
+    return;
+  }
   CUDF_EXPECTS((m + kTileM - 1) / kTileM <= 65535, "bound_filter_int8: too many probe rows");
   dim3 const grid(static_cast<unsigned>((n + kTileN - 1) / kTileN),
                   static_cast<unsigned>((m + kTileM - 1) / kTileM));
@@ -484,6 +712,22 @@ void bound_filter_f16(std::uint16_t const* x,
 {
   if (n == 0 || m == 0) { return; }
   CUDF_EXPECTS(bound_filter_f16_supports(dim), "bound_filter_f16: unsupported vector width");
+  if (launch_small(reinterpret_cast<__half const*>(x),
+                   x_sq,
+                   n,
+                   id_base,
+                   nullptr,
+                   reinterpret_cast<__half const*>(probe),
+                   probe_sq,
+                   rows,
+                   m,
+                   dim,
+                   bound,
+                   slack_terms{slack.a, slack.b, slack.c, slack.x_max},
+                   out,
+                   stream)) {
+    return;
+  }
   CUDF_EXPECTS((m + kTileM - 1) / kTileM <= 65535, "bound_filter_f16: too many probe rows");
   dim3 const grid(static_cast<unsigned>((n + kTileN - 1) / kTileN),
                   static_cast<unsigned>((m + kTileM - 1) / kTileM));

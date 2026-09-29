@@ -28,8 +28,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1108,6 +1110,30 @@ TEST_CASE_METHOD(
   }
 }
 
+namespace {
+
+/// A radius at the 1/@p at-th quantile of @p pairs' distances, set halfway between two distinct
+/// ones: a pair sitting on the radius is in or out depending on how each search rounds it.
+std::string radius_between(std::vector<std::pair<std::string, double>> const& pairs, double at)
+{
+  std::vector<double> d;
+  for (auto const& p : pairs) {
+    d.push_back(p.second);
+  }
+  std::sort(d.begin(), d.end());
+  auto const i = static_cast<std::size_t>(static_cast<double>(d.size()) / at);
+  auto j       = i + 1;
+  while (j < d.size() && d[j] <= d[i] * (1 + 1e-4)) {
+    ++j;
+  }
+  REQUIRE(j < d.size());
+  std::ostringstream out;
+  out << std::setprecision(17) << (d[i] + d[j]) / 2;
+  return out.str();
+}
+
+}  // namespace
+
 TEST_CASE_METHOD(KMeansFixture,
                  "UINT8 and float16 cluster lists on the host tier give the exact join's answer",
                  "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
@@ -1149,13 +1175,58 @@ TEST_CASE_METHOD(KMeansFixture,
     auto const kk = "k => " + std::to_string(k) + ", ";
     same(fetch(kk + approx), fetch(kk + "search_mode => 'exact-gemm'"));
   }
-  // A radius around the median 10th-nearest distance.
-  auto tenth = fetch("k => 10, search_mode => 'exact-gemm'");
-  std::sort(
-    tenth.begin(), tenth.end(), [](auto const& x, auto const& y) { return x.second < y.second; });
   auto const eps = "join_mode => 'threshold', eps => " +
-                   std::to_string(tenth.at(tenth.size() * 9 / 10).second) + ", ";
+                   radius_between(fetch("k => 10, search_mode => 'exact-gemm'"), 10.0 / 9) + ", ";
   auto const exact = fetch(eps + "search_mode => 'exact-gemm'");
   REQUIRE(exact.size() > 50);
+  same(fetch(eps + approx), exact);
+}
+
+TEST_CASE_METHOD(
+  KMeansFixture,
+  "a few probe rows over UINT8 and float16 cluster lists give the exact join's answer",
+  "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // Every slice then serves at most three probe rows, which the bounded search scores one corpus
+  // row per thread instead of in tensor-core tiles; the answers must not change.
+  auto const bytes  = GENERATE(true, false);
+  auto const prefix = std::string(bytes ? "kmsu" : "kmsh");
+  create_lists_tables(*this, prefix, bytes ? "gpu" : "host", bytes);
+  run_ok("CREATE TABLE " + prefix + "_few AS SELECT * FROM " + prefix + "_probe WHERE id < 3;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_few', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => 16);");
+  run_ok("SELECT * FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" + prefix +
+         "_c', storage => '" + (bytes ? "uint8" : "float16") + "');");
+
+  auto const fetch = [&](const std::string& mode) {
+    std::vector<std::pair<std::string, double>> out;
+    for (auto const& r :
+         ok_rows(*con,
+                 "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_few','vec','" +
+                   prefix + "_corpus','vec', metric => 'l2', " + mode + ");")) {
+      out.emplace_back(r.at(0), std::stod(r.at(1)));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+  auto const same = [](auto const& a, auto const& b) {
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      CHECK(a[i].first == b[i].first);
+      CHECK(std::abs(a[i].second - b[i].second) <= 1e-5 * std::max(1.0, b[i].second));
+    }
+  };
+  auto const approx = "search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 16";
+  for (auto const k : {1, 10, 100}) {
+    auto const kk = "k => " + std::to_string(k) + ", ";
+    same(fetch(kk + approx), fetch(kk + "search_mode => 'exact-gemm'"));
+  }
+  auto const eps = "join_mode => 'threshold', eps => " +
+                   radius_between(fetch("k => 50, search_mode => 'exact-gemm'"), 2) + ", ";
+  auto const exact = fetch(eps + "search_mode => 'exact-gemm'");
+  REQUIRE(exact.size() > 10);
   same(fetch(eps + approx), exact);
 }
