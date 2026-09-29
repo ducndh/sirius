@@ -18,6 +18,8 @@
 // predicate hoisted into a projection and then ignored, so count(*) FILTER (WHERE c) returned the
 // unfiltered count with no error.
 
+#include "duckdb/main/config.hpp"
+
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/sirius_test_env.hpp>
@@ -25,6 +27,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <set>
 #include <string>
 #include <system_error>
 
@@ -58,6 +61,13 @@ class AggregateFilterFixture {
     }
     con = std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
     require_ok(*con, "SET enable_duckdb_fallback = false");
+    // The shared database's optimizer mask is DB-global and an earlier test can leave it
+    // cleared; DuckDB's compressed materialization then rewrites these small-range columns into
+    // shapes the GPU plan does not translate. Pin the mask Sirius publishes at load for this
+    // fixture, the way the pipeline-conversion fixtures do, and restore it afterwards.
+    auto& disabled = duckdb::DBConfig::GetConfig(*con->context).options.disabled_optimizers;
+    original_disabled_optimizers = disabled;
+    disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
     // The shared environment's database is in-memory and the GPU scan reads a database
     // file's block manager, so the table is written to a file by a plain DuckDB instance
     // (Sirius is disabled for secondary instances) and attached read-only, as the TPC-H
@@ -84,6 +94,8 @@ class AggregateFilterFixture {
   ~AggregateFilterFixture()
   {
     if (con) {
+      duckdb::DBConfig::GetConfig(*con->context).options.disabled_optimizers =
+        original_disabled_optimizers;
       con->Query("USE memory");
       con->Query("DETACH afdb");
     }
@@ -122,6 +134,7 @@ class AggregateFilterFixture {
 
   std::unique_ptr<duckdb::Connection> con;
   std::filesystem::path db_path;
+  std::set<duckdb::OptimizerType> original_disabled_optimizers;
 };
 
 }  // namespace
@@ -130,22 +143,24 @@ TEST_CASE_METHOD(AggregateFilterFixture,
                  "aggregate FILTER - ungrouped count(*)/count/sum/min/max/avg",
                  "[integration][gpu_execution][aggregate][filter]")
 {
-  compare("SELECT count(*) FILTER (WHERE v > 25000) AS c_star, "
-          "       count(v) FILTER (WHERE g = 3) AS c_v, "
-          "       sum(v) FILTER (WHERE g IN (1, 2)) AS s, "
-          "       min(v) FILTER (WHERE g = 7) AS mn, "
-          "       max(v) FILTER (WHERE g = 7) AS mx, "
-          "       avg(d) FILTER (WHERE v IS NOT NULL) AS a "
-          "FROM af");
+  compare(
+    "SELECT count(*) FILTER (WHERE v > 25000) AS c_star, "
+    "       count(v) FILTER (WHERE g = 3) AS c_v, "
+    "       sum(v) FILTER (WHERE g IN (1, 2)) AS s, "
+    "       min(v) FILTER (WHERE g = 7) AS mn, "
+    "       max(v) FILTER (WHERE g = 7) AS mx, "
+    "       avg(d) FILTER (WHERE v IS NOT NULL) AS a "
+    "FROM af");
 }
 
 TEST_CASE_METHOD(AggregateFilterFixture,
                  "aggregate FILTER - grouped, mixed with unfiltered aggregates",
                  "[integration][gpu_execution][aggregate][filter]")
 {
-  compare("SELECT g, count(*) AS n, count(*) FILTER (WHERE v > 25000) AS n_hi, "
-          "       sum(v) FILTER (WHERE d > 2) AS s_d, sum(v) AS s "
-          "FROM af GROUP BY g ORDER BY g");
+  compare(
+    "SELECT g, count(*) AS n, count(*) FILTER (WHERE v > 25000) AS n_hi, "
+    "       sum(v) FILTER (WHERE d > 2) AS s_d, sum(v) AS s "
+    "FROM af GROUP BY g ORDER BY g");
 }
 
 TEST_CASE_METHOD(AggregateFilterFixture,
@@ -155,8 +170,10 @@ TEST_CASE_METHOD(AggregateFilterFixture,
   // Predicates statistics cannot fold: a filter the optimizer proves constant becomes a
   // constant CASE, and two of those in one projection hit a pre-existing translation gap
   // that has nothing to do with FILTER (the same query with explicit CASE fails the same way).
-  compare("SELECT count(*) FILTER (WHERE v % 7 = 99) AS none, sum(v) FILTER (WHERE v % 7 = 99) AS s_none, "
-          "       count(*) FILTER (WHERE g % 1 = 0) AS all_rows FROM af");
+  compare(
+    "SELECT count(*) FILTER (WHERE v % 7 = 99) AS none, sum(v) FILTER (WHERE v % 7 = 99) AS "
+    "s_none, "
+    "       count(*) FILTER (WHERE g % 1 = 0) AS all_rows FROM af");
 }
 
 TEST_CASE_METHOD(AggregateFilterFixture,
@@ -175,8 +192,7 @@ TEST_CASE_METHOD(AggregateFilterFixture,
   // string_agg keeps every input; there is no NULL-skipping rewrite for it, so with fallback off
   // the statement must fail rather than return the unfiltered aggregate.
   require_ok(*con, "SET gpu_execution = true");
-  auto gpu = con->Query(
-    "SELECT string_agg(CAST(g AS VARCHAR), ',') FILTER (WHERE g < 2) FROM af");
+  auto gpu = con->Query("SELECT string_agg(CAST(g AS VARCHAR), ',') FILTER (WHERE g < 2) FROM af");
   REQUIRE(gpu);
   REQUIRE(gpu->HasError());
 }
