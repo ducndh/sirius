@@ -772,7 +772,8 @@ std::optional<expr_ref> gpu_expression_translator::add_expression(
     case pow: return add_function_expression<cudf::ast::ast_operator::POW>(alt, table_src);
     case abs: return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::ABS);
     case sqrt: return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::SQRT);
-    case floor: return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::FLOOR);
+    case floor:
+      return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::FLOOR);
     case ceil: return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::CEIL);
     case exp: return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::EXP);
     case ln: return add_unary_function_expression(alt, table_src, cudf::ast::ast_operator::LOG);
@@ -793,9 +794,8 @@ std::optional<expr_ref> gpu_expression_translator::add_unary_function_expression
   if (alt.arguments().size() != 1) { return std::nullopt; }
   auto arg = add_expression(*alt.arguments()[0], table_src);
   if (!arg) { return std::nullopt; }
-  auto const wants_double =
-    sirius::get_cudf_type(alt.return_type()).id() == cudf::type_id::FLOAT64;
-  auto const arg_type = node_logical_type_id(*alt.arguments()[0]);
+  auto const wants_double = sirius::get_cudf_type(alt.return_type()).id() == cudf::type_id::FLOAT64;
+  auto const arg_type     = node_logical_type_id(*alt.arguments()[0]);
   if (arg_type != sirius::type_id::FLOAT && arg_type != sirius::type_id::DOUBLE) {
     return std::nullopt;
   }
@@ -837,10 +837,9 @@ std::optional<expr_ref> gpu_expression_translator::add_round_expression(
     scale *= 10.0;
   }
   // Same scalar type as the argument so cuDF sees one type on both sides of the operators.
-  auto scale_lit = is_double
-                     ? add_literal_expression<cudf::numeric_scalar<double>>(scale, true)
-                     : add_literal_expression<cudf::numeric_scalar<float>>(
-                         static_cast<float>(scale), true);
+  auto scale_lit = is_double ? add_literal_expression<cudf::numeric_scalar<double>>(scale, true)
+                             : add_literal_expression<cudf::numeric_scalar<float>>(
+                                 static_cast<float>(scale), true);
   if (!scale_lit) { return std::nullopt; }
   auto scaled =
     _ast_tree.emplace<cudf::ast::operation>(cudf::ast::ast_operator::MUL, *arg, *scale_lit);

@@ -146,11 +146,13 @@ enum class list_storage : std::uint8_t { automatic, float32, uint8, float16 };
  * @brief `sirius_kmeans_build_lists(table, column, clustering)`: build @ref cluster_lists for a
  *        pinned column under a fitted clustering, replacing any lists that clustering had.
  *
- * GPU tier when the pin is GPU-resident and the copy fits the device, HOST tier otherwise.
+ * GPU tier when the pin is GPU-resident and the copy fits the device, HOST tier otherwise, or
+ * always HOST with @p host_tier.
  */
 cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                             const kmeans_assign_request& req,
-                                            list_storage storage = list_storage::automatic);
+                                            list_storage storage = list_storage::automatic,
+                                            bool host_tier       = false);
 
 /// The lists built for @p clustering, or nullptr when there are none.
 [[nodiscard]] const cluster_lists* find_cluster_lists(duckdb::SiriusContext& ctx,

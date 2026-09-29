@@ -31,11 +31,10 @@
 
 // cudf
 #include <cudf/binaryop.hpp>
-#include <cudf/round.hpp>
-#include <cudf/unary.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/cudf_utils.hpp>
 #include <cudf/datetime.hpp>
+#include <cudf/round.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/attributes.hpp>
 #include <cudf/strings/combine.hpp>
@@ -452,7 +451,8 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     auto arg = evaluate(*args[0], evaluation_mode::MATERIALIZE);
     std::unique_ptr<cudf::column> input;
     if (arg.is_scalar()) {
-      input = cudf::make_column_from_scalar(arg.get_scalar(), _input_table.num_rows(), _stream, _mr);
+      input =
+        cudf::make_column_from_scalar(arg.get_scalar(), _input_table.num_rows(), _stream, _mr);
     }
     auto const in_view = arg.is_scalar() ? input->view() : arg.get_column_view();
     auto out           = cudf::unary_operation(in_view, op, _stream, _mr);
@@ -480,11 +480,14 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
       auto const& sc = d.get_scalar();
       switch (sc.type().id()) {
         case cudf::type_id::INT8:
-          digits = static_cast<cudf::numeric_scalar<int8_t> const&>(sc).value(_stream); break;
+          digits = static_cast<cudf::numeric_scalar<int8_t> const&>(sc).value(_stream);
+          break;
         case cudf::type_id::INT16:
-          digits = static_cast<cudf::numeric_scalar<int16_t> const&>(sc).value(_stream); break;
+          digits = static_cast<cudf::numeric_scalar<int16_t> const&>(sc).value(_stream);
+          break;
         case cudf::type_id::INT32:
-          digits = static_cast<cudf::numeric_scalar<int32_t> const&>(sc).value(_stream); break;
+          digits = static_cast<cudf::numeric_scalar<int32_t> const&>(sc).value(_stream);
+          break;
         case cudf::type_id::INT64:
           digits = static_cast<std::int32_t>(
             static_cast<cudf::numeric_scalar<int64_t> const&>(sc).value(_stream));
@@ -497,10 +500,11 @@ evaluate_result expression_evaluator::evaluate(sirius::ast::function_call const&
     auto arg = evaluate(*args[0], evaluation_mode::MATERIALIZE);
     std::unique_ptr<cudf::column> input;
     if (arg.is_scalar()) {
-      input = cudf::make_column_from_scalar(arg.get_scalar(), _input_table.num_rows(), _stream, _mr);
+      input =
+        cudf::make_column_from_scalar(arg.get_scalar(), _input_table.num_rows(), _stream, _mr);
     }
     auto const in_view = arg.is_scalar() ? input->view() : arg.get_column_view();
-    auto out = cudf::round(in_view, digits, cudf::rounding_method::HALF_UP, _stream, _mr);
+    auto out           = cudf::round(in_view, digits, cudf::rounding_method::HALF_UP, _stream, _mr);
     if (out->type() != output_type) { out = cudf::cast(out->view(), output_type, _stream, _mr); }
     return evaluate_result(std::move(out));
   }

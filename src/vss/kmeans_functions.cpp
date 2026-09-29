@@ -315,7 +315,8 @@ void erase_cluster_lists(duckdb::SiriusContext& ctx, const std::string& clusteri
 
 cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                             const kmeans_assign_request& req,
-                                            list_storage storage)
+                                            list_storage storage,
+                                            bool host_tier)
 {
   static const std::string fn = "sirius_kmeans_build_lists";
   auto const c                = resolve_context(ctx, fn, req.catalog, req.schema, req.table);
@@ -517,8 +518,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   std::unique_ptr<cucascade::memory::reservation> reservation;
   // FP32 lists live where the pin does; UINT8 ones are a quarter of the corpus and go to the
   // device whenever they fit, which is what takes the corpus stream off the query path.
-  bool on_device =
-    c.pin->tier == cucascade::memory::Tier::GPU || encoding != list_encoding::float32;
+  bool on_device = !host_tier && (c.pin->tier == cucascade::memory::Tier::GPU ||
+                                  encoding != list_encoding::float32);
   if (on_device) {
     reservation = index_cache.reserve_index_memory(
       vec_bytes + row_bytes + row_bytes / 2 + (std::size_t{1} << 24), c.target_gpu);

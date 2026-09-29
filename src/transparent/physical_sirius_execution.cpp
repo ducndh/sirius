@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include <atomic>
 #include "transparent/physical_sirius_execution.hpp"
 
 #include "log/logging.hpp"
@@ -35,6 +34,8 @@
 #include <duckdb/optimizer/optimizer.hpp>
 #include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
+
+#include <atomic>
 
 namespace sirius::transparent {
 
@@ -387,9 +388,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         // GPU-only rewrite targets (sirius_knn_join) it is actively misleading -- the
         // user sees "cannot run on the CPU" when the real cause was, say, an OOM. Report
         // the GPU error, which is the actionable one, with the fallback failure attached.
-        throw duckdb::ExecutorException("Sirius GPU execution failed: " + gpu_msg +
-                                        " (CPU fallback also failed: " +
-                                        std::string(fallback_error.what()) + ")");
+        throw duckdb::ExecutorException(
+          "Sirius GPU execution failed: " + gpu_msg +
+          " (CPU fallback also failed: " + std::string(fallback_error.what()) + ")");
       }
     }
 

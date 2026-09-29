@@ -2604,7 +2604,8 @@ static void SiriusKMeansFitFunction(ClientContext& context,
 struct KMeansBuildListsData : public TableFunctionData {
   sirius::vss::kmeans_assign_request req;
   sirius::vss::list_storage storage{sirius::vss::list_storage::automatic};
-  bool finished = false;
+  bool host_tier = false;
+  bool finished  = false;
 };
 
 static unique_ptr<FunctionData> SiriusKMeansBuildListsBind(ClientContext& context,
@@ -2645,6 +2646,13 @@ static unique_ptr<FunctionData> SiriusKMeansBuildListsBind(ClientContext& contex
           "'float16', got '" +
           v + "'");
       }
+    } else if (key == "tier") {
+      auto const v = StringUtil::Lower(kv.second.ToString());
+      if (v != "auto" && v != "host") {
+        throw BinderException("sirius_kmeans_build_lists: tier must be 'auto' or 'host', got '" +
+                              v + "'");
+      }
+      result->host_tier = v == "host";
     }
   }
   req.dim      = ResolveVectorColumn(context,
@@ -2680,7 +2688,8 @@ static void SiriusKMeansBuildListsFunction(ClientContext& context,
     throw InvalidInputException(
       "sirius_kmeans_build_lists requires the Sirius context to be initialized");
   }
-  auto const built = sirius::vss::run_kmeans_build_lists(*sirius_ctx, data.req, data.storage);
+  auto const built =
+    sirius::vss::run_kmeans_build_lists(*sirius_ctx, data.req, data.storage, data.host_tier);
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BIGINT(built.n_rows));
   output.SetValue(1, 0, Value::BIGINT(built.n_clusters));
@@ -3520,7 +3529,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo kmeans_fit_info(kmeans_fit);
   catalog.CreateTableFunction(transaction, kmeans_fit_info);
 
-  // sirius_kmeans_build_lists(table, column, clustering, schema_name =>)
+  // sirius_kmeans_build_lists(table, column, clustering, schema_name =>, storage =>, tier =>)
   TableFunction kmeans_build_lists(
     "sirius_kmeans_build_lists",
     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -3528,6 +3537,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
     SiriusKMeansBuildListsBind);
   kmeans_build_lists.named_parameters["schema_name"] = LogicalType::VARCHAR;
   kmeans_build_lists.named_parameters["storage"]     = LogicalType::VARCHAR;
+  kmeans_build_lists.named_parameters["tier"]        = LogicalType::VARCHAR;
   CreateTableFunctionInfo kmeans_build_lists_info(kmeans_build_lists);
   catalog.CreateTableFunction(transaction, kmeans_build_lists_info);
 

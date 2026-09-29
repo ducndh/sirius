@@ -19,18 +19,18 @@
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
-#include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "expression/aggregate_id.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
+#include "expression/aggregate_id.hpp"
 #include "expression/ast/from_duckdb.hpp"
 #include "expression/ast/node.hpp"
 #include "expression/ast/reference.hpp"
@@ -92,7 +92,7 @@ void rewrite_filtered_aggregate(duckdb::ClientContext& context,
 {
   auto& bound = aggr->Cast<duckdb::BoundAggregateExpression>();
   if (!bound.filter) { return; }
-  auto const& name = bound.function.name;
+  auto const& name         = bound.function.name;
   bool const null_skipping = name == "count" || name == "sum" || name == "sum_no_overflow" ||
                              name == "min" || name == "max" || name == "avg";
   if (name == "count_star") {
@@ -104,21 +104,21 @@ void rewrite_filtered_aggregate(duckdb::ClientContext& context,
     check.when_expr = std::move(bound.filter);
     check.then_expr = std::move(one);
     cased->case_checks.push_back(std::move(check));
-    cased->else_expr =
-      duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value(duckdb::LogicalType::INTEGER));
+    cased->else_expr = duckdb::make_uniq<duckdb::BoundConstantExpression>(
+      duckdb::Value(duckdb::LogicalType::INTEGER));
     children.push_back(std::move(cased));
     auto count = duckdb::CountFun::GetFunctions().GetFunctionByArguments(
       context, {duckdb::LogicalType::INTEGER});
     duckdb::FunctionBinder binder(context);
-    auto rewritten = binder.BindAggregateFunction(
-      count, std::move(children), nullptr, bound.aggr_type);
+    auto rewritten =
+      binder.BindAggregateFunction(count, std::move(children), nullptr, bound.aggr_type);
     rewritten->alias = bound.alias;
     aggr             = std::move(rewritten);
     return;
   }
   if (!null_skipping || bound.children.size() != 1) {
-    throw duckdb::NotImplementedException(
-      "Sirius: aggregate '" + name + "' with a FILTER clause is not supported on the GPU");
+    throw duckdb::NotImplementedException("Sirius: aggregate '" + name +
+                                          "' with a FILTER clause is not supported on the GPU");
   }
   auto& child = bound.children[0];
   auto cased  = duckdb::make_uniq<duckdb::BoundCaseExpression>(child->return_type);
@@ -126,8 +126,8 @@ void rewrite_filtered_aggregate(duckdb::ClientContext& context,
   check.when_expr = std::move(bound.filter);
   check.then_expr = std::move(child);
   cased->case_checks.push_back(std::move(check));
-  cased->else_expr = duckdb::make_uniq<duckdb::BoundConstantExpression>(
-    duckdb::Value(cased->return_type));
+  cased->else_expr =
+    duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value(cased->return_type));
   child = std::move(cased);
 }
 
@@ -859,11 +859,15 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDistinct& op)
 
   // Table indices are irrelevant here: column references were resolved before planning.
   auto aggregate = duckdb::make_uniq<duckdb::LogicalAggregate>(
-    /*group_index=*/0, /*aggregate_index=*/0, duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
+    /*group_index=*/0,
+    /*aggregate_index=*/0,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{});
   aggregate->groups = std::move(op.distinct_targets);
   aggregate->types  = types;
   duckdb::GroupingSet all_groups;
-  for (duckdb::idx_t i = 0; i < types.size(); ++i) { all_groups.insert(i); }
+  for (duckdb::idx_t i = 0; i < types.size(); ++i) {
+    all_groups.insert(i);
+  }
   aggregate->grouping_sets.push_back(std::move(all_groups));
   aggregate->estimated_cardinality = op.estimated_cardinality;
   aggregate->children.push_back(std::move(op.children[0]));

@@ -72,6 +72,7 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1456,15 +1457,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       auto const* v = std::getenv("SIRIUS_VSS_BOUND_GEMM");
       return v == nullptr || std::strcmp(v, "0") != 0;
     }();
-    // Byte-valued lists on the device, searched by a byte-valued probe side, run on the int8 tensor
-    // cores straight from the stored bytes: no chunk is widened or staged, the row norms were
+    // Byte-valued lists, searched by a byte-valued probe side, run on the int8 tensor cores
+    // straight from the stored bytes: no chunk is widened, the row norms were
     // computed at build time, and every dot product is exact. Only the probe is converted, once.
     // A radius join has only the bounded form of that search.
     bool int8_search =
       gemm_search_enabled() && _lists != nullptr &&
       (!radius_join || (bound_gemm_enabled && vss::bound_filter_int8_supports(dim))) &&
-      _lists->encoding == vss::list_encoding::uint8 &&
-      _lists->tier == cucascade::memory::Tier::GPU && _lists->row_sq != nullptr &&
+      _lists->encoding == vss::list_encoding::uint8 && _lists->row_sq != nullptr &&
       (metric == cuvs::distance::DistanceType::L2Expanded ||
        metric == cuvs::distance::DistanceType::L2SqrtExpanded) &&
       dim % 4 == 0;
@@ -1509,7 +1509,6 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // stay layout rows until the end, where the re-scoring needs them.
     bool const f16_bounded = !int8_search && gemm_search_enabled() && _lists != nullptr &&
                              _lists->encoding == vss::list_encoding::float16 &&
-                             _lists->tier == cucascade::memory::Tier::GPU &&
                              _lists->exact_vectors != nullptr &&
                              (metric == cuvs::distance::DistanceType::L2Expanded ||
                               metric == cuvs::distance::DistanceType::L2SqrtExpanded) &&
@@ -1678,12 +1677,105 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     std::int64_t scanned_pairs = 0;
     staged_vector_chunk prefetched;
 
+    // Lists that did not fit the device are read by the same searches: a sweep that reads the
+    // lists in place copies each needed chunk's stored rows in as they are, still compact, and
+    // points the search at the copy. Four rows of slack, as on the device.
+    bool const lists_on_host = _lists != nullptr && _lists->tier == cucascade::memory::Tier::HOST;
+    auto stage_compact       = [&](std::size_t j) {
+      auto const rows  = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
+      auto const first = static_cast<std::int64_t>(j) * _lists->chunk_rows;
+      auto const bytes = static_cast<std::size_t>(rows + 4) * _lists->row_bytes();
+      std::shared_ptr<cucascade::memory::reservation> reservation{
+        mem_space->make_reservation_or_null(bytes)};
+      if (!reservation) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] lists chunk " +
+                                 std::to_string(j) + " needs " + std::to_string(bytes) +
+                                 " bytes device-side, which exceeds this task's budget");
+      }
+      auto buffer =
+        std::make_unique<rmm::device_buffer>(bytes, stage_on, reservation->get_memory_resource());
+      auto* out             = static_cast<std::byte*>(buffer->data());
+      auto const block_rows = _lists->rows_per_block;
+      for (std::int64_t r = 0; r < rows; r += block_rows) {
+        auto const n = std::min(block_rows, rows - r);
+        auto const block =
+          _lists->host_vectors->at(static_cast<std::size_t>((first + r) / block_rows));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(out + static_cast<std::size_t>(r) * _lists->row_bytes(),
+                                      block.data(),
+                                      static_cast<std::size_t>(n) * _lists->row_bytes(),
+                                      cudaMemcpyHostToDevice,
+                                      stage_on.value()));
+      }
+      // As the chunk sources do: the host waits on the copy while the device runs what the
+      // previous chunk issued, and the copy is complete before anything reads it.
+      stage_on.synchronize();
+      staged_vector_chunk staged{cudf::column_view{}, nullptr, std::move(reservation)};
+      staged.buffer = std::move(buffer);
+      return staged;
+    };
+
+    // Sweep 0 of a bounded search only reads each row's nearest cluster, so only the chunks
+    // holding one; with few probe rows that is a small part of what sweep 1 reads.
+    std::vector<std::size_t> nearest_chunks;
+    if (any_bounded) {
+      for (auto const j : needed_chunks) {
+        for (auto const& slice : _chunk_cluster_runs[j]) {
+          if (nearest_edges[static_cast<std::size_t>(slice.cluster)] > 0) {
+            nearest_chunks.push_back(j);
+            break;
+          }
+        }
+      }
+    }
+
+    // The compact chunks sweep 0 copied in stay on the device for sweep 1 while the budget still
+    // has a margin free, and sweep 1 starts with them: lists that nearly fit are read about once.
+    std::map<std::size_t, staged_vector_chunk> kept;
+    bool const keep_chunks = lists_on_host && any_bounded && !radius_join && [] {
+      auto const* v = std::getenv("SIRIUS_VSS_KEEP_LIST_CHUNKS");
+      return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    constexpr std::size_t kKeepMargin = std::size_t{2} << 30;
+    auto can_keep = [&] { return mem_space->make_reservation_or_null(kKeepMargin) != nullptr; };
+    std::vector<std::size_t> kept_first;
+    auto check_chunk_base = [&](std::size_t j, std::int64_t chunk_base) {
+      if (chunk_base != static_cast<std::int64_t>(j) * _lists->chunk_rows) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] lists chunk " +
+                                 std::to_string(j) + " starts at row " +
+                                 std::to_string(static_cast<std::int64_t>(j) * _lists->chunk_rows) +
+                                 " but its cluster runs at " + std::to_string(chunk_base));
+      }
+    };
+
     for (int sweep = radius_join && any_bounded ? 1 : 0; sweep < (any_bounded ? 2 : 1); ++sweep) {
-      // A sweep that reads the lists in place stages nothing.
-      bool const direct = int8_search || (f16_bounded && sweep == 1);
-      prefetched        = needed_chunks.empty() || direct
-                            ? staged_vector_chunk{}
-                            : _corpus->stage(needed_chunks[0], *mem_space, stage_on);
+      if (sweep == 1 && !kept.empty()) {
+        for (auto const& entry : kept) {
+          kept_first.push_back(entry.first);
+        }
+        for (auto const j : needed_chunks) {
+          if (kept.count(j) == 0) { kept_first.push_back(j); }
+        }
+      }
+      auto const& chunks = any_bounded && sweep == 0 ? nearest_chunks
+                           : kept_first.empty()      ? needed_chunks
+                                                     : kept_first;
+      // A sweep that reads the lists in place stages nothing. FP16 lists on the host are copied
+      // in compact for sweep 0 as well, and widened on the device, so that copy can be kept.
+      bool const direct        = int8_search || (f16_bounded && sweep == 1);
+      bool const widen_compact = lists_on_host && f16_bounded && sweep == 0;
+      bool const copy_compact  = (direct && lists_on_host) || widen_compact;
+      auto stage_next          = [&](std::size_t j) {
+        if (copy_compact) {
+          if (auto it = kept.find(j); it != kept.end()) {
+            auto chunk = std::move(it->second);
+            kept.erase(it);
+            return chunk;
+          }
+          return stage_compact(j);
+        }
+        return direct ? staged_vector_chunk{} : _corpus->stage(j, *mem_space, stage_on);
+      };
+      prefetched = chunks.empty() ? staged_vector_chunk{} : stage_next(chunks[0]);
       if (sweep == 1) {
         phase("nearest-cluster sweep");
         bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
@@ -1717,14 +1809,30 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                            stream,
                            mr);
       }
-      for (std::size_t ci = 0; ci < needed_chunks.size(); ++ci) {
-        auto const j            = needed_chunks[ci];
+      for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
+        auto const j            = chunks[ci];
         auto staged             = std::move(prefetched);
         auto const chunk_base   = _chunk_row_base[j];
         float const* chunk_data = nullptr;
         std::int64_t chunk_n    = 0;
+        // Chunk j's stored rows, where a direct sweep reads them.
+        std::byte const* compact = nullptr;
+        std::optional<rmm::device_buffer> widened;
         if (direct) {
           chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
+          check_chunk_base(j, chunk_base);
+          compact = copy_compact ? static_cast<std::byte const*>(staged.buffer->data())
+                                 : static_cast<std::byte const*>(_lists->device_vectors->data()) +
+                                     static_cast<std::size_t>(chunk_base) * _lists->row_bytes();
+        } else if (widen_compact) {
+          chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
+          check_chunk_base(j, chunk_base);
+          widened.emplace(static_cast<std::size_t>(chunk_n * dim) * sizeof(float), stream, mr);
+          vss::widen_float16(static_cast<std::uint16_t const*>(staged.buffer->data()),
+                             chunk_n * dim,
+                             static_cast<float*>(widened->data()),
+                             stream);
+          chunk_data = static_cast<float const*>(widened->data());
         } else {
           auto const chunk_view = vss::list_column_as_dataset_view(staged.view, dim);
           chunk_data            = chunk_view.data_handle();
@@ -1781,22 +1889,20 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           if (sweep == 1) {
             bounded_slice const sl =
               f16_bounded
-                ? bounded_slice{static_cast<std::uint16_t const*>(_lists->device_vectors->data()) +
-                                  id_base * dim,
+                ? bounded_slice{reinterpret_cast<std::uint16_t const*>(compact) + slice.begin * dim,
                                 static_cast<float const*>(_lists->row_sq_f32->data()) + id_base,
                                 slice_rows,
                                 id_base,
                                 nullptr,
                                 rows_c,
                                 m}
-                : bounded_slice{
-                    static_cast<std::int8_t const*>(_lists->device_vectors->data()) + id_base * dim,
-                    static_cast<std::int32_t const*>(_lists->row_sq->data()) + id_base,
-                    slice_rows,
-                    id_base,
-                    id_map,
-                    rows_c,
-                    m};
+                : bounded_slice{reinterpret_cast<std::int8_t const*>(compact) + slice.begin * dim,
+                                static_cast<std::int32_t const*>(_lists->row_sq->data()) + id_base,
+                                slice_rows,
+                                id_base,
+                                id_map,
+                                rows_c,
+                                m};
             launch_bounded(sl);
             ++bounded_launches;
             bounded_padded += ((slice_rows + 127) / 128) * ((m + 127) / 128);
@@ -1839,7 +1945,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
               vss::gather_int32(probe_sq->data(), rows_c, m, routed_sq->data(), stream);
               return vss::gemm_int8_topk(
                 res,
-                static_cast<std::int8_t const*>(_lists->device_vectors->data()) + id_base * dim,
+                reinterpret_cast<std::int8_t const*>(compact) + slice.begin * dim,
                 static_cast<std::int32_t const*>(_lists->row_sq->data()) + id_base,
                 slice_rows,
                 routed_i8->data(),
@@ -1878,12 +1984,18 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
 
         // The searches above are issued, not finished. Staging the next needed chunk now runs its
         // H2D while the GPU works on this one.
-        prefetched = (ci + 1 < needed_chunks.size() && !direct)
-                       ? _corpus->stage(needed_chunks[ci + 1], *mem_space, stage_on)
-                       : staged_vector_chunk{};
-        release_staged(staged);
+        prefetched = ci + 1 < chunks.size() ? stage_next(chunks[ci + 1]) : staged_vector_chunk{};
+        if (keep_chunks && sweep == 0 && can_keep()) {
+          kept.emplace(j, std::move(staged));
+        } else {
+          release_staged(staged);
+        }
       }
     }
+    for (auto& entry : kept) {
+      release_staged(entry.second);
+    }
+    kept.clear();
     if (any_bounded) {
       check_group();
       flush();

@@ -1107,3 +1107,55 @@ TEST_CASE_METHOD(
     }
   }
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "UINT8 and float16 cluster lists on the host tier give the exact join's answer",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // Lists that do not fit the device are copied in a chunk at a time, still compact, and searched
+  // by the same bounded GEMMs as on the device. 70,000 rows span two chunks either way.
+  auto const bytes  = GENERATE(true, false);
+  auto const prefix = std::string(bytes ? "kmhu" : "kmhh");
+  create_lists_tables(*this, prefix, "host", bytes);
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => 16);");
+  auto built = query_ok(*con,
+                        "SELECT tier, encoding FROM sirius_kmeans_build_lists('" + prefix +
+                          "_corpus','vec','" + prefix + "_c', storage => '" +
+                          (bytes ? "uint8" : "float16") + "', tier => 'host');");
+  CHECK(built->GetValue(0, 0).ToString() == "host");
+  CHECK(built->GetValue(1, 0).ToString() == (bytes ? "uint8" : "float16"));
+
+  auto const fetch = [&](const std::string& mode) {
+    std::vector<std::pair<std::string, double>> out;
+    for (auto const& r :
+         ok_rows(*con,
+                 "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_probe','vec','" +
+                   prefix + "_corpus','vec', metric => 'l2', " + mode + ");")) {
+      out.emplace_back(r.at(0), std::stod(r.at(1)));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+  auto const same = [](auto const& a, auto const& b) {
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      CHECK(a[i].first == b[i].first);
+      CHECK(std::abs(a[i].second - b[i].second) <= 1e-5 * std::max(1.0, b[i].second));
+    }
+  };
+  auto const approx = "search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 16";
+  for (auto const k : {1, 20}) {
+    auto const kk = "k => " + std::to_string(k) + ", ";
+    same(fetch(kk + approx), fetch(kk + "search_mode => 'exact-gemm'"));
+  }
+  // A radius around the median 10th-nearest distance.
+  auto tenth = fetch("k => 10, search_mode => 'exact-gemm'");
+  std::sort(
+    tenth.begin(), tenth.end(), [](auto const& x, auto const& y) { return x.second < y.second; });
+  auto const eps = "join_mode => 'threshold', eps => " +
+                   std::to_string(tenth.at(tenth.size() * 9 / 10).second) + ", ";
+  auto const exact = fetch(eps + "search_mode => 'exact-gemm'");
+  REQUIRE(exact.size() > 50);
+  same(fetch(eps + approx), exact);
+}

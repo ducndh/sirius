@@ -81,14 +81,14 @@ constexpr std::array<std::pair<std::string_view, function_id>, 45> kForwardTable
 // Reverse table: Sirius function id -> canonical DuckDB function name.
 // Indexed directly by enum value; never searched.
 constexpr std::array<std::string_view, 37> kReverseTable = {
-  "+", "-", "*", "/", "//",
-  "%", "substring", "~~", "!~~", "contains",
-  "prefix", "suffix", "strlen", "length", "regexp_replace",
-  "concat", "||", "year", "month", "day",
-  "hour", "minute", "second", "millisecond", "microsecond",
-  "date_trunc", "row", "struct_pack", "abs", "sqrt",
-  "floor", "ceil", "round", "exp", "ln",
-  "pow", "error",
+  "+",          "-",         "*",           "/",           "//",
+  "%",          "substring", "~~",          "!~~",         "contains",
+  "prefix",     "suffix",    "strlen",      "length",      "regexp_replace",
+  "concat",     "||",        "year",        "month",       "day",
+  "hour",       "minute",    "second",      "millisecond", "microsecond",
+  "date_trunc", "row",       "struct_pack", "abs",         "sqrt",
+  "floor",      "ceil",      "round",       "exp",         "ln",
+  "pow",        "error",
 };
 
 static_assert(static_cast<std::size_t>(function_id::error) + 1 == 37,

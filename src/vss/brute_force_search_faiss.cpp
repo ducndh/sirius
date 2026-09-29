@@ -43,14 +43,14 @@
 
 #include "vss/brute_force_search.hpp"
 
-#include <faiss/MetricType.h>
-#include <faiss/gpu/GpuDistance.h>
-#include <faiss/gpu/StandardGpuResources.h>
-
 #include <cudf/column/column_factories.hpp>
 #include <cudf/unary.hpp>
 
 #include <raft/core/resource/cuda_stream.hpp>
+
+#include <faiss/MetricType.h>
+#include <faiss/gpu/GpuDistance.h>
+#include <faiss/gpu/StandardGpuResources.h>
 
 #include <cstddef>
 #include <stdexcept>

@@ -123,8 +123,7 @@ class sirius_physical_plan_generator {
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalAggregate& op);
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
-    duckdb::LogicalDistinct& op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDistinct& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin
   // &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
@@ -164,7 +163,8 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_streaming_source_plan(
     duckdb::LogicalGet& op);
 
-  duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_view_side(const sirius::vss::vector_join_side& side, const std::string& extra_column);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_view_side(
+    const sirius::vss::vector_join_side& side, const std::string& extra_column);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan_knn_join(
     duckdb::LogicalGet& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalLimit& op);

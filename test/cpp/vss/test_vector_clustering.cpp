@@ -144,17 +144,14 @@ TEST_CASE("train_centroids places one centroid per separated group", "[vss]")
   auto centroids  = train_centroids({vectors->view()}, dim, spec, stream, mr);
 
   REQUIRE(centroids->size() == 2);
-  auto const values =
-    to_host<float>(cudf::lists_column_view(centroids->view()).child());
+  auto const values = to_host<float>(cudf::lists_column_view(centroids->view()).child());
   REQUIRE(values.size() == 4);
 
   // Which centroid lands on which group is not fixed, so check the set rather than the order.
-  auto const near_origin = [](float x, float y) { return x < 5.0f && y < 5.0f; };
-  auto const near_ten    = [](float x, float y) { return x > 5.0f && y > 5.0f; };
-  bool const first_origin =
-    near_origin(values[0], values[1]) && near_ten(values[2], values[3]);
-  bool const second_origin =
-    near_origin(values[2], values[3]) && near_ten(values[0], values[1]);
+  auto const near_origin   = [](float x, float y) { return x < 5.0f && y < 5.0f; };
+  auto const near_ten      = [](float x, float y) { return x > 5.0f && y > 5.0f; };
+  bool const first_origin  = near_origin(values[0], values[1]) && near_ten(values[2], values[3]);
+  bool const second_origin = near_origin(values[2], values[3]) && near_ten(values[0], values[1]);
   CHECK((first_origin || second_origin));
 }
 
@@ -168,8 +165,7 @@ TEST_CASE("train_centroids samples across every chunk", "[vss]")
   // One group per chunk, so a fit that read only the first chunk could not place a centroid
   // on the second group.
   auto const chunk_a = make_vectors({0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f}, dim);
-  auto const chunk_b =
-    make_vectors({10.0f, 10.0f, 11.0f, 10.0f, 10.0f, 11.0f, 11.0f, 11.0f}, dim);
+  auto const chunk_b = make_vectors({10.0f, 10.0f, 11.0f, 10.0f, 10.0f, 11.0f, 11.0f, 11.0f}, dim);
 
   clustering_spec spec;
   spec.n_clusters = 2;
@@ -178,9 +174,8 @@ TEST_CASE("train_centroids samples across every chunk", "[vss]")
   auto centroids  = train_centroids({chunk_a->view(), chunk_b->view()}, dim, spec, stream, mr);
 
   REQUIRE(centroids->size() == 2);
-  auto const values =
-    to_host<float>(cudf::lists_column_view(centroids->view()).child());
-  auto const max_x = std::max(values[0], values[2]);
+  auto const values = to_host<float>(cudf::lists_column_view(centroids->view()).child());
+  auto const max_x  = std::max(values[0], values[2]);
   CHECK(max_x > 5.0f);
 }
 
@@ -204,7 +199,7 @@ TEST_CASE("assign_to_centroids emits one edge per row at n_probes 1", "[vss]")
   auto const centroids = make_vectors({0.5f, 0.5f, 10.5f, 10.5f}, dim);
 
   assignment_spec spec;
-  spec.n_probes = 1;
+  spec.n_probes         = 1;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
   stream.synchronize();
@@ -229,7 +224,7 @@ TEST_CASE("assign_to_centroids offsets row ids by the chunk base", "[vss]")
   auto const centroids = make_vectors({0.5f, 0.5f, 10.5f, 10.5f}, dim);
 
   assignment_spec spec;
-  spec.n_probes = 1;
+  spec.n_probes         = 1;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, spec, 1000, Metric::L2SqrtExpanded, stream, mr);
   stream.synchronize();
@@ -251,7 +246,7 @@ TEST_CASE("assign_to_centroids repeats a row once per probe and orders by distan
   auto const centroids = make_vectors({0.5f, 0.5f, 10.5f, 10.5f, 100.5f, 100.5f}, dim);
 
   assignment_spec spec;
-  spec.n_probes = 3;
+  spec.n_probes         = 3;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
   stream.synchronize();
@@ -277,7 +272,7 @@ TEST_CASE("assign_to_centroids caps probes at the centroid count", "[vss]")
   auto const centroids = make_vectors({0.5f, 0.5f, 10.5f, 10.5f}, dim);
 
   assignment_spec spec;
-  spec.n_probes = 10;
+  spec.n_probes         = 10;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
   stream.synchronize();
@@ -297,8 +292,8 @@ TEST_CASE("assign_to_centroids radius mode keeps only near-tied centroids", "[vs
   auto const centroids = make_vectors({1.0f, 0.0f, 1.1f, 0.0f, 50.0f, 0.0f}, dim);
 
   assignment_spec spec;
-  spec.radius_factor = 0.2;  // keeps everything within 1.2x of the nearest
-  spec.max_probes    = 3;
+  spec.radius_factor    = 0.2;  // keeps everything within 1.2x of the nearest
+  spec.max_probes       = 3;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
   stream.synchronize();
@@ -321,8 +316,8 @@ TEST_CASE("assign_to_centroids radius mode always keeps the nearest centroid", "
   // A zero radius admits nothing beyond the nearest, which is the tightest setting that must
   // still leave every row present in the assignment.
   assignment_spec spec;
-  spec.radius_factor = 0.000001;
-  spec.max_probes    = 3;
+  spec.radius_factor    = 0.000001;
+  spec.max_probes       = 3;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
   stream.synchronize();
@@ -357,11 +352,9 @@ TEST_CASE("assign_to_centroids round-trips centroids trained by train_centroids"
   REQUIRE(assignment.cluster_ids->size() == 8);
   auto const clusters = to_host<std::int32_t>(assignment.cluster_ids->view());
   // Each separated group must land wholly in one cluster, and the two groups in different ones.
-  CHECK(std::all_of(clusters.begin(), clusters.begin() + 4, [&](std::int32_t c) {
-    return c == clusters[0];
-  }));
-  CHECK(std::all_of(clusters.begin() + 4, clusters.end(), [&](std::int32_t c) {
-    return c == clusters[4];
-  }));
+  CHECK(std::all_of(
+    clusters.begin(), clusters.begin() + 4, [&](std::int32_t c) { return c == clusters[0]; }));
+  CHECK(std::all_of(
+    clusters.begin() + 4, clusters.end(), [&](std::int32_t c) { return c == clusters[4]; }));
   CHECK(clusters[0] != clusters[4]);
 }

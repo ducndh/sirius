@@ -93,11 +93,8 @@ shaped_join_result shape_global_top_k(cudf::column_view const& neighbors,
   // Rank every candidate pair by distance and keep the closest k_global. Ascending is
   // correct for both metrics: the fold works in distance space for cosine too, and the
   // similarity form is applied later in materialize.
-  auto const order = cudf::sorted_order(cudf::table_view{{distances}},
-                                        {cudf::order::ASCENDING},
-                                        {cudf::null_order::AFTER},
-                                        stream,
-                                        mr);
+  auto const order = cudf::sorted_order(
+    cudf::table_view{{distances}}, {cudf::order::ASCENDING}, {cudf::null_order::AFTER}, stream, mr);
   auto const available = static_cast<std::int64_t>(distances.size());
   auto const take      = static_cast<cudf::size_type>(std::min(k_global, available));
   auto const winners   = cudf::slice(order->view(), {0, take}).front();
@@ -134,22 +131,22 @@ shaped_join_result shape_threshold(cudf::column_view const& neighbors,
   {
     cudf::numeric_scalar<std::int32_t> const first(static_cast<std::int32_t>(k - 1), true, stream);
     cudf::numeric_scalar<std::int32_t> const stride(static_cast<std::int32_t>(k), true, stream);
-    auto const last_of_each = cudf::sequence(
-      static_cast<cudf::size_type>(n_left), first, stride, stream, mr);
+    auto const last_of_each =
+      cudf::sequence(static_cast<cudf::size_type>(n_left), first, stride, stream, mr);
     auto const boundary = cudf::gather(cudf::table_view{{keep->view()}},
                                        last_of_each->view(),
                                        cudf::out_of_bounds_policy::DONT_CHECK,
                                        stream,
                                        mr);
-    auto const any = cudf::reduce(boundary->get_column(0).view(),
+    auto const any      = cudf::reduce(boundary->get_column(0).view(),
                                   *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
                                   cudf::data_type{cudf::type_id::BOOL8},
                                   stream,
                                   mr);
     // Synchronizes: the caller needs the verdict on the host to decide whether the answer
     // it is about to emit is complete.
-    truncated = any->is_valid(stream) &&
-                static_cast<cudf::numeric_scalar<bool> const&>(*any).value(stream);
+    truncated =
+      any->is_valid(stream) && static_cast<cudf::numeric_scalar<bool> const&>(*any).value(stream);
   }
 
   return from_table(cudf::apply_boolean_mask(

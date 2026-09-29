@@ -44,9 +44,9 @@ namespace sirius::vss {
 
 /// A shaped join result: parallel columns, one row per surviving pair.
 struct shaped_join_result {
-  std::unique_ptr<cudf::column> left_rows;   ///< INT32 index into the left batch
-  std::unique_ptr<cudf::column> neighbors;   ///< INT64 global right-table row id
-  std::unique_ptr<cudf::column> distances;   ///< FLOAT32 distance
+  std::unique_ptr<cudf::column> left_rows;  ///< INT32 index into the left batch
+  std::unique_ptr<cudf::column> neighbors;  ///< INT64 global right-table row id
+  std::unique_ptr<cudf::column> distances;  ///< FLOAT32 distance
 };
 
 /**
