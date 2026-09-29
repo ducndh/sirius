@@ -24,6 +24,7 @@
 #include "vss/cluster_lists.hpp"
 #include "vss/cudf_raft_interop.hpp"
 #include "vss/cuvs_index_cache.hpp"
+#include "vss/device_context_guard.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_search_internal.hpp"
@@ -129,7 +130,7 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
 {
   static const std::string fn = "sirius_kmeans_fit";
   auto const c                = resolve_context(ctx, fn, req.catalog, req.schema, req.table);
-  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{c.target_gpu}};
+  device_context_guard device_guard{c.target_gpu};
   // The centroids outlive this call by design -- they stay in the index cache until the session
   // ends. rmm::device_buffer records the stream it was allocated on and deallocates on that same
   // stream, so an owned stream here would be destroyed long before the cache frees the column,
@@ -231,7 +232,7 @@ std::unique_ptr<cucascade::host_data_representation> run_kmeans_assign(
 {
   static const std::string fn = "sirius_kmeans_assign";
   auto const c                = resolve_context(ctx, fn, req.catalog, req.schema, req.table);
-  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{c.target_gpu}};
+  device_context_guard device_guard{c.target_gpu};
   rmm::cuda_stream stream_owner;
   auto stream   = stream_owner.view();
   auto const mr = c.space->get_default_allocator();
@@ -320,7 +321,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
 {
   static const std::string fn = "sirius_kmeans_build_lists";
   auto const c                = resolve_context(ctx, fn, req.catalog, req.schema, req.table);
-  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{c.target_gpu}};
+  device_context_guard device_guard{c.target_gpu};
   // The lists outlive this call in the index cache, and a device_buffer frees on the stream it
   // was allocated on, so the persistent buffers use the default stream (as the fit's centroids
   // do); per-chunk scratch uses the owned one.
@@ -826,7 +827,7 @@ std::unique_ptr<cucascade::host_data_representation> run_kmeans_centroids(
     throw duckdb::InvalidInputException(fn + ": no GPU or HOST memory space available");
   }
   auto* space = const_cast<cucascade::memory::memory_space*>(gpu_spaces.front());
-  rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{space->get_device_id()}};
+  device_context_guard device_guard{space->get_device_id()};
   rmm::cuda_stream stream_owner;
   auto stream   = stream_owner.view();
   auto const mr = space->get_default_allocator();
