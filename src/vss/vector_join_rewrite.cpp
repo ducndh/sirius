@@ -302,18 +302,29 @@ struct lifted_relation {
   std::size_t probe_child{0};
 };
 
-/// An inner join on `<>` conditions alone. It keeps nearly every pair, so under a threshold it is
-/// the cross product with its conditions as filters -- unlike an equality or range join, which
-/// can be far more selective than the vector join that would replace it.
+/// An inner join on `<>` conditions and at most one range condition (`a.k < b.k`, as a self-join
+/// uses to count each pair once). It keeps nearly every pair -- a range condition about half -- so
+/// under a threshold it is the cross product with its conditions as filters. Equality joins, and
+/// band joins (two range conditions), can be far more selective than the vector join that would
+/// replace them, and are left alone.
 bool is_inequality_join(const LogicalOperator& op)
 {
   if (op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) { return false; }
   auto const& join = op.Cast<duckdb::LogicalComparisonJoin>();
   if (join.join_type != duckdb::JoinType::INNER || join.conditions.empty()) { return false; }
-  return std::all_of(join.conditions.begin(), join.conditions.end(), [](auto const& c) {
-    return c.comparison == ExpressionType::COMPARE_NOTEQUAL ||
-           c.comparison == ExpressionType::COMPARE_DISTINCT_FROM;
-  });
+  int ranges = 0;
+  for (auto const& c : join.conditions) {
+    switch (c.comparison) {
+      case ExpressionType::COMPARE_NOTEQUAL:
+      case ExpressionType::COMPARE_DISTINCT_FROM: break;
+      case ExpressionType::COMPARE_LESSTHAN:
+      case ExpressionType::COMPARE_GREATERTHAN:
+      case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+      case ExpressionType::COMPARE_GREATERTHANOREQUALTO: ++ranges; break;
+      default: return false;
+    }
+  }
+  return ranges <= 1;
 }
 
 /// Find a CROSS_PRODUCT (or an inequality join) under @p slot, through operators without
@@ -675,7 +686,10 @@ class rewriter {
     while (top->type == LogicalOperatorType::LOGICAL_PROJECTION) {
       top = top->children[0].get();
     }
-    if (top->type != LogicalOperatorType::LOGICAL_UNNEST) { return false; }
+    if (top->type != LogicalOperatorType::LOGICAL_UNNEST &&
+        top->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+      return false;
+    }
 
     // Projection maps select child columns by position, and every child on the path changes
     // shape. They only prune, and the projection installed above restores the delim join's
@@ -759,39 +773,52 @@ class rewriter {
     if (pi == 2) { return decline(3); }
     auto& sub_slot = dj.children[1 - pi];
 
-    // Subquery side, top-down: projections, the unnest, the aggregate.
+    // Subquery side, top-down: projections, then either the unnest of the aggregate's list of k
+    // rows or -- LIMIT 1 -- the aggregate's single value directly.
     std::vector<duckdb::LogicalProjection*> above;
     LogicalOperator* cur = sub_slot.get();
     while (cur->type == LogicalOperatorType::LOGICAL_PROJECTION) {
       above.push_back(&cur->Cast<duckdb::LogicalProjection>());
       cur = cur->children[0].get();
     }
-    if (cur->type != LogicalOperatorType::LOGICAL_UNNEST || cur->expressions.size() != 1) {
+    duckdb::LogicalUnnest* unnest = nullptr;
+    LogicalOperator* agg_op       = cur;
+    if (cur->type == LogicalOperatorType::LOGICAL_UNNEST && cur->expressions.size() == 1) {
+      unnest = &cur->Cast<duckdb::LogicalUnnest>();
+      agg_op = unnest->children[0].get();
+    } else if (cur->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
       return hoist_out_of_lateral(slot, 1 - pi) || decline(4);
     }
-    auto& unnest = cur->Cast<duckdb::LogicalUnnest>();
-    auto* agg_op = unnest.children[0].get();
     if (agg_op->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) { return decline(5); }
     auto& agg = agg_op->Cast<duckdb::LogicalAggregate>();
     if (agg.groups.size() != delim_cols.size() || agg.expressions.size() != 1 ||
         agg.grouping_sets.size() > 1) {
       return decline(6);
     }
-    auto const& aggr     = agg.expressions[0]->Cast<duckdb::BoundAggregateExpression>();
-    auto const& aname    = aggr.function.name;
-    bool const ascending = aname == "arg_min" || aname == "arg_min_nulls_last" || aname == "min_by";
+    auto const& aggr  = agg.expressions[0]->Cast<duckdb::BoundAggregateExpression>();
+    auto const& aname = aggr.function.name;
+    // arg_min/arg_max(value, key[, k]); for LIMIT 1 over the key alone, min/max(key).
+    bool const by_key = aname == "min" || aname == "max";
+    bool const ascending =
+      aname == "arg_min" || aname == "arg_min_nulls_last" || aname == "min_by" || aname == "min";
     bool const descending =
-      aname == "arg_max" || aname == "arg_max_nulls_last" || aname == "max_by";
-    if ((!ascending && !descending) || aggr.children.size() != 3 || aggr.filter ||
-        aggr.aggr_type != duckdb::AggregateType::NON_DISTINCT || aggr.order_bys) {
+      aname == "arg_max" || aname == "arg_max_nulls_last" || aname == "max_by" || aname == "max";
+    auto const arity = unnest ? std::size_t{3} : by_key ? std::size_t{1} : std::size_t{2};
+    if ((!ascending && !descending) || (unnest && by_key) || aggr.children.size() != arity ||
+        aggr.filter || aggr.aggr_type != duckdb::AggregateType::NON_DISTINCT || aggr.order_bys) {
       return decline(7);
     }
-    // The unnest must read the aggregate's list.
-    auto const& un = unnest.expressions[0]->Cast<duckdb::BoundUnnestExpression>();
-    if (un.child->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
-        un.child->Cast<duckdb::BoundColumnRefExpression>().binding !=
-          ColumnBinding(agg.aggregate_index, 0)) {
-      return decline(8);
+    // The column the subquery's values are read from: the unnested row, or the aggregate itself.
+    auto const value_binding =
+      unnest ? ColumnBinding(unnest->unnest_index, 0) : ColumnBinding(agg.aggregate_index, 0);
+    if (unnest) {
+      // The unnest must read the aggregate's list.
+      auto const& un = unnest->expressions[0]->Cast<duckdb::BoundUnnestExpression>();
+      if (un.child->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+          un.child->Cast<duckdb::BoundColumnRefExpression>().binding !=
+            ColumnBinding(agg.aggregate_index, 0)) {
+        return decline(8);
+      }
     }
 
     // Below the aggregate: projections, then CROSS(corpus, DELIM_GET).
@@ -812,7 +839,7 @@ class rewriter {
     auto const delim_bindings = cross.children[dgi]->GetColumnBindings();
     if (delim_bindings.size() != delim_cols.size()) { return decline(11); }
 
-    auto const ordering = inline_projections(*aggr.children[1], below);
+    auto const ordering = inline_projections(*aggr.children[by_key ? 0 : 1], below);
     auto const call     = as_distance_call(*ordering);
     auto const vec_at   = [&](const ColumnBinding& b) {
       return static_cast<std::size_t>(std::find(delim_bindings.begin(), delim_bindings.end(), b) -
@@ -838,10 +865,13 @@ class rewriter {
       }
       group_delim.push_back(at);
     }
-    auto const& kexpr = *aggr.children[2];
-    if (kexpr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) { return decline(15); }
-    auto const k = kexpr.Cast<duckdb::BoundConstantExpression>().value.GetValue<std::int64_t>();
-    if (k <= 0) { return decline(16); }
+    std::int64_t k = 1;
+    if (unnest) {
+      auto const& kexpr = *aggr.children[2];
+      if (kexpr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) { return decline(15); }
+      k = kexpr.Cast<duckdb::BoundConstantExpression>().value.GetValue<std::int64_t>();
+      if (k <= 0) { return decline(16); }
+    }
 
     // The aggregate's value: struct_pack(fields) or a single field, each a corpus column or the
     // distance itself.
@@ -882,8 +912,7 @@ class rewriter {
       duckdb::BoundColumnRefExpression ref(duckdb::LogicalType::ANY, b);
       auto e = inline_projections(ref, above);
       if (single && e->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-          e->Cast<duckdb::BoundColumnRefExpression>().binding ==
-            ColumnBinding(unnest.unnest_index, 0)) {
+          e->Cast<duckdb::BoundColumnRefExpression>().binding == value_binding) {
         auto const& f = *fields[0];
         if (auto const fc = as_distance_call(f)) {
           sub_cols.push_back({true, ColumnBinding{}, fc->kind});
@@ -911,8 +940,7 @@ class rewriter {
       if ((fn.function.name != "struct_extract" && fn.function.name != "struct_extract_at") ||
           !fn.bind_info || fn.children.empty() ||
           fn.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
-          fn.children[0]->Cast<duckdb::BoundColumnRefExpression>().binding !=
-            ColumnBinding(unnest.unnest_index, 0)) {
+          fn.children[0]->Cast<duckdb::BoundColumnRefExpression>().binding != value_binding) {
         return decline(19);
       }
       auto const idx = fn.bind_info->Cast<duckdb::StructExtractBindData>().index;

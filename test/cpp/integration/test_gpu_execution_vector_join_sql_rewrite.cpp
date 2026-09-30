@@ -178,7 +178,13 @@ TEST_CASE_METHOD(SqlRewriteFixture,
   require_gpu_matches_duckdb(
     *con,
     "SELECT p.id, c.id FROM sr_probe p JOIN sr_corpus c ON array_cosine_similarity(p.vec, c.vec) "
-    ">= 0.7 WHERE p.cat <> c.cat AND c.cat < 10;");
+    ">= 0.7 WHERE p.cat <> c.cat AND c.cat < 10;");  // One range condition too, as a self-join
+                                                     // counts each pair once; it keeps about half
+                                                     // the pairs.
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT a.id, b.id FROM sr_corpus a JOIN sr_corpus b ON array_distance(a.vec, b.vec) <= 0.6 "
+    "WHERE a.id < b.id AND a.cat <> b.cat;");
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
@@ -198,6 +204,23 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "SELECT p.id, k.name, n.id FROM sr_probe p, LATERAL (SELECT c.id, c.cat, "
     "array_cosine_similarity(p.vec, c.vec) AS s FROM sr_corpus c ORDER BY s DESC LIMIT 4) n JOIN "
     "sr_cats k ON k.cat = p.cat WHERE n.cat <> p.cat;");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "LATERAL LIMIT 1 runs as the per-row vector join",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  SqlRewriteTables tables(*this);
+  // DuckDB decorrelates LIMIT 1 without the list and unnest: max(similarity) when only the score
+  // is selected, arg_max(value, similarity) otherwise.
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT p.id, round(t.s, 5) FROM sr_probe p, LATERAL (SELECT array_cosine_similarity(p.vec, "
+    "c.vec) AS s FROM sr_corpus c ORDER BY s DESC LIMIT 1) t;");
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT p.id, t.id, round(t.d, 5) FROM sr_probe p, LATERAL (SELECT c.id, array_distance(p.vec, "
+    "c.vec) AS d FROM sr_corpus c WHERE c.cat = 3 ORDER BY d LIMIT 1) t;");
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
