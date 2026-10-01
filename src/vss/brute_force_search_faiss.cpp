@@ -42,6 +42,7 @@
  */
 
 #include "vss/brute_force_search.hpp"
+#include "vss/size_limits.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/unary.hpp>
@@ -107,7 +108,7 @@ knn_result brute_force_knn_faiss(raft::device_resources const& res,
                          metric == cuvs::distance::DistanceType::L2SqrtUnexpanded;
 
   auto const stream  = raft::resource::get_cuda_stream(res);
-  auto const out_len = static_cast<cudf::size_type>(n_queries * k);
+  auto const out_len = column_size(n_queries * k, "vector search top-k");
 
   auto neighbors_col = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT64}, out_len, cudf::mask_state::UNALLOCATED, stream, mr);

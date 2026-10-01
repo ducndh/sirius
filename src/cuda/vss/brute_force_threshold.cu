@@ -15,6 +15,7 @@
  */
 
 #include "vss/brute_force_threshold.hpp"
+#include "vss/size_limits.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/types.hpp>
@@ -68,7 +69,7 @@ void choose_tile_size(
 template <typename T>
 std::unique_ptr<cudf::column> uvector_to_column(rmm::device_uvector<T>&& v, cudf::data_type dt)
 {
-  auto const size = static_cast<cudf::size_type>(v.size());
+  auto const size = column_size(static_cast<std::int64_t>(v.size()), "vector join threshold");
   return std::make_unique<cudf::column>(dt, size, v.release(), rmm::device_buffer{}, 0);
 }
 

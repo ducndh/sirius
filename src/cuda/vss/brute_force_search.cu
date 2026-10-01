@@ -15,6 +15,7 @@
  */
 
 #include "vss/brute_force_search.hpp"
+#include "vss/size_limits.hpp"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -83,7 +84,7 @@ void trim_to_k(std::unique_ptr<cudf::column>& neighbors_col,
                rmm::cuda_stream_view stream,
                rmm::device_async_resource_ref mr)
 {
-  auto const kept = static_cast<cudf::size_type>(n_queries * k);
+  auto const kept = column_size(n_queries * k, "vector search top-k");
   cudf::numeric_scalar<int32_t> const zero(0, true, stream);
   cudf::numeric_scalar<int32_t> const one(1, true, stream);
   auto const positions = cudf::sequence(kept, zero, one, stream, mr);
@@ -183,7 +184,7 @@ knn_result brute_force_knn_untrimmed(raft::device_resources const& res,
 
   // Allocate flattened [n_queries * k_search] outputs through the caller's resource
   // (mr) so they are reserved against the owning memory space.
-  auto const out_size = static_cast<cudf::size_type>(n_queries * k_search);
+  auto const out_size = column_size(n_queries * k_search, "vector search top-k");
   auto neighbors_col  = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT64}, out_size, cudf::mask_state::UNALLOCATED, stream, mr);
   auto distances_col = cudf::make_numeric_column(

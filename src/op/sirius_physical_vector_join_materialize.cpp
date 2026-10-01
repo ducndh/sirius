@@ -21,6 +21,7 @@
 #include "log/logging.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "vss/pinned_column.hpp"
+#include "vss/staging_shortfall.hpp"
 #include "vss/vector_search_internal.hpp"
 
 #include <cudf/binaryop.hpp>
@@ -227,9 +228,8 @@ sirius_physical_vector_join_materialize::probe_side_output_views(
       std::shared_ptr<cucascade::memory::reservation> reservation{
         space.make_reservation_or_null(bytes)};
       if (!reservation) {
-        throw std::runtime_error(
-          "[sirius_physical_vector_join_materialize] probe-side output columns need " +
-          std::to_string(bytes) + " bytes device-side, which exceeds the available budget");
+        vss::throw_staging_shortfall(
+          space, bytes, "[sirius_physical_vector_join_materialize] probe-side output columns");
       }
       auto const batch_id = sirius::get_next_batch_id();
       auto staged         = cucascade::data_batch::make(

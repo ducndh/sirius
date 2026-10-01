@@ -15,6 +15,7 @@
  */
 
 #include "vss/knn_merge.hpp"
+#include "vss/size_limits.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/types.hpp>
@@ -53,7 +54,7 @@ knn_result knn_merge_parts_topk(raft::device_resources const& res,
   auto const in_idx = raft::make_device_matrix_view<const int64_t, int64_t, raft::row_major>(
     stacked_neighbors.data<int64_t>(), n_parts * n_samples, k);
 
-  auto const out_size = static_cast<cudf::size_type>(n_samples * k);
+  auto const out_size = column_size(n_samples * k, "vector join merge");
   auto out_distances  = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::FLOAT32}, out_size, cudf::mask_state::UNALLOCATED, stream, mr);
   auto out_neighbors = cudf::make_numeric_column(

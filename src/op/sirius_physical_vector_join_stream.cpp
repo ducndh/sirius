@@ -34,6 +34,8 @@
 #include "vss/join_result_shaping.hpp"
 #include "vss/knn_merge.hpp"
 #include "vss/pinned_column.hpp"
+#include "vss/size_limits.hpp"
+#include "vss/staging_shortfall.hpp"
 #include "vss/vector_clustering.hpp"
 
 #include <cudf/binaryop.hpp>
@@ -181,15 +183,13 @@ class host_pinned_chunk_source : public vector_chunk_source {
     auto data_rep    = uncompressed_host_chunk(*chunk).slice(cols);
     auto const bytes = data_rep->get_size_in_bytes();
 
-    // Draw the staged copy from the task's budget. A null reservation means the chunk does
-    // not fit what this task was granted, which is a sizing problem to surface, not to
-    // silently exceed.
+    // Draw the staged copy from the task's budget rather than silently exceeding it. A null
+    // reservation is retried once a downgrade has freed memory, unless the chunk could never fit.
     std::shared_ptr<cucascade::memory::reservation> reservation{
       space.make_reservation_or_null(bytes)};
     if (!reservation) {
-      throw std::runtime_error("[sirius_physical_vector_join_stream] corpus chunk " +
-                               std::to_string(i) + " needs " + std::to_string(bytes) +
-                               " bytes device-side, which exceeds this task's budget");
+      vss::throw_staging_shortfall(
+        space, bytes, "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(i));
     }
 
     auto const batch_id = sirius::get_next_batch_id();
@@ -290,9 +290,8 @@ class materialized_chunk_source : public vector_chunk_source {
 
     std::shared_ptr<cucascade::memory::reservation> reservation{reserve_or_spill(space, bytes)};
     if (!reservation) {
-      throw std::runtime_error("[sirius_physical_vector_join_stream] corpus chunk " +
-                               std::to_string(i) + " needs " + std::to_string(bytes) +
-                               " bytes device-side, which exceeds this task's budget");
+      vss::throw_staging_shortfall(
+        space, bytes, "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(i));
     }
 
     auto const batch_id = sirius::get_next_batch_id();
@@ -640,9 +639,8 @@ class cluster_lists_chunk_source : public vector_chunk_source {
     std::shared_ptr<cucascade::memory::reservation> reservation{
       space.make_reservation_or_null(bytes)};
     if (!reservation) {
-      throw std::runtime_error("[sirius_physical_vector_join_stream] corpus chunk " +
-                               std::to_string(i) + " needs " + std::to_string(bytes) +
-                               " bytes device-side, which exceeds this task's budget");
+      vss::throw_staging_shortfall(
+        space, bytes, "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(i));
     }
     auto const mr = reservation->get_memory_resource();
     auto buffer   = std::make_unique<rmm::device_buffer>(
@@ -1248,6 +1246,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // row (a single left row may own the entire global answer), and threshold needs a cap on
   // how many in-range neighbours one left row may have, which is what k supplies there.
   auto const k_join = std::min<std::int64_t>(_request.k, _right_total_rows);
+  vss::column_size(n_left * k_join, "vector join output");
 
   raft::device_resources res{stream};
   auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact;
@@ -1453,7 +1452,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // rows it served, so device memory does not grow with n_probes: a row's answers from its
     // n_probes clusters never coexist.
     {
-      auto const total = static_cast<cudf::size_type>(n_left * k_join);
+      auto const total = vss::column_size(n_left * k_join, "vector join output");
       acc_neighbors    = cudf::make_column_from_scalar(miss_id, total, stream, mr);
       acc_distances    = cudf::make_column_from_scalar(miss_distance, total, stream, mr);
     }
@@ -1825,9 +1824,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       std::shared_ptr<cucascade::memory::reservation> reservation{
         mem_space->make_reservation_or_null(bytes)};
       if (!reservation) {
-        throw std::runtime_error("[sirius_physical_vector_join_stream] lists chunk " +
-                                 std::to_string(j) + " needs " + std::to_string(bytes) +
-                                 " bytes device-side, which exceeds this task's budget");
+        vss::throw_staging_shortfall(
+          *mem_space,
+          bytes,
+          "[sirius_physical_vector_join_stream] lists chunk " + std::to_string(j));
       }
       auto buffer =
         std::make_unique<rmm::device_buffer>(bytes, stage_on, reservation->get_memory_resource());
@@ -2112,11 +2112,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             auto edges =
               threshold_search(res, slice_view, queries_view, search_radius, search_metric, mr);
             if (edges.n_edges > 0) {
-              auto left = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                                    static_cast<cudf::size_type>(edges.n_edges),
-                                                    cudf::mask_state::UNALLOCATED,
-                                                    stream,
-                                                    mr);
+              auto left =
+                cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          vss::column_size(edges.n_edges, "vector join threshold"),
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          mr);
               vss::remap_radius_edges(edges.query_rows->view().data<std::int64_t>(),
                                       rows_c,
                                       left->mutable_view().data<std::int32_t>(),
@@ -2300,7 +2301,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       cudf::numeric_scalar<std::int64_t> const miss_id(-1, true, stream);
       cudf::numeric_scalar<float> const miss_distance(
         std::numeric_limits<float>::infinity(), true, stream);
-      auto const total = static_cast<cudf::size_type>(n_left * k_join);
+      auto const total = vss::column_size(n_left * k_join, "vector join output");
       acc_neighbors    = cudf::make_column_from_scalar(miss_id, total, stream, mr);
       acc_distances    = cudf::make_column_from_scalar(miss_distance, total, stream, mr);
       cudf::numeric_scalar<std::int64_t> const zero(0, true, stream);
@@ -2543,6 +2544,11 @@ std::size_t sirius_physical_vector_join_stream::per_left_batch_estimate(std::siz
   auto const n_left = _probe->chunk_rows(left_idx);
   auto const k      = static_cast<std::size_t>(std::max<std::int64_t>(_request.k, 1));
   auto const block  = n_left * k * (sizeof(std::int64_t) + sizeof(float));
+  // No reservation holds an output past a column's row limit: refuse here, once, instead of
+  // through every out-of-memory retry of the task.
+  auto const k_join =
+    _right_total_rows > 0 ? std::min<std::int64_t>(_request.k, _right_total_rows) : _request.k;
+  vss::column_size(static_cast<std::int64_t>(n_left) * k_join, "vector join output");
 
   // cuVS tiles the pairwise distances against a bounded internal workspace, so its
   // scratch does not scale with the search shape -- the two figures recorded on the

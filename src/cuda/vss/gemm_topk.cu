@@ -16,6 +16,7 @@
 
 #include "vss/brute_force_search.hpp"
 #include "vss/brute_force_threshold.hpp"
+#include "vss/size_limits.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -343,7 +344,7 @@ struct gemm_search {
 template <typename T>
 std::unique_ptr<cudf::column> uvector_to_column(rmm::device_uvector<T>&& v, cudf::type_id id)
 {
-  auto const size = static_cast<cudf::size_type>(v.size());
+  auto const size = column_size(static_cast<std::int64_t>(v.size()), "vector join threshold");
   return std::make_unique<cudf::column>(
     cudf::data_type{id}, size, v.release(), rmm::device_buffer{}, 0);
 }
@@ -404,7 +405,7 @@ knn_result gemm_topk(raft::device_resources const& res,
   auto const m = search.m;
   auto const n = search.n;
 
-  auto const out_size = static_cast<cudf::size_type>(m * k);
+  auto const out_size = column_size(m * k, "vector join top-k");
   auto neighbors      = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT64}, out_size, cudf::mask_state::UNALLOCATED, stream, mr);
   auto distances = cudf::make_numeric_column(
@@ -596,7 +597,7 @@ knn_result gemm_int8_topk(raft::device_resources const& res,
                         std::min<int64_t>(std::max<int64_t>(m, 1), 65535));
   rmm::device_uvector<int32_t> scores(static_cast<std::size_t>(tile_rows * ldc), stream, mr);
 
-  auto const out_size = static_cast<cudf::size_type>(m * k);
+  auto const out_size = column_size(m * k, "vector join top-k");
   auto neighbors      = cudf::make_numeric_column(
     cudf::data_type{cudf::type_id::INT64}, out_size, cudf::mask_state::UNALLOCATED, stream, mr);
   auto distances = cudf::make_numeric_column(

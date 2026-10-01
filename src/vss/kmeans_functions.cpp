@@ -375,6 +375,22 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                         "] vectors but column '" + req.column + "' is FLOAT[" +
                                         std::to_string(req.dim) + "]");
   }
+  // INT8 and FLOAT16 lists only filter; exact answers come from the bounded search's FP32
+  // re-check, which needs these widths. Without it every join would refuse the lists (INT8) or
+  // answer from rounded rows (FLOAT16), so refuse here, before the old lists are dropped.
+  if (storage == list_storage::int8 && !bound_filter_int8_supports(req.dim)) {
+    throw duckdb::InvalidInputException(fn +
+                                        ": storage => 'int8' needs a vector width that is a "
+                                        "multiple of 16 and at most 256, not " +
+                                        std::to_string(req.dim) + "; use 'float16' or 'float32'");
+  }
+  if (storage == list_storage::float16 && !bound_filter_f16_supports(req.dim)) {
+    throw duckdb::InvalidInputException(fn +
+                                        ": storage => 'float16' needs a vector width that is "
+                                        "a multiple of 16, not " +
+                                        std::to_string(req.dim) + "; use 'float32'");
+  }
+
   // Built afresh every time, so the old copy is freed before the new one is allocated.
   index_cache.erase(lists_key(req.clustering));
 
@@ -659,20 +675,32 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     lists.row_sq = std::make_unique<rmm::device_buffer>(
       static_cast<std::size_t>(n_rows) * sizeof(std::int32_t), persistent, persistent_mr);
   }
-  // FLOAT16 lists also keep the FP32 rows, in layout order on the host, for the bounded search to
-  // re-score against; without the room for them the lists still work, only through the lossy path.
+  // FLOAT16 and INT8 lists also keep the FP32 rows, in layout order on the host, for the bounded
+  // search to re-score against. Without them FLOAT16 lists could only answer from rounded rows and
+  // INT8 lists not at all, so a build that cannot hold them is refused.
   std::vector<std::byte*> exact_ptrs;
   std::optional<rmm::device_uvector<unsigned int>> max_norm_bits;
   auto const exact_rows_per_block =
-    static_cast<std::int64_t>(block_bytes / (static_cast<std::size_t>(dim) * sizeof(float)));
-  if ((encoding == list_encoding::float16 || encoding == list_encoding::int8) &&
-      host_mr != nullptr && exact_rows_per_block > 0) {
+    host_mr != nullptr
+      ? static_cast<std::int64_t>(block_bytes / (static_cast<std::size_t>(dim) * sizeof(float)))
+      : std::int64_t{0};
+  if (encoding == list_encoding::float16 || encoding == list_encoding::int8) {
+    auto const exact_bytes =
+      static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(dim) * sizeof(float);
+    auto const refuse = [&](std::string const& why) {
+      throw duckdb::InvalidInputException(
+        fn + ": storage => '" + (encoding == list_encoding::int8 ? "int8" : "float16") +
+        "' keeps an FP32 copy of the column on the host for exact answers (" +
+        std::to_string(exact_bytes) + " bytes), and " + why +
+        "; raise the host memory capacity or use storage => 'float32'");
+    };
+    if (exact_rows_per_block <= 0) { refuse("the host memory pool cannot hold one row of it"); }
     auto const n_blocks = (n_rows + exact_rows_per_block - 1) / exact_rows_per_block;
     try {
       lists.exact_vectors =
         host_mr->allocate_multiple_blocks(static_cast<std::size_t>(n_blocks) * block_bytes);
-    } catch (std::exception const&) {
-      lists.exact_vectors = {};
+    } catch (std::exception const& e) {
+      refuse(std::string{"the host memory pool could not allocate it ("} + e.what() + ")");
     }
     if (lists.exact_vectors) {
       lists.exact_rows_per_block = exact_rows_per_block;

@@ -20,6 +20,7 @@
 #include "data/sirius_converter_registry.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius/exception.hpp"
+#include "vss/staging_shortfall.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
@@ -110,9 +111,10 @@ staged_pinned_chunk stage_pinned_column_chunk(const scan_manager::pinned_entry& 
   std::shared_ptr<cucascade::memory::reservation> reservation{
     gpu_space.make_reservation_or_null(bytes)};
   if (!reservation) {
-    throw internal_exception("VSS: staging host-tier column '" + column_name + "' chunk " +
-                             std::to_string(chunk_index) + " needs " + std::to_string(bytes) +
-                             " device bytes, which exceeds the available budget");
+    throw_staging_shortfall(
+      gpu_space,
+      bytes,
+      "VSS: staging host-tier column '" + column_name + "' chunk " + std::to_string(chunk_index));
   }
 
   auto const batch_id = sirius::get_next_batch_id();

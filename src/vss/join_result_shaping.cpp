@@ -16,6 +16,8 @@
 
 #include "vss/join_result_shaping.hpp"
 
+#include "vss/size_limits.hpp"
+
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/copying.hpp>
@@ -55,7 +57,7 @@ std::unique_ptr<cudf::column> make_left_row_index(std::int64_t n_left,
                                                   rmm::cuda_stream_view stream,
                                                   rmm::device_async_resource_ref mr)
 {
-  auto const total = static_cast<cudf::size_type>(n_left * k);
+  auto const total = column_size(n_left * k, "vector join output");
   cudf::numeric_scalar<std::int32_t> const init(0, true, stream);
   cudf::numeric_scalar<std::int32_t> const step(1, true, stream);
   auto positions = cudf::sequence(total, init, step, stream, mr);

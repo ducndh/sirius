@@ -992,6 +992,34 @@ TEST_CASE_METHOD(KMeansFixture,
 }
 
 TEST_CASE_METHOD(KMeansFixture,
+                 "lists that could not answer exactly are refused at build",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // FLOAT[3]: no width the bounded search re-checks in FP32, so INT8 lists could never be
+  // searched and FLOAT16 lists would answer from rounded rows. Both are refused, and the
+  // refusal leaves lists already built for the clustering in place.
+  create_two_group_table(*this, "kmrb_corpus");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_fit('kmrb_corpus','vec', name => 'kmrb_c', n_clusters => 2);");
+  auto built =
+    query_ok(*con, "SELECT encoding FROM sirius_kmeans_build_lists('kmrb_corpus','vec','kmrb_c');");
+  CHECK(built->GetValue(0, 0).ToString() == "uint8");
+  expect_error(*con,
+               "SELECT * FROM sirius_kmeans_build_lists('kmrb_corpus','vec','kmrb_c', "
+               "storage => 'int8');",
+               "multiple of 16 and at most 256");
+  expect_error(*con,
+               "SELECT * FROM sirius_kmeans_build_lists('kmrb_corpus','vec','kmrb_c', "
+               "storage => 'float16');",
+               "multiple of 16");
+  CHECK(ok_rows(*con,
+                "SELECT left_id FROM sirius_knn_join('kmrb_corpus','vec','kmrb_corpus','vec', "
+                "metric => 'l2', k => 3, search_mode => 'approx', clustering => 'kmrb_c', "
+                "n_probes => 2);")
+          .size() == 400 * 3);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
                  "float16 cluster lists still give the exact join's answer",
                  "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
 {
