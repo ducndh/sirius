@@ -432,8 +432,12 @@ class rewriter {
   {
     for (std::size_t i = 0; i < exprs.size(); ++i) {
       if (!exprs[i]) {
-        exprs[i] =
-          duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value(_slot_types[i]));
+        // The NULL only holds the position. A nested one (usually the vector column, unread
+        // under a count(*)) is a constant the GPU cannot build, and any scalar NULL holds it
+        // as well.
+        auto const& type = _slot_types[i];
+        exprs[i]         = duckdb::make_uniq<duckdb::BoundConstantExpression>(
+          duckdb::Value(type.IsNested() ? duckdb::LogicalType::INTEGER : type));
       }
     }
     auto const index = _binder.GenerateTableIndex();

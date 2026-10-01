@@ -241,6 +241,11 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     *con,
     "SELECT p.id, n.id FROM sr_probe p, LATERAL (SELECT c.id, array_cosine_similarity(p.vec, "
     "c.vec) AS s FROM sr_corpus c WHERE c.cat = 3 ORDER BY s DESC LIMIT 4) n;");
+  // Counting the matches reads none of the join's columns, the probe's vector included.
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT count(*) FROM sr_probe p, LATERAL (SELECT c.id, array_cosine_similarity(p.vec, "
+    "c.vec) AS s FROM sr_corpus c ORDER BY s DESC LIMIT 4) n;");
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
