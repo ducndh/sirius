@@ -304,12 +304,17 @@ struct lifted_relation {
   std::size_t probe_child{0};
 };
 
-/// An inner join on `<>` conditions and at most one range condition (`a.k < b.k`, as a self-join
-/// uses to count each pair once). It keeps nearly every pair -- a range condition about half -- so
-/// under a threshold it is the cross product with its conditions as filters. Equality joins, and
-/// band joins (two range conditions), can be far more selective than the vector join that would
-/// replace them, and are left alone.
-bool is_inequality_join(const LogicalOperator& op)
+/// An inner join on `<>` conditions and range conditions that, under a threshold, is cheaper as
+/// the cross product with its conditions as filters (the vector join first). One range condition
+/// (`a.k < b.k`, as a self-join uses to count each pair once) keeps about half the pairs, so it
+/// always is. A band (two range conditions) is when it keeps enough pairs: joining by the band
+/// first runs on DuckDB's CPU (~50 GFLOP/s of similarity over the band's pairs) against the
+/// GPU's ~8.5 TFLOP/s over all pairs, so the vector join wins once the band keeps more than about
+/// 1/170 of them (a 1% price band on Vec-H keeps ~2%: >600 s on the CPU, 2.6 s vector first).
+/// DuckDB's range-join estimates run far low (that band: 0.017%), so on them a band is mostly left
+/// alone; SIRIUS_VSS_BAND_VECTOR_FIRST=1 takes every band vector first, =0 none. Equality joins
+/// are always left alone.
+bool is_inequality_join(duckdb::ClientContext& context, LogicalOperator& op)
 {
   if (op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) { return false; }
   auto const& join = op.Cast<duckdb::LogicalComparisonJoin>();
@@ -326,18 +331,32 @@ bool is_inequality_join(const LogicalOperator& op)
       default: return false;
     }
   }
-  return ranges <= 1;
+  if (ranges <= 1) { return true; }
+  if (ranges > 2) { return false; }
+  auto const* env = std::getenv("SIRIUS_VSS_BAND_VECTOR_FIRST");
+  if (env != nullptr && std::strcmp(env, "0") == 0) { return false; }
+  if (env != nullptr && std::strcmp(env, "1") == 0) { return true; }
+  double const pairs = static_cast<double>(op.children[0]->EstimateCardinality(context)) *
+                       static_cast<double>(op.children[1]->EstimateCardinality(context));
+  double const kept       = static_cast<double>(op.EstimateCardinality(context));
+  bool const vector_first = pairs > 0 && kept * 170.0 >= pairs;
+  SIRIUS_LOG_INFO("[vector_join_rewrite] band join keeps ~{:.2g} of {:.3g} pairs by estimate: {}",
+                  pairs > 0 ? kept / pairs : 0.0,
+                  pairs,
+                  vector_first ? "vector join first" : "left to the band join");
+  return vector_first;
 }
 
 /// Find a CROSS_PRODUCT (or an inequality join) under @p slot, through operators without
 /// projection maps, with the binding @p probe_vec on exactly one side and @p corpus_vec on the
 /// other.
-std::optional<lifted_relation> find_crossed_relation(unique_ptr<LogicalOperator>& slot,
+std::optional<lifted_relation> find_crossed_relation(duckdb::ClientContext& context,
+                                                     unique_ptr<LogicalOperator>& slot,
                                                      const ColumnBinding& probe_vec,
                                                      const ColumnBinding& corpus_vec)
 {
   auto& op = *slot;
-  if (op.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT || is_inequality_join(op)) {
+  if (op.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT || is_inequality_join(context, op)) {
     for (std::size_t side = 0; side < 2; ++side) {
       if (has_binding(*op.children[side], probe_vec) &&
           has_binding(*op.children[1 - side], corpus_vec)) {
@@ -355,7 +374,7 @@ std::optional<lifted_relation> find_crossed_relation(unique_ptr<LogicalOperator>
   }
   for (auto& child : op.children) {
     if (has_binding(*child, probe_vec)) {
-      return find_crossed_relation(child, probe_vec, corpus_vec);
+      return find_crossed_relation(context, child, probe_vec, corpus_vec);
     }
   }
   return std::nullopt;
@@ -1550,7 +1569,7 @@ class rewriter {
     ColumnBinding probe_vec, corpus_vec;
     auto const idx = pick_threshold(conjuncts, [&](const distance_call& call) {
       for (auto const& [p, c] : {std::pair{call.a, call.b}, std::pair{call.b, call.a}}) {
-        if (auto found = find_crossed_relation(tree, p, c)) {
+        if (auto found = find_crossed_relation(_context, tree, p, c)) {
           lifted     = found;
           probe_vec  = p;
           corpus_vec = c;

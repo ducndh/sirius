@@ -374,6 +374,24 @@ TEST_CASE_METHOD(SqlRewriteFixture,
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a band join can run as a vector join with the band as a filter",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // Two range conditions between the sides (a band) next to a distance threshold. DuckDB's band
+  // estimates run low, so by default the band is left to it; SIRIUS_VSS_BAND_VECTOR_FIRST=1 takes
+  // the vector join first with the band as a filter, on the GPU, with DuckDB's answer.
+  SqlRewriteTables tables(*this);
+  ::setenv("SIRIUS_VSS_BAND_VECTOR_FIRST", "1", 1);
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_BAND_VECTOR_FIRST"); }
+  } unset_band;
+  require_gpu_matches_duckdb(*con,
+                             "SELECT p.id, c.id FROM sr_probe p JOIN sr_corpus c ON "
+                             "c.cat BETWEEN p.cat - 2 AND p.cat + 2 "
+                             "WHERE array_distance(p.vec, c.vec) <= 0.9;");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
                  "a join over a pinned corpus with no lists can build them inside the query",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
