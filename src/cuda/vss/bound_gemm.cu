@@ -1287,7 +1287,9 @@ __device__ float seed_kth(float* my, int cnt, int k, int lane)
   return kth;
 }
 
-// One warp per probe row: its sample's distances go to shared memory, then seed_kth.
+// One warp per probe row, its sample's distances to shared memory, then seed_kth. W lanes share a
+// sample row, each reading a contiguous span of it, so a warp's loads coalesce whatever the width.
+template <int W>
 __global__ void __launch_bounds__(kSeedWarps * 32)
   seed_bound_int8_kernel(int8_t const* __restrict__ x,
                          int32_t const* __restrict__ x_sq,
@@ -1295,6 +1297,7 @@ __global__ void __launch_bounds__(kSeedWarps * 32)
                          int32_t const* __restrict__ probe_sq,
                          int64_t const* __restrict__ first,
                          int32_t const* __restrict__ count,
+                         int64_t const* __restrict__ order,
                          int64_t n,
                          int d,
                          int k,
@@ -1302,24 +1305,31 @@ __global__ void __launch_bounds__(kSeedWarps * 32)
 {
   __shared__ float s_d[kSeedWarps][kSeedSample];
   int const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  int const sub = lane / W, sl = lane % W;
   float* my       = s_d[warp];
   int const words = d / 4;
-  for (int64_t r = static_cast<int64_t>(blockIdx.x) * kSeedWarps + warp; r < n;
-       r += static_cast<int64_t>(gridDim.x) * kSeedWarps) {
+  for (int64_t at = static_cast<int64_t>(blockIdx.x) * kSeedWarps + warp; at < n;
+       at += static_cast<int64_t>(gridDim.x) * kSeedWarps) {
+    auto const r  = order != nullptr ? order[at] : at;
     int const cnt = count[r];
     if (cnt < k) {
       if (lane == 0) { bound[r] = __int_as_float(0x7f800000); }
       continue;
     }
     auto const* q = reinterpret_cast<int const*>(probe + r * d);
-    for (int i = lane; i < cnt; i += 32) {
-      auto const row = first[r] + i;
+    for (int i0 = 0; i0 < cnt; i0 += 32 / W) {
+      int const i    = i0 + sub;
+      auto const row = first[r] + (i < cnt ? i : 0);
       auto const* xr = reinterpret_cast<int const*>(x + row * d);
       int dot        = 0;
-      for (int w = 0; w < words; ++w) {
+      for (int w = sl; w < words; w += W) {
         dot = __dp4a(xr[w], q[w], dot);
       }
-      my[i] = static_cast<float>(probe_sq[r] + x_sq[row] - 2 * dot);
+#pragma unroll
+      for (int o = W / 2; o > 0; o /= 2) {
+        dot += __shfl_xor_sync(0xffffffffu, dot, o, W);
+      }
+      if (sl == 0 && i < cnt) { my[i] = static_cast<float>(probe_sq[r] + x_sq[row] - 2 * dot); }
     }
     __syncwarp();
     float const kth = seed_kth(my, cnt, k, lane);
@@ -1329,6 +1339,7 @@ __global__ void __launch_bounds__(kSeedWarps * 32)
 }
 
 // The same over FLOAT16 rows, the dot accumulated in FP32.
+template <int W>
 __global__ void __launch_bounds__(kSeedWarps * 32)
   seed_bound_f16_kernel(uint16_t const* __restrict__ x,
                         float const* __restrict__ x_sq,
@@ -1336,6 +1347,7 @@ __global__ void __launch_bounds__(kSeedWarps * 32)
                         float const* __restrict__ probe_sq,
                         int64_t const* __restrict__ first,
                         int32_t const* __restrict__ count,
+                        int64_t const* __restrict__ order,
                         int64_t n,
                         int d,
                         int k,
@@ -1343,31 +1355,59 @@ __global__ void __launch_bounds__(kSeedWarps * 32)
 {
   __shared__ float s_d[kSeedWarps][kSeedSample];
   int const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  int const sub = lane / W, sl = lane % W;
   float* my       = s_d[warp];
   int const pairs = d / 2;
-  for (int64_t r = static_cast<int64_t>(blockIdx.x) * kSeedWarps + warp; r < n;
-       r += static_cast<int64_t>(gridDim.x) * kSeedWarps) {
+  for (int64_t at = static_cast<int64_t>(blockIdx.x) * kSeedWarps + warp; at < n;
+       at += static_cast<int64_t>(gridDim.x) * kSeedWarps) {
+    auto const r  = order != nullptr ? order[at] : at;
     int const cnt = count[r];
     if (cnt < k) {
       if (lane == 0) { bound[r] = __int_as_float(0x7f800000); }
       continue;
     }
     auto const* q = reinterpret_cast<__half2 const*>(probe + r * d);
-    for (int i = lane; i < cnt; i += 32) {
-      auto const row = first[r] + i;
+    for (int i0 = 0; i0 < cnt; i0 += 32 / W) {
+      int const i    = i0 + sub;
+      auto const row = first[r] + (i < cnt ? i : 0);
       auto const* xr = reinterpret_cast<__half2 const*>(x + row * d);
       float dot      = 0.f;
-      for (int w = 0; w < pairs; ++w) {
+      for (int w = sl; w < pairs; w += W) {
         float2 const a = __half22float2(xr[w]);
         float2 const b = __half22float2(q[w]);
         dot            = fmaf(a.x, b.x, fmaf(a.y, b.y, dot));
       }
-      my[i] = probe_sq[r] + x_sq[row] - 2.f * dot;
+#pragma unroll
+      for (int o = W / 2; o > 0; o /= 2) {
+        dot += __shfl_xor_sync(0xffffffffu, dot, o, W);
+      }
+      if (sl == 0 && i < cnt) { my[i] = probe_sq[r] + x_sq[row] - 2.f * dot; }
     }
     __syncwarp();
     float const kth = seed_kth(my, cnt, k, lane);
     if (lane == 0) { bound[r] = kth; }
     __syncwarp();
+  }
+}
+
+// Lanes per sample row: about eight 4-byte words each, between 4 and 32.
+int seed_width(int64_t words)
+{
+  int w = 4;
+  while (w < 32 && words >= 16 * w) {
+    w *= 2;
+  }
+  return w;
+}
+
+template <typename Launch>
+void launch_seed_width(int width, Launch&& launch)
+{
+  switch (width) {
+    case 4: launch(std::integral_constant<int, 4>{}); break;
+    case 8: launch(std::integral_constant<int, 8>{}); break;
+    case 16: launch(std::integral_constant<int, 16>{}); break;
+    default: launch(std::integral_constant<int, 32>{}); break;
   }
 }
 
@@ -1379,6 +1419,7 @@ void seed_bound_int8(int8_t const* x,
                      int32_t const* probe_sq,
                      int64_t const* first,
                      int32_t const* count,
+                     int64_t const* order,
                      int64_t n,
                      int64_t dim,
                      int k,
@@ -1388,8 +1429,10 @@ void seed_bound_int8(int8_t const* x,
   if (n == 0) { return; }
   auto const grid =
     static_cast<int>(std::clamp<int64_t>((n + kSeedWarps - 1) / kSeedWarps, 1, 65535));
-  seed_bound_int8_kernel<<<grid, kSeedWarps * 32, 0, stream.value()>>>(
-    x, x_sq, probe, probe_sq, first, count, n, static_cast<int>(dim), k, bound);
+  launch_seed_width(seed_width(dim / 4), [&](auto w) {
+    seed_bound_int8_kernel<decltype(w)::value><<<grid, kSeedWarps * 32, 0, stream.value()>>>(
+      x, x_sq, probe, probe_sq, first, count, order, n, static_cast<int>(dim), k, bound);
+  });
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
@@ -1399,6 +1442,7 @@ void seed_bound_f16(uint16_t const* x,
                     float const* probe_sq,
                     int64_t const* first,
                     int32_t const* count,
+                    int64_t const* order,
                     int64_t n,
                     int64_t dim,
                     int k,
@@ -1408,8 +1452,10 @@ void seed_bound_f16(uint16_t const* x,
   if (n == 0) { return; }
   auto const grid =
     static_cast<int>(std::clamp<int64_t>((n + kSeedWarps - 1) / kSeedWarps, 1, 65535));
-  seed_bound_f16_kernel<<<grid, kSeedWarps * 32, 0, stream.value()>>>(
-    x, x_sq, probe, probe_sq, first, count, n, static_cast<int>(dim), k, bound);
+  launch_seed_width(seed_width(dim / 2), [&](auto w) {
+    seed_bound_f16_kernel<decltype(w)::value><<<grid, kSeedWarps * 32, 0, stream.value()>>>(
+      x, x_sq, probe, probe_sq, first, count, order, n, static_cast<int>(dim), k, bound);
+  });
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

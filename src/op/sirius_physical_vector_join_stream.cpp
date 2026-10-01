@@ -75,6 +75,7 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1559,9 +1560,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       _lists != nullptr && !_lists->offsets.empty() &&
       _lists->offsets.back() <=
         static_cast<std::int64_t>(_lists->offsets.size() - 1) * 20 * vss::kSeedSample;
-    bool const seedable = int8_search && !radius_join &&
+    // The sample is scored on CUDA cores, so past a small batch the GEMM sweep is cheaper even when
+    // the bound is good (470k DataComp rows, d = 768, k = 2: 1.07 s seeded vs 0.76 s).
+    bool const small_batch = n_left * static_cast<std::int64_t>(dim) <= (std::int64_t{1} << 21);
+    bool const seedable    = int8_search && !radius_join &&
                           _lists->tier == cucascade::memory::Tier::GPU && k_join <= 64 &&
-                          seed_enabled && (!codes_int8 || small_clusters);
+                          seed_enabled && (!codes_int8 || (small_clusters && small_batch));
     bool const bounded = int8_search && (n_probes > 1 || radius_join || codes_int8 || seedable) &&
                          vss::bound_filter_int8_supports(dim) && bound_gemm_enabled;
     // FLOAT16 lists that kept their FP32 rows get the same two sweeps with the half-precision
@@ -1627,7 +1631,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // exact k-th and need not search that cluster again. SIRIUS_VSS_SEED=0 keeps the GEMM.
     bool const seed_f16 = f16_bounded && !radius_join &&
                           _lists->tier == cucascade::memory::Tier::GPU && k_join <= 64 &&
-                          seed_enabled && small_clusters;
+                          seed_enabled && small_clusters && small_batch;
     bool const seed = (bounded && seedable) || seed_f16;
     if (f16_bounded) {
       // The probe is rounded like the rows, with its rounded norms and its own rounding error.
@@ -1898,6 +1902,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       }
     };
 
+    // A sample is at most a quarter of its cluster (kSeedSample rows at most, a few times k at
+    // least): a sample near the whole cluster is the sweep again, on CUDA cores.
+    auto seed_rows = [&](std::int64_t size) {
+      auto const floor = std::max<std::int64_t>(64, 8 * k_join);
+      return std::min(size, std::clamp<std::int64_t>(size / 4, floor, vss::kSeedSample));
+    };
     auto seed_bound = [&] {
       std::vector<std::int64_t> first(static_cast<std::size_t>(n_left));
       std::vector<std::int32_t> count(static_cast<std::size_t>(n_left));
@@ -1905,9 +1915,29 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         auto const c = static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]);
         auto const lo                      = _lists->offsets[c];
         first[static_cast<std::size_t>(r)] = lo;
-        count[static_cast<std::size_t>(r)] = static_cast<std::int32_t>(
-          std::min<std::int64_t>(vss::kSeedSample, _lists->offsets[c + 1] - lo));
+        count[static_cast<std::size_t>(r)] =
+          static_cast<std::int32_t>(seed_rows(_lists->offsets[c + 1] - lo));
       }
+      // Probe rows by nearest cluster, so the kernel reads one cluster's sample at a time.
+      std::vector<std::int64_t> order(static_cast<std::size_t>(n_left));
+      {
+        std::vector<std::int64_t> at(_lists->offsets.size(), 0);
+        for (std::int64_t r = 0; r < n_left; ++r) {
+          ++at[static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]) + 1];
+        }
+        std::partial_sum(at.begin(), at.end(), at.begin());
+        for (std::int64_t r = 0; r < n_left; ++r) {
+          auto const c =
+            static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]);
+          order[static_cast<std::size_t>(at[c]++)] = r;
+        }
+      }
+      rmm::device_uvector<std::int64_t> order_d(order.size(), stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(order_d.data(),
+                                    order.data(),
+                                    order.size() * sizeof(std::int64_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.value()));
       rmm::device_uvector<std::int64_t> first_d(first.size(), stream, mr);
       rmm::device_uvector<std::int32_t> count_d(count.size(), stream, mr);
       CUDF_CUDA_TRY(cudaMemcpyAsync(first_d.data(),
@@ -1927,6 +1957,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                             probe_sqf->data(),
                             first_d.data(),
                             count_d.data(),
+                            order_d.data(),
                             n_left,
                             dim,
                             static_cast<int>(k_join),
@@ -1947,6 +1978,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                              probe_sq->data(),
                              first_d.data(),
                              count_d.data(),
+                             order_d.data(),
                              n_left,
                              dim,
                              static_cast<int>(k_join),

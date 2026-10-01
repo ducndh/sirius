@@ -196,6 +196,8 @@ constexpr int kSeedSample = 1024;
 /**
  * @brief bound[r] = the k-th smallest code distance from probe row r to the count[r] int8 rows
  * (norms @p x_sq) starting at layout row first[r]. +inf when count[r] < k. count[r] <= kSeedSample.
+ * Rows are visited in @p order (a permutation of [0, n), nullptr for 0..n-1): rows that share a
+ * sample, run together, find it in cache.
  * For UINT8 rows (stored shifted) the code distance is the exact distance, so this is an upper
  * bound on row r's k-th nearest distance over any corpus holding those rows; for INT8 codes,
  * int8_seed_upper_bound turns it into one.
@@ -206,6 +208,7 @@ void seed_bound_int8(int8_t const* x,
                      int32_t const* probe_sq,
                      int64_t const* first,
                      int32_t const* count,
+                     int64_t const* order,
                      int64_t n,
                      int64_t dim,
                      int k,
@@ -223,6 +226,7 @@ void seed_bound_f16(uint16_t const* x,
                     float const* probe_sq,
                     int64_t const* first,
                     int32_t const* count,
+                    int64_t const* order,
                     int64_t n,
                     int64_t dim,
                     int k,
