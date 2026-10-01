@@ -394,6 +394,37 @@ __global__ void float16_bound_limit_kernel(float const* bound,
   }
 }
 
+__global__ void int8_seed_upper_bound_kernel(
+  float* bound, float const* probe_error, float code_error, float scale, int64_t n)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    float const b = bound[i];
+    if (!(b < INFINITY)) { continue; }
+    float const reach = scale * sqrtf(fmaxf(b, 0.f)) + probe_error[i] + code_error;
+    bound[i]          = reach * reach * (1.f + 1e-6f);
+  }
+}
+
+__global__ void float16_seed_upper_bound_kernel(float* bound,
+                                                float const* probe_sq,
+                                                float const* probe_error,
+                                                float row_error,
+                                                float row_norm,
+                                                int64_t d,
+                                                int64_t n)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    float const b = bound[i];
+    if (!(b < INFINITY)) { continue; }
+    float const norms = sqrtf(probe_sq[i]) + row_norm;
+    float const sums  = 2.f * static_cast<float>(d) * 5.9604645e-8f * norms * norms;
+    float const reach = sqrtf(fmaxf(b + sums, 0.f)) + probe_error[i] + row_error;
+    bound[i]          = reach * reach * (1.f + 1e-6f);
+  }
+}
+
 __global__ void fill_list_offsets_kernel(int32_t* out, int64_t n, int64_t dim)
 {
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i <= n;
@@ -557,6 +588,34 @@ void int8_code_limit(float const* bound,
   int8_code_limit_kernel<<<grid, kBlock, 0, stream.value()>>>(
     bound, probe_error, code_error, scale, n, limit, lower);
   CUDF_CHECK_CUDA(stream.value());
+}
+
+void int8_seed_upper_bound(float* bound,
+                           float const* probe_error,
+                           float code_error,
+                           float scale,
+                           int64_t n,
+                           rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  int8_seed_upper_bound_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+    bound, probe_error, code_error, scale, n);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+void float16_seed_upper_bound(float* bound,
+                              float const* probe_sq,
+                              float const* probe_error,
+                              float row_error,
+                              float row_norm,
+                              int64_t d,
+                              int64_t n,
+                              rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  float16_seed_upper_bound_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+    bound, probe_sq, probe_error, row_error, row_norm, d, n);
+  CUDF_CUDA_TRY(cudaGetLastError());
 }
 
 void half_rows_norms(float const* x,

@@ -1500,3 +1500,49 @@ TEST_CASE_METHOD(KMeansFixture,
     }
   }
 }
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "a seeded sweep over INT8 and float16 lists gives what the GEMM sweep gives",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // Values at 1/1000 steps, which neither 8-bit codes nor halves hold exactly: the seed's sample
+  // distance is raised by the coding or rounding error before it bounds anything, and every
+  // survivor is re-scored in FP32, so the seeded search must return the unseeded one's rows and
+  // FP32 distances, at one probe, at a few, and at every cluster.
+  auto const storage = GENERATE(std::string("int8"), std::string("float16"));
+  auto const prefix  = "kmsd_" + storage;
+  create_lists_tables(*this, prefix, "gpu");
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => 16);");
+  auto built = query_ok(*con,
+                        "SELECT encoding FROM sirius_kmeans_build_lists('" + prefix +
+                          "_corpus','vec','" + prefix + "_c', storage => '" + storage + "');");
+  CHECK(built->GetValue(0, 0).ToString() == storage);
+  auto const fetch = [&](const std::string& args) {
+    std::vector<std::pair<std::string, double>> out;
+    for (auto const& r :
+         ok_rows(*con,
+                 "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_probe','vec','" +
+                   prefix + "_corpus','vec', metric => 'l2', search_mode => 'approx', " +
+                   "clustering => '" + prefix + "_c', " + args + ");")) {
+      out.emplace_back(r.at(0), std::stod(r.at(1)));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+  for (auto const probes : {1, 4, 16}) {
+    for (auto const k : {1, 10}) {
+      auto const args   = "n_probes => " + std::to_string(probes) + ", k => " + std::to_string(k);
+      auto const seeded = fetch(args);
+      ::setenv("SIRIUS_VSS_SEED", "0", 1);
+      auto const gemm = fetch(args);
+      ::unsetenv("SIRIUS_VSS_SEED");
+      REQUIRE(seeded.size() == gemm.size());
+      REQUIRE(seeded.size() == static_cast<std::size_t>(50 * k));
+      for (std::size_t i = 0; i < seeded.size(); ++i) {
+        CHECK(seeded[i].first == gemm[i].first);
+        CHECK(std::abs(seeded[i].second - gemm[i].second) <= 1e-5 * std::max(1.0, gemm[i].second));
+      }
+    }
+  }
+}

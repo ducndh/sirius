@@ -194,10 +194,11 @@ void sqrt_in_place(float* d, int64_t n, rmm::cuda_stream_view stream);
 constexpr int kSeedSample = 1024;
 
 /**
- * @brief bound[r] = the k-th smallest exact distance from probe row r to the count[r] UINT8 rows
- * (stored shifted to int8, norms @p x_sq) starting at layout row first[r]: an upper bound on row
- * r's k-th nearest distance over any corpus holding those rows. +inf when count[r] < k.
- * count[r] <= kSeedSample.
+ * @brief bound[r] = the k-th smallest code distance from probe row r to the count[r] int8 rows
+ * (norms @p x_sq) starting at layout row first[r]. +inf when count[r] < k. count[r] <= kSeedSample.
+ * For UINT8 rows (stored shifted) the code distance is the exact distance, so this is an upper
+ * bound on row r's k-th nearest distance over any corpus holding those rows; for INT8 codes,
+ * int8_seed_upper_bound turns it into one.
  */
 void seed_bound_int8(int8_t const* x,
                      int32_t const* x_sq,
@@ -210,6 +211,23 @@ void seed_bound_int8(int8_t const* x,
                      int k,
                      float* bound,
                      rmm::cuda_stream_view stream);
+
+/**
+ * @brief seed_bound_int8 over FLOAT16 rows (IEEE half bits, FP32 norms of the rounded rows in
+ * @p x_sq): bound[r] = the k-th smallest FP16-computed distance |q̂|² + |x̂|² - 2 q̂·x̂, with the
+ * dot accumulated in FP32. float16_seed_upper_bound turns it into an FP32 upper bound.
+ */
+void seed_bound_f16(uint16_t const* x,
+                    float const* x_sq,
+                    uint16_t const* probe,
+                    float const* probe_sq,
+                    int64_t const* first,
+                    int32_t const* count,
+                    int64_t n,
+                    int64_t dim,
+                    int k,
+                    float* bound,
+                    rmm::cuda_stream_view stream);
 
 /// d[i] *= factor for i in [0, n).
 void scale_in_place(float* d, int64_t n, float factor, rmm::cuda_stream_view stream);

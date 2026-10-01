@@ -1546,13 +1546,22 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // memory. Distances stay squared until the end, where the bound is compared.
     // A radius join is the same search with the radius as every row's bound, in one sweep: there
     // is no k-th distance to seed, and a pair under the bound is final when found.
-    // Lossless UINT8 lists on the device can seed sweep 0 (below), which makes even one probe a
-    // bounded search.
-    bool const seedable = int8_search && !codes_int8 && !radius_join &&
-                          _lists->tier == cucascade::memory::Tier::GPU && k_join <= 64 && [] {
-                            auto const* v = std::getenv("SIRIUS_VSS_SEED");
-                            return v == nullptr || std::string_view{v} != "0";
-                          }();
+    // Lists on the device can seed sweep 0 (below), which makes even one probe a bounded search.
+    bool const seed_enabled = [] {
+      auto const* v = std::getenv("SIRIUS_VSS_SEED");
+      return v == nullptr || std::string_view{v} != "0";
+    }();
+    // A seed for inexact rows (INT8 codes, FLOAT16) is raised by the coding error and its survivors
+    // are re-scored, so a sample of a large cluster seeds too loosely to pay: past ~20 samples'
+    // worth of rows per cluster (Deep100M, ~97k rows a cluster: 0.39 -> 0.86 s at 10k probes) the
+    // GEMM sweep's exact k-th is cheaper. Lossless UINT8 rows seed exactly at any cluster size.
+    bool const small_clusters =
+      _lists != nullptr && !_lists->offsets.empty() &&
+      _lists->offsets.back() <=
+        static_cast<std::int64_t>(_lists->offsets.size() - 1) * 20 * vss::kSeedSample;
+    bool const seedable = int8_search && !radius_join &&
+                          _lists->tier == cucascade::memory::Tier::GPU && k_join <= 64 &&
+                          seed_enabled && (!codes_int8 || small_clusters);
     bool const bounded = int8_search && (n_probes > 1 || radius_join || codes_int8 || seedable) &&
                          vss::bound_filter_int8_supports(dim) && bound_gemm_enabled;
     // FLOAT16 lists that kept their FP32 rows get the same two sweeps with the half-precision
@@ -1569,9 +1578,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                              vss::bound_filter_f16_supports(dim) && bound_gemm_enabled;
     bool const any_bounded = bounded || f16_bounded;
     // FP16 and INT8 lists filter with inexact distances: their bounded search keeps layout rows as
-    // ids, re-scores every candidate in FP32 from the kept rows, and searches the nearest cluster
-    // again in sweep 1 (sweep 0 only seeds the bound). INT8 filters in code space, under a
-    // per-row limit derived from the FP32 bound and both sides' coding errors.
+    // ids and re-scores every candidate in FP32 from the kept rows. Unseeded, they search the
+    // nearest cluster again in sweep 1 (sweep 0 only sets the bound). INT8 filters in code space,
+    // under a per-row limit derived from the FP32 bound and both sides' coding errors.
     bool const rescore = f16_bounded || codes_int8;
     // Both filter under a per-row limit derived from the FP32 bound and both sides' rounding.
     std::optional<rmm::device_uvector<float>> code_limit;
@@ -1609,12 +1618,17 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     };
     bool const sqrt_at_end =
       any_bounded && search_metric == cuvs::distance::DistanceType::L2SqrtExpanded;
-    // Lossless UINT8 lists on the device run sweep 0 -- each row's nearest cluster, which only sets
-    // the bounded sweep's starting bound -- as a bounded search too, a few grouped launches instead
-    // of a GEMM and a selection per cluster. Its own bound is the k-th smallest distance to the
-    // first kSeedSample rows of that cluster, which are corpus rows; what passes is merged, and the
-    // exact k-th of the nearest cluster bounds sweep 1 as before. SIRIUS_VSS_SEED=0 keeps the GEMM.
-    bool const seed = bounded && seedable && !rescore;
+    // Lists on the device run sweep 0 -- each row's nearest cluster, which only sets the bounded
+    // sweep's starting bound -- as a bounded search too, a few grouped launches instead of a GEMM
+    // and a selection per cluster. Its own bound comes from the first kSeedSample rows of that
+    // cluster: their k-th smallest distance, which for INT8 codes and FLOAT16 rows is first raised
+    // by both sides' coding or rounding error so it bounds the FP32 distance. What passes is merged
+    // (re-scored in FP32 where the rows are inexact), so sweep 1 starts from the nearest cluster's
+    // exact k-th and need not search that cluster again. SIRIUS_VSS_SEED=0 keeps the GEMM.
+    bool const seed_f16 = f16_bounded && !radius_join &&
+                          _lists->tier == cucascade::memory::Tier::GPU && k_join <= 64 &&
+                          seed_enabled && small_clusters;
+    bool const seed = (bounded && seedable) || seed_f16;
     if (f16_bounded) {
       // The probe is rounded like the rows, with its rounded norms and its own rounding error.
       probe_f16.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
@@ -1906,17 +1920,51 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                     count.size() * sizeof(std::int32_t),
                                     cudaMemcpyHostToDevice,
                                     stream.value()));
-      vss::seed_bound_int8(static_cast<std::int8_t const*>(_lists->device_vectors->data()),
-                           static_cast<std::int32_t const*>(_lists->row_sq->data()),
-                           probe_i8->data(),
-                           probe_sq->data(),
-                           first_d.data(),
-                           count_d.data(),
-                           n_left,
-                           dim,
-                           static_cast<int>(k_join),
-                           bound->data(),
-                           stream);
+      if (f16_bounded) {
+        vss::seed_bound_f16(static_cast<std::uint16_t const*>(_lists->device_vectors->data()),
+                            static_cast<float const*>(_lists->row_sq_f32->data()),
+                            probe_f16->data(),
+                            probe_sqf->data(),
+                            first_d.data(),
+                            count_d.data(),
+                            n_left,
+                            dim,
+                            static_cast<int>(k_join),
+                            bound->data(),
+                            stream);
+        vss::float16_seed_upper_bound(bound->data(),
+                                      probe_sqf->data(),
+                                      probe_half_error->data(),
+                                      _lists->half_error,
+                                      _lists->max_row_norm,
+                                      dim,
+                                      n_left,
+                                      stream);
+      } else {
+        vss::seed_bound_int8(static_cast<std::int8_t const*>(_lists->device_vectors->data()),
+                             static_cast<std::int32_t const*>(_lists->row_sq->data()),
+                             probe_i8->data(),
+                             probe_sq->data(),
+                             first_d.data(),
+                             count_d.data(),
+                             n_left,
+                             dim,
+                             static_cast<int>(k_join),
+                             bound->data(),
+                             stream);
+        if (codes_int8) {
+          vss::int8_seed_upper_bound(bound->data(),
+                                     probe_code_error->data(),
+                                     _lists->code_error,
+                                     _lists->code_scale,
+                                     n_left,
+                                     stream);
+        }
+      }
+      if (rescore) {
+        code_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
+        refresh_code_limit(bound->data());
+      }
     };
     for (int sweep = radius_join && any_bounded ? 1 : 0; sweep < (any_bounded ? 2 : 1); ++sweep) {
       if (sweep == 1 && !kept.empty()) {
@@ -1932,7 +1980,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                                      : kept_first;
       // A sweep that reads the lists in place stages nothing. FP16 lists on the host are copied
       // in compact for sweep 0 as well, and widened on the device, so that copy can be kept.
-      bool const direct        = int8_search || (f16_bounded && sweep == 1);
+      bool const direct        = int8_search || (f16_bounded && (sweep == 1 || seed));
       bool const widen_compact = lists_on_host && f16_bounded && sweep == 0;
       bool const copy_compact  = (direct && lists_on_host) || widen_compact;
       auto stage_next          = [&](std::size_t j) {
@@ -1962,7 +2010,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
         if (radius_join) {
           vss::fill_bound(bound->data(), n_left, radius_bound, stream);
-        } else if (rescore) {
+        } else if (rescore && !seed) {
           vss::exact_distances(search_queries.data_handle(),
                                nullptr,
                                k_join,
@@ -2032,7 +2080,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           auto eb          = edge_begin[static_cast<std::size_t>(slice.cluster)];
           auto ee          = edge_begin[static_cast<std::size_t>(slice.cluster) + 1];
           auto const split = eb + nearest_edges[static_cast<std::size_t>(slice.cluster)];
-          if (bounded && !radius_join && !rescore) { (sweep == 0 ? ee : eb) = split; }
+          if (any_bounded && !radius_join && (!rescore || seed)) { (sweep == 0 ? ee : eb) = split; }
           if (rescore && sweep == 0) { ee = split; }
           if (eb == ee) { continue; }
           // The slice was cut from the cluster column's chunk j; this is the first point at

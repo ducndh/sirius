@@ -1257,8 +1257,37 @@ namespace {
 
 constexpr int kSeedWarps = 8;
 
-// One warp per probe row: its sample's distances go to shared memory, then k rounds of a warp
-// argmin take the k smallest; the last one taken is the bound.
+// k rounds of a warp argmin over a probe row's sample distances in shared memory; the last one
+// taken is the k-th smallest. Consumes @p my.
+__device__ float seed_kth(float* my, int cnt, int k, int lane)
+{
+  float kth = 0.f;
+  for (int t = 0; t < k; ++t) {
+    float best = __int_as_float(0x7f800000);
+    int at     = -1;
+    for (int i = lane; i < cnt; i += 32) {
+      if (my[i] < best) {
+        best = my[i];
+        at   = i;
+      }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o /= 2) {
+      float const ob = __shfl_xor_sync(0xffffffffu, best, o);
+      int const oa   = __shfl_xor_sync(0xffffffffu, at, o);
+      if (ob < best || (ob == best && oa > at)) {
+        best = ob;
+        at   = oa;
+      }
+    }
+    kth = best;
+    if (lane == 0 && at >= 0) { my[at] = __int_as_float(0x7f800000); }
+    __syncwarp();
+  }
+  return kth;
+}
+
+// One warp per probe row: its sample's distances go to shared memory, then seed_kth.
 __global__ void __launch_bounds__(kSeedWarps * 32)
   seed_bound_int8_kernel(int8_t const* __restrict__ x,
                          int32_t const* __restrict__ x_sq,
@@ -1293,29 +1322,50 @@ __global__ void __launch_bounds__(kSeedWarps * 32)
       my[i] = static_cast<float>(probe_sq[r] + x_sq[row] - 2 * dot);
     }
     __syncwarp();
-    float kth = 0.f;
-    for (int t = 0; t < k; ++t) {
-      float best = __int_as_float(0x7f800000);
-      int at     = -1;
-      for (int i = lane; i < cnt; i += 32) {
-        if (my[i] < best) {
-          best = my[i];
-          at   = i;
-        }
-      }
-#pragma unroll
-      for (int o = 16; o > 0; o /= 2) {
-        float const ob = __shfl_xor_sync(0xffffffffu, best, o);
-        int const oa   = __shfl_xor_sync(0xffffffffu, at, o);
-        if (ob < best || (ob == best && oa > at)) {
-          best = ob;
-          at   = oa;
-        }
-      }
-      kth = best;
-      if (lane == 0 && at >= 0) { my[at] = __int_as_float(0x7f800000); }
-      __syncwarp();
+    float const kth = seed_kth(my, cnt, k, lane);
+    if (lane == 0) { bound[r] = kth; }
+    __syncwarp();
+  }
+}
+
+// The same over FLOAT16 rows, the dot accumulated in FP32.
+__global__ void __launch_bounds__(kSeedWarps * 32)
+  seed_bound_f16_kernel(uint16_t const* __restrict__ x,
+                        float const* __restrict__ x_sq,
+                        uint16_t const* __restrict__ probe,
+                        float const* __restrict__ probe_sq,
+                        int64_t const* __restrict__ first,
+                        int32_t const* __restrict__ count,
+                        int64_t n,
+                        int d,
+                        int k,
+                        float* __restrict__ bound)
+{
+  __shared__ float s_d[kSeedWarps][kSeedSample];
+  int const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  float* my       = s_d[warp];
+  int const pairs = d / 2;
+  for (int64_t r = static_cast<int64_t>(blockIdx.x) * kSeedWarps + warp; r < n;
+       r += static_cast<int64_t>(gridDim.x) * kSeedWarps) {
+    int const cnt = count[r];
+    if (cnt < k) {
+      if (lane == 0) { bound[r] = __int_as_float(0x7f800000); }
+      continue;
     }
+    auto const* q = reinterpret_cast<__half2 const*>(probe + r * d);
+    for (int i = lane; i < cnt; i += 32) {
+      auto const row = first[r] + i;
+      auto const* xr = reinterpret_cast<__half2 const*>(x + row * d);
+      float dot      = 0.f;
+      for (int w = 0; w < pairs; ++w) {
+        float2 const a = __half22float2(xr[w]);
+        float2 const b = __half22float2(q[w]);
+        dot            = fmaf(a.x, b.x, fmaf(a.y, b.y, dot));
+      }
+      my[i] = probe_sq[r] + x_sq[row] - 2.f * dot;
+    }
+    __syncwarp();
+    float const kth = seed_kth(my, cnt, k, lane);
     if (lane == 0) { bound[r] = kth; }
     __syncwarp();
   }
@@ -1339,6 +1389,26 @@ void seed_bound_int8(int8_t const* x,
   auto const grid =
     static_cast<int>(std::clamp<int64_t>((n + kSeedWarps - 1) / kSeedWarps, 1, 65535));
   seed_bound_int8_kernel<<<grid, kSeedWarps * 32, 0, stream.value()>>>(
+    x, x_sq, probe, probe_sq, first, count, n, static_cast<int>(dim), k, bound);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+void seed_bound_f16(uint16_t const* x,
+                    float const* x_sq,
+                    uint16_t const* probe,
+                    float const* probe_sq,
+                    int64_t const* first,
+                    int32_t const* count,
+                    int64_t n,
+                    int64_t dim,
+                    int k,
+                    float* bound,
+                    rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  auto const grid =
+    static_cast<int>(std::clamp<int64_t>((n + kSeedWarps - 1) / kSeedWarps, 1, 65535));
+  seed_bound_f16_kernel<<<grid, kSeedWarps * 32, 0, stream.value()>>>(
     x, x_sq, probe, probe_sq, first, count, n, static_cast<int>(dim), k, bound);
   CUDF_CUDA_TRY(cudaGetLastError());
 }

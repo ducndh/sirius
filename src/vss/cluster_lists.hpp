@@ -276,6 +276,17 @@ void int8_code_limit(float const* bound,
                      rmm::cuda_stream_view stream,
                      bool lower = false);
 
+/// An INT8 seed (seed_bound_int8's k-th code distance b) as an FP32 bound, in place: k rows lie
+/// within code distance b of probe row r, so each lies within (scale·√b + probe_error[r] +
+/// code_error)² of it in FP32, the decoded pair being within both sides' coding error of the true
+/// one. That bounds row r's k-th nearest distance.
+void int8_seed_upper_bound(float* bound,
+                           float const* probe_error,
+                           float code_error,
+                           float scale,
+                           std::int64_t n,
+                           rmm::cuda_stream_view stream);
+
 /// |half(x)|^2 per row of FP32 rows @p x and their half-rounded copy @p h, with each row's
 /// rounding error |x - half(x)| to row_error[i] and/or into *max_error_bits, and the largest
 /// |half(x)| into *max_norm_bits, for whichever are given (non-negative floats' bits).
@@ -303,6 +314,18 @@ void float16_bound_limit(float const* bound,
                          float* limit,
                          rmm::cuda_stream_view stream,
                          bool lower = false);
+
+/// A FLOAT16 seed (seed_bound_f16's k-th FP16-computed distance) as an FP32 bound, in place: the
+/// rounded pair's distance is within the FP32 sums' error of the computed one (as in
+/// float16_bound_limit), and the true pair within probe_error[r] + row_error of the rounded one.
+void float16_seed_upper_bound(float* bound,
+                              float const* probe_sq,
+                              float const* probe_error,
+                              float row_error,
+                              float row_norm,
+                              std::int64_t d,
+                              std::int64_t n,
+                              rmm::cuda_stream_view stream);
 
 /// |x|^2 per row of shifted int8 rows, exact in int32.
 void int8_row_sq_norms(std::int8_t const* x,
