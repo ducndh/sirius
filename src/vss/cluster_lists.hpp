@@ -181,6 +181,10 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
 struct exact_lists_choice {
   std::string clustering;
   std::int64_t n_clusters{0};
+  list_encoding encoding{list_encoding::float32};
+  bool on_device{false};
+  /// FLOAT16 rows in clusters small enough that the first sweep is seeded (no fixed sweep 0).
+  bool seeded{false};
 };
 
 /// A clustering of (@p catalog, @p schema, @p table, @p column) whose lists hold all @p n_rows

@@ -334,12 +334,24 @@ TEST_CASE_METHOD(SqlRewriteFixture,
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
   SqlRewriteTables tables(*this);
-  // FLOAT32 lists (these values are not bytes) answer exactly once every cluster is probed, so
-  // the rewritten joins search through them: the prune statistics, which only the clustered
-  // search records, move, and the answers stay DuckDB's. The lists hold rows as they are, not
-  // unit rows, so a cosine join keeps the exact GEMM.
+  // FLOAT32 lists (these values are not bytes) answer exactly once every cluster is probed, but
+  // hold the same bytes as the pin, so by cost the rewrite keeps brute force: the prune
+  // statistics, which only the clustered search records, stay put. Forced through the lists they
+  // move, and the answers stay DuckDB's. The lists hold rows as they are, not unit rows, so a
+  // cosine join keeps the exact GEMM either way.
   run_ok("SELECT * FROM sirius_kmeans_fit('sr_corpus','vec', name => 'sr_c', n_clusters => 8);");
   run_ok("SELECT * FROM sirius_kmeans_build_lists('sr_corpus','vec','sr_c');");
+  auto const unforced = sirius::test::get_vector_join_prune_stats(*con);
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT p.id, n.id, n.d FROM sr_probe p, LATERAL (SELECT c.id, "
+    "array_distance(p.vec, c.vec) AS d FROM sr_corpus c ORDER BY d LIMIT 7) n;");
+  CHECK(sirius::test::get_vector_join_prune_stats(*con).pairs_exhaustive ==
+        unforced.pairs_exhaustive);
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "lists", 1);
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_ACCESS_PATH"); }
+  } unset_access_path;
   auto const before = sirius::test::get_vector_join_prune_stats(*con);
   require_gpu_matches_duckdb(
     *con,
@@ -359,4 +371,39 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "c.vec) AS s FROM sr_corpus c ORDER BY s DESC LIMIT 4) n;");
   CHECK(sirius::test::get_vector_join_prune_stats(*con).pairs_exhaustive ==
         radius.pairs_exhaustive);
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a join over a pinned corpus with no lists can build them inside the query",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // With no lists, SIRIUS_VSS_ACCESS_PATH=lists has the rewrite fit a clustering and write lists
+  // of the pinned column first (as SIRIUS_VSS_BUILD_IN_QUERY=1 does when the cost model says the
+  // build pays), then search them in full: DuckDB's answer, and the lists stay for later queries.
+  // Byte values and a width of 16, so the lists it builds are UINT8 and searched exactly.
+  SqlRewriteTables tables(*this);
+  auto const bytes = [](const std::string& seed) {
+    return "list_transform(range(16), lambda d: (hash(i * 100 + d + " + seed +
+           ") % 256)::FLOAT)::FLOAT[16]";
+  };
+  run_ok("CREATE TABLE sr_bytes AS SELECT i::INTEGER AS id, " + bytes("0") +
+         " AS vec FROM range(4000) t(i);");
+  run_ok("CREATE TABLE sr_bytes_probe AS SELECT i::INTEGER AS id, " + bytes("9999") +
+         " AS vec FROM range(30) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_bytes', tier => 'gpu', format => 'duckdb');");
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "lists", 1);
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_ACCESS_PATH"); }
+  } unset_access_path;
+  auto const before = sirius::test::get_vector_join_prune_stats(*con);
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT p.id, n.id, n.d FROM sr_bytes_probe p, LATERAL (SELECT c.id, "
+    "array_distance(p.vec, c.vec) AS d FROM sr_bytes c ORDER BY d LIMIT 5) n;");
+  CHECK(sirius::test::get_vector_join_prune_stats(*con).pairs_exhaustive > before.pairs_exhaustive);
+  auto centroids =
+    con->Query("SELECT count(*) FROM sirius_kmeans_centroids('__sirius_auto_sr_bytes_vec');");
+  REQUIRE_FALSE(centroids->HasError());
+  CHECK(centroids->GetValue(0, 0).GetValue<std::int64_t>() > 0);
 }

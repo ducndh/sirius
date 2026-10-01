@@ -331,7 +331,12 @@ std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
     if (!exact) { continue; }
     auto const entry = find_clustering_entry(ctx, name);
     if (entry == nullptr) { continue; }
-    return exact_lists_choice{name, entry->meta.n_lists};
+    auto const clusters = static_cast<std::int64_t>(lists->offsets.size()) - 1;
+    return exact_lists_choice{name,
+                              entry->meta.n_lists,
+                              lists->encoding,
+                              lists->tier == cucascade::memory::Tier::GPU,
+                              clusters > 0 && lists->offsets.back() <= clusters * 20 * kSeedSample};
   }
   return std::nullopt;
 }
