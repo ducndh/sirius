@@ -52,6 +52,7 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 #include "vss/access_path_cost.hpp"
@@ -304,15 +305,76 @@ struct lifted_relation {
   std::size_t probe_child{0};
 };
 
+/// Share of all pairs a band keeps, from the min/max statistics DuckDB's statistics propagation
+/// left on the join (one pair per condition, kept only if every condition got one). One condition
+/// bounds an expression from below and the other from above; the band's width is the gap between
+/// the bounds' midpoints, and its share is that width over the bounded expression's range -- a
+/// uniform spread assumed, so skew moves it, but by a factor, not by DuckDB's ~100x.
+std::optional<double> band_selectivity(duckdb::LogicalComparisonJoin const& join)
+{
+  if (join.join_stats.size() != 2 * join.conditions.size()) { return std::nullopt; }
+  auto range_of = [](duckdb::BaseStatistics const& st) -> std::optional<std::pair<double, double>> {
+    if (st.GetStatsType() != duckdb::StatisticsType::NUMERIC_STATS ||
+        !duckdb::NumericStats::HasMinMax(st)) {
+      return std::nullopt;
+    }
+    try {
+      return std::pair{
+        duckdb::NumericStats::Min(st).DefaultCastAs(duckdb::LogicalType::DOUBLE).GetValue<double>(),
+        duckdb::NumericStats::Max(st)
+          .DefaultCastAs(duckdb::LogicalType::DOUBLE)
+          .GetValue<double>()};
+    } catch (std::exception&) {
+      return std::nullopt;
+    }
+  };
+  // Per range condition: which side bounds the other from below (left <= right means the left
+  // expression is a lower bound of the right one).
+  struct bound {
+    std::pair<double, double> left, right;
+    bool left_is_lower;
+  };
+  std::vector<bound> bounds;
+  for (std::size_t i = 0; i < join.conditions.size(); ++i) {
+    auto const cmp = join.conditions[i].comparison;
+    bool const lower =
+      cmp == ExpressionType::COMPARE_LESSTHAN || cmp == ExpressionType::COMPARE_LESSTHANOREQUALTO;
+    bool const upper = cmp == ExpressionType::COMPARE_GREATERTHAN ||
+                       cmp == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+    if (!lower && !upper) { continue; }
+    auto const l = range_of(*join.join_stats[2 * i]);
+    auto const r = range_of(*join.join_stats[2 * i + 1]);
+    if (!l || !r) { return std::nullopt; }
+    bounds.push_back({*l, *r, lower});
+  }
+  if (bounds.size() != 2 || bounds[0].left_is_lower == bounds[1].left_is_lower) {
+    return std::nullopt;
+  }
+  auto const& lo = bounds[0].left_is_lower ? bounds[0] : bounds[1];
+  auto const& hi = bounds[0].left_is_lower ? bounds[1] : bounds[0];
+  auto mid       = [](std::pair<double, double> const& r) { return (r.first + r.second) / 2; };
+  auto span      = [](std::pair<double, double> const& r) { return r.second - r.first; };
+  // Either the left side brackets the right (lo.left <= right <= hi.left) or the right brackets
+  // the left (hi.right <= left <= lo.right); the reading with a positive width is the band.
+  double const width_on_right = mid(hi.left) - mid(lo.left);
+  double const width_on_left  = mid(lo.right) - mid(hi.right);
+  double const width          = std::max(width_on_right, width_on_left);
+  double const range          = width_on_right >= width_on_left ? span(lo.right) : span(lo.left);
+  if (!(width > 0) || !(range > 0)) { return std::nullopt; }
+  return std::min(1.0, width / range);
+}
+
 /// An inner join on `<>` conditions and range conditions that, under a threshold, is cheaper as
 /// the cross product with its conditions as filters (the vector join first). One range condition
 /// (`a.k < b.k`, as a self-join uses to count each pair once) keeps about half the pairs, so it
-/// always is. A band (two range conditions) is when it keeps enough pairs: joining by the band
-/// first runs on DuckDB's CPU (~50 GFLOP/s of similarity over the band's pairs) against the
-/// GPU's ~8.5 TFLOP/s over all pairs, so the vector join wins once the band keeps more than about
-/// 1/170 of them (a 1% price band on Vec-H keeps ~2%: >600 s on the CPU, 2.6 s vector first).
-/// DuckDB's range-join estimates run far low (that band: 0.017%), so on them a band is mostly left
-/// alone; SIRIUS_VSS_BAND_VECTOR_FIRST=1 takes every band vector first, =0 none. Equality joins
+/// always is. A band (two range conditions) is when it keeps enough pairs. Joining by the band
+/// first runs on DuckDB's CPU, which pays per band pair mostly to gather both vectors: on Vec-H
+/// images (d = 1152, 24 threads) 8.7 us a pair (a 0.01% price band, 2.9M pairs: 25.3 s), against
+/// the GPU's 0.73 ns a pair over all 1.15e10 (8.4 s). So the vector join wins once the band keeps
+/// more than about 1/10,000 of the pairs; both sides scale with d, so the ratio does not. The share
+/// comes from band_selectivity when the join carries min/max statistics for both sides of its
+/// conditions; DuckDB's own range-join estimate is the fallback, and it runs far low (that band:
+/// 0.017%). SIRIUS_VSS_BAND_VECTOR_FIRST=1 takes every band vector first, =0 none. Equality joins
 /// are always left alone.
 bool is_inequality_join(duckdb::ClientContext& context, LogicalOperator& op)
 {
@@ -338,11 +400,15 @@ bool is_inequality_join(duckdb::ClientContext& context, LogicalOperator& op)
   if (env != nullptr && std::strcmp(env, "1") == 0) { return true; }
   double const pairs = static_cast<double>(op.children[0]->EstimateCardinality(context)) *
                        static_cast<double>(op.children[1]->EstimateCardinality(context));
-  double const kept       = static_cast<double>(op.EstimateCardinality(context));
-  bool const vector_first = pairs > 0 && kept * 170.0 >= pairs;
-  SIRIUS_LOG_INFO("[vector_join_rewrite] band join keeps ~{:.2g} of {:.3g} pairs by estimate: {}",
-                  pairs > 0 ? kept / pairs : 0.0,
+  auto const from_stats   = band_selectivity(join);
+  double const share      = from_stats ? *from_stats
+                            : pairs > 0 ? static_cast<double>(op.EstimateCardinality(context)) / pairs
+                                        : 0.0;
+  bool const vector_first = share * 1e4 >= 1.0;
+  SIRIUS_LOG_INFO("[vector_join_rewrite] band join keeps ~{:.2g} of {:.3g} pairs ({}): {}",
+                  share,
                   pairs,
+                  from_stats ? "column statistics" : "DuckDB's estimate",
                   vector_first ? "vector join first" : "left to the band join");
   return vector_first;
 }

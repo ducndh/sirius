@@ -377,9 +377,9 @@ TEST_CASE_METHOD(SqlRewriteFixture,
                  "a band join can run as a vector join with the band as a filter",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
-  // Two range conditions between the sides (a band) next to a distance threshold. DuckDB's band
-  // estimates run low, so by default the band is left to it; SIRIUS_VSS_BAND_VECTOR_FIRST=1 takes
-  // the vector join first with the band as a filter, on the GPU, with DuckDB's answer.
+  // Two range conditions between the sides (a band) next to a distance threshold;
+  // SIRIUS_VSS_BAND_VECTOR_FIRST=1 takes the vector join first with the band as a filter whatever
+  // the estimate says, on the GPU, with DuckDB's answer.
   SqlRewriteTables tables(*this);
   ::setenv("SIRIUS_VSS_BAND_VECTOR_FIRST", "1", 1);
   struct unset_on_exit {
@@ -389,6 +389,32 @@ TEST_CASE_METHOD(SqlRewriteFixture,
                              "SELECT p.id, c.id FROM sr_probe p JOIN sr_corpus c ON "
                              "c.cat BETWEEN p.cat - 2 AND p.cat + 2 "
                              "WHERE array_distance(p.vec, c.vec) <= 0.9;");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a band join's own statistics decide whether the vector join goes first",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // cat is 0..19, so a +-2 band keeps about 4/19 of the pairs: vector join first, on the GPU. id
+  // is 0..19,999, so a band one wide keeps about 1/20,000: left to DuckDB's band join, same answer.
+  SqlRewriteTables tables(*this);
+  require_gpu_matches_duckdb(*con,
+                             "SELECT p.id, c.id FROM sr_probe p JOIN sr_corpus c ON "
+                             "c.cat BETWEEN p.cat - 2 AND p.cat + 2 "
+                             "WHERE array_distance(p.vec, c.vec) <= 0.9;");
+
+  auto const narrow =
+    "SELECT p.id, c.id FROM sr_probe p JOIN sr_corpus c ON "
+    "c.id BETWEEN p.id * 600 AND p.id * 600 + 1 WHERE array_distance(p.vec, c.vec) <= 3.0;";
+  con->Query("SET gpu_execution = false;");
+  auto const expected = sorted_rows(*con, narrow);
+  con->Query("SET gpu_execution = true;");
+  auto const before = sirius::test::get_transparent_execution_stats(*con);
+  auto const got    = sorted_rows(*con, narrow);
+  auto const after  = sirius::test::get_transparent_execution_stats(*con);
+  sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
+  REQUIRE(!expected.empty());
+  REQUIRE(rows_match(got, expected));
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
