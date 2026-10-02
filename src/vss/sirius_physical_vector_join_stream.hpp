@@ -286,7 +286,8 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// Peak bytes for one left batch's task: the accumulator, the partial being folded
   /// in, and the stacked pair the merge reads. Independent of the right batch count,
   /// which is the point of the fold.
-  [[nodiscard]] std::size_t per_left_batch_estimate(std::size_t left_idx) const;
+  [[nodiscard]] std::size_t per_left_batch_estimate(std::size_t left_idx,
+                                                    bool with_routing = true) const;
 
   /// The corpus row order, shared with materialize. Null on the pinned path, where the
   /// pinned_entry plays the same role.

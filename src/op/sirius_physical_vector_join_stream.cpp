@@ -73,6 +73,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <format>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -1250,6 +1251,21 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // how many in-range neighbours one left row may have, which is what k supplies there.
   auto const k_join = std::min<std::int64_t>(_request.k, _right_total_rows);
   vss::column_size(n_left * k_join, "vector join output");
+  // A top-k task whose estimate exceeds the whole device cannot fit however much memory is
+  // released, so it is refused here, once, instead of through every out-of-memory retry of the
+  // executor (k = 32,768 over 10,000 probes used to retry for ~5 s before failing). The routing
+  // term of a clustered search only paces admission; it is not exact enough to refuse on.
+  if (_request.mode != vss::vector_join_mode::threshold) {
+    auto const need = per_left_batch_estimate(left_idx, /*with_routing=*/false);
+    if (need > mem_space->get_max_memory()) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] k = " + std::to_string(k_join) + " over " +
+        std::to_string(n_left) + " probe rows needs ~" +
+        std::format("{:.1f}", need / 1073741824.0) + " GiB on the device, more than it has (" +
+        std::format("{:.1f}", mem_space->get_max_memory() / 1073741824.0) +
+        " GiB); ask for a smaller k or join fewer probe rows at a time");
+    }
+  }
 
   raft::device_resources res{stream};
   auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact;
@@ -1269,6 +1285,24 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // it has no k -- and therefore none of the k <= 1024 ceiling that knn_merge_parts imposes.
   bool const radius_join = _request.mode == vss::vector_join_mode::threshold;
   std::vector<std::unique_ptr<cudf::column>> radius_left, radius_neighbors, radius_distances;
+  // The edges are held on the device until the concatenate (16 B a pair, and as much again while
+  // it copies them), so past the whole device / 32 B the output cannot fit however much else is
+  // released, and an out-of-memory retry would only re-fold the corpus to the same point.
+  std::int64_t radius_pairs = 0;
+  auto const radius_cap     = static_cast<std::int64_t>(mem_space->get_max_memory() / 32);
+  auto note_radius_part     = [&](std::int64_t pairs) {
+    radius_pairs += pairs;
+    if (radius_pairs > radius_cap) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] the pairs within the threshold reach " +
+        std::to_string(radius_pairs) +
+        " for one probe batch, more than device memory can hold as "
+            "output (~" +
+        std::to_string(radius_cap) +
+        "); tighten the threshold or join fewer probe "
+            "rows at a time");
+    }
+  };
   // The kernel works in distance space. For cosine with a similarity threshold the user's
   // "score >= eps" is the same set as "distance <= 1 - eps"; for a distance threshold it is eps
   // directly. Identical to what the shape_threshold path below computes.
@@ -1701,6 +1735,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           stream,
           mr);
         if (kept.rows.size() > 0) {
+          note_radius_part(static_cast<std::int64_t>(kept.rows.size()));
           radius_left.push_back(
             std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
           radius_neighbors.push_back(
@@ -2208,6 +2243,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                       id_base,
                                       stream,
                                       id_map);
+              note_radius_part(edges.n_edges);
               radius_left.push_back(std::move(left));
               radius_neighbors.push_back(std::move(edges.neighbors));
               radius_distances.push_back(std::move(edges.distances));
@@ -2461,6 +2497,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                                      mr);
           }
           // shaped_join_result carries left_rows as INT32; the kernel emits INT64.
+          note_radius_part(static_cast<std::int64_t>(edges.neighbors->size()));
           radius_left.push_back(cudf::cast(
             edges.query_rows->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr));
           radius_neighbors.push_back(std::move(edges.neighbors));
@@ -2617,14 +2654,16 @@ void sirius_physical_vector_join_stream::sink(const operator_data& output_data,
 //===----------------------------------------------------------------------===//
 // Memory estimation
 //===----------------------------------------------------------------------===//
-std::size_t sirius_physical_vector_join_stream::per_left_batch_estimate(std::size_t left_idx) const
+std::size_t sirius_physical_vector_join_stream::per_left_batch_estimate(std::size_t left_idx,
+                                                                        bool with_routing) const
 {
   // Live at once: the accumulator, one batch's partial, and the stacked pair the
   // merge reads (2x), plus the merge output. Six [n_left x k] blocks covers it, with
   // the same 1 MiB floor the split design used. Notably independent of the right
   // batch count -- the split design's merge stage scaled with it.
   auto const n_left = _probe->chunk_rows(left_idx);
-  auto const k      = static_cast<std::size_t>(std::max<std::int64_t>(_request.k, 1));
+  auto const k      = static_cast<std::size_t>(std::max<std::int64_t>(
+    _right_total_rows > 0 ? std::min<std::int64_t>(_request.k, _right_total_rows) : _request.k, 1));
   auto const block  = n_left * k * (sizeof(std::int64_t) + sizeof(float));
   // No reservation holds an output past a column's row limit: refuse here, once, instead of
   // through every out-of-memory retry of the task.
@@ -2666,7 +2705,19 @@ std::size_t sirius_physical_vector_join_stream::per_left_batch_estimate(std::siz
     }
   }
 
-  return (block * 6) + std::max(cuvs_scratch, gemm_scratch) + staged_chunk + (std::size_t{1} << 20);
+  // Clustered search: each probe row's routing edges (~45 B an edge across assignment and the
+  // sort that orders them), and on the bounded paths the candidate buffer and its merge.
+  std::size_t routed = 0;
+  if (with_routing && _centroids != nullptr) {
+    auto const probes = static_cast<std::size_t>(std::max<std::int64_t>(_request.n_probes, 1));
+    routed            = n_left * probes * 45;
+    if (_lists != nullptr) {
+      routed += std::max<std::size_t>(std::size_t{1} << 22, 4 * n_left * k) * 16 + n_left * k * 32;
+    }
+  }
+
+  return (block * 6) + std::max(cuvs_scratch, gemm_scratch) + staged_chunk + routed +
+         (std::size_t{1} << 20);
 }
 
 std::size_t sirius_physical_vector_join_stream::no_history_peak_memory_estimate(

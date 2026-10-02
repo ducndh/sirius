@@ -143,7 +143,8 @@ threshold_join_result brute_force_threshold(raft::device_resources const& res,
   std::size_t out_size = 0;
   auto const grow_to   = [&](std::size_t need) {
     if (need <= out_q.capacity()) return;
-    std::size_t cap = std::max<std::size_t>(need, out_q.capacity() * 2);
+    auto const cap = static_cast<std::size_t>(grown_pair_capacity(
+      out_q.capacity(), need, 2 * sizeof(int64_t) + sizeof(float), "brute_force_threshold"));
     out_q.reserve(cap, stream);
     out_n.reserve(cap, stream);
     out_dist.reserve(cap, stream);

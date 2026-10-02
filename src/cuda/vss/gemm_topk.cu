@@ -502,7 +502,8 @@ threshold_join_result gemm_threshold(raft::device_resources const& res,
         size += emitted;
         return;
       }
-      auto const grown = std::max(capacity * 2, size + static_cast<std::size_t>(emitted));
+      auto const grown = static_cast<std::size_t>(grown_pair_capacity(
+        capacity, size + emitted, 2 * sizeof(int64_t) + sizeof(float), "gemm_threshold"));
       rows.resize(grown, stream);
       cols.resize(grown, stream);
       dist.resize(grown, stream);
