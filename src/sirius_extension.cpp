@@ -3354,8 +3354,15 @@ static void SiriusPostOptimizeVectorJoin(OptimizerExtensionInput& input,
     } catch (std::exception&) {
       original = nullptr;
     }
-    if (original && sirius::vss::rewrite_plain_sql_vector_joins(
-                      input.context, input.optimizer.binder, plan) > 0) {
+    bool inlined        = false;
+    auto const rewrites = original ? sirius::vss::rewrite_plain_sql_vector_joins(
+                                       input.context, input.optimizer.binder, plan, &inlined)
+                                   : 0;
+    // The rewriter may put a materialized CTE back in place before matching; with nothing rewritten
+    // after all, that is not the plan to run.
+    if (original && rewrites == 0 && inlined) {
+      plan = std::move(original);
+    } else if (rewrites > 0) {
       try {
         sirius::planner::sirius_physical_plan_generator planner(input.context);
         (void)planner.create_plan(sirius::transparent::copy_logical_plan(*plan, input.context));

@@ -41,11 +41,14 @@ namespace sirius::vss {
  * the operator's outputs and the distance expression to its score. Plans the rewrite cannot prove
  * equivalent are left unchanged.
  *
+ * @param inlined_ctes set when a materialized CTE carrying vectors was put back in place to expose
+ *        the join; with nothing rewritten the caller should keep its own copy of the plan
  * @return how many joins were rewritten
  */
 std::size_t rewrite_plain_sql_vector_joins(duckdb::ClientContext& context,
                                            duckdb::Binder& binder,
-                                           duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
+                                           duckdb::unique_ptr<duckdb::LogicalOperator>& plan,
+                                           bool* inlined_ctes = nullptr);
 
 /// Whether @p plan computes a vector distance anywhere: the only plans the rewrite can change.
 bool plan_has_vector_distance(duckdb::LogicalOperator& plan);

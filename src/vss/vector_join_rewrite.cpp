@@ -24,6 +24,7 @@
 #include "duckdb/function/scalar/struct_utils.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
+#include "duckdb/optimizer/cte_inlining.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
@@ -39,11 +40,14 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/logical_operator_deep_copy.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
+#include "duckdb/planner/operator/logical_cte.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -475,12 +479,15 @@ class rewriter {
   {
   }
 
+  [[nodiscard]] bool inlined() const { return _inlined; }
+
   std::size_t run()
   {
     std::size_t rewrites = 0;
     if (std::getenv("SIRIUS_VSS_REWRITE_DUMP") != nullptr) {
       SIRIUS_LOG_INFO("[vector_join_rewrite] plan before:\n{}", _root->ToString());
     }
+    inline_vector_ctes(_root);
     // One pattern per pass: a rewrite moves subtrees, so the search restarts from the root.
     while (rewrites < 16 && try_one(_root)) {
       ++rewrites;
@@ -493,6 +500,71 @@ class rewriter {
   }
 
  private:
+  /// DuckDB turns a subplan that appears twice into a materialized CTE (COMMON_SUBPLAN), so a
+  /// self-join written as `images JOIN part ... JOIN images JOIN part` reaches the matcher with
+  /// both sides as CTE scans, and a scan of a materialized CTE has no vectors to search. A CTE that
+  /// carries an ARRAY column is put back in place, a copy per scan, as DuckDB's own CTE inlining
+  /// does; one it would refuse to inline (volatile functions and the like) is left. The caller
+  /// keeps DuckDB's plan when nothing is rewritten after all.
+  void inline_vector_ctes(unique_ptr<LogicalOperator>& op)
+  {
+    for (auto& child : op->children) {
+      inline_vector_ctes(child);
+    }
+    if (op->type != LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) { return; }
+    auto& cte        = op->Cast<duckdb::LogicalCTE>();
+    auto& definition = cte.children[0];
+    definition->ResolveOperatorTypes();
+    bool const vector =
+      std::any_of(definition->types.begin(), definition->types.end(), [](auto const& t) {
+        return t.id() == duckdb::LogicalTypeId::ARRAY;
+      });
+    if (!vector) { return; }
+    duckdb::PreventInlining prevent;
+    prevent.VisitOperator(*definition);
+    if (prevent.prevent_inlining) { return; }
+    bool copied_all = true;
+    std::function<void(unique_ptr<LogicalOperator>&)> fill =
+      [&](unique_ptr<LogicalOperator>& node) {
+        if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+          auto& ref = node->Cast<duckdb::LogicalCTERef>();
+          if (ref.cte_index != cte.table_index) { return; }
+          unique_ptr<LogicalOperator> copy;
+          try {
+            duckdb::LogicalOperatorDeepCopy deep_copy(_binder, nullptr);
+            copy = deep_copy.DeepCopy(definition);
+          } catch (std::exception&) {
+            copied_all = false;
+            return;
+          }
+          copy->ResolveOperatorTypes();
+          duckdb::vector<unique_ptr<Expression>> columns;
+          auto const bindings = copy->GetColumnBindings();
+          for (std::size_t i = 0; i < bindings.size(); ++i) {
+            columns.push_back(
+              duckdb::make_uniq<duckdb::BoundColumnRefExpression>(copy->types[i], bindings[i]));
+          }
+          auto projection =
+            duckdb::make_uniq<duckdb::LogicalProjection>(ref.table_index, std::move(columns));
+          projection->children.push_back(std::move(copy));
+          node = std::move(projection);
+          return;
+        }
+        for (auto& child : node->children) {
+          fill(child);
+        }
+      };
+    auto body = std::move(cte.children[1]);
+    fill(body);
+    if (!copied_all) {
+      cte.children[1] = std::move(body);  // the scans left are still served by the CTE
+      _inlined        = true;
+      return;
+    }
+    op       = std::move(body);
+    _inlined = true;
+  }
+
   /// What a column of the replaced operator becomes: the score, a corpus column, or -- for a
   /// LATERAL correlated on more than its vector -- a probe column.
   struct join_col {
@@ -2350,6 +2422,7 @@ class rewriter {
   }
 
   duckdb::ClientContext& _context;
+  bool _inlined{false};
   duckdb::Binder& _binder;
   unique_ptr<LogicalOperator>& _root;
   /// The columns and types of the operator try_one last handed to a pattern.
@@ -2391,11 +2464,15 @@ bool plan_has_vector_distance(LogicalOperator& plan)
 
 std::size_t rewrite_plain_sql_vector_joins(duckdb::ClientContext& context,
                                            duckdb::Binder& binder,
-                                           duckdb::unique_ptr<duckdb::LogicalOperator>& plan)
+                                           duckdb::unique_ptr<duckdb::LogicalOperator>& plan,
+                                           bool* inlined_ctes)
 {
   if (!plan || !rewrite_enabled(context)) { return 0; }
   try {
-    return rewriter(context, binder, plan).run();
+    rewriter r(context, binder, plan);
+    auto const n = r.run();
+    if (inlined_ctes != nullptr) { *inlined_ctes = r.inlined(); }
+    return n;
   } catch (duckdb::InternalException&) {
     throw;
   } catch (std::exception& e) {

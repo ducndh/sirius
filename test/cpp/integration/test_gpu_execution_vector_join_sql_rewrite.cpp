@@ -392,6 +392,20 @@ TEST_CASE_METHOD(SqlRewriteFixture,
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a self-join DuckDB shares as a materialized CTE is still rewritten",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // The same relation on both sides (probe joined to its category, twice): DuckDB's common-subplan
+  // pass turns it into a CTE scanned twice, which carries no vectors to search until the rewrite
+  // puts it back in place.
+  SqlRewriteTables tables(*this);
+  require_gpu_matches_duckdb(*con,
+                             "SELECT a.id, b.id FROM sr_probe a JOIN sr_cats ca ON a.cat = ca.cat "
+                             "JOIN sr_probe b ON array_distance(a.vec, b.vec) <= 1.5 "
+                             "JOIN sr_cats cb ON b.cat = cb.cat WHERE a.id < b.id;");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
                  "a band join's own statistics decide whether the vector join goes first",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
