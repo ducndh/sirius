@@ -203,6 +203,7 @@ class host_pinned_chunk_source : public vector_chunk_source {
       auto mut = batch->to_mutable();
       mut.convert_to<cucascade::gpu_table_representation>(
         sirius::converter_registry::get(), *reservation, stream);
+      mut.rebind_stream(stream);  // the converter binds the copy to its own stream
     }
     auto const table = sirius::get_cudf_table_view(*batch);
     return staged_vector_chunk{table.column(0), std::move(batch), std::move(reservation)};
@@ -304,6 +305,7 @@ class materialized_chunk_source : public vector_chunk_source {
       auto mut = staged->to_mutable();
       mut.convert_to<cucascade::gpu_table_representation>(
         sirius::converter_registry::get(), *reservation, stream);
+      mut.rebind_stream(stream);  // the converter binds the copy to its own stream
     }
     auto const table = sirius::get_cudf_table_view(*staged);
     return staged_vector_chunk{
@@ -1235,9 +1237,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   }
   auto const mr = mem_space->get_default_allocator();
 
-  // Held for the whole task: every corpus chunk is searched against this probe chunk. Staged
-  // on the compute stream, so its eventual free is already ordered behind the searches that
-  // read it and needs no rebind, unlike the corpus chunks below.
+  // Held for the whole task: every corpus chunk is searched against this probe chunk. A copy
+  // staged back from the host is freed on the compute stream (the chunk sources rebind it), so
+  // dropping it as execute returns, before the task's stream sync, is ordered behind the searches.
   auto staged_probe  = _probe->stage(left_idx, *mem_space, stream);
   auto const queries = vss::list_column_as_dataset_view(staged_probe.view, dim);
   auto const n_left  = static_cast<std::int64_t>(queries.extent(0));

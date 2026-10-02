@@ -126,6 +126,11 @@ staged_pinned_chunk stage_pinned_column_chunk(const scan_manager::pinned_entry& 
     auto mut = batch->to_mutable();
     mut.convert_to<cucascade::gpu_table_representation>(
       sirius::converter_registry::get(), *reservation, stream);
+    // The converter copies on a stream of its own and binds the copy to it, so the copy's free
+    // would be ordered behind nothing the caller does: dropping the chunk right after enqueueing a
+    // gather on `stream` hands its memory back while the gather still reads it, and another task
+    // can overwrite it first. Freed on the reading stream instead.
+    mut.rebind_stream(stream);
   }
   auto view = sirius::get_cudf_table_view(*batch).column(0);
   return staged_pinned_chunk{view, std::move(batch), std::move(reservation)};
