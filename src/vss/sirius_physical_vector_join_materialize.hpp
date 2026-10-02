@@ -104,6 +104,12 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
 
   /// The corpus output columns at @p neighbors (pin rows), from only the pin chunks those rows fall
   /// in: an answer of n x k rows reads n x k chunks at most, not the whole column.
+  /// One piece of a left batch's pairs [left row, right id, distance] -> the TVF schema.
+  std::unique_ptr<cudf::table> materialize_piece(std::size_t partition_idx,
+                                                 cudf::table_view pairs,
+                                                 cucascade::memory::memory_space& space,
+                                                 rmm::cuda_stream_view stream);
+
   std::unique_ptr<cudf::table> gather_right_from_pin(cudf::column_view neighbors,
                                                      rmm::cuda_stream_view stream,
                                                      ::cucascade::memory::memory_space& space);

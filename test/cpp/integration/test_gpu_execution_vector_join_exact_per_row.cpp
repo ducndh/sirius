@@ -525,6 +525,58 @@ TEST_CASE_METHOD(VectorJoinFixture,
 }
 
 // -----------------------------------------------------------------------------
+// A threshold answer that outgrows the device leaves it in pieces: the stream stage moves what
+// it holds to host memory each time it passes a budget, and materialize brings the pieces back
+// one at a time. The budget is lowered so a small join takes that path across several corpus
+// chunks; every pair and its distance must come out as an exhaustive CPU range query has them.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - a threshold answer moved to host in pieces is unchanged",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  // Grid points padded with zeros: 130 MB of corpus is two pin chunks under the test config's
+  // 100 MB scan batches, so the pairs arrive in more than one part.
+  run_ok("CREATE TABLE ro_corpus (id INTEGER, vec FLOAT[64]);");
+  run_ok(
+    "INSERT INTO ro_corpus SELECT i, list_resize([(i%500)::float, (i//500)::float], 64, 0::float) "
+    "FROM range(500000) t(i);");
+  run_ok("CREATE TABLE ro_probe (id INTEGER, vec FLOAT[64]);");
+  run_ok(
+    "INSERT INTO ro_probe SELECT i, list_resize([(i*37%500)::float, (i*101%1000)::float], 64, "
+    "0::float) FROM range(64) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'ro_probe',  tier => 'gpu',  format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'ro_corpus', tier => 'host', format => 'duckdb');");
+
+  // Squared distances between grid points are whole numbers, so they compare exactly.
+  con->Query("SET gpu_execution = false;");
+  auto const reference = ok_rows(*con,
+                                 "SELECT p.id, c.id, round(array_distance(p.vec, c.vec) ^ 2)::BIGINT "
+                                 "FROM ro_probe p, ro_corpus c "
+                                 "WHERE array_distance(p.vec, c.vec) <= 6.0;");
+  con->Query("SET gpu_execution = true;");
+  REQUIRE(reference.size() > 4000);
+
+  ::setenv("SIRIUS_VSS_RADIUS_FLUSH_PAIRS", "500", 1);
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_RADIUS_FLUSH_PAIRS"); }
+  } const unset;
+  run_ok("CREATE TEMP TABLE ro_joined AS SELECT left_id, right_id, distance FROM "
+         "sirius_knn_join('ro_probe','vec','ro_corpus','vec', search_mode => 'exact', "
+         "metric => 'l2', join_mode => 'threshold', eps => 6.0, left_output_columns => ['id'], "
+         "right_output_columns => ['id']);");
+  // Rounded on the CPU: the GPU's FLOAT -> BIGINT cast truncates.
+  con->Query("SET gpu_execution = false;");
+  auto const joined =
+    ok_rows(*con, "SELECT left_id, right_id, round(distance ^ 2)::BIGINT FROM ro_joined;");
+  con->Query("SET gpu_execution = true;");
+  REQUIRE(joined == reference);
+
+  run_ok("SELECT * FROM unpin_table('ro_corpus');");
+  run_ok("SELECT * FROM unpin_table('ro_probe');");
+}
+
+// -----------------------------------------------------------------------------
 // Query-side partitioning: the probe side no longer has to be device-resident either.
 // A task owns one probe chunk and searches the whole corpus against it, so both sides
 // can exceed VRAM at once -- the shape every rec-sys candidate-generation join has.

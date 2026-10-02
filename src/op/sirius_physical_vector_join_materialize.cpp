@@ -539,42 +539,63 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
   auto const partition_idx  = input.get_partition_idx().value_or(0);  // = left batch index
   auto const& input_batches = input.get_read_only_batches();
 
-  cucascade::memory::memory_space* space = nullptr;
-  for (auto const& batch : input_batches) {
-    if (space == nullptr) { space = batch.get_memory_space(); }
-  }
-  if (input_batches.empty() || space == nullptr) {
+  if (input_batches.empty()) {
     return std::make_unique<pipelineable_operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
+  // The stream stage always ends a left batch with a device-resident piece.
+  cucascade::memory::memory_space* space = nullptr;
+  for (auto const& batch : input_batches) {
+    if (batch.get_current_tier() == cucascade::memory::Tier::GPU) {
+      space = batch.get_memory_space();
+      break;
+    }
+  }
+  if (space == nullptr) {
+    throw std::runtime_error(
+      "[sirius_physical_vector_join_materialize] no join output piece is on the device");
+  }
 
   ensure_initialized(stream, *space);
-  auto const mr = space->get_default_allocator();
 
-  // Merge emits one result batch per partition; concatenate defensively if more.
-  std::vector<cudf::column_view> left_row_views;
-  std::vector<cudf::column_view> neighbor_views;
-  std::vector<cudf::column_view> distance_views;
-  for (auto const& ro : input_batches) {
-    auto const tv = sirius::get_cudf_table_view(ro);
-    left_row_views.push_back(tv.column(0));  // INT32 row index into the left batch
-    neighbor_views.push_back(tv.column(1));  // INT64 global right id
-    distance_views.push_back(tv.column(2));  // FLOAT32 distance
+  // A threshold whose answer outgrew the device arrives in several pieces, all but the last moved
+  // to host memory by the stream stage. This stage runs in the same task, so nothing restages them
+  // for it: each is brought back, materialized and its output moved out again, so only one piece
+  // is on the device at a time.
+  auto& registry = sirius::converter_registry::get();
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  for (auto const& piece : input_batches) {
+    cucascade::memory::memory_space* host = nullptr;
+    std::shared_ptr<cucascade::data_batch> staged;
+    if (piece.get_current_tier() != cucascade::memory::Tier::GPU) {
+      host   = piece.get_memory_space();
+      staged = piece.clone_to<cucascade::gpu_table_representation>(
+        registry, sirius::get_next_batch_id(), space, stream);
+      // Copied on a converter stream of its own; freed on this one instead.
+      staged->to_mutable().rebind_stream(stream);
+    }
+    auto const tv  = staged ? sirius::get_cudf_table_view(*staged) : sirius::get_cudf_table_view(piece);
+    auto out_table = materialize_piece(partition_idx, tv, *space, stream);
+    staged.reset();
+    auto batch = sirius::make_data_batch(std::move(out_table), *space, stream, batch_telemetry());
+    if (host != nullptr) {
+      batch->to_mutable().convert_to<cucascade::host_data_representation>(registry, host, stream);
+    }
+    batches.push_back(std::move(batch));
   }
-  std::unique_ptr<cudf::column> left_row_owned;
-  std::unique_ptr<cudf::column> neighbor_owned;
-  std::unique_ptr<cudf::column> distance_owned;
-  cudf::column_view left_row_view = left_row_views.front();
-  cudf::column_view neighbor_view = neighbor_views.front();
-  cudf::column_view distance_view = distance_views.front();
-  if (input_batches.size() > 1) {
-    left_row_owned = cudf::concatenate(left_row_views, stream, mr);
-    neighbor_owned = cudf::concatenate(neighbor_views, stream, mr);
-    distance_owned = cudf::concatenate(distance_views, stream, mr);
-    left_row_view  = left_row_owned->view();
-    neighbor_view  = neighbor_owned->view();
-    distance_view  = distance_owned->view();
-  }
+  return std::make_unique<pipelineable_operator_data>(std::move(batches));
+}
+
+std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::materialize_piece(
+  std::size_t partition_idx,
+  cudf::table_view pairs,
+  cucascade::memory::memory_space& space,
+  rmm::cuda_stream_view stream)
+{
+  auto const mr = space.get_default_allocator();
+  cudf::column_view const left_row_view = pairs.column(0);  // INT32 row index into the left batch
+  cudf::column_view const neighbor_view = pairs.column(1);  // INT64 global right id
+  cudf::column_view const distance_view = pairs.column(2);  // FLOAT32 distance
 
   // Left columns gathered by the left row each pair belongs to. This used to repeat every
   // left row k times, which assumed a fixed k per row; threshold and global top-k are ragged
@@ -599,7 +620,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
   // Right columns gathered by the global neighbor id.
   std::unique_ptr<cudf::table> right_gathered;
   if (_right_pin != nullptr) {
-    right_gathered = gather_right_from_pin(neighbor_view, stream, *space);
+    right_gathered = gather_right_from_pin(neighbor_view, stream, space);
   } else if (_right_output_concat && _right_output_concat->num_columns() > 0) {
     right_gathered = cudf::gather(_right_output_concat->view(),
                                   neighbor_view,
@@ -647,12 +668,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
   // are widened back before anything downstream reduces over them.
   sirius::vss::restore_native_carriers(
     out_cols, std::vector<sirius::logical_type>(types.begin(), types.end()), stream, mr);
-  auto out_table = std::make_unique<cudf::table>(std::move(out_cols));
-
-  auto batch = sirius::make_data_batch(std::move(out_table), *space, stream, batch_telemetry());
-  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
-  batches.push_back(std::move(batch));
-  return std::make_unique<pipelineable_operator_data>(std::move(batches));
+  return std::make_unique<cudf::table>(std::move(out_cols));
 }
 
 std::size_t sirius_physical_vector_join_materialize::no_history_peak_memory_estimate(

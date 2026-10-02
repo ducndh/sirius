@@ -1285,23 +1285,78 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // it has no k -- and therefore none of the k <= 1024 ceiling that knn_merge_parts imposes.
   bool const radius_join = _request.mode == vss::vector_join_mode::threshold;
   std::vector<std::unique_ptr<cudf::column>> radius_left, radius_neighbors, radius_distances;
-  // The edges are held on the device until the concatenate (16 B a pair, and as much again while
-  // it copies them), so past the whole device / 32 B the output cannot fit however much else is
-  // released, and an out-of-memory retry would only re-fold the corpus to the same point.
-  std::int64_t radius_pairs = 0;
-  auto const radius_cap     = static_cast<std::int64_t>(mem_space->get_max_memory() / 32);
-  auto note_radius_part     = [&](std::int64_t pairs) {
-    radius_pairs += pairs;
-    if (radius_pairs > radius_cap) {
+  // A threshold's answer can outgrow the device. Once the pairs held on it (16 B each) pass a
+  // budget they are closed into an output batch and moved to host memory, the way the downgrade
+  // executor spills a batch waiting between operators; materialize takes the batches one at a time,
+  // so only the host pool bounds the answer. Past host and device together nothing can hold it,
+  // and an out-of-memory retry would only re-fold the corpus to the same point.
+  std::vector<std::shared_ptr<::cucascade::data_batch>> offloaded;
+  std::int64_t held_pairs  = 0;
+  std::int64_t total_pairs = 0;
+  float radius_scale       = 1.0f;  // unit-row cosine search reports twice the cosine distance
+  cucascade::memory::memory_space const* host_space = nullptr;
+  if (_sirius_ctx != nullptr) {
+    for (auto const* h :
+         _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+      if (host_space == nullptr || h->get_available_memory() > host_space->get_available_memory()) {
+        host_space = h;
+      }
+    }
+  }
+  auto flush_pairs = std::max<std::int64_t>(
+    std::int64_t{1} << 20, static_cast<std::int64_t>(mem_space->get_max_memory() / 16 / 16));
+  if (auto const* env = std::getenv("SIRIUS_VSS_RADIUS_FLUSH_PAIRS")) {
+    flush_pairs = std::max<std::int64_t>(1, std::atoll(env));
+  }
+  auto const max_pairs = static_cast<std::int64_t>(
+    ((host_space != nullptr ? host_space->get_max_memory() : 0) + mem_space->get_max_memory() / 2) /
+    16);
+  auto flush_radius = [&]() {
+    if (radius_left.empty()) { return; }
+    auto concat = [&](std::vector<std::unique_ptr<cudf::column>>& parts) {
+      std::unique_ptr<cudf::column> out;
+      if (parts.size() == 1) {
+        out = std::move(parts.front());
+      } else {
+        std::vector<cudf::column_view> views;
+        for (auto const& c : parts) {
+          views.push_back(c->view());
+        }
+        out = cudf::concatenate(views, stream, mr);
+      }
+      parts.clear();
+      return out;
+    };
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(concat(radius_left));
+    cols.push_back(concat(radius_neighbors));
+    cols.push_back(concat(radius_distances));
+    if (radius_scale != 1.0f) {
+      vss::scale_in_place(cols[2]->mutable_view().data<float>(), cols[2]->size(), radius_scale, stream);
+    }
+    auto piece = sirius::make_data_batch(
+      std::make_unique<cudf::table>(std::move(cols)), *mem_space, stream, batch_telemetry());
+    piece->to_mutable().convert_to<cucascade::host_data_representation>(
+      sirius::converter_registry::get(), host_space, stream);
+    offloaded.push_back(std::move(piece));
+    SIRIUS_LOG_DEBUG("[sirius_physical_vector_join_stream] left batch {}: {} threshold pairs moved "
+                     "to host memory (piece {})",
+                     left_idx,
+                     held_pairs,
+                     offloaded.size());
+    held_pairs = 0;
+  };
+  auto note_radius_part = [&](std::int64_t pairs) {
+    held_pairs += pairs;
+    total_pairs += pairs;
+    if (total_pairs > max_pairs) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_stream] the pairs within the threshold reach " +
-        std::to_string(radius_pairs) +
-        " for one probe batch, more than device memory can hold as "
-            "output (~" +
-        std::to_string(radius_cap) +
-        "); tighten the threshold or join fewer probe "
-            "rows at a time");
+        std::to_string(total_pairs) + " for one probe batch, more than host and device memory " +
+        "can hold as output (~" + std::to_string(max_pairs) + "); tighten the threshold or join " +
+        "fewer probe rows at a time");
     }
+    if (host_space != nullptr && held_pairs > flush_pairs) { flush_radius(); }
   };
   // The kernel works in distance space. For cosine with a similarity threshold the user's
   // "score >= eps" is the same set as "distance <= 1 - eps"; for a distance threshold it is eps
@@ -1343,6 +1398,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         "unit rows and answer only cosine joins; rebuild them without it for an " +
         _request.metric + " join");
     }
+    if (unit_cosine) { radius_scale = 0.5f; }
     auto const search_metric = unit_cosine ? cuvs::distance::DistanceType::L2Expanded : metric;
     auto const search_radius = unit_cosine ? 2.f * radius_eps : radius_eps;
     std::optional<rmm::device_uvector<float>> unit_probe;
@@ -1735,13 +1791,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           stream,
           mr);
         if (kept.rows.size() > 0) {
-          note_radius_part(static_cast<std::int64_t>(kept.rows.size()));
+          auto const pairs = static_cast<std::int64_t>(kept.rows.size());
           radius_left.push_back(
             std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
           radius_neighbors.push_back(
             std::make_unique<cudf::column>(std::move(kept.ids), rmm::device_buffer{}, 0));
           radius_distances.push_back(
             std::make_unique<cudf::column>(std::move(kept.distances), rmm::device_buffer{}, 0));
+          note_radius_part(pairs);
         }
         CUDF_CUDA_TRY(
           cudaMemsetAsync(candidates->count.data(), 0, sizeof(unsigned long long), stream.value()));
@@ -2243,10 +2300,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                       id_base,
                                       stream,
                                       id_map);
-              note_radius_part(edges.n_edges);
               radius_left.push_back(std::move(left));
               radius_neighbors.push_back(std::move(edges.neighbors));
               radius_distances.push_back(std::move(edges.distances));
+              note_radius_part(edges.n_edges);
             }
             continue;
           }
@@ -2497,11 +2554,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                                      mr);
           }
           // shaped_join_result carries left_rows as INT32; the kernel emits INT64.
-          note_radius_part(static_cast<std::int64_t>(edges.neighbors->size()));
+          auto const pairs = static_cast<std::int64_t>(edges.neighbors->size());
           radius_left.push_back(cudf::cast(
             edges.query_rows->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr));
           radius_neighbors.push_back(std::move(edges.neighbors));
           radius_distances.push_back(std::move(edges.distances));
+          note_radius_part(pairs);
         }
         continue;
       }
@@ -2623,8 +2681,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   out_cols.push_back(std::move(shaped.distances));
   auto out_table = std::make_unique<cudf::table>(std::move(out_cols));
 
-  auto batch = sirius::make_data_batch(std::move(out_table), *mem_space, stream, batch_telemetry());
-  std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+  auto batch   = sirius::make_data_batch(std::move(out_table), *mem_space, stream, batch_telemetry());
+  auto batches = std::move(offloaded);
   batches.push_back(std::move(batch));
   return std::make_unique<partitioned_operator_data>(std::move(batches), left_idx);
 }
