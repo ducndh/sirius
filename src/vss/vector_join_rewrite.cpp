@@ -52,6 +52,7 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
@@ -61,6 +62,7 @@
 #include "sirius_context.hpp"
 #include "vss/access_path_cost.hpp"
 #include "vss/cluster_lists.hpp"
+#include "vss/device_rates.hpp"
 #include "vss/kmeans_functions.hpp"
 #include "vss/vector_join.hpp"
 #include "vss/vector_join_binding.hpp"
@@ -374,8 +376,9 @@ std::optional<double> band_selectivity(duckdb::LogicalComparisonJoin const& join
 /// always is. A band (two range conditions) is when it keeps enough pairs. Joining by the band
 /// first runs on DuckDB's CPU, which pays per band pair mostly to gather both vectors: on Vec-H
 /// images (d = 1152, 24 threads) 8.7 us a pair (a 0.01% price band, 2.9M pairs: 25.3 s), against
-/// the GPU's 0.73 ns a pair over all 1.15e10 (8.4 s). So the vector join wins once the band keeps
-/// more than about 1/10,000 of the pairs; both sides scale with d, so the ratio does not. The share
+/// the A5000's 0.73 ns a pair over all 1.15e10 (8.4 s). So there the vector join wins once the band
+/// keeps more than about 1/12,000 of the pairs; both sides scale with d, so the ratio does not. The
+/// CPU side is scaled by DuckDB's threads and the GPU side by the device's FP32 rate. The share
 /// comes from band_selectivity when the join carries min/max statistics for both sides of its
 /// conditions; DuckDB's own range-join estimate is the fallback, and it runs far low (that band:
 /// 0.017%). SIRIUS_VSS_BAND_VECTOR_FIRST=1 takes every band vector first, =0 none. Equality joins
@@ -408,7 +411,11 @@ bool is_inequality_join(duckdb::ClientContext& context, LogicalOperator& op)
   double const share      = from_stats ? *from_stats
                             : pairs > 0 ? static_cast<double>(op.EstimateCardinality(context)) / pairs
                                         : 0.0;
-  bool const vector_first = share * 1e4 >= 1.0;
+  auto const threads = std::max<double>(
+    1.0, duckdb::TaskScheduler::GetScheduler(context).NumberOfThreads());
+  double const cpu_per_pair = 8.7e-6 * 24.0 / threads;
+  double const gpu_per_pair = 0.73e-9 / current_device_scale().fp32;
+  bool const vector_first   = share * cpu_per_pair >= gpu_per_pair;
   SIRIUS_LOG_INFO("[vector_join_rewrite] band join keeps ~{:.2g} of {:.3g} pairs ({}): {}",
                   share,
                   pairs,
@@ -802,7 +809,8 @@ class rewriter {
     shape.corpus_rows      = static_cast<double>(rows);
     shape.dim              = static_cast<double>(req.dim);
     shape.corpus_on_device = pin != nullptr && pin->tier == cucascade::memory::Tier::GPU;
-    double const brute     = access_path_cost::brute(shape);
+    access_path_cost const cost{current_device_scale()};
+    double const brute     = cost.brute(shape);
     auto describe          = [&](exact_lists_choice const& c) {
       shape.list_bytes_per_value = c.encoding == list_encoding::uint8     ? 1
                                             : c.encoding == list_encoding::float16 ? 2
@@ -822,7 +830,7 @@ class rewriter {
       shape.list_bytes_per_value = cosine ? 2 : 1;
       shape.lists_on_device      = true;
       shape.n_clusters           = 1024;
-      double const built         = access_path_cost::build(shape) + access_path_cost::lists(shape);
+      double const built         = cost.build(shape) + cost.lists(shape);
       if (force == "cost" && built >= brute) {
         SIRIUS_LOG_INFO(
           "[vector_join_rewrite] '{}': brute force ({:.3f} s est.) over building lists ({:.3f} s)",
@@ -835,7 +843,7 @@ class rewriter {
       if (!choice) { return false; }
     }
     describe(*choice);
-    double const listed = access_path_cost::lists(shape);
+    double const listed = cost.lists(shape);
     bool const fp32     = choice->encoding == list_encoding::float32;
     if (force == "cost" && (fp32 || listed >= brute)) {
       SIRIUS_LOG_INFO(

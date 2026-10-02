@@ -20,6 +20,7 @@ target_sources(
           vss/brute_force_search.cu
           vss/brute_force_threshold.cu
           vss/cluster_fold.cu
+          vss/device_rates.cu
           vss/gemm_topk.cu
           vss/knn_merge.cu
           vss/vector_clustering.cu

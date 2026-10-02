@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "vss/device_rates.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -36,21 +38,40 @@ struct access_path_shape {
   bool inexact_unseeded{false};  ///< FLOAT16 rows in clusters too large to seed (a fixed sweep 0)
 };
 
-/// Seconds for an exact join, by an analytic model whose constants are the A5000 grid's
-/// (RTX A5000 24 GB, measured 2026-10-01; within ~15% of the measured cells it was fitted on).
+/// Seconds for an exact join, by an analytic model fitted on the A5000 grid (RTX A5000 24 GB,
+/// measured 2026-10-01; within ~15% of the measured cells it was fitted on). On another GPU each
+/// rate is scaled by how that device compares on the resource the rate measures (device_scale);
+/// the fixed overheads (statement, slice, chunk) are launch and synchronisation costs and are kept.
 /// Only the comparison between the paths matters, so constants shared by both are dropped.
 struct access_path_cost {
   static constexpr double statement = 0.004;   ///< per-statement floor (s)
-  static constexpr double fp32_gemm = 8.5e12;  ///< brute-force FP32 GEMM, multiply-adds x 2 per s
-  static constexpr double int8_gemm = 77e12;   ///< bounded int8 tile kernel on UINT8 rows
-  static constexpr double f16_gemm  = 41e12;   ///< bounded FLOAT16 kernel
-  static constexpr double pcie      = 21e9;    ///< host-pinned rows streamed per query (B/s)
-  static constexpr double hbm       = 500e9;   ///< device-resident lists read by a small batch
   static constexpr double slice     = 1e-4;    ///< per cluster slice launched alone (> 128 rows)
-  static constexpr double sweep0    = 0.25;    ///< un-seeded FLOAT16 first sweep, once M >= ~100
   static constexpr double chunk     = 3.5e-3;  ///< per pinned chunk of a small brute batch
 
-  [[nodiscard]] static double brute(access_path_shape const& s)
+  explicit access_path_cost(device_scale const& d)
+    : fp32_gemm{8.5e12 * d.fp32},
+      int8_gemm{77e12 * d.int8},
+      f16_gemm{41e12 * d.f16},
+      pcie{21e9 * d.pcie},
+      hbm{500e9 * d.hbm},
+      sweep0{0.25 / d.f16},
+      fit_per_value{1e-9 / d.fp32},
+      write_per_value_u8{1.0e-9 / d.hbm},
+      write_per_value_f16{1.4e-9 / d.hbm}
+  {
+  }
+
+  double fp32_gemm;  ///< brute-force FP32 GEMM, multiply-adds x 2 per s
+  double int8_gemm;  ///< bounded int8 tile kernel on UINT8 rows
+  double f16_gemm;   ///< bounded FLOAT16 kernel
+  double pcie;       ///< host-pinned rows streamed per query (B/s)
+  double hbm;        ///< device-resident lists read by a small batch
+  double sweep0;     ///< un-seeded FLOAT16 first sweep, once M >= ~100
+  double fit_per_value;
+  double write_per_value_u8;
+  double write_per_value_f16;
+
+  [[nodiscard]] double brute(access_path_shape const& s) const
   {
     double const work = 2.0 * s.probe_rows * s.corpus_rows * s.dim;
     if (!s.corpus_on_device) {
@@ -60,7 +81,7 @@ struct access_path_cost {
     return statement + (s.probe_rows < 512 ? chunks * chunk : 0.0) + work / fp32_gemm;
   }
 
-  [[nodiscard]] static double lists(access_path_shape const& s)
+  [[nodiscard]] double lists(access_path_shape const& s) const
   {
     double const work  = 2.0 * s.probe_rows * s.corpus_rows * s.dim;
     double const rate  = s.list_bytes_per_value == 1   ? int8_gemm
@@ -74,11 +95,12 @@ struct access_path_cost {
 
   /// Fitting the clustering (k-means on at most 2M sampled rows) and writing the lists. The fit
   /// varies with the data (0.65-3.3 s over the grid), so it is rounded up rather than modelled.
-  [[nodiscard]] static double build(access_path_shape const& s)
+  [[nodiscard]] double build(access_path_shape const& s) const
   {
     double const train = std::min(s.corpus_rows, 2e6);
-    return 1.5 + 1e-9 * train * s.dim +
-           (s.list_bytes_per_value == 1 ? 1.0e-9 : 1.4e-9) * s.corpus_rows * s.dim;
+    return 1.5 + fit_per_value * train * s.dim +
+           (s.list_bytes_per_value == 1 ? write_per_value_u8 : write_per_value_f16) *
+             s.corpus_rows * s.dim;
   }
 };
 

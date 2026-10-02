@@ -1,6 +1,7 @@
 target_sources(
   sirius_objects
   PRIVATE cuvs_index_cache.cpp
+          device_rates.cpp
           distance_metric.cpp
           enn_top_k.cpp
           join_result_shaping.cpp

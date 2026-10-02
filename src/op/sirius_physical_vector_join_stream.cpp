@@ -26,6 +26,7 @@
 #include "sirius_context.hpp"
 #include "vss/bound_gemm.hpp"
 #include "vss/brute_force_search.hpp"
+#include "vss/device_rates.hpp"
 #include "vss/brute_force_threshold.hpp"
 #include "vss/cluster_fold.hpp"
 #include "vss/cluster_lists.hpp"
@@ -1652,9 +1653,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       _lists != nullptr && !_lists->offsets.empty() &&
       _lists->offsets.back() <=
         static_cast<std::int64_t>(_lists->offsets.size() - 1) * 20 * vss::kSeedSample;
-    // The sample is scored on CUDA cores, so past a small batch the GEMM sweep is cheaper even when
-    // the bound is good (470k DataComp rows, d = 768, k = 2: 1.07 s seeded vs 0.76 s).
-    bool const small_batch = n_left * static_cast<std::int64_t>(dim) <= (std::int64_t{1} << 21);
+    // The sample is scored on CUDA cores, so past a small batch the GEMM sweep (tensor cores) is
+    // cheaper even when the bound is good (470k DataComp rows, d = 768, k = 2: 1.07 s seeded vs
+    // 0.76 s). The A5000's 2^21 probe values moves with the device's CUDA-core : INT8 tensor ratio.
+    auto const& scale      = vss::current_device_scale();
+    bool const small_batch = static_cast<double>(n_left) * static_cast<double>(dim) <=
+                             static_cast<double>(std::int64_t{1} << 21) * scale.fp32 / scale.int8;
     bool const seedable    = int8_search && !radius_join &&
                           _lists->tier == cucascade::memory::Tier::GPU && k_join <= 64 &&
                           seed_enabled && (!codes_int8 || (small_clusters && small_batch));
@@ -1984,8 +1988,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       auto const* v = std::getenv("SIRIUS_VSS_KEEP_LIST_CHUNKS");
       return v == nullptr || std::strcmp(v, "0") != 0;
     }();
-    constexpr std::size_t kKeepMargin = std::size_t{2} << 30;
-    auto can_keep = [&] { return mem_space->make_reservation_or_null(kKeepMargin) != nullptr; };
+    auto const keep_margin = mem_space->get_max_memory() / 12;
+    auto can_keep = [&] { return mem_space->make_reservation_or_null(keep_margin) != nullptr; };
     std::vector<std::size_t> kept_first;
     auto check_chunk_base = [&](std::size_t j, std::int64_t chunk_base) {
       if (chunk_base != static_cast<std::int64_t>(j) * _lists->chunk_rows) {

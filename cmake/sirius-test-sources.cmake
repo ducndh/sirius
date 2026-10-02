@@ -258,6 +258,7 @@ set(TEST_SOURCES
     test/cpp/vss/test_brute_force_threshold.cpp
     test/cpp/vss/test_cudf_raft_interop.cpp
     test/cpp/vss/test_cuvs_index_cache.cpp
+    test/cpp/vss/test_device_rates.cpp
     test/cpp/vss/test_distance_metric.cpp
     test/cpp/vss/test_enn_top_k.cpp
     test/cpp/vss/test_ivf_flat_index.cpp
