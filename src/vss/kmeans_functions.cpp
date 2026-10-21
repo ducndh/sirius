@@ -565,8 +565,18 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   bool const check_uint8 =
     !unit_rows && (storage == list_storage::automatic || storage == list_storage::uint8 ||
                    storage == list_storage::exact);
+  // One list asked for as UINT8 over rows in host memory checks them in pass 2, as it codes them:
+  // a pass of its own would copy every row across PCIe once more. A column that is not bytes is
+  // then refused after the build rather than before it.
+  bool const check_in_pass_2 = check_uint8 && one_list && storage == list_storage::uint8 &&
+                               c.pin->tier != cucascade::memory::Tier::GPU;
   rmm::device_uvector<unsigned long long> non_uint8(1, stream, mr);
   CUDF_CUDA_TRY(cudaMemsetAsync(non_uint8.data(), 0, sizeof(unsigned long long), stream.value()));
+  auto const refuse_non_uint8 = [&](unsigned long long count) {
+    throw duckdb::InvalidInputException(fn + ": storage => 'uint8' needs every value of '" +
+                                        req.column + "' to be an integer in [0, 255]; " +
+                                        std::to_string(count) + " are not");
+  };
   // INT8 codes need each component's range over every row, taken while the chunks are resident.
   bool const want_int8 = storage == list_storage::int8;
   std::optional<rmm::device_uvector<unsigned int>> col_min, col_max;
@@ -622,7 +632,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     }
   }
   // One list that is neither checked for bytes nor coded as INT8 has nothing to do in pass 1.
-  if (!one_list || check_uint8 || want_int8) {
+  if (!one_list || (check_uint8 && !check_in_pass_2) || want_int8) {
     // One list (the exact join's compact layout) labels nothing: every row is in it, and the
     // labels are already zero.
     std::optional<centroid_labeler> labeler;
@@ -639,7 +649,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       rmm::device_uvector<std::int32_t> chunk_labels(
         labeler ? static_cast<std::size_t>(rows) : 0, stream, mr);
       if (labeler) { labeler->label(staged.view, chunk_labels.data()); }
-      if (check_uint8) {
+      if (check_uint8 && !check_in_pass_2) {
         count_non_uint8(list_column_as_dataset_view(staged.view, dim).data_handle(),
                         rows * dim,
                         non_uint8.data(),
@@ -697,11 +707,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                 cudaMemcpyDeviceToHost,
                                 stream.value()));
   stream.synchronize();
-  if (storage == list_storage::uint8 && non_uint8_host != 0) {
-    throw duckdb::InvalidInputException(fn + ": storage => 'uint8' needs every value of '" +
-                                        req.column + "' to be an integer in [0, 255]; " +
-                                        std::to_string(non_uint8_host) + " are not");
-  }
+  if (storage == list_storage::uint8 && non_uint8_host != 0) { refuse_non_uint8(non_uint8_host); }
   // 'auto' is the planner's choice, the one a statement that builds its own lists makes ('exact'):
   // bytes as UINT8, anything else as FLOAT16 that the bounded search re-scores in FP32 -- where the
   // width allows it and the FP32 rows can be read, in place from the pin or as a host copy that
@@ -1147,6 +1153,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                            rotation ? rotation_slack(dim) : 0.f);
       }
       if (encoding == list_encoding::uint8) {
+        if (check_in_pass_2) { count_non_uint8(x, rows * dim, non_uint8.data(), stream); }
         narrow_to_shifted_int8(x, rows * dim, reinterpret_cast<std::int8_t*>(coded), stream);
       }
       if (encoding == list_encoding::uint8 || encoding == list_encoding::int8) {
@@ -1175,6 +1182,15 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                " rows but the pin reports " + std::to_string(n_rows));
     }
     kept_rotated.reset();
+    if (check_in_pass_2) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(&non_uint8_host,
+                                    non_uint8.data(),
+                                    sizeof(non_uint8_host),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.value()));
+      stream.synchronize();
+      if (non_uint8_host != 0) { refuse_non_uint8(non_uint8_host); }
+    }
   }
 
   // Pass 2: stage each chunk again and move its rows into the lists. A list's rows keep pin

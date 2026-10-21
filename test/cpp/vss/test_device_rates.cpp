@@ -66,6 +66,49 @@ TEST_CASE("the access path cost model scales each rate by its own resource", "[v
   CHECK(tensor2.lists(s) < a5000.lists(s));
 }
 
+TEST_CASE("the exact join's one list costs a read of the rows, not a clustering", "[vss]")
+{
+  access_path_cost const cost{device_scale{}};
+  sirius::vss::access_path_shape s;
+  s.probe_rows           = 1000;
+  s.corpus_rows          = 1e7;
+  s.dim                  = 96;
+  s.corpus_on_device     = true;
+  s.list_bytes_per_value = 1;
+  s.lists_on_device      = true;
+  s.n_clusters           = 1;
+
+  // Deep10M pinned on the device, built as a statement builds it: 0.055 s measured (2026-10-21).
+  CHECK(cost.codes(s) > 0.035);
+  CHECK(cost.codes(s) < 0.075);
+  // So 1,000 probe rows already repay it: build + search 0.05-0.1 s against brute force 0.32 s.
+  CHECK(cost.codes(s) + cost.lists(s) < 0.5 * cost.brute(s));
+  // A clustering of even 64 partitions costs far more to fit, assign and write.
+  s.n_clusters = 64;
+  CHECK(cost.build(s) > 10 * cost.codes(s));
+  s.n_clusters = 1;
+
+  // Cosine lists copy their unit rows to the host in FP32: 0.185 s measured.
+  s.unit_rows            = true;
+  s.list_bytes_per_value = 2;
+  CHECK(cost.codes(s) > 0.15);
+  CHECK(cost.codes(s) < 0.23);
+  s.unit_rows            = false;
+  s.list_bytes_per_value = 1;
+
+  // SIFT100M pinned in host memory: two PCIe copies of the rows, 3.99 s measured.
+  s.corpus_rows      = 1e8;
+  s.dim              = 128;
+  s.corpus_on_device = false;
+  CHECK(cost.codes(s) > 3.4);
+  CHECK(cost.codes(s) < 4.6);
+  // Twice the PCIe bandwidth halves it; tensor throughput does not move it.
+  access_path_cost const pcie2{device_scale{.pcie = 2}};
+  access_path_cost const tensor2{device_scale{.f16 = 2, .int8 = 2}};
+  CHECK(pcie2.codes(s) < 0.51 * cost.codes(s));
+  CHECK(tensor2.codes(s) == cost.codes(s));
+}
+
 TEST_CASE("lists a statement builds for itself get more clusters for a larger probe side", "[vss]")
 {
   using sirius::vss::choose_cluster_count;

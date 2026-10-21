@@ -976,6 +976,7 @@ class rewriter {
       shape.list_bytes_per_value = cosine ? 2 : 1;
       shape.lists_on_device      = true;
       shape.n_clusters           = 1;
+      shape.unit_rows            = cosine;
       double const built         = cost.codes(shape) + cost.lists(shape);
       if (force == "cost" && built >= brute) {
         SIRIUS_LOG_INFO(
@@ -986,6 +987,12 @@ class rewriter {
           built);
         return false;
       }
+      SIRIUS_LOG_INFO(
+        "[vector_join_rewrite] '{}': writing its codes and searching them ({:.3f} s est.) over "
+        "brute force ({:.3f} s)",
+        table.name,
+        built,
+        brute);
       choice = build_lists_in_query(*sirius_ctx,
                                     req,
                                     catalog,

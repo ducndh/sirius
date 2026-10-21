@@ -1322,6 +1322,21 @@ TEST_CASE_METHOD(KMeansFixture,
     CHECK(std::abs(a - b) <= 1e-4 * (1.0 + std::abs(b)));
   }
 
+  // Values in [0, 1) are not bytes, so one list asked for as UINT8 is refused on either pin tier
+  // (over a host pin the check runs in the coding pass, not before it) and leaves no lists.
+  if (!bytes) {
+    expect_error(*con,
+                 "SELECT * FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" +
+                   prefix + "_c', storage => 'uint8', tier => '" + lists_tier + "');",
+                 "integer in [0, 255]");
+    expect_error(*con,
+                 "SELECT left_id FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
+                   "_corpus','vec', metric => 'l2', k => 10, search_mode => 'approx', "
+                   "clustering => '" +
+                   prefix + "_c', n_probes => 1);",
+                 "sirius_kmeans_build_lists");
+  }
+
   struct variant {
     std::string storage, metric, env, value;
   };
