@@ -135,6 +135,14 @@ bool exact_copy_asked()
   return v != nullptr && std::string_view{v} == "1";
 }
 
+/// SIRIUS_VSS_ONE_LIST_FAST=0: one cluster is fitted by k-means and its list built the way many
+/// are (labels, a counting sort, a gather and a scatter per chunk), to compare against.
+bool one_list_fast()
+{
+  auto const* v = std::getenv("SIRIUS_VSS_ONE_LIST_FAST");
+  return v == nullptr || std::string_view{v} != "0";
+}
+
 /// Pinned host memory a kernel reads and writes in place, through the same pointer.
 rmm::device_async_resource_ref mapped_host_resource()
 {
@@ -237,9 +245,11 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
     };
     // A host-tier pin gives up its sample in place: the device reads the strided rows through the
     // pin's mapping. They are a few percent of the column, which staging moved whole to take them.
-    auto const map = c.pin->tier == cucascade::memory::Tier::HOST
-                       ? map_pinned_rows(*c.pin, req.column, req.dim, *c.space, stream, mr)
-                       : std::nullopt;
+    // One cluster's few hundred rows are read so on either tier, without a sync per chunk.
+    bool const one_mean = n_clusters == 1 && !req.spec.rows_are_centroids && one_list_fast();
+    auto const map      = c.pin->tier == cucascade::memory::Tier::HOST || one_mean
+                            ? map_pinned_rows(*c.pin, req.column, req.dim, *c.space, stream, mr)
+                            : std::nullopt;
     for (std::size_t i = 0; map && i < n_chunks; ++i) {
       auto const first = map->chunk_first_row[i];
       auto const rows  = map->chunk_first_row[i + 1] - first;
@@ -282,6 +292,9 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
       }
       centroids =
         views.size() == 1 ? std::move(samples.front()) : cudf::concatenate(views, stream, mr);
+    } else if (one_mean) {
+      // One centroid settles on the sample's mean; k-means' iterations find nothing else.
+      centroids = mean_centroid(views, req.dim, stream, mr);
     } else {
       // Both counts are already resolved against the full table; passing them through stops
       // train_centroids from re-deriving them from the sample it is handed.
@@ -522,6 +535,10 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   if (n_rows == 0) {
     throw duckdb::InvalidInputException(fn + ": table '" + req.table + "' is empty");
   }
+  // One list (the exact join's compact layout) holds every row in pin order: layout row r is pin
+  // row r. It needs no labels, no sort, no index arrays and no gather or scatter, and pass 2 writes
+  // each chunk's rows straight to their place.
+  bool const one_list = n_clusters == 1 && one_list_fast();
 
   telemetry::batch_telemetry_info const telemetry_info{};
   auto const n_chunks = pinned_column_chunk_count(*c.pin, req.column);
@@ -542,7 +559,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
 
   // Pass 1: every row's nearest centroid, to the host. 4 bytes a row, so even 100M rows is
   // 400 MB, and the host is where the counting sort below is cheapest to run deterministically.
-  std::vector<std::int32_t> labels(static_cast<std::size_t>(n_rows));
+  std::vector<std::int32_t> labels(one_list ? 0 : static_cast<std::size_t>(n_rows));
   // Whether every component is a byte, counted while the chunks are resident anyway: that is
   // what decides if the lists may be stored as UINT8 without changing a single value.
   bool const check_uint8 =
@@ -586,7 +603,26 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       stream.synchronize();  // `host` goes out of scope
     }
   }
-  {
+  // One list rotated before coding keeps the rows pass 1 rotates and codes them from there, rather
+  // than rotate every row again, when the device holds them besides what the lists will take and
+  // the room the lists leave (below), so that where the lists go does not change.
+  std::optional<rmm::device_uvector<float>> kept_rotated;
+  if (one_list && rotation && !host_tier) {
+    auto const rows_bytes = static_cast<std::size_t>(n_rows * dim) * sizeof(float);
+    auto const lists_bytes =
+      static_cast<std::size_t>(n_rows) * (static_cast<std::size_t>(dim) + 12) +
+      (std::size_t{1} << 24);
+    auto const headroom =
+      std::max<std::size_t>(std::size_t{2} << 30, c.space->get_max_memory() / 4);
+    if (c.space->get_available_memory() >= rows_bytes + lists_bytes + headroom) {
+      try {
+        kept_rotated.emplace(static_cast<std::size_t>(n_rows * dim), stream, mr);
+      } catch (rmm::bad_alloc const&) {
+      }
+    }
+  }
+  // One list that is neither checked for bytes nor coded as INT8 has nothing to do in pass 1.
+  if (!one_list || check_uint8 || want_int8) {
     // One list (the exact join's compact layout) labels nothing: every row is in it, and the
     // labels are already zero.
     std::optional<centroid_labeler> labeler;
@@ -611,16 +647,27 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       }
       if (want_int8) {
         auto const* chunk_rows = list_column_as_dataset_view(staged.view, dim).data_handle();
-        // A rotation's range is taken as the rows are rotated, without writing them out.
+        auto* const keep       = kept_rotated ? kept_rotated->data() + base * dim : nullptr;
+        // A rotation's range is taken as the rows are rotated, without writing them out unless
+        // they are kept.
         if (!rotation || !rotate_rows_min_max(chunk_rows,
                                               rows,
                                               dim,
                                               static_cast<float const*>(rotation->data()),
                                               col_min->data(),
                                               col_max->data(),
-                                              stream)) {
-          column_min_max(
-            rotated_rows(chunk_rows, rows), rows, dim, col_min->data(), col_max->data(), stream);
+                                              stream,
+                                              keep)) {
+          if (keep != nullptr) {
+            rotate_rows(
+              chunk_rows, rows, dim, static_cast<float const*>(rotation->data()), keep, stream);
+          }
+          column_min_max(keep != nullptr ? keep : rotated_rows(chunk_rows, rows),
+                         rows,
+                         dim,
+                         col_min->data(),
+                         col_max->data(),
+                         stream);
         }
       }
       // Before the copy below, which waits for the labels: into pageable memory it is synchronous.
@@ -769,8 +816,10 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     }
     lists.offsets.back() = run;
   }
-  std::vector<std::int64_t> dest(static_cast<std::size_t>(n_rows));
-  if (n_clusters == 1) {
+  std::vector<std::int64_t> dest(one_list ? 0 : static_cast<std::size_t>(n_rows));
+  if (one_list) {
+    // Layout row r is pin row r.
+  } else if (n_clusters == 1) {
     std::iota(dest.begin(), dest.end(), std::int64_t{0});
   } else {
     parallel([&](std::int64_t t, std::int64_t lo, std::int64_t hi) {
@@ -879,7 +928,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     auto* ids = static_cast<std::int64_t*>(lists.row_ids->data());
     parallel([&](std::int64_t, std::int64_t lo, std::int64_t hi) {
       for (auto r = lo; r < hi; ++r) {
-        ids[dest[static_cast<std::size_t>(r)]] = r;
+        ids[one_list ? r : dest[static_cast<std::size_t>(r)]] = r;
       }
     });
   }
@@ -985,6 +1034,149 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
 
   phase("allocate");
 
+  auto const row_bytes_v     = lists.row_bytes();
+  auto const exact_row_bytes = static_cast<std::size_t>(dim) * sizeof(float);
+  // Where a byte of the host-resident layout lives, and how many bytes follow it in its block.
+  using piece         = std::pair<std::byte*, std::size_t>;
+  auto const exact_at = [&](std::size_t at) -> piece {
+    auto const row = static_cast<std::int64_t>(at / exact_row_bytes);
+    auto const in_block =
+      static_cast<std::size_t>(row % exact_rows_per_block) * exact_row_bytes + at % exact_row_bytes;
+    return {exact_ptrs[static_cast<std::size_t>(row / exact_rows_per_block)] + in_block,
+            static_cast<std::size_t>(exact_rows_per_block) * exact_row_bytes - in_block};
+  };
+  auto const chunk_at = [&](std::size_t at) -> piece {
+    auto const chunk_bytes = static_cast<std::size_t>(lists.chunk_rows) * row_bytes_v;
+    auto const chunk       = at / chunk_bytes;
+    auto const in_chunk    = at % chunk_bytes;
+    auto const in_block    = in_chunk % block_bytes;
+    auto const this_chunk =
+      static_cast<std::size_t>(lists.rows_in_chunk(static_cast<std::int64_t>(chunk))) * row_bytes_v;
+    return {host_chunks[chunk]->at(in_chunk / block_bytes).data() + in_block,
+            std::min(block_bytes - in_block, this_chunk - in_chunk)};
+  };
+
+  // Pass 2 of one list: chunk i's rows are layout rows [base, base + rows), coded straight into
+  // their place on the device, or coded on the device and copied into place in the host blocks.
+  // The per-row values the search reads (norms, coding errors, the row map) are the ones the
+  // general pass below computes for the same rows.
+  if (one_list) {
+    // @p bytes from the device at @p src to layout byte @p at of the host blocks @p where maps.
+    auto const to_host = [&](
+                           void const* src, std::size_t at, std::size_t bytes, auto const& where) {
+      auto const* from = static_cast<std::byte const*>(src);
+      while (bytes > 0) {
+        auto const [out, room] = where(at);
+        auto const now         = std::min(bytes, room);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(out, from, now, cudaMemcpyDeviceToHost, stream.value()));
+        from += now;
+        at += now;
+        bytes -= now;
+      }
+    };
+    pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
+    std::int64_t base = 0;
+    for (std::size_t i = 0; i < n_chunks; ++i) {
+      auto staged     = walk.take(i);
+      auto const rows = static_cast<std::int64_t>(staged.view.size());
+      if (rows == 0) { continue; }
+      if (base + rows > n_rows) {
+        throw std::runtime_error(fn + ": pinned column holds more rows than the pin reports");
+      }
+      auto const first = static_cast<std::size_t>(base);
+      float const* x   = list_column_as_dataset_view(staged.view, dim).data_handle();
+      std::optional<rmm::device_uvector<float>> unit;
+      if (unit_rows) {
+        unit.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
+        normalize_rows(x, rows, dim, unit->data(), stream);
+        x = unit->data();
+      }
+      // The rows in the list encoding: in place on the device, else in a buffer copied out below.
+      // FP32 rows are the chunk's own.
+      std::optional<rmm::device_buffer> coded_buf;
+      std::byte* coded = nullptr;
+      if (on_device) {
+        coded = static_cast<std::byte*>(lists.device_vectors->data()) + first * row_bytes_v;
+      } else if (encoding != list_encoding::float32) {
+        coded_buf.emplace(static_cast<std::size_t>(rows) * row_bytes_v, stream, mr);
+        coded = static_cast<std::byte*>(coded_buf->data());
+      }
+      if (encoding == list_encoding::float32 && on_device) {
+        CUDF_CUDA_TRY(cudaMemcpyAsync(coded,
+                                      x,
+                                      static_cast<std::size_t>(rows) * row_bytes_v,
+                                      cudaMemcpyDeviceToDevice,
+                                      stream.value()));
+      }
+      if (encoding == list_encoding::float16) {
+        narrow_to_float16(x, rows * dim, reinterpret_cast<std::uint16_t*>(coded), stream);
+      }
+      if (lists.has_exact_rows()) {
+        std::optional<rmm::device_uvector<float>> sq_buf;
+        if (!lists.row_sq_f32) { sq_buf.emplace(static_cast<std::size_t>(rows), stream, mr); }
+        auto* const sq =
+          sq_buf ? sq_buf->data() : static_cast<float*>(lists.row_sq_f32->data()) + first;
+        if (encoding == list_encoding::float16) {
+          half_rows_norms(x,
+                          reinterpret_cast<std::uint16_t const*>(coded),
+                          rows,
+                          dim,
+                          sq,
+                          nullptr,
+                          half_error_bits->data(),
+                          max_norm_bits->data(),
+                          stream);
+        } else {
+          float_row_sq_norms(x, rows, dim, sq, max_norm_bits->data(), stream);
+        }
+        if (lists.exact_vectors) {
+          to_host(
+            x, first * exact_row_bytes, static_cast<std::size_t>(rows) * exact_row_bytes, exact_at);
+        }
+      }
+      if (encoding == list_encoding::int8) {
+        quantize_rows_int8(kept_rotated ? kept_rotated->data() + base * dim : rotated_rows(x, rows),
+                           rows,
+                           dim,
+                           static_cast<float const*>(lists.code_offset->data()),
+                           lists.code_scale,
+                           reinterpret_cast<std::int8_t*>(coded),
+                           nullptr,
+                           code_error_bits->data(),
+                           stream,
+                           rotation ? rotation_slack(dim) : 0.f);
+      }
+      if (encoding == list_encoding::uint8) {
+        narrow_to_shifted_int8(x, rows * dim, reinterpret_cast<std::int8_t*>(coded), stream);
+      }
+      if (encoding == list_encoding::uint8 || encoding == list_encoding::int8) {
+        int8_row_sq_norms(reinterpret_cast<std::int8_t const*>(coded),
+                          rows,
+                          dim,
+                          static_cast<std::int32_t*>(lists.row_sq->data()) + first,
+                          stream);
+      }
+      if (on_device) {
+        scatter_row_ids(
+          nullptr, rows, base, static_cast<std::int64_t*>(lists.row_ids->data()), stream);
+      } else {
+        to_host(coded != nullptr ? static_cast<void const*>(coded) : x,
+                first * row_bytes_v,
+                static_cast<std::size_t>(rows) * row_bytes_v,
+                chunk_at);
+      }
+      walk.prefetch_after(i);
+      // The staged chunk and the buffers above are released once this iteration ends.
+      stream.synchronize();
+      base += rows;
+    }
+    if (base != n_rows) {
+      throw std::runtime_error(fn + ": pinned column holds " + std::to_string(base) +
+                               " rows but the pin reports " + std::to_string(n_rows));
+    }
+    kept_rotated.reset();
+  }
+
   // Pass 2: stage each chunk again and move its rows into the lists. A list's rows keep pin
   // order, so the rows one chunk contributes to a list are one contiguous run of that list, and
   // the chunk is grouped by cluster on the device so that they are one run of the chunk too.
@@ -994,33 +1186,11 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   // which grows with the cluster count and was most of the build at 16,384 clusters; writing
   // rows through mapped host memory from a kernel ran at ~5 GB/s, one scattered PCIe write per
   // row.
-  {
+  if (!one_list) {
     struct run {
       std::int64_t first;  // position in the grouped chunk
       std::int64_t dest;   // first layout row
       std::int64_t rows;
-    };
-    auto const row_bytes_v     = lists.row_bytes();
-    auto const exact_row_bytes = static_cast<std::size_t>(dim) * sizeof(float);
-    // Where a byte of the host-resident layout lives, and how many bytes follow it in its block.
-    using piece         = std::pair<std::byte*, std::size_t>;
-    auto const exact_at = [&](std::size_t at) -> piece {
-      auto const row      = static_cast<std::int64_t>(at / exact_row_bytes);
-      auto const in_block = static_cast<std::size_t>(row % exact_rows_per_block) * exact_row_bytes +
-                            at % exact_row_bytes;
-      return {exact_ptrs[static_cast<std::size_t>(row / exact_rows_per_block)] + in_block,
-              static_cast<std::size_t>(exact_rows_per_block) * exact_row_bytes - in_block};
-    };
-    auto const chunk_at = [&](std::size_t at) -> piece {
-      auto const chunk_bytes = static_cast<std::size_t>(lists.chunk_rows) * row_bytes_v;
-      auto const chunk       = at / chunk_bytes;
-      auto const in_chunk    = at % chunk_bytes;
-      auto const in_block    = in_chunk % block_bytes;
-      auto const this_chunk =
-        static_cast<std::size_t>(lists.rows_in_chunk(static_cast<std::int64_t>(chunk))) *
-        row_bytes_v;
-      return {host_chunks[chunk]->at(in_chunk / block_bytes).data() + in_block,
-              std::min(block_bytes - in_block, this_chunk - in_chunk)};
     };
 
     // One grouped chunk on its way to the host. `copies` is declared last so that an unwinding

@@ -23,7 +23,10 @@
 
 #include <cudf/lists/lists_column_view.hpp>
 
+#include <cudf/utilities/default_stream.hpp>
+
 #include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
 
 #include <cuda_runtime_api.h>
 
@@ -37,6 +40,7 @@
 #include <utils/parquet_fixture_utils.hpp>
 #include <utils/sirius_test_env.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
+#include <vss/cluster_lists.hpp>
 #include <vss/pinned_column.hpp>
 #include <vss/vector_clustering.hpp>
 
@@ -44,6 +48,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -1179,6 +1184,205 @@ TEST_CASE_METHOD(KMeansFixture,
       sampled[i].first != oracle[i].first || std::llabs(sampled[i].second - oracle[i].second) > 1;
   }
   CHECK(mismatched == 0);
+}
+
+namespace {
+
+std::vector<std::uint8_t> read_bytes(void const* p, std::size_t n)
+{
+  std::vector<std::uint8_t> out(n);
+  if (n > 0) { REQUIRE(cudaMemcpy(out.data(), p, n, cudaMemcpyDefault) == cudaSuccess); }
+  return out;
+}
+
+std::uint32_t float_bits(float f)
+{
+  std::uint32_t b = 0;
+  std::memcpy(&b, &f, sizeof(b));
+  return b;
+}
+
+// Everything a search reads from a clustering's lists, on the host: the layout, the rows in their
+// encoding (from the device or from the host chunks), the row map, the per-row norms, the FP32
+// copy, the code offset and rotation, and the scalars the bounds are made of, as bits.
+struct lists_bytes {
+  std::string layout;
+  std::vector<std::uint8_t> rows, row_ids, row_sq, row_sq_f32, code_offset, code_rotation, exact;
+  std::vector<std::uint32_t> scalars;
+};
+
+lists_bytes read_lists(duckdb::Connection& con, const std::string& clustering)
+{
+  auto const ctx    = sirius::test::get_registered_sirius_context(con);
+  auto const* lists = sirius::vss::find_cluster_lists(*ctx, clustering);
+  REQUIRE(lists != nullptr);
+  auto const n         = static_cast<std::size_t>(lists->n_rows);
+  auto const row_bytes = lists->row_bytes();
+  lists_bytes out;
+  std::ostringstream layout;
+  layout << static_cast<int>(lists->tier) << " " << static_cast<int>(lists->encoding) << " "
+         << lists->n_clusters << " " << lists->chunk_rows << " " << lists->unit_rows << " "
+         << lists->exact_pin.has_value() << " " << (lists->exact_vectors != nullptr);
+  for (auto const o : lists->offsets) {
+    layout << " " << o;
+  }
+  out.layout = layout.str();
+  if (lists->tier == cucascade::memory::Tier::GPU) {
+    out.rows = read_bytes(lists->device_vectors->data(), n * row_bytes);
+  } else {
+    auto const stream = cudf::get_default_stream();
+    rmm::device_buffer staged(n * row_bytes, stream);
+    for (std::int64_t ch = 0; ch < lists->num_chunks(); ++ch) {
+      auto const ro =
+        sirius::vss::lock_host_list_chunk(*lists, static_cast<std::size_t>(ch), stream);
+      sirius::vss::copy_host_list_rows(
+        *lists,
+        ro,
+        0,
+        lists->rows_in_chunk(ch),
+        static_cast<std::byte*>(staged.data()) +
+          static_cast<std::size_t>(ch * lists->chunk_rows) * row_bytes,
+        stream);
+      stream.synchronize();
+    }
+    out.rows = read_bytes(staged.data(), staged.size());
+  }
+  out.row_ids = read_bytes(lists->row_ids->data(), n * sizeof(std::int64_t));
+  if (lists->row_sq) { out.row_sq = read_bytes(lists->row_sq->data(), n * sizeof(std::int32_t)); }
+  if (lists->row_sq_f32) {
+    out.row_sq_f32 = read_bytes(lists->row_sq_f32->data(), n * sizeof(float));
+  }
+  if (lists->code_offset) {
+    out.code_offset = read_bytes(lists->code_offset->data(), lists->code_offset->size());
+  }
+  if (lists->code_rotation) {
+    out.code_rotation = read_bytes(lists->code_rotation->data(), lists->code_rotation->size());
+  }
+  if (lists->exact_vectors) {
+    auto const per_block = static_cast<std::size_t>(lists->exact_rows_per_block);
+    auto const row       = static_cast<std::size_t>(lists->dim) * sizeof(float);
+    for (std::size_t r = 0; r < n; r += per_block) {
+      auto const block = lists->exact_vectors->at(r / per_block);
+      auto const* from = reinterpret_cast<std::uint8_t const*>(block.data());
+      out.exact.insert(out.exact.end(), from, from + std::min(per_block, n - r) * row);
+    }
+  }
+  out.scalars = {float_bits(lists->max_row_norm),
+                 float_bits(lists->half_error),
+                 float_bits(lists->code_scale),
+                 float_bits(lists->code_error)};
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "one list built in place holds the bytes the general build writes for it",
+                 "[integration][gpu_execution][array][vss][kmeans][lists][one_list]")
+{
+  // One list is the pin in pin order, which the build writes chunk by chunk in place (unless
+  // SIRIUS_VSS_ONE_LIST_FAST=0) instead of labelling, sorting, gathering and scattering it, and
+  // its one centroid is the sample's mean instead of a k-means fit. Every byte the bounded search
+  // reads -- the codes, the row map, the norms, the FP32 copy, each bound's error terms -- must be
+  // what the general build writes for one cluster, and the join over them the exact one. 16 MB
+  // scan batches pin the corpus as several chunks; FLOAT[256] puts host lists in two chunks of
+  // many blocks.
+  auto const pin_tier   = GENERATE(std::string("gpu"), std::string("host"));
+  auto const lists_tier = GENERATE(std::string("auto"), std::string("host"));
+  auto const bytes      = GENERATE(false, true);
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      for (auto const* v :
+           {"SIRIUS_VSS_ONE_LIST_FAST", "SIRIUS_VSS_INT8_ROTATE", "SIRIUS_VSS_EXACT_COPY"}) {
+        ::unsetenv(v);
+      }
+    }
+  } unset_env;
+  auto const prefix = "kmf_" + pin_tier + "_" + lists_tier + (bytes ? "_u8" : "_f32");
+  run_ok("SET scan_task_batch_size = 16000000;");
+  create_lists_tables(*this, prefix, pin_tier, bytes);
+  run_ok("RESET scan_task_batch_size;");
+
+  // The centroid: the sample's mean, which is what k-means' fit of one cluster returns.
+  auto const fit = [&](const std::string& name) {
+    run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + name +
+           "', n_clusters => 1);");
+    return ok_rows(*con, "SELECT dim_index, value FROM sirius_kmeans_centroids('" + name + "');");
+  };
+  auto const mean = fit(prefix + "_c");
+  ::setenv("SIRIUS_VSS_ONE_LIST_FAST", "0", 1);
+  auto const kmeans = fit(prefix + "_k");
+  ::unsetenv("SIRIUS_VSS_ONE_LIST_FAST");
+  REQUIRE(mean.size() == 256u);
+  REQUIRE(kmeans.size() == mean.size());
+  for (std::size_t i = 0; i < mean.size(); ++i) {
+    CHECK(mean[i].at(0) == kmeans[i].at(0));
+    auto const a = std::stod(mean[i].at(1)), b = std::stod(kmeans[i].at(1));
+    CHECK(std::abs(a - b) <= 1e-4 * (1.0 + std::abs(b)));
+  }
+
+  struct variant {
+    std::string storage, metric, env, value;
+  };
+  std::vector<variant> const variants =
+    bytes ? std::vector<variant>{{"uint8", "l2", "", ""}, {"auto", "l2", "", ""}}
+          : std::vector<variant>{{"int8", "l2", "SIRIUS_VSS_INT8_ROTATE", "1"},
+                                 {"int8", "l2", "SIRIUS_VSS_INT8_ROTATE", "0"},
+                                 {"float16", "l2", "", ""},
+                                 {"float16", "l2", "SIRIUS_VSS_EXACT_COPY", "1"},
+                                 {"float32", "l2", "", ""},
+                                 {"auto", "l2", "", ""},
+                                 {"float16", "cosine", "", ""}};
+  for (auto const& v : variants) {
+    INFO("storage " << v.storage << ", metric " << v.metric << ", " << v.env << "=" << v.value);
+    if (!v.env.empty()) { ::setenv(v.env.c_str(), v.value.c_str(), 1); }
+    auto const build = [&] {
+      run_ok("SELECT * FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" + prefix +
+             "_c', storage => '" + v.storage + "', tier => '" + lists_tier + "', metric => '" +
+             v.metric + "');");
+      return read_lists(*con, prefix + "_c");
+    };
+    auto const fast = build();
+
+    auto const join = [&](const std::string& extra) {
+      return "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_probe','vec','" +
+             prefix + "_corpus','vec', metric => '" + v.metric +
+             "', output_type => 'distance', k => 10, " + extra + ");";
+    };
+    auto const exact = distance_multiset(*con, join("search_mode => 'exact-gemm'"));
+    auto const one   = distance_multiset(
+      *con, join("search_mode => 'approx', clustering => '" + prefix + "_c', n_probes => 1"));
+    REQUIRE(exact.size() == 50u * 10u);
+    REQUIRE(one.size() == exact.size());
+    std::size_t mismatched = 0;
+    for (std::size_t i = 0; i < exact.size(); ++i) {
+      mismatched +=
+        one[i].first != exact[i].first || std::llabs(one[i].second - exact[i].second) > 2;
+    }
+    CHECK(mismatched == 0);
+
+    ::setenv("SIRIUS_VSS_ONE_LIST_FAST", "0", 1);
+    auto const general = build();
+    ::unsetenv("SIRIUS_VSS_ONE_LIST_FAST");
+    if (!v.env.empty()) { ::unsetenv(v.env.c_str()); }
+
+    CHECK(fast.layout == general.layout);
+    CHECK(fast.rows == general.rows);
+    CHECK(fast.row_ids == general.row_ids);
+    CHECK(fast.row_sq == general.row_sq);
+    CHECK(fast.row_sq_f32 == general.row_sq_f32);
+    CHECK(fast.code_offset == general.code_offset);
+    CHECK(fast.code_rotation == general.code_rotation);
+    CHECK(fast.exact == general.exact);
+    CHECK(fast.scalars == general.scalars);
+    // Not vacuous: rows and a row map were read, and the per-row arrays the encoding has.
+    CHECK(fast.rows.size() == 70000u * 256u *
+                                (v.storage == "float32"                                      ? 4u
+                                 : v.storage == "float16" || (!bytes && v.storage == "auto") ? 2u
+                                                                                             : 1u));
+    CHECK(fast.row_ids.size() == 70000u * 8u);
+  }
 }
 
 TEST_CASE_METHOD(KMeansFixture,
