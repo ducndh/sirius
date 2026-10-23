@@ -1041,10 +1041,12 @@ TEST_CASE_METHOD(KMeansFixture,
   // The exact join's compact layout: one list, no partitioning, whose bounded sweep lowers each
   // probe row's bound as it goes -- from the seed's sample with the lists on the device, from an
   // unbounded first piece in host memory. INT8 and FLOAT16 codes are re-scored in FP32, so the
-  // k distances are the exact join's whatever the bound let through.
+  // k distances are the exact join's whatever the bound let through. k = 129 and 1000 seed from
+  // samples of 8k rows, past the 1,024 the seed kernel holds in shared memory, so on the device
+  // their seeds are ranked through device memory instead.
   auto const tier    = GENERATE(std::string("gpu"), std::string("host"));
   auto const storage = GENERATE(std::string("uint8"), std::string("int8"), std::string("float16"));
-  auto const k       = GENERATE(1, 5, 64);
+  auto const k       = GENERATE(1, 5, 64, 129, 1000);
   auto const prefix  = "kmr_" + tier + "_" + storage + "_k" + std::to_string(k);
   create_lists_tables(*this, prefix, "gpu", storage == "uint8");
 

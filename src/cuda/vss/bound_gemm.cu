@@ -22,6 +22,7 @@
 
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_scan.cuh>
+#include <cub/device/device_segmented_radix_sort.cuh>
 #include <cub/device/device_select.cuh>
 #include <thrust/iterator/counting_iterator.h>
 
@@ -1812,6 +1813,99 @@ __global__ void __launch_bounds__(kSeedWarps * 32)
   }
 }
 
+// A sample larger than the shared-memory buffer: one warp per probe row of a batch (positions b0..
+// b0 + nb of @p order) writes its distances to row j of @p out (@p stride floats a row), +inf past
+// its count, for a segmented sort to rank. The distances are those of the kernels above.
+template <int W, bool F16>
+__global__ void __launch_bounds__(kSeedWarps * 32)
+  seed_distances_kernel(void const* __restrict__ x_v,
+                        void const* __restrict__ x_sq_v,
+                        void const* __restrict__ probe_v,
+                        void const* __restrict__ probe_sq_v,
+                        int64_t const* __restrict__ first,
+                        int32_t const* __restrict__ count,
+                        int64_t const* __restrict__ order,
+                        int64_t b0,
+                        int64_t nb,
+                        int d,
+                        int stride,
+                        float* __restrict__ out)
+{
+  int const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  int const sub = lane / W, sl = lane % W;
+  float const inf = __int_as_float(0x7f800000);
+  for (int64_t j = static_cast<int64_t>(blockIdx.x) * kSeedWarps + warp; j < nb;
+       j += static_cast<int64_t>(gridDim.x) * kSeedWarps) {
+    auto const r  = order != nullptr ? order[b0 + j] : b0 + j;
+    int const cnt = count[r];
+    float* my     = out + j * stride;
+    for (int i0 = 0; i0 < stride; i0 += 32 / W) {
+      int const i = i0 + sub;
+      if (i0 >= cnt) {   // the whole group is past the sample (i0 is the same for every lane)
+        if (sl == 0 && i < stride) { my[i] = inf; }
+        continue;
+      }
+      auto const row = first[r] + (i < cnt ? i : 0);
+      float dist;
+      if constexpr (F16) {
+        auto const* q  = static_cast<__half2 const*>(probe_v) + r * (d / 2);
+        auto const* xr = static_cast<__half2 const*>(x_v) + row * (d / 2);
+        float dot      = 0.f;
+        for (int w = sl; w < d / 2; w += W) {
+          float2 const a = __half22float2(xr[w]);
+          float2 const b = __half22float2(q[w]);
+          dot            = fmaf(a.x, b.x, fmaf(a.y, b.y, dot));
+        }
+#pragma unroll
+        for (int o = W / 2; o > 0; o /= 2) {
+          dot += __shfl_xor_sync(0xffffffffu, dot, o, W);
+        }
+        dist = static_cast<float const*>(probe_sq_v)[r] + static_cast<float const*>(x_sq_v)[row] -
+               2.f * dot;
+      } else {
+        auto const* q  = static_cast<int const*>(probe_v) + r * (d / 4);
+        auto const* xr = static_cast<int const*>(x_v) + row * (d / 4);
+        int dot        = 0;
+        for (int w = sl; w < d / 4; w += W) {
+          dot = __dp4a(xr[w], q[w], dot);
+        }
+#pragma unroll
+        for (int o = W / 2; o > 0; o /= 2) {
+          dot += __shfl_xor_sync(0xffffffffu, dot, o, W);
+        }
+        dist = static_cast<float>(static_cast<int32_t const*>(probe_sq_v)[r] +
+                                  static_cast<int32_t const*>(x_sq_v)[row] - 2 * dot);
+      }
+      if (sl == 0 && i < stride) { my[i] = i < cnt ? dist : inf; }
+    }
+  }
+}
+
+__global__ void segment_offsets_kernel(int* offsets, int64_t nb, int stride)
+{
+  for (int64_t j = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; j <= nb;
+       j += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    offsets[j] = static_cast<int>(j * stride);
+  }
+}
+
+// bound[r] = the k-th of row j's sorted sample distances (+inf when the sample has fewer than k).
+__global__ void seed_kth_from_sorted_kernel(float const* sorted,
+                                            int32_t const* count,
+                                            int64_t const* order,
+                                            int64_t b0,
+                                            int64_t nb,
+                                            int stride,
+                                            int k,
+                                            float* bound)
+{
+  for (int64_t j = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; j < nb;
+       j += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const r = order != nullptr ? order[b0 + j] : b0 + j;
+    bound[r]     = count[r] < k ? __int_as_float(0x7f800000) : sorted[j * stride + k - 1];
+  }
+}
+
 // Lanes per sample row: about eight 4-byte words each, between 4 and 32.
 int seed_width(int64_t words)
 {
@@ -1835,6 +1929,76 @@ void launch_seed_width(int width, Launch&& launch)
 
 }  // namespace
 
+namespace {
+
+// The seed of a sample larger than the shared-memory buffer: each batch of probe rows writes its
+// sample distances to device memory (at most kSeedBatchFloats of them), a segmented radix sort
+// ranks every row's, and the k-th is read off. Linear in the sample, so k in the thousands costs
+// about as much a sample row as k = 10 does.
+constexpr int64_t kSeedBatchFloats = int64_t{1} << 24;
+
+template <bool F16>
+void seed_bound_sorted(void const* x,
+                       void const* x_sq,
+                       void const* probe,
+                       void const* probe_sq,
+                       int64_t const* first,
+                       int32_t const* count,
+                       int64_t const* order,
+                       int64_t n,
+                       int64_t dim,
+                       int k,
+                       int64_t max_count,
+                       float* bound,
+                       rmm::cuda_stream_view stream,
+                       rmm::device_async_resource_ref mr)
+{
+  auto const stride = static_cast<int>(max_count);
+  auto const batch  = std::clamp<int64_t>(kSeedBatchFloats / stride, 1, n);
+  rmm::device_uvector<float> dist(static_cast<std::size_t>(batch * stride), stream, mr);
+  rmm::device_uvector<float> sorted(static_cast<std::size_t>(batch * stride), stream, mr);
+  rmm::device_uvector<int> offsets(static_cast<std::size_t>(batch + 1), stream, mr);
+  std::size_t temp_bytes = 0;
+  cub::DeviceSegmentedRadixSort::SortKeys(nullptr,
+                                          temp_bytes,
+                                          dist.data(),
+                                          sorted.data(),
+                                          static_cast<int>(batch * stride),
+                                          static_cast<int>(batch),
+                                          offsets.data(),
+                                          offsets.data() + 1,
+                                          0,
+                                          sizeof(float) * 8,
+                                          stream.value());
+  rmm::device_buffer temp(temp_bytes, stream, mr);
+  auto const words = F16 ? dim / 2 : dim / 4;
+  for (int64_t b0 = 0; b0 < n; b0 += batch) {
+    auto const nb   = std::min(batch, n - b0);
+    auto const grid = static_cast<int>(std::clamp<int64_t>((nb + kSeedWarps - 1) / kSeedWarps, 1, 65535));
+    launch_seed_width(seed_width(words), [&](auto w) {
+      seed_distances_kernel<decltype(w)::value, F16><<<grid, kSeedWarps * 32, 0, stream.value()>>>(
+        x, x_sq, probe, probe_sq, first, count, order, b0, nb, static_cast<int>(dim), stride, dist.data());
+    });
+    segment_offsets_kernel<<<grid_for(nb + 1), 256, 0, stream.value()>>>(offsets.data(), nb, stride);
+    cub::DeviceSegmentedRadixSort::SortKeys(temp.data(),
+                                            temp_bytes,
+                                            dist.data(),
+                                            sorted.data(),
+                                            static_cast<int>(nb * stride),
+                                            static_cast<int>(nb),
+                                            offsets.data(),
+                                            offsets.data() + 1,
+                                            0,
+                                            sizeof(float) * 8,
+                                            stream.value());
+    seed_kth_from_sorted_kernel<<<grid_for(nb), 256, 0, stream.value()>>>(
+      sorted.data(), count, order, b0, nb, stride, k, bound);
+    CUDF_CUDA_TRY(cudaGetLastError());
+  }
+}
+
+}  // namespace
+
 void seed_bound_int8(int8_t const* x,
                      int32_t const* x_sq,
                      int8_t const* probe,
@@ -1845,10 +2009,17 @@ void seed_bound_int8(int8_t const* x,
                      int64_t n,
                      int64_t dim,
                      int k,
+                     int64_t max_count,
                      float* bound,
-                     rmm::cuda_stream_view stream)
+                     rmm::cuda_stream_view stream,
+                     rmm::device_async_resource_ref mr)
 {
   if (n == 0) { return; }
+  if (max_count > kSeedSample) {
+    seed_bound_sorted<false>(
+      x, x_sq, probe, probe_sq, first, count, order, n, dim, k, max_count, bound, stream, mr);
+    return;
+  }
   auto const grid =
     static_cast<int>(std::clamp<int64_t>((n + kSeedWarps - 1) / kSeedWarps, 1, 65535));
   launch_seed_width(seed_width(dim / 4), [&](auto w) {
@@ -1868,10 +2039,17 @@ void seed_bound_f16(uint16_t const* x,
                     int64_t n,
                     int64_t dim,
                     int k,
+                    int64_t max_count,
                     float* bound,
-                    rmm::cuda_stream_view stream)
+                    rmm::cuda_stream_view stream,
+                    rmm::device_async_resource_ref mr)
 {
   if (n == 0) { return; }
+  if (max_count > kSeedSample) {
+    seed_bound_sorted<true>(
+      x, x_sq, probe, probe_sq, first, count, order, n, dim, k, max_count, bound, stream, mr);
+    return;
+  }
   auto const grid =
     static_cast<int>(std::clamp<int64_t>((n + kSeedWarps - 1) / kSeedWarps, 1, 65535));
   launch_seed_width(seed_width(dim / 2), [&](auto w) {

@@ -201,12 +201,15 @@ void kth_distance_bound(float const* acc_distances,
 /// d[i] = sqrt(d[i]) for i in [0, n).
 void sqrt_in_place(float* d, int64_t n, rmm::cuda_stream_view stream);
 
-/// Most sample rows seed_bound_int8 reads per probe row.
+/// Most sample rows the seed kernels hold per probe row in shared memory; a larger sample goes
+/// through device memory and a segmented sort.
 constexpr int kSeedSample = 1024;
 
 /**
  * @brief bound[r] = the k-th smallest code distance from probe row r to the count[r] int8 rows
- * (norms @p x_sq) starting at layout row first[r]. +inf when count[r] < k. count[r] <= kSeedSample.
+ * (norms @p x_sq) starting at layout row first[r]. +inf when count[r] < k. @p max_count is the
+ * largest count[r]: up to kSeedSample the distances stay in shared memory, above it they are
+ * written to device memory (@p mr) for a batch of probe rows at a time and sorted per row.
  * Rows are visited in @p order (a permutation of [0, n), nullptr for 0..n-1): rows that share a
  * sample, run together, find it in cache.
  * For UINT8 rows (stored shifted) the code distance is the exact distance, so this is an upper
@@ -223,8 +226,10 @@ void seed_bound_int8(int8_t const* x,
                      int64_t n,
                      int64_t dim,
                      int k,
+                     int64_t max_count,
                      float* bound,
-                     rmm::cuda_stream_view stream);
+                     rmm::cuda_stream_view stream,
+                     rmm::device_async_resource_ref mr);
 
 /**
  * @brief seed_bound_int8 over FLOAT16 rows (IEEE half bits, FP32 norms of the rounded rows in
@@ -241,8 +246,10 @@ void seed_bound_f16(uint16_t const* x,
                     int64_t n,
                     int64_t dim,
                     int k,
+                    int64_t max_count,
                     float* bound,
-                    rmm::cuda_stream_view stream);
+                    rmm::cuda_stream_view stream,
+                    rmm::device_async_resource_ref mr);
 
 /// d[i] *= factor for i in [0, n).
 void scale_in_place(float* d, int64_t n, float factor, rmm::cuda_stream_view stream);
