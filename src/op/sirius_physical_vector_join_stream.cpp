@@ -2516,9 +2516,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     }();
     // Lists in host memory have no device rows to sample; with the bound lowered as it goes, their
     // sweep starts from an unbounded first piece instead, which serves as the sample.
+    // The seed is the k-th of a sample of kSeedSample rows, so it needs k well below the sample: up
+    // to a quarter of it, where the seed is at most the sample's 25th percentile. Unseeded, the
+    // sweep ranks every row first (a full GEMM and selection), which at k = 100 is most of the join.
+    constexpr std::int64_t kMaxSeedK = vss::kSeedSample / 4;
     bool const seedable =
       int8_search && !radius_join &&
-      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && k_join <= 64 &&
+      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && k_join <= kMaxSeedK &&
       seed_enabled && (!codes_int8 || (small_clusters && small_batch) || running_bound_rows > 0);
     bool const bounded = int8_search && (n_probes > 1 || radius_join || codes_int8 || seedable) &&
                          vss::bound_filter_int8_supports(dim) && bound_gemm_enabled;
@@ -2601,7 +2605,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // exact k-th and need not search that cluster again. SIRIUS_VSS_SEED=0 keeps the GEMM.
     bool const seed_f16 =
       f16_bounded && _lists != nullptr && !radius_join &&
-      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && k_join <= 64 &&
+      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && k_join <= kMaxSeedK &&
       seed_enabled && ((small_clusters && small_batch) || running_bound_rows > 0);
     bool const seed = (bounded && seedable) || seed_f16;
     // Unseeded, sweep 0 ranks each row's nearest cluster on the half-precision tensor cores from
@@ -3049,10 +3053,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // A sample is at most a quarter of its cluster (kSeedSample rows at most, a few times k at
     // least): a sample near the whole cluster is the sweep again, on CUDA cores.
     auto seed_rows = [&](std::int64_t size) {
-      auto const floor = std::max<std::int64_t>(64, 8 * k_join);
-      return std::min(
-        size,
-        std::clamp<std::int64_t>(size / 4, floor, std::max<std::int64_t>(floor, vss::kSeedSample)));
+      // The seed kernel holds at most kSeedSample distances per probe row, so the floor of 8k rows
+      // gives way to that for k > kSeedSample / 8: any k rows still bound the k-th distance.
+      auto const floor = std::min<std::int64_t>(std::max<std::int64_t>(64, 8 * k_join), vss::kSeedSample);
+      return std::min(size, std::clamp<std::int64_t>(size / 4, floor, vss::kSeedSample));
     };
     auto seed_bound = [&] {
       std::vector<std::int64_t> first(static_cast<std::size_t>(n_left));
