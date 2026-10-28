@@ -899,6 +899,87 @@ TEST_CASE_METHOD(SqlRewriteFixture,
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a probe row outside float16's range is searched in FP32 over float16 lists",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // Probe row 7 has a component of 70,000, which float16 rounds to infinity: the bounded FP16
+  // search gave its pairs NaN filter values, which no limit admits, and dropped every one of them
+  // without an error. Its batch is searched in FP32 instead, from the kept FP32 rows, so each
+  // answer is DuckDB's: through the exact join's single FLOAT16 list, through partitions all
+  // probed, and for the inner product (which refused such a probe). The corpus's first component
+  // is 15 * id, under 60,000 (inside float16's range, so its lists build), which keeps row 7's
+  // neighbours far apart; the rest are not bytes, so the lists are FLOAT16.
+  SqlRewriteTables tables(*this);
+  run_ok(
+    "CREATE TABLE sr_wide16 AS SELECT i::INTEGER AS id, list_transform(range(16), lambda d: "
+    "(CASE WHEN d = 0 THEN i * 15.0 ELSE (hash(i * 100 + d) % 100000) / 977.0 END)::FLOAT)"
+    "::FLOAT[16] AS vec FROM range(4000) t(i);");
+  run_ok(
+    "CREATE TABLE sr_wide16_probe AS SELECT i::INTEGER AS id, list_transform(range(16), lambda "
+    "d: (CASE WHEN i = 7 AND d = 0 THEN 70000.0 ELSE (hash(i * 100 + d + 9999) % 100000) / 977.0 "
+    "END)::FLOAT)::FLOAT[16] AS vec FROM range(30) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_wide16', tier => 'gpu', format => 'duckdb');");
+  struct reset_on_exit {
+    duckdb::Connection& con;
+    ~reset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_ACCESS_PATH");
+      con.Query("RESET vector_join_probes;");
+    }
+  } reset{*con};
+  auto const lateral =
+    "SELECT p.id, n.id, n.d FROM sr_wide16_probe p, LATERAL (SELECT c.id, "
+    "array_distance(p.vec, c.vec) AS d FROM sr_wide16 c ORDER BY d LIMIT 5) n;";
+  // Row 7 is 10,015 or more from every row, the others mostly under 10,600 from a few hundred.
+  auto const threshold =
+    "SELECT p.id, c.id FROM sr_wide16_probe p, sr_wide16 c WHERE "
+    "array_distance(p.vec, c.vec) <= 10600.0;";
+  auto const lateral_ip =
+    "SELECT p.id, n.id, n.s FROM sr_wide16_probe p, LATERAL (SELECT c.id, "
+    "array_inner_product(p.vec, c.vec) AS s FROM sr_wide16 c ORDER BY s DESC LIMIT 5) n;";
+  auto const fell_back = [](auto&& run) {
+    sirius::test::scoped_recording_log_sink log{"info"};
+    run();
+    for (auto const& r : log.records()) {
+      if (r.message.find("outside float16's range; searching this batch") != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  };
+  auto const has_rows_of_7 = [&](std::string const& sql) {
+    con->Query("SET gpu_execution = false;");
+    auto const rows = sorted_rows(*con, sql);
+    con->Query("SET gpu_execution = true;");
+    return std::any_of(rows.begin(), rows.end(), [](auto const& r) { return r[0] == "7"; });
+  };
+  REQUIRE(has_rows_of_7(lateral));
+  REQUIRE(has_rows_of_7(threshold));
+
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "lists", 1);
+  CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, lateral); }));
+  auto codes = con->Query(
+    "SELECT count(DISTINCT cluster_id) FROM "
+    "sirius_kmeans_centroids('__sirius_auto_codes_sr_wide16_vec');");
+  REQUIRE_FALSE(codes->HasError());
+  CHECK(codes->GetValue(0, 0).GetValue<std::int64_t>() == 1);
+  CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, threshold); }));
+  CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, lateral_ip); }));
+  ::unsetenv("SIRIUS_VSS_ACCESS_PATH");
+
+  // Partitions of the corpus, every one probed: exact too.
+  run_ok("SET vector_join_probes = 1000;");
+  CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, lateral); }));
+  auto partitions = con->Query(
+    "SELECT count(DISTINCT cluster_id) FROM "
+    "sirius_kmeans_centroids('__sirius_auto_sr_wide16_vec');");
+  REQUIRE_FALSE(partitions->HasError());
+  CHECK(partitions->GetValue(0, 0).GetValue<std::int64_t>() > 1);
+  CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, threshold); }));
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
                  "a probe that is a pinned table is read from its pin",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
