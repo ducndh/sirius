@@ -62,6 +62,7 @@
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 #include "vss/access_path_cost.hpp"
+#include "vss/bound_gemm.hpp"
 #include "vss/cluster_lists.hpp"
 #include "vss/device_rates.hpp"
 #include "vss/kmeans_functions.hpp"
@@ -76,6 +77,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sirius::vss {
@@ -90,7 +92,35 @@ using duckdb::LogicalOperator;
 using duckdb::LogicalOperatorType;
 using duckdb::unique_ptr;
 
-enum class distance_kind { l2, cosine_similarity, cosine_distance };
+enum class distance_kind {
+  l2,
+  cosine_similarity,
+  cosine_distance,
+  inner_product,           ///< array_inner_product: higher is closer
+  negative_inner_product,  ///< array_negative_inner_product: -q.x, lower is closer
+};
+
+/// The join metric a distance function is answered with.
+const char* metric_name(distance_kind k)
+{
+  switch (k) {
+    case distance_kind::l2: return "l2";
+    case distance_kind::cosine_similarity:
+    case distance_kind::cosine_distance: return "cosine";
+    default: return "ip";
+  }
+}
+
+/// Whether a function's value grows as the pair gets closer (ordered DESC, bounded from below).
+bool is_similarity(distance_kind k)
+{
+  return k == distance_kind::cosine_similarity || k == distance_kind::inner_product;
+}
+
+bool same_metric(distance_kind a, distance_kind b)
+{
+  return std::string_view{metric_name(a)} == metric_name(b);
+}
 
 struct distance_call {
   distance_kind kind;
@@ -119,6 +149,12 @@ std::optional<distance_call> as_distance_call(const Expression& e)
     kind = distance_kind::cosine_similarity;
   } else if (f.function.name == "array_cosine_distance") {
     kind = distance_kind::cosine_distance;
+  } else if (f.function.name == "array_inner_product" ||
+             f.function.name == "array_dot_product") {
+    kind = distance_kind::inner_product;
+  } else if (f.function.name == "array_negative_inner_product" ||
+             f.function.name == "array_negative_dot_product") {
+    kind = distance_kind::negative_inner_product;
   } else {
     return std::nullopt;
   }
@@ -164,15 +200,15 @@ std::optional<threshold_predicate> as_threshold(const Expression& e)
   auto const& value = const_side->Cast<duckdb::BoundConstantExpression>().value;
   if (value.IsNull() || !value.type().IsNumeric()) { return std::nullopt; }
   auto const bound         = value.GetValue<double>();
-  bool const is_similarity = call->kind == distance_kind::cosine_similarity;
+  bool const similarity = is_similarity(call->kind);
   switch (type) {
     case ExpressionType::COMPARE_LESSTHAN:
     case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-      if (is_similarity) { return std::nullopt; }
+      if (similarity) { return std::nullopt; }
       break;
     case ExpressionType::COMPARE_GREATERTHAN:
     case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-      if (!is_similarity) { return std::nullopt; }
+      if (!similarity) { return std::nullopt; }
       break;
     default: return std::nullopt;
   }
@@ -311,15 +347,20 @@ unique_ptr<Expression> score_expression(duckdb::ClientContext& context,
                                         const ColumnBinding& score)
 {
   auto ref = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(duckdb::LogicalType::FLOAT, score);
-  bool const joined_cosine = joined != distance_kind::l2;
-  if (requested == distance_kind::l2) {
-    if (joined_cosine) { return nullptr; }
-    return ref;
-  }
-  if (!joined_cosine) { return nullptr; }
-  // The cosine join emits similarity.
-  if (requested == distance_kind::cosine_similarity) { return ref; }
+  if (!same_metric(requested, joined)) { return nullptr; }
+  // The l2 join emits the distance; the cosine join the similarity; the inner-product join the
+  // inner product.
+  if (requested == distance_kind::l2 || is_similarity(requested)) { return ref; }
   duckdb::vector<unique_ptr<Expression>> args;
+  if (requested == distance_kind::negative_inner_product) {
+    // -q.x, exactly: a multiplication by -1 (an operator the GPU projection runs).
+    args.push_back(std::move(ref));
+    args.push_back(duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::FLOAT(-1.0F)));
+    duckdb::ErrorData error;
+    duckdb::FunctionBinder binder(context);
+    return binder.BindScalarFunction(
+      DEFAULT_SCHEMA, "*", std::move(args), error, /*is_operator=*/true);
+  }
   args.push_back(duckdb::make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::FLOAT(1.0F)));
   args.push_back(std::move(ref));
   duckdb::ErrorData error;
@@ -738,8 +779,7 @@ class rewriter {
       for_each_expression_outside(*_root, slot.get(), [&](unique_ptr<Expression>& e) {
         std::function<void(const Expression&)> walk = [&](const Expression& x) {
           if (auto const c = as_distance_call(x); c && (c->a == probe_vec || c->b == probe_vec)) {
-            if (pair && (!same_pair(*pair, c->a, c->b) ||
-                         (pair->kind == distance_kind::l2) != (c->kind == distance_kind::l2))) {
+            if (pair && (!same_pair(*pair, c->a, c->b) || !same_metric(pair->kind, c->kind))) {
               ok = false;
             }
             if (!pair) { pair = c; }
@@ -860,6 +900,7 @@ class rewriter {
     auto const probes = setting.GetValue<std::int64_t>();
     if (probes <= 0) { return false; }
     bool const cosine           = req.metric == "cosine";
+    bool const ip               = req.metric == "ip";
     auto const n_rows           = static_cast<std::int64_t>(rows);
     std::int64_t fixed_clusters = 0;
     if (_context.TryGetCurrentSetting("vector_join_clusters", setting) && !setting.IsNull()) {
@@ -870,9 +911,11 @@ class rewriter {
         !setting.ToString().empty()) {
       choice =
         find_named_lists(ctx, setting.ToString(), catalog, schema, table, column, cosine, n_rows);
+      // An inner-product join searches FLOAT16 (re-scored) or FP32 rows only.
+      if (choice && ip && !ip_searchable(ctx, *choice)) { choice.reset(); }
     }
     if (!choice) {
-      choice = find_exact_lists(ctx, catalog, schema, table, column, cosine, n_rows, 2);
+      choice = find_exact_lists(ctx, catalog, schema, table, column, cosine, n_rows, 2, ip);
     }
     if (!choice) {
       auto const* build_env = std::getenv("SIRIUS_VSS_BUILD_IN_QUERY");
@@ -885,7 +928,7 @@ class rewriter {
         shape.probe_rows           = std::max(probe_rows, 1.0);
         shape.corpus_rows          = static_cast<double>(rows);
         shape.dim                  = static_cast<double>(req.dim);
-        shape.list_bytes_per_value = cosine ? 2 : 1;
+        shape.list_bytes_per_value = cosine || ip ? 2 : 1;
         n_clusters =
           choose_cluster_count(access_path_cost{current_device_scale()}, shape, probes).n_clusters;
       }
@@ -897,13 +940,13 @@ class rewriter {
                                     column,
                                     rows,
                                     n_clusters,
-                                    auto_lists_name(table, column, cosine));
+                                    auto_lists_name(table, column, req.metric));
     }
     if (!choice) { return false; }
     req.search_mode = vector_join_search_mode::approx;
     req.clustering  = choice->clustering;
     req.n_probes =
-      fixed_clusters == 0 && choice->clustering == auto_lists_name(table, column, cosine)
+      fixed_clusters == 0 && choice->clustering == auto_lists_name(table, column, req.metric)
         ? scaled_probes(
             probes, choice->n_clusters, reference_cluster_count(static_cast<double>(rows)))
         : std::min(probes, choice->n_clusters);
@@ -944,8 +987,16 @@ class rewriter {
       return true;
     }
     bool const cosine = req.metric == "cosine";
-    auto choice       = find_exact_lists(
-      *sirius_ctx, catalog, schema, table.name, column, cosine, static_cast<std::int64_t>(rows));
+    bool const ip     = req.metric == "ip";
+    auto choice       = find_exact_lists(*sirius_ctx,
+                                   catalog,
+                                   schema,
+                                   table.name,
+                                   column,
+                                   cosine,
+                                   static_cast<std::int64_t>(rows),
+                                   1,
+                                   ip);
     auto pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
       catalog, schema, table.name);
     access_path_shape shape;
@@ -973,7 +1024,7 @@ class rewriter {
       // never pay). It is searched whole, its bound lowered as it goes, so there is no clustering
       // to fit: partitions would only cut the corpus into smaller GEMMs.
       if (req.dim % 16 != 0) { return false; }
-      shape.list_bytes_per_value = cosine ? 2 : 1;
+      shape.list_bytes_per_value = cosine || ip ? 2 : 1;
       shape.lists_on_device      = true;
       shape.n_clusters           = 1;
       shape.unit_rows            = cosine;
@@ -1001,7 +1052,7 @@ class rewriter {
                                     column,
                                     rows,
                                     1,
-                                    codes_lists_name(table.name, column, cosine));
+                                    codes_lists_name(table.name, column, req.metric));
       if (!choice) { return false; }
     }
     describe(*choice);
@@ -1029,21 +1080,38 @@ class rewriter {
     return true;
   }
 
+  /// The suffix that keeps one metric's in-query lists apart from another's: cosine lists hold
+  /// unit rows, and inner-product lists are FLOAT16 where an l2 join's may be UINT8.
+  static std::string lists_suffix(const std::string& metric)
+  {
+    return metric == "cosine" ? "_cosine" : metric == "ip" ? "_ip" : "";
+  }
+
+  /// Lists an inner-product join can search: FLOAT16 rows with their FP32 rows kept (the bounded
+  /// search, re-scored in FP32), or FP32 rows.
+  static bool ip_searchable(duckdb::SiriusContext& ctx, exact_lists_choice const& choice)
+  {
+    if (choice.encoding == list_encoding::float32) { return true; }
+    if (choice.encoding != list_encoding::float16) { return false; }
+    auto const* lists = find_cluster_lists(ctx, choice.clustering);
+    return lists != nullptr && lists->has_exact_rows() && bound_filter_f16_supports(lists->dim);
+  }
+
   /// The name lists built inside a query are kept under.
   static std::string auto_lists_name(const std::string& table,
                                      const std::string& column,
-                                     bool cosine)
+                                     const std::string& metric)
   {
-    return "__sirius_auto_" + table + "_" + column + (cosine ? "_cosine" : "");
+    return "__sirius_auto_" + table + "_" + column + lists_suffix(metric);
   }
 
   /// The name the exact join's single list of codes, built inside a query, is kept under: apart
   /// from the approximate join's partitions, which it must not stand in for.
   static std::string codes_lists_name(const std::string& table,
                                       const std::string& column,
-                                      bool cosine)
+                                      const std::string& metric)
   {
-    return "__sirius_auto_codes_" + table + "_" + column + (cosine ? "_cosine" : "");
+    return "__sirius_auto_codes_" + table + "_" + column + lists_suffix(metric);
   }
 
   /// Fits a clustering of the pinned column into @p n_clusters and writes its lists, under @p name,
@@ -1079,8 +1147,13 @@ class rewriter {
       lists.table      = table;
       lists.column     = column;
       lists.dim        = req.dim;
-      run_kmeans_build_lists(
-        ctx, lists, cosine ? list_storage::float16 : list_storage::exact, false, cosine);
+      // Inner-product lists are FLOAT16 like cosine's, but of the rows as they are.
+      run_kmeans_build_lists(ctx,
+                             lists,
+                             cosine || req.metric == "ip" ? list_storage::float16
+                                                          : list_storage::exact,
+                             false,
+                             cosine);
     } catch (std::exception const& e) {
       SIRIUS_LOG_INFO(
         "[vector_join_rewrite] building lists for '{}' declined: {}", table, e.what());
@@ -1309,7 +1382,7 @@ class rewriter {
     auto const delim_vec  = delim_bindings[vi];
     auto const probe_vec  = delim_cols[vi];
     auto const corpus_vec = call->a == delim_vec ? call->b : call->a;
-    if ((call->kind == distance_kind::cosine_similarity) != descending) { return decline(13); }
+    if (is_similarity(call->kind) != descending) { return decline(13); }
     if (vector_may_hold_nulls(_context, *dj.children[pi], probe_vec) ||
         vector_may_hold_nulls(_context, *cross.children[1 - dgi], corpus_vec)) {
       return decline(19);
@@ -1500,7 +1573,7 @@ class rewriter {
     auto const call  = as_distance_call(*key);
     if (!call) { return false; }
     bool const asc = topn.orders[0].type == duckdb::OrderType::ASCENDING;
-    if ((call->kind == distance_kind::cosine_similarity) == asc) { return false; }
+    if (is_similarity(call->kind) == asc) { return false; }
     std::size_t ai = 2;
     for (std::size_t c = 0; c < 2; ++c) {
       if (has_binding(*cross_slot->children[c], call->a) &&
@@ -1584,16 +1657,20 @@ class rewriter {
   {
     SiriusVectorJoinBindData bind;
     auto& req        = bind.req;
+    // Every metric but l2 emits a similarity (for ip, the inner product).
     bool const cos   = call.kind != distance_kind::l2;
     req.mode         = mode;
     req.probe_scalar = probe_scalar;
     if (mode == vector_join_mode::threshold) {
-      // Unbounded: every pair passes (a cosine similarity is never below -1).
+      // Unbounded: every pair passes (a cosine similarity is never below -1, an inner product
+      // never below FLOAT's lowest).
       req.eps = call.kind == distance_kind::l2
                   ? static_cast<double>(std::numeric_limits<float>::max())
+                : std::string_view{metric_name(call.kind)} == "ip"
+                  ? -std::numeric_limits<double>::infinity()
                   : -2.0;
     }
-    req.metric      = cos ? "cosine" : "l2";
+    req.metric      = metric_name(call.kind);
     req.search_mode = vector_join_search_mode::exact_gemm;
     req.k           = k;
     req.dim         = static_cast<std::int64_t>(call.dim);
@@ -1849,7 +1926,7 @@ class rewriter {
     }
     remap_above(p);
     SIRIUS_LOG_INFO("[vector_join_rewrite] {} {} rewritten to sirius_knn_join_rel ({}, {})",
-                    cos ? "cosine" : "l2",
+                    metric_name(call.kind),
                     mode == vector_join_mode::per_row_top_k  ? "LATERAL top-" + std::to_string(k)
                     : mode == vector_join_mode::global_top_k ? "global top-" + std::to_string(k)
                                                              : std::string("all-pairs distance"),
@@ -2002,12 +2079,11 @@ class rewriter {
     auto const& a  = pred.call.a;
     auto const& b  = pred.call.b;
     bool ok        = true;
-    bool const cos = pred.call.kind != distance_kind::l2;
     auto check     = [&](const Expression& e) {
       if (reads_vectors_raw(e, a, b)) { ok = false; }
       std::function<void(const Expression&)> metric_ok = [&](const Expression& x) {
         if (auto const call = as_distance_call(x); call && same_pair(*call, a, b)) {
-          if ((call->kind != distance_kind::l2) != cos) { ok = false; }
+          if (!same_metric(call->kind, pred.call.kind)) { ok = false; }
           return;
         }
         duckdb::ExpressionIterator::EnumerateChildren(x, metric_ok);
@@ -2110,13 +2186,14 @@ class rewriter {
     auto& req       = bind.req;
     bool const cos  = pred.call.kind != distance_kind::l2;
     req.mode        = vector_join_mode::threshold;
-    req.metric      = cos ? "cosine" : "l2";
+    req.metric      = metric_name(pred.call.kind);
     req.search_mode = vector_join_search_mode::exact_gemm;
     req.k           = 10;
     req.dim         = static_cast<std::int64_t>(pred.call.dim);
     req.output_type = cos ? vector_join_output_type::similarity : vector_join_output_type::distance;
-    // A cosine-distance bound d is the similarity bound 1 - d.
-    req.eps = pred.call.kind == distance_kind::cosine_distance ? 1.0 - pred.bound : pred.bound;
+    // A cosine-distance bound d is the similarity bound 1 - d; a negative-inner-product bound t
+    // is the inner-product bound -t.
+    req.eps = req_eps_in_score_space(pred);
     req.probe_from_scan = true;
     req.build_from_scan = true;
 
@@ -2474,12 +2551,12 @@ class rewriter {
 
     bool const cos  = pred.call.kind != distance_kind::l2;
     req.mode        = vector_join_mode::threshold;
-    req.metric      = cos ? "cosine" : "l2";
+    req.metric      = metric_name(pred.call.kind);
     req.search_mode = vector_join_search_mode::exact_gemm;
     req.k           = 10;
     req.dim         = static_cast<std::int64_t>(pred.call.dim);
     req.output_type = cos ? vector_join_output_type::similarity : vector_join_output_type::distance;
-    req.eps = pred.call.kind == distance_kind::cosine_distance ? 1.0 - pred.bound : pred.bound;
+    req.eps         = req_eps_in_score_space(pred);
     duckdb::vector<duckdb::LogicalType> returned_types;
     duckdb::vector<std::string> returned_names;
     std::vector<std::pair<ColumnBinding, std::size_t>> remap;
@@ -2635,12 +2712,13 @@ class rewriter {
 
   static double req_eps_in_score_space(const threshold_predicate& pred)
   {
+    if (pred.call.kind == distance_kind::negative_inner_product) { return -pred.bound; }
     return pred.call.kind == distance_kind::cosine_distance ? 1.0 - pred.bound : pred.bound;
   }
 
   static const char* req_metric_name(const threshold_predicate& pred)
   {
-    return pred.call.kind == distance_kind::l2 ? "l2" : "cosine";
+    return metric_name(pred.call.kind);
   }
 
   duckdb::ClientContext& _context;
@@ -2661,7 +2739,9 @@ bool expression_has_vector_distance(Expression& e)
   if (e.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION) {
     auto const& name = e.Cast<duckdb::BoundFunctionExpression>().function.name;
     if (name == "array_distance" || name == "array_cosine_similarity" ||
-        name == "array_cosine_distance") {
+        name == "array_cosine_distance" || name == "array_inner_product" ||
+        name == "array_dot_product" || name == "array_negative_inner_product" ||
+        name == "array_negative_dot_product") {
       return true;
     }
   }

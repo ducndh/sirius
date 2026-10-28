@@ -133,7 +133,9 @@ void bound_filter_f16(std::uint16_t const* x,
 
 /**
  * @brief distances[i] = |probe[r] - x[ids[i]]|^2 in FP32, r = rows[i] (or i / k when @p rows is
- * null), with x read where @p source says. Pairs with ids[i] < 0 are left alone.
+ * null), with x read where @p source says. Pairs with ids[i] < 0 are left alone. With
+ * @p inner_product, distances[i] = -2 probe[r].x[ids[i]] (the FP32 dot, scaled exactly) instead:
+ * the distance an inner-product join ranks by.
  * With @p certain_below, a pair whose current distance is <= certain_below[its row] -- a filter
  * distance already proven to be within the caller's limit -- is not re-scored but set to
  * @p certain_value.
@@ -149,7 +151,8 @@ void exact_distances(float const* probe,
                      rmm::cuda_stream_view stream,
                      rmm::device_async_resource_ref mr,
                      float const* certain_below = nullptr,
-                     float certain_value        = 0.f);
+                     float certain_value        = 0.f,
+                     bool inner_product         = false);
 
 /// out = rows start, start + stride, ... (count of them) of the column @p source reads, FP32
 /// [count x dim] on the device: a strided sample taken without moving the rest of the column.
@@ -161,7 +164,7 @@ void gather_exact_rows(exact_rows const& source,
                        float* out,
                        rmm::cuda_stream_view stream);
 
-/// bound[r] = the largest of row r's k distances (+inf when any is a miss).
+/// bound[r] = the largest of row r's k distances (+inf when any is a miss; any sign).
 void row_max_bound(float const* acc_distances,
                    int64_t n_rows,
                    int64_t k,

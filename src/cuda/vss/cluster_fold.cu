@@ -519,6 +519,25 @@ __global__ void half_rows_norms_kernel(float const* x,
   }
 }
 
+// The inner-product join's distance is D(q, x) = -2 q.x. Its FP16 filter computes F = -2 times the
+// FP32 sum of half(q)_i half(x)_i (the kernels' |half(q)|^2 + |half(x)|^2 - 2 dot with both norms
+// passed as zero), and its re-score R = -2 times the FP32 sum of q_i x_i. With qn = |half(q)|,
+// e_q = |q - half(q)|, e_x <= row_error and |half(x)| <= row_norm:
+//   |D(half(q), half(x)) - D(q, x)| <= 2 (qn e_x + e_q |x|) <= 2 (qn e_x + e_q (row_norm + e_x))
+// by Cauchy-Schwarz (in place of L2's triangle inequality), the filter's FP32 sum is within
+// 2 d 2^-24 qn row_norm of the rounded pair's dot (twice the textbook bound, as for L2: the
+// tensor cores' order is unspecified) and the re-score's within d 2^-24 |q| |x|. So |F - R| is at
+// most the slack below, and a pair with R <= b has F <= b + slack. Widened by 1e-5 for the FP32
+// arithmetic computing it.
+__device__ __forceinline__ float inner_product_half_slack(
+  float qn, float e_q, float row_error, float row_norm, float d)
+{
+  float const x_reach = row_norm + row_error;
+  return 2.f *
+         (qn * row_error + e_q * x_reach + 3.f * d * 5.9604645e-8f * (qn + e_q) * x_reach) *
+         (1.f + 1e-5f);
+}
+
 // FP16 rows are compared as |half(q)|^2 + |half(x)|^2 - 2 half(q).half(x) in FP32; that is the
 // squared distance of the rounded pair up to the FP32 sums' error, at most
 // 2 d 2^-24 (|half(q)| + max |half(x)|)^2 (twice the textbook bound: the tensor cores' order is
@@ -531,13 +550,20 @@ __global__ void float16_bound_limit_kernel(float const* bound,
                                            int64_t d,
                                            int64_t n,
                                            float* limit,
-                                           bool lower)
+                                           bool lower,
+                                           bool inner_product)
 {
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     float const b = bound[i];
     if (!(b < INFINITY)) {
       limit[i] = INFINITY;
+      continue;
+    }
+    if (inner_product) {
+      float const s = inner_product_half_slack(
+        sqrtf(probe_sq[i]), probe_error[i], row_error, row_norm, static_cast<float>(d));
+      limit[i] = lower ? b - s - 1e-6f * (fabsf(b) + s) : b + s + 1e-6f * (fabsf(b) + s);
       continue;
     }
     float const norms = sqrtf(probe_sq[i]) + row_norm;
@@ -570,12 +596,19 @@ __global__ void float16_seed_upper_bound_kernel(float* bound,
                                                 float row_error,
                                                 float row_norm,
                                                 int64_t d,
-                                                int64_t n)
+                                                int64_t n,
+                                                bool inner_product)
 {
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     float const b = bound[i];
     if (!(b < INFINITY)) { continue; }
+    if (inner_product) {
+      float const s = inner_product_half_slack(
+        sqrtf(probe_sq[i]), probe_error[i], row_error, row_norm, static_cast<float>(d));
+      bound[i] = b + s + 1e-6f * (fabsf(b) + s);
+      continue;
+    }
     float const norms = sqrtf(probe_sq[i]) + row_norm;
     float const sums  = 2.f * static_cast<float>(d) * 5.9604645e-8f * norms * norms;
     float const reach = sqrtf(fmaxf(b + sums, 0.f)) + probe_error[i] + row_error;
@@ -1085,11 +1118,12 @@ void float16_seed_upper_bound(float* bound,
                               float row_norm,
                               int64_t d,
                               int64_t n,
-                              rmm::cuda_stream_view stream)
+                              rmm::cuda_stream_view stream,
+                              bool inner_product)
 {
   if (n == 0) { return; }
   float16_seed_upper_bound_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
-    bound, probe_sq, probe_error, row_error, row_norm, d, n);
+    bound, probe_sq, probe_error, row_error, row_norm, d, n, inner_product);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
@@ -1119,12 +1153,13 @@ void float16_bound_limit(float const* bound,
                          int64_t n,
                          float* limit,
                          rmm::cuda_stream_view stream,
-                         bool lower)
+                         bool lower,
+                         bool inner_product)
 {
   if (n == 0) { return; }
   auto const grid = std::min(grid_for(n), 65535);
   float16_bound_limit_kernel<<<grid, kBlock, 0, stream.value()>>>(
-    bound, probe_sq, probe_error, row_error, row_norm, d, n, limit, lower);
+    bound, probe_sq, probe_error, row_error, row_norm, d, n, limit, lower, inner_product);
   CUDF_CHECK_CUDA(stream.value());
 }
 

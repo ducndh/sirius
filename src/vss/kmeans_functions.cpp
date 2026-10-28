@@ -412,7 +412,8 @@ std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
                                                    const std::string& column,
                                                    bool cosine,
                                                    std::int64_t n_rows,
-                                                   std::int64_t min_clusters)
+                                                   std::int64_t min_clusters,
+                                                   bool float_rows_only)
 {
   std::optional<exact_lists_choice> found;
   for (auto const& name : ctx.get_cuvs_index_cache().names_on_column(
@@ -420,7 +421,7 @@ std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
     auto const* lists = find_cluster_lists(ctx, name);
     if (lists == nullptr || lists->n_rows != n_rows || lists->unit_rows != cosine) { continue; }
     bool const exact = lists->encoding == list_encoding::float32 ||
-                       lists->encoding == list_encoding::uint8 ||
+                       (lists->encoding == list_encoding::uint8 && !float_rows_only) ||
                        (lists->encoding == list_encoding::float16 && lists->has_exact_rows() &&
                         bound_filter_f16_supports(lists->dim));
     if (!exact) { continue; }

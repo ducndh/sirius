@@ -1920,6 +1920,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact;
   auto const metric =
     vss::join_selection_distance_type_from_metric(_request.metric, exact_unexpanded);
+  // An inner-product join ranks by D = -2 q.x (smaller is closer, like a distance; the factor is
+  // exact in FP32), so every fold, merge and bound below works on it unchanged. Its scores are
+  // computed from the FP32 rows: by the FP32 GEMM, or by the FP32 re-score of an FP16 filter.
+  bool const ip = metric == cuvs::distance::DistanceType::InnerProduct;
+  if (ip && !gemm_search_enabled()) {
+    throw std::runtime_error(
+      "[sirius_physical_vector_join_stream] an inner-product join runs only through the GEMM "
+      "search, which SIRIUS_VSS_GEMM_TOPK=0 turns off");
+  }
 
   // Running [n_left x k_join] accumulator. Seeded by the first right batch, then
   // every later batch is folded in and released, so peak device memory does not
@@ -2023,10 +2032,26 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   };
   // The kernel works in distance space. For cosine with a similarity threshold the user's
   // "score >= eps" is the same set as "distance <= 1 - eps"; for a distance threshold it is eps
-  // directly. Identical to what the shape_threshold path below computes.
-  auto const radius_eps = _request.output_type == vss::vector_join_output_type::similarity
-                            ? static_cast<float>(1.0 - _request.eps)
-                            : static_cast<float>(_request.eps);
+  // directly. Identical to what the shape_threshold path below computes. For an inner product,
+  // "q.x >= eps" is D = -2 q.x <= -2 eps, and a negative-inner-product bound "-q.x <= eps" is
+  // D <= 2 eps; past FLOAT's range the radius is infinite (every pair) or -infinite (none).
+  auto const radius_eps = [&] {
+    if (ip) {
+      double const r = _request.output_type == vss::vector_join_output_type::similarity
+                         ? -2.0 * _request.eps
+                         : 2.0 * _request.eps;
+      if (r > static_cast<double>(std::numeric_limits<float>::max())) {
+        return std::numeric_limits<float>::infinity();
+      }
+      if (r < -static_cast<double>(std::numeric_limits<float>::max())) {
+        return -std::numeric_limits<float>::infinity();
+      }
+      return static_cast<float>(r);
+    }
+    return _request.output_type == vss::vector_join_output_type::similarity
+             ? static_cast<float>(1.0 - _request.eps)
+             : static_cast<float>(_request.eps);
+  }();
 
   // A threshold join asked for the pairs in one order only (earlier_by / other_by) keeps a pair
   // by its two rows' keys; candidate ids are pin rows, or over inexact lists their layout rows.
@@ -2549,8 +2574,18 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       scan_f16 || (!int8_search && gemm_search_enabled() && _lists != nullptr &&
                    _lists->encoding == vss::list_encoding::float16 && _lists->has_exact_rows() &&
                    (search_metric == cuvs::distance::DistanceType::L2Expanded ||
-                    search_metric == cuvs::distance::DistanceType::L2SqrtExpanded) &&
+                    search_metric == cuvs::distance::DistanceType::L2SqrtExpanded || ip) &&
                    vss::bound_filter_f16_supports(dim) && bound_gemm_enabled);
+    // An inner-product join reads FLOAT16 lists only through the bounded search, which re-scores
+    // every pair from the FP32 rows; ranked on the half rows alone its scores would be the half
+    // rows' inner products.
+    if (ip && _lists != nullptr && _lists->encoding == vss::list_encoding::float16 &&
+        !f16_bounded) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] an inner-product join reads float16 cluster lists "
+        "only through the bounded search (vector width a multiple of 16, the FP32 rows kept, "
+        "SIRIUS_VSS_BOUND_GEMM on); rebuild the lists with storage => 'float32'");
+    }
     bool const any_bounded = bounded || f16_bounded;
     // FP16 and INT8 lists filter with inexact distances: their bounded search keeps layout rows as
     // ids and re-scores every candidate in FP32 from the kept rows. Unseeded, they search the
@@ -2565,11 +2600,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     std::optional<rmm::device_uvector<float>> certain_limit;
     std::optional<rmm::device_uvector<std::uint16_t>> probe_f16;
     std::optional<rmm::device_uvector<float>> probe_sqf, probe_half_error;
+    std::optional<rmm::device_uvector<float>> ip_probe_zero_sq, ip_row_zero_sq;
     // The FLOAT16 rows' largest rounding error and norm, which the filter limit allows for: the
     // lists' own, or for a scanned corpus the staged chunk's, set as each chunk is coded.
     float row_half_error = _lists != nullptr ? _lists->half_error : 0.f;
     float row_norm_max   = _lists != nullptr ? _lists->max_row_norm : 0.f;
-    auto code_limits     = [&](float const* bound_rows, float* limit, bool lower) {
+    auto code_limits = [&](float const* bound_rows, float* limit, bool lower) {
       if (codes_int8) {
         vss::int8_code_limit(bound_rows,
                              probe_code_error->data(),
@@ -2589,7 +2625,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                  n_left,
                                  limit,
                                  stream,
-                                 lower);
+                                 lower,
+                                 ip);
       }
     };
     auto refresh_code_limit = [&](float const* bound_rows) {
@@ -2612,7 +2649,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // Unseeded, sweep 0 ranks each row's nearest cluster on the half-precision tensor cores from
     // the stored rows; only the bound it leaves is used, and that is re-scored in FP32 first.
     // SIRIUS_VSS_F16_GEMM=0 widens the rows and ranks them with the FP32 GEMM instead.
-    bool const f16_sweep0 = f16_bounded && !scan_f16 && !seed && [] {
+    // An inner-product join keeps to the searches it was verified on: the seed, the bounded
+    // filter, and the FP32 GEMM ranking of an unseeded sweep 0.
+    bool const f16_sweep0 = f16_bounded && !scan_f16 && !seed && !ip && [] {
       auto const* v = std::getenv("SIRIUS_VSS_F16_GEMM");
       return v == nullptr || std::string_view{v} != "0";
     }();
@@ -2637,7 +2676,43 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                            nullptr,
                            nullptr,
                            stream);
+      if (ip) {
+        // A probe component past half's range becomes infinite, and its pairs' filter values
+        // infinite or NaN, which no limit admits: refused rather than silently dropped. (The
+        // rows' own range is checked when their lists are built.)
+        std::vector<float> host_sq(static_cast<std::size_t>(n_left));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(host_sq.data(),
+                                      probe_sqf->data(),
+                                      host_sq.size() * sizeof(float),
+                                      cudaMemcpyDeviceToHost,
+                                      stream.value()));
+        stream.synchronize();
+        for (auto const v : host_sq) {
+          if (!std::isfinite(v)) {
+            throw std::runtime_error(
+              "[sirius_physical_vector_join_stream] a probe row is outside float16's range for "
+              "the inner-product join over float16 lists; build them with storage => 'float32'");
+          }
+        }
+        // The filter kernels compute |q|^2 + |x|^2 - 2 q.x from the norms they are handed: with
+        // zeros on both sides that is -2 q.x, the inner-product distance, exactly.
+        ip_probe_zero_sq.emplace(static_cast<std::size_t>(n_left), stream, mr);
+        CUDF_CUDA_TRY(cudaMemsetAsync(
+          ip_probe_zero_sq->data(), 0, ip_probe_zero_sq->size() * sizeof(float), stream.value()));
+        if (_lists != nullptr && !_lists->offsets.empty()) {
+          ip_row_zero_sq.emplace(
+            static_cast<std::size_t>(std::max<std::int64_t>(_lists->offsets.back(), 1)),
+            stream,
+            mr);
+          CUDF_CUDA_TRY(cudaMemsetAsync(
+            ip_row_zero_sq->data(), 0, ip_row_zero_sq->size() * sizeof(float), stream.value()));
+        }
+      }
     }
+    // The probe norms the filter kernels read: zeros for an inner product (see above).
+    auto probe_filter_sq = [&]() -> float const* {
+      return ip_probe_zero_sq ? ip_probe_zero_sq->data() : probe_sqf->data();
+    };
     // Where the FP32 re-score reads a layout row: the lists' kept rows, or for a scanned corpus the
     // staged chunk, pointed at as each chunk is coded (its candidates are flushed before it goes).
     auto exact_source = rescore && _lists != nullptr ? _lists->exact_source() : vss::exact_rows{};
@@ -2703,7 +2778,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                stream,
                                mr,
                                certain_limit ? certain_limit->data() : nullptr,
-                               radius_bound);
+                               radius_bound,
+                               ip);
           kept = vss::take_pairs(kept.rows.data(),
                                  kept.ids.data(),
                                  kept.distances.data(),
@@ -2768,7 +2844,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                  exact_source,
                                  dim,
                                  stream,
-                                 mr);
+                                 mr,
+                                 nullptr,
+                                 0.f,
+                                 ip);
             fold_best(taken.rows.data(),
                       taken.ids.data(),
                       taken.distances.data(),
@@ -2797,7 +2876,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                              stream,
                              mr,
                              certain_limit ? certain_limit->data() : nullptr,
-                             radius_bound);
+                             radius_bound,
+                             ip);
       }
       auto const t1 = debug_mark();
       if (dbg) { rescore_seconds += std::chrono::duration<double>(t1 - t0).count(); }
@@ -2882,7 +2962,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                               sl.n,
                               sl.id_base,
                               probe_f16->data(),
-                              probe_sqf->data(),
+                              probe_filter_sq(),
                               sl.rows,
                               sl.m,
                               dim,
@@ -2925,7 +3005,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                 f16_bounded,
                                 f16_bounded ? static_cast<void const*>(probe_f16->data())
                                             : static_cast<void const*>(probe_i8->data()),
-                                f16_bounded ? static_cast<void const*>(probe_sqf->data())
+                                f16_bounded ? static_cast<void const*>(probe_filter_sq())
                                             : static_cast<void const*>(probe_sq->data()),
                                 dim,
                                 f16_bounded || codes_int8 ? code_limit->data() : bound->data(),
@@ -2970,10 +3050,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     bool const lists_on_host = _lists != nullptr && _lists->tier == cucascade::memory::Tier::HOST;
     // The per-row norms the searches read (INT32 for byte rows, FP32 for half rows) are copied in
     // behind the rows, so lists on the host keep none of their size on the device.
-    void const* const list_norms = _lists == nullptr ? nullptr
-                                   : _lists->encoding == vss::list_encoding::float16
-                                     ? (_lists->row_sq_f32 ? _lists->row_sq_f32->data() : nullptr)
-                                     : (_lists->row_sq ? _lists->row_sq->data() : nullptr);
+    // An inner product's filter reads zeros in their place (see probe_filter_sq).
+    void const* const list_norms =
+      _lists == nullptr  ? nullptr
+      : ip_row_zero_sq   ? static_cast<void const*>(ip_row_zero_sq->data())
+      : _lists->encoding == vss::list_encoding::float16
+        ? (_lists->row_sq_f32 ? _lists->row_sq_f32->data() : nullptr)
+        : (_lists->row_sq ? _lists->row_sq->data() : nullptr);
     auto const staged_rows_bytes = [&](std::int64_t rows) {
       return (static_cast<std::size_t>(rows + 4) * _lists->row_bytes() + 255) / 256 * 256;
     };
@@ -3106,9 +3189,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                     stream.value()));
       if (f16_bounded) {
         vss::seed_bound_f16(static_cast<std::uint16_t const*>(_lists->device_vectors->data()),
-                            static_cast<float const*>(_lists->row_sq_f32->data()),
+                            ip_row_zero_sq
+                              ? ip_row_zero_sq->data()
+                              : static_cast<float const*>(_lists->row_sq_f32->data()),
                             probe_f16->data(),
-                            probe_sqf->data(),
+                            probe_filter_sq(),
                             first_d.data(),
                             count_d.data(),
                             order_d.data(),
@@ -3126,7 +3211,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                       _lists->max_row_norm,
                                       dim,
                                       n_left,
-                                      stream);
+                                      stream,
+                                      ip);
       } else {
         vss::seed_bound_int8(static_cast<std::int8_t const*>(_lists->device_vectors->data()),
                              static_cast<std::int32_t const*>(_lists->row_sq->data()),
@@ -3179,7 +3265,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       // every cluster in one launch over the device lists (nearest_cluster_topk) instead of one
       // GEMM and top-k call per cluster, whose ~0.18 ms of host setup dwarfs its arithmetic once
       // each cluster has only tens of probe rows. SIRIUS_VSS_GROUPED_SWEEP0=0 keeps the calls.
-      bool const grouped_sweep0 = sweep == 0 && rescore && !seed && !radius_join &&
+      bool const grouped_sweep0 = sweep == 0 && rescore && !seed && !radius_join && !ip &&
                                   earlier_cut == nullptr && k_join <= 64 && !lists_on_host &&
                                   ((int8_search && probe_i8) || (f16_sweep0 && probe_f16)) && [] {
                                     auto const* v = std::getenv("SIRIUS_VSS_GROUPED_SWEEP0");
@@ -3234,7 +3320,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                  exact_source,
                                  dim,
                                  stream,
-                                 mr);
+                                 mr,
+                                 nullptr,
+                                 0.f,
+                                 ip);
           }
           vss::row_max_bound(
             acc_distances->view().data<float>(), n_left, k_join, bound->data(), stream);
@@ -3638,7 +3727,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                  scan_source(s),
                                  dim,
                                  stream,
-                                 mr);
+                                 mr,
+                                 nullptr,
+                                 0.f,
+                                 ip);
           }
           // Fold in place: a row is routed to a cluster at most once, so the rows of one slice
           // are distinct and no two threads of the fold write the same accumulator row.
@@ -4060,9 +4152,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         // The kernel works in distance space. For cosine with a similarity threshold the
         // user's "score >= eps" is the same set as "distance <= 1 - eps"; for a distance
         // threshold it is eps directly.
-        auto const max_distance = _request.output_type == vss::vector_join_output_type::similarity
-                                    ? static_cast<float>(1.0 - _request.eps)
-                                    : static_cast<float>(_request.eps);
+        auto const max_distance = radius_eps;
         bool truncated          = false;
         shaped                  = vss::shape_threshold(acc_neighbors->view(),
                                       acc_distances->view(),

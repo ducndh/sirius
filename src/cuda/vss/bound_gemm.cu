@@ -928,7 +928,9 @@ __device__ inline float pinned_value(pinned_row const& r, int c, int block_shift
 }
 
 // One warp per pair: the exact FP32 squared distance between probe row rows[i] (or i / k when
-// rows is null) and layout row ids[i], read where src says.
+// rows is null) and layout row ids[i], read where src says; with IP, -2 times their FP32 inner
+// product instead (the inner-product join's distance).
+template <bool IP>
 __global__ void exact_distances_kernel(float const* __restrict__ probe,
                                        int32_t const* __restrict__ rows,
                                        int64_t k,
@@ -962,8 +964,12 @@ __global__ void exact_distances_kernel(float const* __restrict__ probe,
     if (src.copy_blocks != nullptr) {
       float const* x = src.copy_blocks[id / src.rows_per_block] + (id % src.rows_per_block) * d;
       for (int c = lane; c < d; c += 32) {
-        float const t = q[c] - x[c];
-        s             = fmaf(t, t, s);
+        if constexpr (IP) {
+          s = fmaf(q[c], x[c], s);
+        } else {
+          float const t = q[c] - x[c];
+          s             = fmaf(t, t, s);
+        }
       }
     } else {
       // A pinned row need not start on a 128-byte line (a host chunk's floats follow its other
@@ -977,8 +983,13 @@ __global__ void exact_distances_kernel(float const* __restrict__ probe,
         auto const at = line + lane * static_cast<int64_t>(sizeof(float));
         auto const c  = (at - x.offset) / static_cast<int64_t>(sizeof(float));
         if (at >= x.offset && c < d) {
-          float const t = q[c] - pinned_value(pinned_row{x.blocks, at}, 0, src.block_shift);
-          s             = fmaf(t, t, s);
+          float const v = pinned_value(pinned_row{x.blocks, at}, 0, src.block_shift);
+          if constexpr (IP) {
+            s = fmaf(q[c], v, s);
+          } else {
+            float const t = q[c] - v;
+            s             = fmaf(t, t, s);
+          }
         }
       }
     }
@@ -986,7 +997,7 @@ __global__ void exact_distances_kernel(float const* __restrict__ probe,
     for (int o = 16; o > 0; o /= 2) {
       s += __shfl_xor_sync(0xffffffffu, s, o);
     }
-    if (lane == 0) { distances[i] = s; }
+    if (lane == 0) { distances[i] = IP ? -2.f * s : s; }
   }
 }
 
@@ -1037,7 +1048,8 @@ __global__ void row_max_kernel(float const* acc_d, int64_t n_rows, int64_t k, fl
 {
   for (int64_t r = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; r < n_rows;
        r += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    float b = 0.f;
+    // From -inf, not 0: an inner-product join's distances are negative.
+    float b = -INFINITY;
     for (int64_t j = 0; j < k; ++j) {
       b = fmaxf(b, acc_d[r * k + j]);
     }
@@ -1085,8 +1097,10 @@ __global__ void merge_keys_kernel(float const* acc_d,
       d   = cand_d[i - acc_n];
       atomicAdd(per_row + row, 1);
     }
-    // Distances are >= 0, so their bit patterns order as unsigned integers (+inf included).
-    keys[i]  = (row << 32) | __float_as_uint(fmaxf(d, 0.f));
+    // The bits flipped so that they order as unsigned integers for any sign (an inner-product
+    // join's distances are negative); for d >= 0 (+inf included) the order is the bits' own.
+    auto const bits = __float_as_uint(d);
+    keys[i]         = (row << 32) | ((bits & 0x80000000u) != 0 ? ~bits : (bits | 0x80000000u));
     order[i] = i;
   }
 }
@@ -1450,7 +1464,8 @@ void exact_distances(float const* probe,
                      rmm::cuda_stream_view stream,
                      rmm::device_async_resource_ref mr,
                      float const* certain_below,
-                     float certain_value)
+                     float certain_value,
+                     bool inner_product)
 {
   if (n_pairs == 0) { return; }
   // From the pin, the pairs are taken in pin-row order. A copy in layout order kept each
@@ -1495,7 +1510,10 @@ void exact_distances(float const* probe,
   auto const warps_per_block = 8;
   auto const grid            = static_cast<int>(
     std::clamp<int64_t>((n_pairs + warps_per_block - 1) / warps_per_block, 1, 65535));
-  exact_distances_kernel<<<grid, warps_per_block * 32, 0, stream.value()>>>(
+  (inner_product ? exact_distances_kernel<true> : exact_distances_kernel<false>)<<<grid,
+                                                                                warps_per_block * 32,
+                                                                                0,
+                                                                                stream.value()>>>(
     probe,
     rows,
     k,

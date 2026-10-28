@@ -2933,6 +2933,7 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   req.eps                  = 0.0;
   bool join_mode_is_set    = false;
   bool output_type_is_set  = false;
+  bool eps_is_set          = false;
   std::string left_schema  = "main";
   std::string right_schema = "main";
   std::vector<std::string> left_out_cols;
@@ -2953,7 +2954,8 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
     } else if (key == "n_probes") {
       req.n_probes = kv.second.GetValue<int64_t>();
     } else if (key == "eps") {
-      req.eps = kv.second.GetValue<double>();
+      req.eps    = kv.second.GetValue<double>();
+      eps_is_set = true;
     } else if (key == "metric") {
       req.metric = StringUtil::Lower(kv.second.ToString());
     } else if (key == "search_mode") {
@@ -3088,17 +3090,27 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
     throw BinderException(
       "sirius_knn_join: n_probes only means anything with clustering => '<name>'");
   }
-  if (req.eps < 0.0) { throw BinderException("sirius_knn_join: eps must be >= 0"); }
-  if (req.metric != "l2" && req.metric != "cosine") {
-    throw BinderException("sirius_knn_join: metric must be one of 'l2', 'cosine', got '" +
+  // 'ip' is DuckDB's inner product: the score is q.x (output_type 'similarity', the default) or
+  // array_negative_inner_product's -q.x ('distance'), and eps bounds that score, so it may be
+  // negative; any eps given makes the join a threshold join unless mode says otherwise.
+  bool const ip = req.metric == "ip";
+  if (req.eps < 0.0 && !ip) { throw BinderException("sirius_knn_join: eps must be >= 0"); }
+  if (req.metric != "l2" && req.metric != "cosine" && !ip) {
+    throw BinderException("sirius_knn_join: metric must be one of 'l2', 'cosine', 'ip', got '" +
                           req.metric + "'");
   }
   if (!join_mode_is_set) {
-    req.mode = req.eps > 0.0 ? vector_join_mode::threshold : vector_join_mode::per_row_top_k;
+    req.mode = (ip ? eps_is_set : req.eps > 0.0) ? vector_join_mode::threshold
+                                                 : vector_join_mode::per_row_top_k;
   }
   if (!output_type_is_set) {
-    req.output_type = req.metric == "cosine" ? vector_join_output_type::similarity
-                                             : vector_join_output_type::distance;
+    req.output_type = req.metric == "cosine" || ip ? vector_join_output_type::similarity
+                                                   : vector_join_output_type::distance;
+  }
+  if (ip && (req.best_only || !req.earlier_by.empty())) {
+    throw BinderException(
+      "sirius_knn_join: keep => 'best', earlier_by and other_by are not supported for metric => "
+      "'ip'");
   }
   if (req.best_only && req.mode != vector_join_mode::threshold) {
     throw BinderException(

@@ -110,6 +110,10 @@ threshold_join_result brute_force_threshold(raft::device_resources const& res,
                                             std::size_t tile_rows,
                                             std::size_t tile_cols)
 {
+  // See brute_force_knn: the inner product's distance (-2 q.x) only exists in the GEMM form.
+  if (metric == cuvs::distance::DistanceType::InnerProduct) {
+    return gemm_threshold(res, dataset, queries, eps, metric, mr);
+  }
   auto const stream = raft::resource::get_cuda_stream(res);
   auto const policy = raft::resource::get_thrust_policy(res);
 

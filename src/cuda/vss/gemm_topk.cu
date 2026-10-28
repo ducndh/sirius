@@ -56,7 +56,9 @@ constexpr int kWarp  = 32;
 // A cosine THRESHOLD instead keeps the raw dot product and applies 1 - q.x / (|q||x|) per pair:
 // on the boundary that is what decides membership, and it is the formula DuckDB and cuVS round
 // the same way, where normalizing first moves a few boundary pairs.
-enum class score_kind : int { l2_squared, l2, cosine, cosine_raw };
+// Inner product ranks by -2 q.x, a GEMM over [q] and [-2x]: the score is the join's distance
+// itself (twice the negative inner product, exact in FP32 since the factor is a power of two).
+enum class score_kind : int { l2_squared, l2, cosine, cosine_raw, inner_product };
 
 std::optional<score_kind> score_kind_of(cuvs::distance::DistanceType metric)
 {
@@ -64,6 +66,7 @@ std::optional<score_kind> score_kind_of(cuvs::distance::DistanceType metric)
     case cuvs::distance::DistanceType::L2Expanded: return score_kind::l2_squared;
     case cuvs::distance::DistanceType::L2SqrtExpanded: return score_kind::l2;
     case cuvs::distance::DistanceType::CosineExpanded: return score_kind::cosine;
+    case cuvs::distance::DistanceType::InnerProduct: return score_kind::inner_product;
     default: return std::nullopt;
   }
 }
@@ -75,6 +78,7 @@ __global__ void prepare_dataset_kernel(
 {
   bool const cosine = kind == static_cast<int>(score_kind::cosine) ||
                       kind == static_cast<int>(score_kind::cosine_raw);
+  bool const ip      = kind == static_cast<int>(score_kind::inner_product);
   auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / kWarp);
   auto const lane  = static_cast<int64_t>(threadIdx.x % kWarp);
   for (int64_t r = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp; r < n; r += warps) {
@@ -92,12 +96,12 @@ __global__ void prepare_dataset_kernel(
     for (int64_t j = lane; j < d; j += kWarp) {
       out[r * dp + j] = scale * x[r * d + j];
     }
-    auto const extra = cosine ? d : d + 1;
+    auto const extra = cosine || ip ? d : d + 1;
     for (int64_t j = extra + lane; j < dp; j += kWarp) {
       out[r * dp + j] = 0.f;
     }
     if (lane == 0) {
-      if (!cosine) { out[r * dp + d] = acc; }
+      if (!cosine && !ip) { out[r * dp + d] = acc; }
       root_norms[r] = sqrtf(acc);
     }
   }
@@ -110,6 +114,7 @@ __global__ void prepare_queries_kernel(
 {
   bool const cosine = kind == static_cast<int>(score_kind::cosine) ||
                       kind == static_cast<int>(score_kind::cosine_raw);
+  bool const ip      = kind == static_cast<int>(score_kind::inner_product);
   auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / kWarp);
   auto const lane  = static_cast<int64_t>(threadIdx.x % kWarp);
   for (int64_t r = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp; r < m; r += warps) {
@@ -127,12 +132,12 @@ __global__ void prepare_queries_kernel(
     for (int64_t j = lane; j < d; j += kWarp) {
       out[r * dp + j] = scale * q[r * d + j];
     }
-    auto const extra = cosine ? d : d + 1;
+    auto const extra = cosine || ip ? d : d + 1;
     for (int64_t j = extra + lane; j < dp; j += kWarp) {
       out[r * dp + j] = 0.f;
     }
     if (lane == 0) {
-      if (!cosine) { out[r * dp + d] = 1.f; }
+      if (!cosine && !ip) { out[r * dp + d] = 1.f; }
       norms[r] = acc;
     }
   }
@@ -143,6 +148,8 @@ __global__ void prepare_queries_kernel(
 __device__ __forceinline__ float score_to_distance(float s, float qn, int kind)
 {
   if (kind == static_cast<int>(score_kind::cosine)) { return 1.f + s; }
+  // -2 q.x is the distance itself; it is negative for every pair with a positive inner product.
+  if (kind == static_cast<int>(score_kind::inner_product)) { return s; }
   auto const v = fmaxf(s + qn, 0.f);
   return kind == static_cast<int>(score_kind::l2) ? sqrtf(v) : v;
 }
@@ -237,6 +244,8 @@ __global__ void threshold_bounds_kernel(
        r += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     if (kind == static_cast<int>(score_kind::cosine)) {
       bounds[r] = eps - 1.f;  // 1 + s <= eps
+    } else if (kind == static_cast<int>(score_kind::inner_product)) {
+      bounds[r] = eps;  // the score is the distance, -2 q.x <= eps
     } else {
       auto const eps2 = kind == static_cast<int>(score_kind::l2) ? eps * eps : eps;
       bounds[r]       = eps2 - norms[r];  // s + |q|^2 <= eps^2
@@ -273,8 +282,13 @@ struct gemm_search {
       m(queries.extent(0)),
       d(dataset.extent(1)),
       // L2 carries |x|^2 through one extra column; the pad keeps rows 16-byte aligned.
-      dp((d + (kind_ == score_kind::cosine || kind_ == score_kind::cosine_raw ? 0 : 1) + 3) / 4 *
-         4),
+      dp((d +
+          (kind_ == score_kind::cosine || kind_ == score_kind::cosine_raw ||
+               kind_ == score_kind::inner_product
+             ? 0
+             : 1) +
+          3) /
+         4 * 4),
       kind(kind_),
       xa(static_cast<std::size_t>(n * dp), raft::resource::get_cuda_stream(res), mr),
       qa(static_cast<std::size_t>(m * dp), raft::resource::get_cuda_stream(res), mr),
