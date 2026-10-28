@@ -4384,6 +4384,18 @@ static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scop
                    params->enable_runtime_size_estimation);
 }
 
+// Only checks the value: the vector join's rewrite reads the setting when it plans a join.
+static void SetVectorJoinProbes(ClientContext& /*context*/, SetScope /*scope*/, Value& parameter)
+{
+  if (parameter.IsNull()) { return; }
+  auto const c = DoubleValue::Get(parameter);
+  if (std::isnan(c) || c < 0.0) {
+    throw InvalidInputException(
+      "vector_join_probes must be a number >= 0 (0 runs the exact join), got %s",
+      parameter.ToString());
+  }
+}
+
 void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
 {
   auto const& operator_defaults    = defaults.get_operator_params();
@@ -4484,17 +4496,20 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
   add_sirius_option(config,
                     option_visibility::user,
                     "vector_join_probes",
-                    "Clusters each probe row searches when a vector join written in SQL goes "
-                    "through cluster lists (0, the default: every cluster, an exact answer)",
-                    LogicalType::BIGINT,
-                    Value::BIGINT(0));
+                    "c >= 0: makes a vector join written in SQL approximate. Each probe row "
+                    "searches min(ceil(c * sqrt(N)), N) of the N clusters of lists Sirius sized "
+                    "itself, or ceil(c) of lists built explicitly or under vector_join_clusters "
+                    "(0, the default: no clusters, the exact join)",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(0),
+                    SetVectorJoinProbes);
   add_sirius_option(config,
                     option_visibility::user,
                     "vector_join_clusters",
                     "Clusters of the lists a vector join builds inside a statement under "
-                    "vector_join_probes (0, the default: chosen by cost from the probe side's "
-                    "estimated rows, with vector_join_probes stated against sqrt(rows) clusters, "
-                    "at most 1024, and scaled to the count chosen)",
+                    "vector_join_probes, which is then a count of clusters (0, the default: "
+                    "chosen by cost from the probe side's estimated rows, from sqrt(rows) "
+                    "clusters, at most 1024, up to 16 times that)",
                     LogicalType::BIGINT,
                     Value::BIGINT(0));
   add_sirius_option(config,

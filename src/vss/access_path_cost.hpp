@@ -153,43 +153,62 @@ struct cluster_count_choice {
   std::int64_t probes{0};
 };
 
-/// The count vector_join_probes is stated against: the square root of the rows, at most 1,024.
+/// The fewest clusters choose_cluster_count considers: the square root of the rows, at most 1,024.
 [[nodiscard]] inline std::int64_t reference_cluster_count(double corpus_rows)
 {
   return std::clamp<std::int64_t>(static_cast<std::int64_t>(std::sqrt(corpus_rows)), 1, 1024);
 }
 
-/// @p probes of the reference count, as probes of @p n_clusters. Recall follows probes over the
-/// square root of the cluster count, so this holds it: on SIFT100M and Deep100M between 1,024
-/// and 16,384 clusters, within 0.003 from recall 0.97 up and higher below it.
-[[nodiscard]] inline std::int64_t scaled_probes(std::int64_t probes,
-                                                std::int64_t n_clusters,
-                                                std::int64_t reference)
+namespace detail {
+/// ceil(@p x) for @p x a product of decimals: 0.07 * 100 is 7.000000000000001 in doubles, which a
+/// plain ceil makes 8.
+[[nodiscard]] inline double ceil_of_product(double x) { return std::ceil(x * (1.0 - 1e-12)); }
+
+/// min(max(@p want, 1), @p n_clusters), with @p want possibly infinite.
+[[nodiscard]] inline std::int64_t clamp_probes(double want, std::int64_t n_clusters)
 {
-  // Every reference cluster is every cluster: an exact answer stays one.
-  if (probes >= reference) { return n_clusters; }
-  if (n_clusters <= reference) { return std::min(probes, n_clusters); }
-  auto const scaled =
-    std::ceil(static_cast<double>(probes) * std::sqrt(static_cast<double>(n_clusters) / reference));
-  return std::min(static_cast<std::int64_t>(scaled), n_clusters);
+  if (!(want < static_cast<double>(n_clusters))) { return n_clusters; }
+  return std::max<std::int64_t>(1, static_cast<std::int64_t>(want));
+}
+}  // namespace detail
+
+/// The clusters a probe row visits under `SET vector_join_probes = c` when Sirius picked the count
+/// N of the lists itself: n_p = min(ceil(c * sqrt(N)), N), at least 1 for c > 0, and 0 (the exact
+/// join, no lists) for c = 0. Recall follows n_p / sqrt(N), so one c holds it whichever N the cost
+/// model picks: on SIFT100M and Deep100M between 1,024 and 16,384 clusters, within 0.003 from
+/// recall 0.97 up and higher below it. c >= sqrt(N) visits every cluster.
+[[nodiscard]] inline std::int64_t scaled_probes(double c, std::int64_t n_clusters)
+{
+  if (!(c > 0.0) || n_clusters <= 0) { return 0; }
+  return detail::clamp_probes(
+    detail::ceil_of_product(c * std::sqrt(static_cast<double>(n_clusters))), n_clusters);
+}
+
+/// The clusters a probe row visits under `SET vector_join_probes = c` when the user fixed the
+/// count N (lists built with sirius_kmeans_build_lists, or `vector_join_clusters` set): c counts
+/// clusters there, rounded up, n_p = min(ceil(c), N), at least 1 for c > 0.
+[[nodiscard]] inline std::int64_t literal_probes(double c, std::int64_t n_clusters)
+{
+  if (!(c > 0.0) || n_clusters <= 0) { return 0; }
+  return detail::clamp_probes(detail::ceil_of_product(c), n_clusters);
 }
 
 /// More clusters cost the build once (the fit and the assignment grow with the count) and save
 /// every probe row search time (it scans probes x rows-per-cluster rows, which at held recall
 /// falls with the square root of the count). Picks the count, among the reference and its
 /// doublings up to 16 times it with at least 256 rows a cluster, with the least estimated build
-/// plus search for @p shape's probe rows; @p probes is stated against the reference.
+/// plus search for @p shape's probe rows, each count N searched through scaled_probes(@p c, N).
 [[nodiscard]] inline cluster_count_choice choose_cluster_count(access_path_cost const& cost,
                                                                access_path_shape shape,
-                                                               std::int64_t probes)
+                                                               double c)
 {
   auto const reference = reference_cluster_count(shape.corpus_rows);
-  cluster_count_choice best{reference, std::min(probes, reference)};
+  cluster_count_choice best{reference, scaled_probes(c, reference)};
   double best_cost = 0;
   for (auto n = reference; n <= 16 * reference; n *= 2) {
     if (n > reference && shape.corpus_rows / static_cast<double>(n) < 256.0) { break; }
     shape.n_clusters    = static_cast<double>(n);
-    auto const p        = scaled_probes(probes, n, reference);
+    auto const p        = scaled_probes(c, n);
     double const cost_n = cost.build(shape) + cost.probed(shape, static_cast<double>(p));
     if (n == reference || cost_n < best_cost) {
       best      = cluster_count_choice{n, p};

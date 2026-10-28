@@ -19,6 +19,7 @@
 #include <vss/device_rates.hpp>
 
 #include <cmath>
+#include <limits>
 
 using sirius::vss::access_path_cost;
 using sirius::vss::device_rates;
@@ -120,42 +121,63 @@ TEST_CASE("lists a statement builds for itself get more clusters for a larger pr
   s.list_bytes_per_value = 1;
   s.lists_on_device      = true;
 
-  // A few thousand probe rows cannot repay a larger build: the reference count, probes as given.
+  // A few thousand probe rows cannot repay a larger build: sqrt(rows) clusters, at most 1,024.
+  // c = 0.5 visits ceil(0.5 * sqrt(1024)) = 16 of them.
   s.probe_rows     = 1e4;
-  auto const small = choose_cluster_count(cost, s, 16);
+  auto const small = choose_cluster_count(cost, s, 0.5);
   CHECK(small.n_clusters == 1024);
   CHECK(small.probes == 16);
 
   // A self-join can, and its probes follow the square root of the count.
   s.probe_rows    = 1e8;
-  auto const self = choose_cluster_count(cost, s, 16);
+  auto const self = choose_cluster_count(cost, s, 0.5);
   CHECK(self.n_clusters > 1024);
   CHECK(self.n_clusters <= 16 * 1024);
-  CHECK(self.probes == scaled_probes(16, self.n_clusters, 1024));
+  CHECK(self.probes == scaled_probes(0.5, self.n_clusters));
 
   std::int64_t last = 0;
   for (double const m : {1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9}) {
     s.probe_rows = m;
-    auto const c = choose_cluster_count(cost, s, 16).n_clusters;
+    auto const c = choose_cluster_count(cost, s, 0.5).n_clusters;
     CHECK(c >= last);
     last = c;
   }
 
-  // Probing every reference cluster asks for the exact answer, which more clusters only delay.
+  // A c that visits every cluster of every count asks for the exact answer, which more clusters
+  // only delay.
   s.probe_rows = 1e8;
-  CHECK(choose_cluster_count(cost, s, 1024).n_clusters == 1024);
+  CHECK(choose_cluster_count(cost, s, 1e6).n_clusters == 1024);
+  CHECK(choose_cluster_count(cost, s, std::numeric_limits<double>::infinity()).n_clusters == 1024);
 
   // No count leaves a cluster fewer than 256 rows.
   s.corpus_rows = 1e5;
-  CHECK(choose_cluster_count(cost, s, 4).n_clusters == 316);
+  CHECK(choose_cluster_count(cost, s, 0.25).n_clusters == 316);
 
-  CHECK(scaled_probes(16, 1024, 1024) == 16);
-  CHECK(scaled_probes(16, 4096, 1024) == 32);
-  CHECK(scaled_probes(16, 16384, 1024) == 64);
-  CHECK(scaled_probes(5, 2048, 1024) == 8);
-  CHECK(scaled_probes(1024, 4096, 1024) == 4096);
-  CHECK(scaled_probes(16, 512, 1024) == 16);
-  CHECK(scaled_probes(900, 512, 1024) == 512);
+  // n_p = min(ceil(c * sqrt(N)), N), at least 1 for c > 0, on lists Sirius sized itself.
+  CHECK(scaled_probes(0.5, 1024) == 16);
+  CHECK(scaled_probes(0.5, 4096) == 32);
+  CHECK(scaled_probes(0.5, 16384) == 64);
+  CHECK(scaled_probes(5.0 / 32, 2048) == 8);
+  CHECK(scaled_probes(0.07, 10000) == 7);  // 0.07 * 100 is 7.000000000000001 in doubles
+  CHECK(scaled_probes(0.55, 10000) == 55);
+  CHECK(scaled_probes(0.555, 10000) == 56);
+  CHECK(scaled_probes(1e-9, 4096) == 1);
+  CHECK(scaled_probes(32, 4096) == 2048);
+  CHECK(scaled_probes(64, 4096) == 4096);
+  CHECK(scaled_probes(1e9, 4096) == 4096);
+  CHECK(scaled_probes(std::numeric_limits<double>::infinity(), 4096) == 4096);
+  CHECK(scaled_probes(0.5, 512) == 12);
+  CHECK(scaled_probes(0, 4096) == 0);
+  CHECK(scaled_probes(-1, 4096) == 0);
+  CHECK(scaled_probes(std::numeric_limits<double>::quiet_NaN(), 4096) == 0);
+
+  // On lists the user sized, c counts clusters, rounded up.
+  using sirius::vss::literal_probes;
+  CHECK(literal_probes(2, 252) == 2);
+  CHECK(literal_probes(2.5, 252) == 3);
+  CHECK(literal_probes(0.1, 252) == 1);
+  CHECK(literal_probes(1000, 252) == 252);
+  CHECK(literal_probes(0, 252) == 0);
 
   // The two sides of the trade: the build grows with the count, the search falls.
   s.corpus_rows       = 1e8;
