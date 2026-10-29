@@ -21,13 +21,19 @@
 #include "vss/vector_join.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace duckdb {
 class ClientContext;
+class DuckTableEntry;
 class SiriusContext;
 }  // namespace duckdb
+
+namespace sirius::scan_manager {
+struct pinned_entry;
+}  // namespace sirius::scan_manager
 
 namespace sirius::vss {
 
@@ -48,6 +54,28 @@ duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
 ///                     also decides which columns can be emitted. False for a side fed by the
 ///                     build phase: its scan reads the table whether or not a pin happens to be
 ///                     caching it, so columns come from the catalog and no pin is required.
+/// Record that a statement writes to the table pinned as generation @p pin_generation (see
+/// SiriusContext's prepare hooks, which already refuse an UPDATE on a pinned table). Recorded
+/// when the statement is prepared, so a write that rolls back still counts.
+void note_pinned_table_written(std::uint64_t pin_generation);
+
+/// Why the vector join cannot read @p table's rows out of its pin @p pin for @p context's
+/// transaction, or nullopt when it can. A duckdb pin is the table's last-checkpointed image as
+/// it was pinned, deleted rows included and later inserts excluded; ordinary scans reconcile it
+/// with DuckDB's visibility on every query, but the vector join reads the pinned rows as they
+/// are. So this asks what the scans' own guards ask (sirius_plan_get.cpp, prepare_for_query): a
+/// transaction no older than the pin, no rows inserted (in this transaction or committed past the
+/// pinned prefix), and, from the scans' keep-mask walk, no pinned row this transaction cannot
+/// see; and no statement written to the table since the pin. That last one stands in for the
+/// scans' checkpoint check: a CHECKPOINT folds a write into the image (and can compact deleted
+/// rows away) so it leaves no trace to walk, but without a write it changes none of the table's
+/// rows, and a pin then serves however many checkpoints follow. A parquet pin is immutable and
+/// always serves. The mask walk's clean verdict is kept per pin for as long as no commit lands.
+[[nodiscard]] std::optional<std::string> pinned_rows_mismatch(
+  duckdb::ClientContext& context,
+  sirius::scan_manager::pinned_entry const& pin,
+  duckdb::DuckTableEntry& table);
+
 /// Bind `SELECT * FROM <view>` for a view-typed join side: the names and types the join can
 /// emit, and (in the planner) the logical plan to stream.
 duckdb::BoundStatement bind_view_select(duckdb::ClientContext& context,

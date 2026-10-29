@@ -1032,3 +1032,162 @@ TEST_CASE_METHOD(SqlRewriteFixture,
                              "array_distance(p.vec, c.vec) <= 6.0;");
   run_ok("SELECT * FROM unpin_table('sr_far');");
 }
+
+namespace {
+
+/// The "[vector_join_rewrite] ..." lines logged while @p run runs.
+template <typename F>
+std::vector<std::string> rewrite_log(F&& run)
+{
+  sirius::test::scoped_recording_log_sink log{"info"};
+  run();
+  std::vector<std::string> lines;
+  for (auto const& r : log.records()) {
+    if (r.message.find("[vector_join_rewrite]") != std::string::npos) {
+      lines.push_back(r.message);
+    }
+  }
+  return lines;
+}
+
+bool any_line_has(std::vector<std::string> const& lines, std::string const& needle)
+{
+  return std::any_of(lines.begin(), lines.end(), [&](std::string const& l) {
+    return l.find(needle) != std::string::npos;
+  });
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a DELETE or INSERT on a pinned corpus leaves the vector join to DuckDB",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // The pin holds the rows as they were pinned, a deleted row included and an inserted one
+  // missing; ordinary scans reconcile that with DuckDB's visibility, but the vector join reads the
+  // pinned rows as they are. It returned the deleted row 5 and missed the inserted 9999. Now the
+  // rewrite leaves such a statement to DuckDB, the table function refuses to read the pin, and
+  // the table function over a scan (which applies the visibility) answers.
+  auto const floats = [](const std::string& seed) {
+    return "list_transform(range(16), lambda d: ((hash(i * 100 + d + " + seed +
+           ") % 100000) / 977.0)::FLOAT)::FLOAT[16]";
+  };
+  run_ok("CREATE TABLE sr_dml AS SELECT i::INTEGER AS id, " + floats("0") +
+         " AS vec FROM range(4000) t(i);");
+  run_ok("CREATE TABLE sr_dml_probe AS SELECT id, vec FROM sr_dml WHERE id IN (5, 6, 7);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_dml', tier => 'gpu', format => 'duckdb');");
+  struct unpin_on_exit {
+    duckdb::Connection& con;
+    ~unpin_on_exit() { con.Query("SELECT * FROM unpin_table('sr_dml');"); }
+  } unpin{*con};
+  auto const lateral =
+    "SELECT p.id, n.id, n.d FROM sr_dml_probe p, LATERAL (SELECT c.id, array_distance(p.vec, "
+    "c.vec) AS d FROM sr_dml c ORDER BY d LIMIT 2) n;";
+  auto const threshold =
+    "SELECT p.id, c.id FROM sr_dml_probe p, sr_dml c WHERE array_distance(p.vec, c.vec) <= 40.0;";
+  auto const on_duckdb = [&](std::string const& sql) {
+    con->Query("SET gpu_execution = false;");
+    auto rows = sorted_rows(*con, sql);
+    con->Query("SET gpu_execution = true;");
+    return rows;
+  };
+  CHECK(any_line_has(rewrite_log([&] { require_gpu_matches_duckdb(*con, lateral); }),
+                     "rewritten to sirius_knn_join_rel"));
+
+  run_ok("DELETE FROM sr_dml WHERE id = 5;");
+  run_ok("INSERT INTO sr_dml SELECT 9999, vec FROM sr_dml WHERE id = 7;");
+  for (auto const* sql : {lateral, threshold}) {
+    UNSCOPED_INFO("query: " << sql);
+    auto const expected = on_duckdb(sql);
+    std::vector<std::vector<std::string>> got;
+    auto const lines = rewrite_log([&] { got = sorted_rows(*con, sql); });
+    CHECK(rows_match(got, expected));
+    CHECK(any_line_has(lines, "left to DuckDB: the pin of 'sr_dml' no longer holds its rows"));
+  }
+  auto const after = on_duckdb(lateral);
+  REQUIRE(std::any_of(after.begin(), after.end(), [](auto const& r) { return r[1] == "9999"; }));
+
+  auto const pinned_tvf = con->Query(
+    "SELECT * FROM sirius_knn_join('sr_dml_probe','vec','sr_dml','vec', probe_source => 'scan', "
+    "k => 2);");
+  REQUIRE(pinned_tvf->HasError());
+  UNSCOPED_INFO("error: " << pinned_tvf->GetError());
+  CHECK(pinned_tvf->GetError().find("the pin of right table 'sr_dml' no longer holds the "
+                                    "table's rows") != std::string::npos);
+  CHECK(pinned_tvf->GetError().find("build_source => 'scan'") != std::string::npos);
+  auto const scanned_tvf =
+    sorted_rows(*con,
+                "SELECT left_id, right_id, distance FROM sirius_knn_join('sr_dml_probe','vec',"
+                "'sr_dml','vec', probe_source => 'scan', build_source => 'scan', k => 2);");
+  CHECK(rows_match(scanned_tvf, after));
+
+  // A pin taken after a CHECKPOINT answers as DuckDB does too: from its rows, or, while the
+  // deleted rows are still in storage (and so in the pin), by leaving the statement to DuckDB.
+  run_ok("SELECT * FROM unpin_table('sr_dml');");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_dml', tier => 'gpu', format => 'duckdb');");
+  CHECK(rows_match(sorted_rows(*con, lateral), after));
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "lists cached from an earlier pin are not used for a re-pinned table",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // The rewrite keeps the lists it builds for later statements, and found them by table, column
+  // and row count, so a table changed while unpinned and pinned again with as many rows was
+  // searched through the lists of its old rows. Lists now serve only the pin (generation) they
+  // were built from.
+  auto const floats = [](const std::string& seed) {
+    return "list_transform(range(16), lambda d: ((hash(i * 100 + d + " + seed +
+           ") % 100000) / 977.0)::FLOAT)::FLOAT[16]";
+  };
+  run_ok("CREATE TABLE sr_rp AS SELECT i::INTEGER AS id, " + floats("0") +
+         " AS vec FROM range(4000) t(i);");
+  run_ok("CREATE TABLE sr_rp_probe AS SELECT id, vec FROM sr_rp WHERE id IN (5, 6, 7);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_rp', tier => 'gpu', format => 'duckdb');");
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "lists", 1);
+  struct reset_on_exit {
+    duckdb::Connection& con;
+    ~reset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_ACCESS_PATH");
+      con.Query("SELECT * FROM unpin_table('sr_rp');");
+    }
+  } reset{*con};
+  auto const lateral =
+    "SELECT p.id, n.id, n.d FROM sr_rp_probe p, LATERAL (SELECT c.id, array_distance(p.vec, "
+    "c.vec) AS d FROM sr_rp c ORDER BY d LIMIT 2) n;";
+  auto const built = [](std::vector<std::string> const& lines) {
+    return any_line_has(lines, "built lists '__sirius_auto_codes_sr_rp_vec'");
+  };
+  CHECK(built(rewrite_log([&] { require_gpu_matches_duckdb(*con, lateral); })));
+  CHECK_FALSE(built(rewrite_log([&] { require_gpu_matches_duckdb(*con, lateral); })));
+
+  // The same table, as many rows, other vectors: a fresh table, so no deleted rows in its pin.
+  run_ok("SELECT * FROM unpin_table('sr_rp');");
+  run_ok("DROP TABLE sr_rp;");
+  run_ok("CREATE TABLE sr_rp AS SELECT i::INTEGER AS id, " + floats("777") +
+         " AS vec FROM range(4000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_rp', tier => 'gpu', format => 'duckdb');");
+  CHECK(built(rewrite_log([&] { require_gpu_matches_duckdb(*con, lateral); })));
+
+  // An UPDATE while unpinned, then a re-pin: DuckDB updates a vector as a delete and an insert,
+  // so the pin holds the old row too, and the statement is DuckDB's.
+  run_ok("SELECT * FROM unpin_table('sr_rp');");
+  run_ok(
+    "UPDATE sr_rp SET vec = list_transform(range(16), lambda d: 1000.0::FLOAT)::FLOAT[16] "
+    "WHERE id = 6;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_rp', tier => 'gpu', format => 'duckdb');");
+  con->Query("SET gpu_execution = false;");
+  auto const expected = sorted_rows(*con, lateral);
+  con->Query("SET gpu_execution = true;");
+  std::vector<std::vector<std::string>> got;
+  auto const lines = rewrite_log([&] { got = sorted_rows(*con, lateral); });
+  CHECK(rows_match(got, expected));
+  CHECK(
+    std::none_of(got.begin(), got.end(), [](auto const& r) { return r[0] == "6" && r[1] == "6"; }));
+}

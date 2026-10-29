@@ -17,6 +17,7 @@
 #include "vss/vector_join_rewrite.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/types.hpp"
@@ -2755,6 +2756,35 @@ bool expression_has_vector_distance(Expression& e)
 
 }  // namespace
 
+namespace {
+
+/// A table @p op reads whose pin no longer holds its rows (pinned_rows_mismatch), and why.
+std::optional<std::string> stale_pinned_table(duckdb::ClientContext& context,
+                                              duckdb::SiriusContext& ctx,
+                                              LogicalOperator& op)
+{
+  if (op.type == LogicalOperatorType::LOGICAL_GET) {
+    auto table = op.Cast<duckdb::LogicalGet>().GetTable();
+    if (table && table->IsDuckTable()) {
+      auto const pin = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
+        table->ParentCatalog().GetName(), table->ParentSchema().name, table->name);
+      if (pin != nullptr) {
+        if (auto const why =
+              pinned_rows_mismatch(context, *pin, table->Cast<duckdb::DuckTableEntry>())) {
+          return "'" + table->name + "' no longer holds its rows (" + *why + ")";
+        }
+      }
+    }
+  }
+  for (auto& child : op.children) {
+    if (!child) { continue; }
+    if (auto why = stale_pinned_table(context, ctx, *child)) { return why; }
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
 bool plan_has_vector_distance(LogicalOperator& plan)
 {
   bool found = false;
@@ -2773,6 +2803,14 @@ std::size_t rewrite_plain_sql_vector_joins(duckdb::ClientContext& context,
 {
   if (!plan || !rewrite_enabled(context)) { return 0; }
   try {
+    // The rewritten join reads pinned rows as they were pinned, which a DELETE or INSERT since
+    // (or a CHECKPOINT) leaves behind the table; such a statement stays DuckDB's.
+    if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+      if (auto const why = stale_pinned_table(context, *sirius_ctx, *plan)) {
+        SIRIUS_LOG_INFO("[vector_join_rewrite] left to DuckDB: the pin of {}", *why);
+        return 0;
+      }
+    }
     rewriter r(context, binder, plan);
     auto const n = r.run();
     if (inlined_ctes != nullptr) { *inlined_ctes = r.inlined(); }

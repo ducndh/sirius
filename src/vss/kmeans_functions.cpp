@@ -405,6 +405,24 @@ const cluster_lists* find_cluster_lists(duckdb::SiriusContext& ctx, const std::s
   return entry->index_as<cluster_lists>();
 }
 
+namespace {
+
+/// Whether @p lists were built from the pin that stands for (@p catalog, @p schema, @p table) now.
+/// After an unpin and re-pin, or a pin_table that replaced the entry, they describe rows the table
+/// may no longer hold; the generation tells the new pin apart even at the old one's address.
+bool built_from_current_pin(duckdb::SiriusContext& ctx,
+                            cluster_lists const& lists,
+                            const std::string& catalog,
+                            const std::string& schema,
+                            const std::string& table)
+{
+  auto const pin =
+    ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(catalog, schema, table);
+  return pin != nullptr && pin->generation == lists.pin_generation;
+}
+
+}  // namespace
+
 std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
                                                    const std::string& catalog,
                                                    const std::string& schema,
@@ -419,7 +437,14 @@ std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
   for (auto const& name : ctx.get_cuvs_index_cache().names_on_column(
          catalog, schema, table, column, index_kind::kmeans_centroids)) {
     auto const* lists = find_cluster_lists(ctx, name);
-    if (lists == nullptr || lists->n_rows != n_rows || lists->unit_rows != cosine) { continue; }
+    if (lists == nullptr) { continue; }
+    // Lists of an earlier pin can never serve again: drop them, and a statement that wants lists
+    // builds its own from the pin as it is.
+    if (!built_from_current_pin(ctx, *lists, catalog, schema, table)) {
+      erase_cluster_lists(ctx, name);
+      continue;
+    }
+    if (lists->n_rows != n_rows || lists->unit_rows != cosine) { continue; }
     bool const exact = lists->encoding == list_encoding::float32 ||
                        (lists->encoding == list_encoding::uint8 && !float_rows_only) ||
                        (lists->encoding == list_encoding::float16 && lists->has_exact_rows() &&
@@ -459,7 +484,7 @@ std::optional<exact_lists_choice> find_named_lists(duckdb::SiriusContext& ctx,
   auto const* lists = find_cluster_lists(ctx, clustering);
   auto const entry  = find_clustering_entry(ctx, clustering);
   if (lists == nullptr || entry == nullptr || lists->n_rows != n_rows ||
-      lists->unit_rows != cosine) {
+      lists->unit_rows != cosine || !built_from_current_pin(ctx, *lists, catalog, schema, table)) {
     return std::nullopt;
   }
   auto const clusters = static_cast<std::int64_t>(lists->offsets.size()) - 1;
@@ -804,12 +829,13 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   }
 
   cluster_lists lists;
-  lists.pin        = c.pin.get();
-  lists.table      = req.table;
-  lists.column     = req.column;
-  lists.n_rows     = n_rows;
-  lists.dim        = dim;
-  lists.n_clusters = n_clusters;
+  lists.pin            = c.pin.get();
+  lists.pin_generation = c.pin->generation;
+  lists.table          = req.table;
+  lists.column         = req.column;
+  lists.n_rows         = n_rows;
+  lists.dim            = dim;
+  lists.n_clusters     = n_clusters;
   lists.offsets.assign(static_cast<std::size_t>(n_clusters) + 1, 0);
   std::vector<std::vector<std::int64_t>> start = hist;
   {

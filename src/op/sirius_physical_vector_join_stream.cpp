@@ -1230,7 +1230,8 @@ void sirius_physical_vector_join_stream::initialize_locked()
     // row space that copy's neighbour ids are reported in.
     _lists =
       _sirius_ctx != nullptr ? vss::find_cluster_lists(*_sirius_ctx, _request.clustering) : nullptr;
-    if (_lists == nullptr || _lists->pin != right_pin.get() || _lists->column != right.column ||
+    if (_lists == nullptr || _lists->pin != right_pin.get() ||
+        _lists->pin_generation != right_pin->generation || _lists->column != right.column ||
         _lists->n_rows != static_cast<std::int64_t>(right_pin->num_rows)) {
       throw std::runtime_error("[sirius_physical_vector_join_stream] clustering '" +
                                _request.clustering + "' has no lists over the current pin of '" +
