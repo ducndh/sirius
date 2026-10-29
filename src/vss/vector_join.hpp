@@ -31,12 +31,14 @@ enum class vector_join_mode : std::uint8_t {
   threshold,
 };
 
-/// - exact_direct: search_mode => 'exact-direct' (undocumented): brute force, L2 computed from
-///                 the differences (cuVS's Unexpanded form), with no GEMM, filter or codes.
 /// - exact_gemm:   search_mode => 'exact' (and its alias 'exact-gemm'), the default and what the
-///                 SQL rewrite runs: the GEMM join, L2 through |q|^2 + |x|^2 - 2 q.x. Exact up to
-///                 the FP32 rounding of that sum, which cancels for rows far from the origin and
-///                 close together (|q|^2 much larger than |q - x|^2); exact_direct is not.
+///                 SQL rewrite runs: the exact join, ranking L2 by the FP32 sum of (q_j - x_j)^2.
+///                 Its exhaustive search computes that sum from the differences; lists answer it
+///                 with a coded filter and an FP32 re-score, or (FP32 rows, every cluster probed)
+///                 from the differences too. The GEMM form |q|^2 + |x|^2 - 2 q.x is never the
+///                 answer: it cancels for rows far from the origin and close together.
+/// - exact_direct: search_mode => 'exact-direct' (undocumented): the same exhaustive search;
+///                 kept for the harnesses that name it.
 /// - approx:       search_mode => 'approx': through the lists of a clustering, n_probes of them.
 enum class vector_join_search_mode : std::uint8_t {
   exact_direct,

@@ -2274,6 +2274,19 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                             : queries;
 
     auto const n_probes = std::clamp<std::int64_t>(_request.n_probes, 1, _n_clusters);
+    // Every cluster probed is the exact join through lists. Rows that a plain FP32 search ranks
+    // (FP32 lists, or rows the coded searches below do not take) then rank as the exhaustive
+    // fold's do, L2 from the differences; the coded searches keep their own FP32 re-score.
+    auto const ranked_metric = [&] {
+      if (n_probes < _n_clusters) { return search_metric; }
+      if (search_metric == cuvs::distance::DistanceType::L2Expanded) {
+        return cuvs::distance::DistanceType::L2Unexpanded;
+      }
+      if (search_metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
+        return cuvs::distance::DistanceType::L2SqrtUnexpanded;
+      }
+      return search_metric;
+    }();
 
     // Each probe row picks its own n_probes nearest centroids, the way an IVF index routes a
     // query. Routing a whole probe cluster through its centroid's nearest centroids kept a
@@ -3665,7 +3678,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                           slice_view,
                                           queries_view,
                                           search_radius,
-                                          search_metric,
+                                          ranked_metric,
                                           mr,
                                           0,
                                           count_only && !keyed);
@@ -3751,11 +3764,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                 search_metric == cuvs::distance::DistanceType::L2SqrtExpanded && !bounded,
                 mr);
             }
-            return gemm_search_enabled() && vss::gemm_search_supports(search_metric)
-                     ? vss::gemm_topk(res, slice_view, queries_view, k_eff, search_metric, mr)
+            // A re-scored sweep 0 only sets each row's bound, so it keeps the GEMM.
+            auto const ranked = rescore ? search_metric : ranked_metric;
+            return gemm_search_enabled() && vss::gemm_search_supports(ranked)
+                     ? vss::gemm_topk(res, slice_view, queries_view, k_eff, ranked, mr)
                      : vss::brute_force_knn_untrimmed(
                          res,
-                         vss::brute_force_build(res, slice_view, search_metric),
+                         vss::brute_force_build(res, slice_view, ranked),
                          queries_view,
                          k_eff,
                          mr);
@@ -3896,6 +3911,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   } else {
     auto const n_chunks = _corpus->num_chunks();
     std::int64_t offset = 0;  // running base of the current chunk in right-table row space
+    // Every exhaustive join is an exact one, and an exact L2 join ranks by the FP32 sum of
+    // (q_j - x_j)^2. The GEMM's |q|^2 + |x|^2 - 2 q.x cancels for rows far from the origin and
+    // close together, so L2 is computed from the differences (cuVS's Unexpanded form) here.
+    auto const exhaustive_metric =
+      vss::join_selection_distance_type_from_metric(_request.metric, /*exact_unexpanded=*/true);
 
     // Staging runs on its own stream so chunk j+1's H2D overlaps chunk j's compute. The
     // converter host-synchronizes at the end of its copy, so what is actually overlapped is
@@ -3995,7 +4015,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                           searched,
                                           queries,
                                           radius_eps,
-                                          metric,
+                                          exhaustive_metric,
                                           mr,
                                           kGemmMinProbeRows,
                                           count_only && !keyed);
@@ -4060,8 +4080,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
 
       auto const k_eff = std::min<std::int64_t>(k_join, batch_rows);
 
-      // Expanded L2 and cosine go through the GEMM-ranked search; the unexpanded `exact` mode keeps
-      // cuVS.
+      // Cosine goes through the GEMM-ranked search; L2 (unexpanded, above) through cuVS.
       if (_corpus->is_streaming()) {
         ensure_device_headroom(
           _sirius_ctx,
@@ -4069,10 +4088,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           vss::gemm_search_tile_bytes() + static_cast<std::size_t>(batch_rows) *
                                             static_cast<std::size_t>(dim + 4) * sizeof(float));
       }
-      auto knn =
-        gemm_search_enabled() && vss::gemm_search_supports(metric) && n_left >= kGemmMinProbeRows
-          ? vss::gemm_topk(res, dataset, queries, k_eff, metric, mr)
-          : vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
+      auto knn = gemm_search_enabled() && vss::gemm_search_supports(exhaustive_metric) &&
+                     n_left >= kGemmMinProbeRows
+                   ? vss::gemm_topk(res, dataset, queries, k_eff, exhaustive_metric, mr)
+                   : vss::brute_force_knn(res, dataset, queries, k_eff, exhaustive_metric, mr);
 
       // The search above is issued, not finished. Staging the next chunk now runs its H2D
       // while the GPU works on this one; the host blocks inside the converter, the device

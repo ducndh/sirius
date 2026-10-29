@@ -2960,8 +2960,8 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
       req.metric = StringUtil::Lower(kv.second.ToString());
     } else if (key == "search_mode") {
       auto const mode = StringUtil::Lower(kv.second.ToString());
-      // 'exact' is the GEMM join the SQL rewrite runs; 'exact-gemm' is kept as its alias for
-      // the harnesses that name it. 'exact-direct' computes L2 from the differences instead.
+      // 'exact' is the exact join the SQL rewrite runs; 'exact-gemm' and 'exact-direct' are kept
+      // for the harnesses that name them, and run the same search.
       if (mode == "exact" || mode == "exact-gemm") {
         req.search_mode = vector_join_search_mode::exact_gemm;
       } else if (mode == "exact-direct") {
@@ -2971,7 +2971,7 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
       } else {
         throw BinderException(
           "sirius_knn_join: search_mode must be 'exact' or 'approx' (also accepted: "
-          "'exact-gemm', the same as 'exact', and 'exact-direct', L2 without the GEMM)");
+          "'exact-gemm' and 'exact-direct', both the same as 'exact')");
       }
     } else if (key == "join_mode") {
       auto const jm = StringUtil::Lower(kv.second.ToString());

@@ -398,8 +398,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_threshold_join::execute(
   if (!right_empty) {
     auto const dataset = vss::list_column_as_dataset_view(right.column(right_vector_col_idx), dim);
     raft::device_resources res{stream};
+    // An exact join: L2 from the differences, not |q|^2 + |x|^2 - 2 q.x, which cancels for rows
+    // far from the origin (see the vector join stream operator's exhaustive search).
     auto const metric_type =
-      vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/false);
+      vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/true);
 
     // Bound each threshold call so its edge list can never exceed a cudf column's int32 length.
     // A single query row produces at most n_right edges, so keeping query_tile * n_right under the

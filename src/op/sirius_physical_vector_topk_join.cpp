@@ -324,8 +324,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_join::execute(
   auto const dataset = vss::list_column_as_dataset_view(right.column(right_vector_col_idx), dim);
   auto const queries = vss::list_column_as_dataset_view(left.column(left_vector_col_idx), dim);
   raft::device_resources res{stream};
+  // An exact join: L2 from the differences, not |q|^2 + |x|^2 - 2 q.x, which cancels for rows
+  // far from the origin (see the vector join stream operator's exhaustive search).
   auto const metric_type =
-    vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/false);
+    vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/true);
 
   auto const k_eff = std::min(k, n_right);
   auto knn         = vss::brute_force_knn(res, dataset, queries, k_eff, metric_type, mr);
@@ -390,8 +392,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_join::execute_global(
   auto const dataset = vss::list_column_as_dataset_view(right.column(right_vector_col_idx), dim);
   auto const queries = vss::list_column_as_dataset_view(left.column(left_vector_col_idx), dim);
   raft::device_resources res{stream};
+  // An exact join: L2 from the differences, not |q|^2 + |x|^2 - 2 q.x, which cancels for rows
+  // far from the origin (see the vector join stream operator's exhaustive search).
   auto const metric_type =
-    vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/false);
+    vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/true);
   auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric_type, mr);
 
   // Candidates are k_eff per left row: left row i repeated k_eff times.

@@ -1003,3 +1003,32 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "SELECT p.id, n.id, n.d FROM sr_probe p, LATERAL (SELECT c.id, array_distance(p.vec, c.vec) "
     "AS d FROM sr_corpus c WHERE c.cat = 3 ORDER BY d LIMIT 4) n;");
 }
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a plain-SQL LATERAL over rows far from the origin is DuckDB's",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // Rows [i, i+1, i+2] of width 3 (no codes), so the rewrite takes the exhaustive search. Ranked
+  // by |q|^2 + |x|^2 - 2 q.x (about 7.4e9 a term in FP32, against shells 3 apart) the probe's own
+  // row 49,800 was missed and rows from 49,794 to 49,811 came back instead of 49,796 to 49,804.
+  run_ok(
+    "CREATE TABLE sr_far AS SELECT i::INTEGER AS id, [i::FLOAT, (i + 1)::FLOAT, (i + 2)::FLOAT]"
+    "::FLOAT[3] AS vec FROM range(50000) t(i);");
+  run_ok(
+    "CREATE TABLE sr_far_probe AS SELECT * FROM (VALUES (0, [49800.0, 49801.0, 49802.0]), "
+    "(1, [49890.0, 49891.0, 49892.0]), (2, [49810.0, 49811.0, 49812.0]), (3, [49780.0, "
+    "49781.0, 49782.0]), (4, [49820.0, 49821.0, 49822.0])) t(id, vec);");
+  run_ok(
+    "CREATE TABLE sr_far_p AS SELECT id::INTEGER AS id, vec::FLOAT[3] AS vec FROM "
+    "sr_far_probe;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_far', tier => 'gpu', format => 'duckdb');");
+  require_gpu_matches_duckdb(*con,
+                             "SELECT p.id, n.id, n.d FROM sr_far_p p, LATERAL (SELECT c.id, "
+                             "array_distance(p.vec, c.vec) AS d FROM sr_far c ORDER BY d LIMIT "
+                             "9) n;");
+  require_gpu_matches_duckdb(*con,
+                             "SELECT p.id, c.id FROM sr_far_p p, sr_far c WHERE "
+                             "array_distance(p.vec, c.vec) <= 6.0;");
+  run_ok("SELECT * FROM unpin_table('sr_far');");
+}

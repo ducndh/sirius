@@ -2884,9 +2884,9 @@ TEST_CASE_METHOD(KMeansFixture,
     "FROM sjs_t p, sjs_t c WHERE p.id % 3000 = 0) WHERE rk <= 3;");
   REQUIRE(oracle.size() == 100u * 3u);
 
-  // The exhaustive join is exact-direct: the GEMM join's distances carry the FP32 rounding of
-  // |q|^2 + |x|^2 - 2 q.x (6 of the oracle's 300 differ), which the comparison does not allow.
-  for (auto const& sql : {approx(4), approx(16), join("search_mode => 'exact-direct'")}) {
+  // The exhaustive join computes L2 from the differences; ranked by the GEMM form
+  // |q|^2 + |x|^2 - 2 q.x, 6 of the oracle's 300 distances differed.
+  for (auto const& sql : {approx(4), approx(16), join("search_mode => 'exact'")}) {
     INFO(sql);
     auto const shared = ok_rows(*con, sql);
     REQUIRE(shared.size() == 300000u * 3u);
