@@ -1941,7 +1941,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   }
 
   raft::device_resources res{stream};
-  auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact;
+  auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact_direct;
   auto const metric =
     vss::join_selection_distance_type_from_metric(_request.metric, exact_unexpanded);
   // An inner-product join ranks by D = -2 q.x (smaller is closer, like a distance; the factor is

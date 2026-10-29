@@ -2960,15 +2960,18 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
       req.metric = StringUtil::Lower(kv.second.ToString());
     } else if (key == "search_mode") {
       auto const mode = StringUtil::Lower(kv.second.ToString());
-      if (mode == "exact") {
-        req.search_mode = vector_join_search_mode::exact;
-      } else if (mode == "exact-gemm") {
+      // 'exact' is the GEMM join the SQL rewrite runs; 'exact-gemm' is kept as its alias for
+      // the harnesses that name it. 'exact-direct' computes L2 from the differences instead.
+      if (mode == "exact" || mode == "exact-gemm") {
         req.search_mode = vector_join_search_mode::exact_gemm;
+      } else if (mode == "exact-direct") {
+        req.search_mode = vector_join_search_mode::exact_direct;
       } else if (mode == "approx") {
         req.search_mode = vector_join_search_mode::approx;
       } else {
         throw BinderException(
-          "sirius_knn_join: search_mode must be 'exact', 'exact-gemm', or 'approx'");
+          "sirius_knn_join: search_mode must be 'exact' or 'approx' (also accepted: "
+          "'exact-gemm', the same as 'exact', and 'exact-direct', L2 without the GEMM)");
       }
     } else if (key == "join_mode") {
       auto const jm = StringUtil::Lower(kv.second.ToString());
@@ -3039,7 +3042,7 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   if (req.n_clusters < 0) { throw BinderException("sirius_knn_join: n_clusters must be >= 0"); }
   if (req.n_probes < 1) { throw BinderException("sirius_knn_join: n_probes must be >= 1"); }
   // Approximate search is unimplemented: nothing downstream reads search_mode beyond the
-  // exact/exact-gemm distinction, nor n_clusters/n_probes at all, so accepting them ran an
+  // exact/exact-direct distinction, nor n_clusters/n_probes at all, so accepting them ran an
   // exhaustive search while the query said otherwise -- results indistinguishable from an
   // approximate run that happened to be perfect. Refusing is the only honest answer until
   // there is a real approximate path.

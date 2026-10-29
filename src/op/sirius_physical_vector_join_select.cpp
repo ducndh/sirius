@@ -171,7 +171,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_select::execute(
   // Allocations flow through the task's reservation-aware current resource.
   auto const mr = mem_space->get_default_allocator();
   raft::device_resources res{stream};
-  auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact;
+  auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact_direct;
   auto const metric =
     vss::join_selection_distance_type_from_metric(_request.metric, exact_unexpanded);
   auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
