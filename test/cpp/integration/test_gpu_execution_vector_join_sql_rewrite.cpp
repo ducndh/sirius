@@ -30,8 +30,11 @@
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -1190,4 +1193,126 @@ TEST_CASE_METHOD(SqlRewriteFixture,
   CHECK(rows_match(got, expected));
   CHECK(
     std::none_of(got.begin(), got.end(), [](auto const& r) { return r[0] == "6" && r[1] == "6"; }));
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "cosine ranks near-duplicates on rows normalized in FP32",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite][cosine]")
+{
+  // Row i is the probe with its first component moved by (2000 - i) * 1e-4, so the nearest six
+  // are rows 1999 down to 1994, at cosine distances of about 2.5e-10 to 9e-9. The GEMM's
+  // 1 - q.x / (|q| |x|) rounds those to 0 and returned rows 1985..1999 in no order (DuckDB's own
+  // array_cosine_distance, the same formula, returned 1980..1989). An exact cosine join ranks the
+  // rows normalized in FP32 by L2 between them: here every exhaustive and every-cluster search.
+  run_ok(
+    "CREATE TABLE sr_cos AS SELECT i::INTEGER AS id, list_transform(range(16), lambda d: (CASE "
+    "WHEN d = 0 THEN 1.0 + (2000 - i) * 0.0001 ELSE 0.5 + d * 0.07 END)::FLOAT)::FLOAT[16] AS "
+    "vec FROM range(2000) t(i);");
+  run_ok(
+    "CREATE TABLE sr_cos_probe AS SELECT 0::INTEGER AS id, list_transform(range(16), lambda d: "
+    "(CASE WHEN d = 0 THEN 1.0 ELSE 0.5 + d * 0.07 END)::FLOAT)::FLOAT[16] AS vec;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_cos', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'sr_cos_probe', tier => 'gpu', format => 'duckdb');");
+  struct reset_on_exit {
+    duckdb::Connection& con;
+    ~reset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_ACCESS_PATH");
+      ::unsetenv("SIRIUS_VSS_SQL_REWRITE");
+      con.Query("SELECT * FROM unpin_table('sr_cos_probe');");
+      con.Query("SELECT * FROM unpin_table('sr_cos');");
+    }
+  } reset{*con};
+
+  // The cosine distance of row i, in double from the rows as stored.
+  auto const oracle = [](int i) {
+    std::array<double, 16> q{}, x{};
+    for (int d = 0; d < 16; ++d) {
+      q[d] = static_cast<float>(d == 0 ? 1.0 : 0.5 + d * 0.07);
+      x[d] = d == 0 ? static_cast<float>(1.0 + (2000 - i) * 0.0001) : q[d];
+    }
+    double nq = 0, nx = 0, s = 0;
+    for (int d = 0; d < 16; ++d) {
+      nq += q[d] * q[d];
+      nx += x[d] * x[d];
+    }
+    for (int d = 0; d < 16; ++d) {
+      auto const diff = q[d] / std::sqrt(nq) - x[d] / std::sqrt(nx);
+      s += diff * diff;
+    }
+    return s / 2;
+  };
+  std::vector<std::string> const nearest{"1994", "1995", "1996", "1997", "1998", "1999"};
+  // The ids of a result's rows (column @p id_col), sorted, and each row's distance near the
+  // oracle's (column @p d_col, when given): within 10%, the FP32 normalization's rounding.
+  auto const ids_of = [&](std::vector<std::vector<std::string>> const& rows,
+                          std::size_t id_col,
+                          std::optional<std::size_t> d_col) {
+    std::vector<std::string> ids;
+    for (auto const& r : rows) {
+      ids.push_back(r[id_col]);
+      if (d_col) {
+        auto const want = oracle(std::stoi(r[id_col]));
+        auto const got  = std::stod(r[*d_col]);
+        UNSCOPED_INFO("row " << r[id_col] << ": " << got << " vs " << want);
+        CHECK(std::fabs(got - want) <= 0.1 * want);
+      }
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+  };
+  auto const tvf = [&](std::string const& extra) {
+    return sorted_rows(*con,
+                       "SELECT right_id, distance FROM sirius_knn_join('sr_cos_probe','vec',"
+                       "'sr_cos','vec', metric => 'cosine', output_type => 'distance'" +
+                         extra + ");");
+  };
+  auto const lateral =
+    "SELECT n.id, n.d FROM sr_cos_probe p, LATERAL (SELECT c.id, array_cosine_distance(p.vec, "
+    "c.vec) AS d FROM sr_cos c ORDER BY d LIMIT 6) n;";
+
+  // The exhaustive search: top-k, and a threshold between the 6th and 7th distances.
+  CHECK(ids_of(tvf(", k => 6"), 0, 1) == nearest);
+  char eps_text[32];
+  std::snprintf(eps_text, sizeof eps_text, "%.17g", (oracle(1994) + oracle(1993)) / 2);
+  std::string const eps{eps_text};
+  CHECK(ids_of(tvf(", join_mode => 'threshold', eps => " + eps), 0, 1) == nearest);
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "brute", 1);
+  CHECK(ids_of(sorted_rows(*con, lateral), 0, 1) == nearest);
+  // A FLOAT bound: against a DOUBLE one DuckDB compares the distance cast to DOUBLE, which the
+  // rewrite does not match, and the statement stays DuckDB's.
+  auto const within =
+    "SELECT p.id, c.id, array_cosine_distance(p.vec, c.vec) FROM sr_cos_probe p, sr_cos c WHERE "
+    "array_cosine_distance(p.vec, c.vec) <= " +
+    eps + "::FLOAT;";
+  CHECK(ids_of(sorted_rows(*con, within), 1, 2) == nearest);
+  // The coded path (FLOAT16 unit rows, every candidate re-scored in FP32), unchanged.
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "lists", 1);
+  CHECK(ids_of(sorted_rows(*con, lateral), 0, 1) == nearest);
+  ::unsetenv("SIRIUS_VSS_ACCESS_PATH");
+
+  // Every cluster probed: FP32 lists of the rows as they are, and of unit rows.
+  run_ok("SELECT * FROM sirius_kmeans_fit('sr_cos','vec', name => 'sr_cos_c', n_clusters => 4);");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('sr_cos','vec','sr_cos_c', storage => "
+    "'float32');");
+  CHECK(ids_of(tvf(", k => 6, search_mode => 'approx', clustering => 'sr_cos_c', n_probes => 4"),
+               0,
+               1) == nearest);
+  CHECK(ids_of(tvf(", join_mode => 'threshold', eps => " + eps +
+                   ", search_mode => 'approx', clustering => 'sr_cos_c', n_probes => 4"),
+               0,
+               1) == nearest);
+  run_ok("SELECT * FROM sirius_kmeans_fit('sr_cos','vec', name => 'sr_cos_u', n_clusters => 4);");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('sr_cos','vec','sr_cos_u', storage => "
+    "'float32', metric => 'cosine');");
+  CHECK(ids_of(tvf(", k => 6, search_mode => 'approx', clustering => 'sr_cos_u', n_probes => 4"),
+               0,
+               1) == nearest);
+
+  // With the rewrite off, the physical planner's own vector top-k join answers.
+  ::setenv("SIRIUS_VSS_SQL_REWRITE", "0", 1);
+  CHECK(ids_of(sorted_rows(*con, lateral), 0, 1) == nearest);
 }

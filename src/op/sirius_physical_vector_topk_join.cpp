@@ -25,6 +25,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "vss/bound_gemm.hpp"
 #include "vss/distance_metric.hpp"
 
 #include <cudf/binaryop.hpp>
@@ -46,6 +47,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -97,6 +99,25 @@ std::unique_ptr<cudf::column> pad_rows_to_k(cudf::column_view const& src,
   return out;
 }
 
+/// @p rows normalized in FP32 into @p out, as a view: how an exact cosine join reads its rows,
+/// ranking L2 between unit rows, |q^ - x^|^2 = 2 (1 - cos) (halve_distances turns it back).
+vss::dataset_matrix_view unit_rows_of(vss::dataset_matrix_view rows,
+                                      std::optional<rmm::device_uvector<float>>& out,
+                                      rmm::cuda_stream_view stream,
+                                      rmm::device_async_resource_ref mr)
+{
+  auto const n   = rows.extent(0);
+  auto const dim = rows.extent(1);
+  out.emplace(static_cast<std::size_t>(n * dim), stream, mr);
+  if (n > 0) { vss::normalize_rows(rows.data_handle(), n, dim, out->data(), stream); }
+  return raft::make_device_matrix_view<const float, int64_t, raft::row_major>(out->data(), n, dim);
+}
+
+/// A squared distance between unit rows, halved: the cosine distance 1 - cos.
+void halve_distances(cudf::column& distances, rmm::cuda_stream_view stream)
+{
+  vss::scale_in_place(distances.mutable_view().data<float>(), distances.size(), 0.5f, stream);
+}
 }  // namespace
 
 sirius_physical_vector_topk_join::sirius_physical_vector_topk_join(
@@ -321,18 +342,27 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_join::execute(
       "Vector top-k join: left batch rows * k exceeds a cuDF column; lower the batch size");
   }
 
-  auto const dataset = vss::list_column_as_dataset_view(right.column(right_vector_col_idx), dim);
-  auto const queries = vss::list_column_as_dataset_view(left.column(left_vector_col_idx), dim);
+  auto dataset = vss::list_column_as_dataset_view(right.column(right_vector_col_idx), dim);
+  auto queries = vss::list_column_as_dataset_view(left.column(left_vector_col_idx), dim);
   raft::device_resources res{stream};
   // An exact join: L2 from the differences, not |q|^2 + |x|^2 - 2 q.x, which cancels for rows
-  // far from the origin (see the vector join stream operator's exhaustive search).
+  // far from the origin; cosine the same way on rows normalized in FP32 (see the vector join
+  // stream operator's exhaustive search).
+  bool const cosine = metric == "cosine";
+  std::optional<rmm::device_uvector<float>> unit_dataset, unit_queries;
+  if (cosine) {
+    dataset = unit_rows_of(dataset, unit_dataset, stream, mr);
+    queries = unit_rows_of(queries, unit_queries, stream, mr);
+  }
   auto const metric_type =
-    vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/true);
+    cosine ? cuvs::distance::DistanceType::L2Unexpanded
+           : vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/true);
 
   auto const k_eff = std::min(k, n_right);
   auto knn         = vss::brute_force_knn(res, dataset, queries, k_eff, metric_type, mr);
-  auto neighbors   = std::move(knn.neighbors);
-  auto distances   = std::move(knn.distances);
+  if (cosine) { halve_distances(*knn.distances, stream); }
+  auto neighbors = std::move(knn.neighbors);
+  auto distances = std::move(knn.distances);
   if (k_eff < k) {
     // Padding rows: an out-of-range index gathers as NULL, at a distance that never wins the merge
     // over a real neighbor.
@@ -389,14 +419,23 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_join::execute_global(
       "Vector top-k join: left batch rows * k exceeds a cuDF column; lower the batch size");
   }
 
-  auto const dataset = vss::list_column_as_dataset_view(right.column(right_vector_col_idx), dim);
-  auto const queries = vss::list_column_as_dataset_view(left.column(left_vector_col_idx), dim);
+  auto dataset = vss::list_column_as_dataset_view(right.column(right_vector_col_idx), dim);
+  auto queries = vss::list_column_as_dataset_view(left.column(left_vector_col_idx), dim);
   raft::device_resources res{stream};
   // An exact join: L2 from the differences, not |q|^2 + |x|^2 - 2 q.x, which cancels for rows
-  // far from the origin (see the vector join stream operator's exhaustive search).
+  // far from the origin; cosine the same way on rows normalized in FP32 (see the vector join
+  // stream operator's exhaustive search).
+  bool const cosine = metric == "cosine";
+  std::optional<rmm::device_uvector<float>> unit_dataset, unit_queries;
+  if (cosine) {
+    dataset = unit_rows_of(dataset, unit_dataset, stream, mr);
+    queries = unit_rows_of(queries, unit_queries, stream, mr);
+  }
   auto const metric_type =
-    vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/true);
+    cosine ? cuvs::distance::DistanceType::L2Unexpanded
+           : vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/true);
   auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric_type, mr);
+  if (cosine) { halve_distances(*knn.distances, stream); }
 
   // Candidates are k_eff per left row: left row i repeated k_eff times.
   cudf::numeric_scalar<cudf::size_type> zero(0, true, stream);

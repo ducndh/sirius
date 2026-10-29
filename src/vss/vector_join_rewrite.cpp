@@ -118,6 +118,14 @@ bool is_similarity(distance_kind k)
   return k == distance_kind::cosine_similarity || k == distance_kind::inner_product;
 }
 
+/// Whether the join answering a call of kind @p k emits a similarity (the cosine similarity, or
+/// the inner product) rather than a distance. A cosine distance is emitted as one: as 1 - the
+/// similarity in FLOAT it would round a near-duplicate's distance (below about 6e-8) to 0.
+bool score_is_similarity(distance_kind k)
+{
+  return k != distance_kind::l2 && k != distance_kind::cosine_distance;
+}
+
 bool same_metric(distance_kind a, distance_kind b)
 {
   return std::string_view{metric_name(a)} == metric_name(b);
@@ -349,9 +357,14 @@ unique_ptr<Expression> score_expression(duckdb::ClientContext& context,
 {
   auto ref = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(duckdb::LogicalType::FLOAT, score);
   if (!same_metric(requested, joined)) { return nullptr; }
-  // The l2 join emits the distance; the cosine join the similarity; the inner-product join the
-  // inner product.
-  if (requested == distance_kind::l2 || is_similarity(requested)) { return ref; }
+  // The l2 join emits the distance; the cosine join the similarity or the distance, whichever the
+  // call it answers asked for (score_is_similarity); the inner-product join the inner product.
+  bool const joined_similarity = score_is_similarity(joined);
+  if (requested == distance_kind::l2 || requested == distance_kind::inner_product ||
+      (requested == distance_kind::cosine_similarity && joined_similarity) ||
+      (requested == distance_kind::cosine_distance && !joined_similarity)) {
+    return ref;
+  }
   duckdb::vector<unique_ptr<Expression>> args;
   if (requested == distance_kind::negative_inner_product) {
     // -q.x, exactly: a multiplication by -1 (an operator the GPU projection runs).
@@ -1660,15 +1673,14 @@ class rewriter {
   {
     SiriusVectorJoinBindData bind;
     auto& req        = bind.req;
-    // Every metric but l2 emits a similarity (for ip, the inner product).
-    bool const cos   = call.kind != distance_kind::l2;
+    // Every metric but l2 and the cosine distance emits a similarity (for ip, the inner product).
+    bool const cos   = score_is_similarity(call.kind);
     req.mode         = mode;
     req.probe_scalar = probe_scalar;
     if (mode == vector_join_mode::threshold) {
       // Unbounded: every pair passes (a cosine similarity is never below -1, an inner product
       // never below FLOAT's lowest).
-      req.eps = call.kind == distance_kind::l2
-                  ? static_cast<double>(std::numeric_limits<float>::max())
+      req.eps = !cos ? static_cast<double>(std::numeric_limits<float>::max())
                 : std::string_view{metric_name(call.kind)} == "ip"
                   ? -std::numeric_limits<double>::infinity()
                   : -2.0;
@@ -2187,7 +2199,7 @@ class rewriter {
 
     SiriusVectorJoinBindData bind;
     auto& req       = bind.req;
-    bool const cos  = pred.call.kind != distance_kind::l2;
+    bool const cos  = score_is_similarity(pred.call.kind);
     req.mode        = vector_join_mode::threshold;
     req.metric      = metric_name(pred.call.kind);
     req.search_mode = vector_join_search_mode::exact_gemm;
@@ -2552,7 +2564,7 @@ class rewriter {
       right_names.clear();
     }
 
-    bool const cos  = pred.call.kind != distance_kind::l2;
+    bool const cos  = score_is_similarity(pred.call.kind);
     req.mode        = vector_join_mode::threshold;
     req.metric      = metric_name(pred.call.kind);
     req.search_mode = vector_join_search_mode::exact_gemm;
@@ -2715,8 +2727,9 @@ class rewriter {
 
   static double req_eps_in_score_space(const threshold_predicate& pred)
   {
+    // A cosine distance is compared as one (score_is_similarity), like an l2 distance.
     if (pred.call.kind == distance_kind::negative_inner_product) { return -pred.bound; }
-    return pred.call.kind == distance_kind::cosine_distance ? 1.0 - pred.bound : pred.bound;
+    return pred.bound;
   }
 
   static const char* req_metric_name(const threshold_predicate& pred)
