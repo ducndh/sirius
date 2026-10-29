@@ -1316,3 +1316,130 @@ TEST_CASE_METHOD(SqlRewriteFixture,
   ::setenv("SIRIUS_VSS_SQL_REWRITE", "0", 1);
   CHECK(ids_of(sorted_rows(*con, lateral), 0, 1) == nearest);
 }
+
+namespace {
+
+/// A pinned table of near-duplicates: 200 groups of four rows at offsets 0, 1, 3 and 7 along the
+/// group's own direction (so every row's nearest member is unique, with a clear gap), then 100
+/// rows on their own. Groups and singletons are random 16-d directions, far apart in cosine.
+void create_dedup_table(SqlRewriteFixture& fx, std::string const& name, std::string const& key_type)
+{
+  auto const comp = [](std::string const& seed) {
+    return "((hash(g * 100 + d + " + seed + ") % 2000)::FLOAT / 1000.0 - 1.0)";
+  };
+  fx.run_ok("CREATE TABLE " + name + " AS SELECT (g * 4 + j)::" + key_type +
+            " AS id, list_transform(range(16), lambda d: (" + comp("0") +
+            " + 0.05 * ([0, 1, 3, 7])[j + 1] * " + comp("777") +
+            ")::FLOAT)::FLOAT[16] AS vec FROM range(200) a(g), range(4) b(j) UNION ALL "
+            "SELECT (800 + g)::" +
+            key_type + " AS id, list_transform(range(16), lambda d: " + comp("4242") +
+            "::FLOAT)::FLOAT[16] AS vec FROM range(100) a(g);");
+  fx.run_ok("CHECKPOINT;");
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a LATERAL best match within a cap runs as the best-match threshold join",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite][best_match]")
+{
+  // The deduplication query: per row the nearest earlier row (s.id < r.id), kept when its
+  // similarity reaches 0.97. DuckDB plans the predicate as a join with the correlated columns and
+  // pushes the cap into the subquery; the rewrite reads it as the operator's best-match threshold
+  // join, keep => 'best' with earlier_by => 'id' (other_by for s.id <> r.id).
+  create_dedup_table(*this, "sr_dd", "INTEGER");
+  run_ok("SELECT * FROM pin_table(name => 'sr_dd', tier => 'gpu', format => 'duckdb');");
+  struct reset_on_exit {
+    duckdb::Connection& con;
+    ~reset_on_exit()
+    {
+      con.Query("RESET vector_join_probes;");
+      con.Query("RESET vector_join_clusters;");
+      con.Query("SELECT * FROM unpin_table('sr_dd');");
+    }
+  } reset{*con};
+  auto const dedup = [](std::string const& cmp,
+                        std::string const& limit = "1",
+                        std::string const& cap   = " WHERE m.sim >= 0.97") {
+    return "SELECT r.id, m.id, m.sim FROM sr_dd r, LATERAL (SELECT s.id, "
+           "array_cosine_similarity(r.vec, s.vec) AS sim FROM sr_dd s WHERE s.id " +
+           cmp + " r.id ORDER BY array_cosine_distance(r.vec, s.vec) LIMIT " + limit + ") m" + cap +
+           ";";
+  };
+  auto const tvf = [&](std::string const& key, std::string const& extra = "") {
+    return sorted_rows(*con,
+                       "SELECT left_id, right_id, similarity FROM sirius_knn_join('sr_dd','vec',"
+                       "'sr_dd','vec', metric => 'cosine', join_mode => 'threshold', eps => 0.97, "
+                       "keep => 'best', " +
+                         key + " => 'id'" + extra + ");");
+  };
+
+  for (auto const& [cmp, key] : {std::pair{std::string{"<"}, std::string{"earlier_by"}},
+                                 std::pair{std::string{"<>"}, std::string{"other_by"}}}) {
+    UNSCOPED_INFO("s.id " << cmp << " r.id");
+    auto const sql = dedup(cmp);
+    std::vector<std::vector<std::string>> got;
+    auto const lines = rewrite_log([&] { require_gpu_matches_duckdb(*con, sql); });
+    CHECK(any_line_has(lines, "LATERAL best match"));
+    got = sorted_rows(*con, sql);
+    // Most group rows have a member within the cap (588 earlier ones, 788 with <>).
+    CHECK(got.size() > (cmp == "<" ? 500u : 700u));
+    CHECK(rows_match(got, tvf(key)));
+  }
+
+  // Approximate: the same lists under both, so the same answer.
+  run_ok("SET vector_join_clusters = 16;");
+  run_ok("SET vector_join_probes = 4;");
+  auto const approx = sorted_rows(*con, dedup("<"));
+  CHECK(rows_match(approx,
+                   tvf("earlier_by",
+                       ", search_mode => 'approx', clustering => '__sirius_auto_sr_dd_vec_cosine', "
+                       "n_probes => 4")));
+  run_ok("RESET vector_join_probes;");
+  run_ok("RESET vector_join_clusters;");
+
+  // What the operator does not answer stays DuckDB's: k > 1, no cap, a cap that is strict.
+  for (auto const& sql : {dedup("<", "3"),
+                          dedup("<", "1", ""),
+                          dedup("<>", "3", ""),
+                          dedup("<", "1", " WHERE m.sim > 0.97")}) {
+    UNSCOPED_INFO("query: " << sql);
+    con->Query("SET gpu_execution = false;");
+    auto const expected = sorted_rows(*con, sql);
+    con->Query("SET gpu_execution = true;");
+    std::vector<std::vector<std::string>> got;
+    auto const lines = rewrite_log([&] { got = sorted_rows(*con, sql); });
+    CHECK_FALSE(any_line_has(lines, "LATERAL best match"));
+    CHECK(rows_match(got, expected));
+  }
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a LATERAL best match the operator cannot key stays DuckDB's",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite][best_match]")
+{
+  // A key that is not an integer, and a side that is not pinned.
+  create_dedup_table(*this, "sr_ddf", "DOUBLE");
+  create_dedup_table(*this, "sr_ddu", "INTEGER");
+  run_ok("SELECT * FROM pin_table(name => 'sr_ddf', tier => 'gpu', format => 'duckdb');");
+  struct unpin_on_exit {
+    duckdb::Connection& con;
+    ~unpin_on_exit() { con.Query("SELECT * FROM unpin_table('sr_ddf');"); }
+  } unpin{*con};
+  for (auto const* table : {"sr_ddf", "sr_ddu"}) {
+    auto const sql =
+      std::string("SELECT r.id, m.id FROM ") + table +
+      " r, LATERAL (SELECT s.id, array_cosine_similarity(r.vec, s.vec) AS sim FROM " + table +
+      " s WHERE s.id < r.id ORDER BY array_cosine_distance(r.vec, s.vec) LIMIT 1) m "
+      "WHERE m.sim >= 0.97;";
+    UNSCOPED_INFO("query: " << sql);
+    con->Query("SET gpu_execution = false;");
+    auto const expected = sorted_rows(*con, sql);
+    con->Query("SET gpu_execution = true;");
+    std::vector<std::vector<std::string>> got;
+    auto const lines = rewrite_log([&] { got = sorted_rows(*con, sql); });
+    CHECK_FALSE(any_line_has(lines, "LATERAL best match"));
+    CHECK(rows_match(got, expected));
+    CHECK(expected.size() > 500u);
+  }
+}
