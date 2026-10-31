@@ -2960,15 +2960,18 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
       req.metric = StringUtil::Lower(kv.second.ToString());
     } else if (key == "search_mode") {
       auto const mode = StringUtil::Lower(kv.second.ToString());
-      if (mode == "exact") {
-        req.search_mode = vector_join_search_mode::exact;
-      } else if (mode == "exact-gemm") {
+      // 'exact' is the exact join the SQL rewrite runs; 'exact-gemm' and 'exact-direct' are kept
+      // for the harnesses that name them, and run the same search.
+      if (mode == "exact" || mode == "exact-gemm") {
         req.search_mode = vector_join_search_mode::exact_gemm;
+      } else if (mode == "exact-direct") {
+        req.search_mode = vector_join_search_mode::exact_direct;
       } else if (mode == "approx") {
         req.search_mode = vector_join_search_mode::approx;
       } else {
         throw BinderException(
-          "sirius_knn_join: search_mode must be 'exact', 'exact-gemm', or 'approx'");
+          "sirius_knn_join: search_mode must be 'exact' or 'approx' (also accepted: "
+          "'exact-gemm' and 'exact-direct', both the same as 'exact')");
       }
     } else if (key == "join_mode") {
       auto const jm = StringUtil::Lower(kv.second.ToString());
@@ -3039,7 +3042,7 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   if (req.n_clusters < 0) { throw BinderException("sirius_knn_join: n_clusters must be >= 0"); }
   if (req.n_probes < 1) { throw BinderException("sirius_knn_join: n_probes must be >= 1"); }
   // Approximate search is unimplemented: nothing downstream reads search_mode beyond the
-  // exact/exact-gemm distinction, nor n_clusters/n_probes at all, so accepting them ran an
+  // exact/exact-direct distinction, nor n_clusters/n_probes at all, so accepting them ran an
   // exhaustive search while the query said otherwise -- results indistinguishable from an
   // approximate run that happened to be perfect. Refusing is the only honest answer until
   // there is a real approximate path.
@@ -4384,6 +4387,18 @@ static void SetEnableRuntimeSizeEstimation(ClientContext& context, SetScope scop
                    params->enable_runtime_size_estimation);
 }
 
+// Only checks the value: the vector join's rewrite reads the setting when it plans a join.
+static void SetVectorJoinProbes(ClientContext& /*context*/, SetScope /*scope*/, Value& parameter)
+{
+  if (parameter.IsNull()) { return; }
+  auto const c = DoubleValue::Get(parameter);
+  if (std::isnan(c) || c < 0.0) {
+    throw InvalidInputException(
+      "vector_join_probes must be a number >= 0 (0 runs the exact join), got %s",
+      parameter.ToString());
+  }
+}
+
 void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::sirius_config& defaults)
 {
   auto const& operator_defaults    = defaults.get_operator_params();
@@ -4484,17 +4499,20 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config, const sirius::siriu
   add_sirius_option(config,
                     option_visibility::user,
                     "vector_join_probes",
-                    "Clusters each probe row searches when a vector join written in SQL goes "
-                    "through cluster lists (0, the default: every cluster, an exact answer)",
-                    LogicalType::BIGINT,
-                    Value::BIGINT(0));
+                    "c >= 0: makes a vector join written in SQL approximate. Each probe row "
+                    "searches min(ceil(c * sqrt(N)), N) of the N clusters of lists Sirius sized "
+                    "itself, or ceil(c) of lists built explicitly or under vector_join_clusters "
+                    "(0, the default: no clusters, the exact join)",
+                    LogicalType::DOUBLE,
+                    Value::DOUBLE(0),
+                    SetVectorJoinProbes);
   add_sirius_option(config,
                     option_visibility::user,
                     "vector_join_clusters",
                     "Clusters of the lists a vector join builds inside a statement under "
-                    "vector_join_probes (0, the default: chosen by cost from the probe side's "
-                    "estimated rows, with vector_join_probes stated against sqrt(rows) clusters, "
-                    "at most 1024, and scaled to the count chosen)",
+                    "vector_join_probes, which is then a count of clusters (0, the default: "
+                    "chosen by cost from the probe side's estimated rows, from sqrt(rows) "
+                    "clusters, at most 1024, up to 16 times that)",
                     LogicalType::BIGINT,
                     Value::BIGINT(0));
   add_sirius_option(config,

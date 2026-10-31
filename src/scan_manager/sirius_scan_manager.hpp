@@ -246,6 +246,11 @@ struct pinned_entry {
   /// without revoking a query that already co-owns it. Null unless the late-mat
   /// gate is on.
   std::shared_ptr<late_mat::pin_entry_handle> late_mat_handle;
+  /// Identifies this entry object among every pin published in the process, so state derived
+  /// from a pin (the vector join's cluster lists, its notes on writes) can tell a re-pin from the
+  /// pin it was built from, even when the new entry happens to live at the old address. Assigned
+  /// when the entry is published under its name; never 0.
+  std::uint64_t generation{0};
   /// MVCC snapshot metadata for duckdb-native pins, attached by
   /// @ref sirius_scan_manager::attach_mvcc_metadata right after insert. nullptr
   /// for parquet pins (immutable sources need no visibility reconciliation).

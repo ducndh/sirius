@@ -44,6 +44,7 @@
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "util/duckdb_error_message.hpp"
 #include "vss/cuvs_index_cache.hpp"
+#include "vss/vector_join_binding.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
 
@@ -56,6 +57,7 @@
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <cucascade/memory/small_pinned_host_memory_resource.hpp>
 #include <duckdb/common/allocator.hpp>
+#include <duckdb/execution/operator/persistent/physical_delete.hpp>
 #include <duckdb/execution/operator/persistent/physical_insert.hpp>
 #include <duckdb/execution/operator/persistent/physical_merge_into.hpp>
 #include <duckdb/execution/operator/persistent/physical_update.hpp>
@@ -170,6 +172,51 @@ void reject_update_to_pinned_table(SiriusContext& sirius_context,
 
   if (update_guard.owns_lock()) {
     connection_state->set_pinned_update_guard(std::move(update_guard));
+  }
+}
+
+optional_ptr<TableCatalogEntry const> find_write_target(PhysicalOperator const& op)
+{
+  switch (op.type) {
+    case PhysicalOperatorType::UPDATE: return &op.Cast<PhysicalUpdate>().tableref;
+    case PhysicalOperatorType::DELETE_OPERATOR: return &op.Cast<PhysicalDelete>().tableref;
+    case PhysicalOperatorType::INSERT: {
+      auto const& insert = op.Cast<PhysicalInsert>();
+      if (insert.insert_table) { return &*insert.insert_table; }
+      break;
+    }
+    default: break;
+  }
+  for (auto const& child : op.GetChildren()) {
+    if (auto target = find_write_target(child.get())) { return target; }
+  }
+  return nullptr;
+}
+
+/// The vector join reads a pin's rows as they were pinned, and a CHECKPOINT can fold a write into
+/// the table so that nothing in its storage still shows it: note every statement that writes to a
+/// pinned table, before it runs (sirius::vss::pinned_rows_mismatch reads the note).
+void note_write_to_pinned_table(SiriusContext& sirius_context,
+                                ClientContext& context,
+                                PreparedStatementData& prepared)
+{
+  switch (prepared.statement_type) {
+    case StatementType::UPDATE_STATEMENT:
+    case StatementType::INSERT_STATEMENT:
+    case StatementType::DELETE_STATEMENT:
+    case StatementType::MERGE_INTO_STATEMENT:
+    case StatementType::COPY_STATEMENT: break;
+    default: return;
+  }
+  if (!prepared.physical_plan) { return; }
+  auto target = find_write_target(prepared.physical_plan->Root());
+  if (!target) { return; }
+  SiriusContext::SlotGuard pin_registry_guard(sirius_context, context);
+  auto& scan_manager     = sirius_context.get_scan_manager();
+  auto const pinned_name = pinned_name_for_table(scan_manager, *target);
+  if (!pinned_name) { return; }
+  if (auto const* pin = scan_manager.find_pinned_entry(*pinned_name)) {
+    sirius::vss::note_pinned_table_written(pin->generation);
   }
 }
 
@@ -1475,6 +1522,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
 {
   if (!is_internal_query_active(context)) {
     reject_update_to_pinned_table(*this, context, prepared);
+    note_write_to_pinned_table(*this, context, prepared);
   }
   if (is_internal_query_active(context)) { return RebindQueryInfo::DO_NOT_REBIND; }
   auto conn_state = get_sirius_connection_state(context);
@@ -1696,6 +1744,7 @@ RebindQueryInfo SiriusContext::OnExecutePrepared(ClientContext& context,
 {
   auto& prepared = info.prepared_statement;
   reject_update_to_pinned_table(*this, context, prepared);
+  note_write_to_pinned_table(*this, context, prepared);
 
   // GPU eligibility can drift with data alone (e.g. an insert pushes a varchar past
   // the overflow-string limit) and data changes never trigger DuckDB's own rebind.

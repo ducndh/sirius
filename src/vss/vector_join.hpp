@@ -31,12 +31,17 @@ enum class vector_join_mode : std::uint8_t {
   threshold,
 };
 
-/// - exact:      brute force, L2 computed Unexpanded, no GEMM.
-/// - exact_gemm: brute force, L2 computed Expanded (with GEMM). Exact for
-///               normalized / moderate-magnitude vectors.
-/// - approx:     not implemented yet
+/// - exact_gemm:   search_mode => 'exact' (and its alias 'exact-gemm'), the default and what the
+///                 SQL rewrite runs: the exact join, ranking L2 by the FP32 sum of (q_j - x_j)^2.
+///                 Its exhaustive search computes that sum from the differences; lists answer it
+///                 with a coded filter and an FP32 re-score, or (FP32 rows, every cluster probed)
+///                 from the differences too. The GEMM form |q|^2 + |x|^2 - 2 q.x is never the
+///                 answer: it cancels for rows far from the origin and close together.
+/// - exact_direct: search_mode => 'exact-direct' (undocumented): the same exhaustive search;
+///                 kept for the harnesses that name it.
+/// - approx:       search_mode => 'approx': through the lists of a clustering, n_probes of them.
 enum class vector_join_search_mode : std::uint8_t {
-  exact,
+  exact_direct,
   exact_gemm,
   approx,
 };

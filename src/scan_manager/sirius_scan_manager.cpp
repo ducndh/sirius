@@ -2846,9 +2846,15 @@ void sirius_scan_manager::remove_pinned_entry(const std::string& name)
 }
 void sirius_scan_manager::publish_late_mat_handle(const std::string& name)
 {
-  if (!late_mat::late_mat_enabled()) { return; }
   auto it = _pinned_entries.find(name);
   if (it == _pinned_entries.end()) { return; }
+  // Every newly published entry object gets its own generation, gate or not (see
+  // pinned_entry::generation). From one counter for the whole process, not this manager's: state
+  // keyed by it (the vector join's notes on a pin) outlives a database, and the next database's
+  // first pin must not inherit the last one's.
+  static std::atomic<std::uint64_t> next_generation{1};
+  it->second->generation = next_generation.fetch_add(1, std::memory_order_relaxed);
+  if (!late_mat::late_mat_enabled()) { return; }
   // Republishing on the same object is an in-place lifecycle change, so revoke
   // its prior generation before installing the new handle.
   if (it->second->late_mat_handle) { it->second->late_mat_handle->invalidate(); }

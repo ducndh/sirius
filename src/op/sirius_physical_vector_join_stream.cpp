@@ -886,7 +886,14 @@ class borrow_window {
 /// from the task's budget, the same bargain the host pin makes.
 class cluster_lists_chunk_source : public vector_chunk_source {
  public:
-  explicit cluster_lists_chunk_source(const vss::cluster_lists& lists) : _lists(lists) {}
+  /// With @p exact_rows, a FLOAT16 chunk is staged from the FP32 rows the lists kept instead of
+  /// widened from its half rows: for a search that must score the rows as they are.
+  explicit cluster_lists_chunk_source(const vss::cluster_lists& lists, bool exact_rows = false)
+    : _lists(lists),
+      _exact_rows(exact_rows && lists.encoding == vss::list_encoding::float16 &&
+                  lists.has_exact_rows())
+  {
+  }
 
   [[nodiscard]] std::size_t num_chunks() const override
   {
@@ -937,6 +944,22 @@ class cluster_lists_chunk_source : public vector_chunk_source {
     auto const mr = reservation->get_memory_resource();
     auto buffer   = std::make_unique<rmm::device_buffer>(
       static_cast<std::size_t>(rows) * float_row_bytes(), stream, mr);
+    if (_exact_rows) {
+      // Layout rows [first, first + rows) of the kept FP32 rows, which the re-score reads too.
+      vss::gather_exact_rows(_lists.exact_source(),
+                             first,
+                             1,
+                             rows,
+                             _lists.dim,
+                             static_cast<float*>(buffer->data()),
+                             stream);
+      stream.synchronize();
+      staged_vector_chunk staged{list_view(static_cast<const float*>(buffer->data()), rows),
+                                 nullptr,
+                                 std::move(reservation)};
+      staged.buffer = std::move(buffer);
+      return staged;
+    }
 
     // The chunk in its stored encoding, device-side: in place for the GPU tier, copied in block by
     // block for the HOST tier -- a chunk starts on a block boundary, so it is whole blocks plus a
@@ -1002,6 +1025,7 @@ class cluster_lists_chunk_source : public vector_chunk_source {
   }
 
   const vss::cluster_lists& _lists;
+  bool _exact_rows{false};
 };
 
 /// A corpus chunk for the fold: staged on @p stage_on under a reservation of its own, so its copy
@@ -1206,7 +1230,8 @@ void sirius_physical_vector_join_stream::initialize_locked()
     // row space that copy's neighbour ids are reported in.
     _lists =
       _sirius_ctx != nullptr ? vss::find_cluster_lists(*_sirius_ctx, _request.clustering) : nullptr;
-    if (_lists == nullptr || _lists->pin != right_pin.get() || _lists->column != right.column ||
+    if (_lists == nullptr || _lists->pin != right_pin.get() ||
+        _lists->pin_generation != right_pin->generation || _lists->column != right.column ||
         _lists->n_rows != static_cast<std::int64_t>(right_pin->num_rows)) {
       throw std::runtime_error("[sirius_physical_vector_join_stream] clustering '" +
                                _request.clustering + "' has no lists over the current pin of '" +
@@ -1917,7 +1942,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   }
 
   raft::device_resources res{stream};
-  auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact;
+  auto const exact_unexpanded = _request.search_mode == vss::vector_join_search_mode::exact_direct;
   auto const metric =
     vss::join_selection_distance_type_from_metric(_request.metric, exact_unexpanded);
   // An inner-product join ranks by D = -2 q.x (smaller is closer, like a distance; the factor is
@@ -2237,19 +2262,40 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         "unit rows and answer only cosine joins; rebuild them without it for an " +
         _request.metric + " join");
     }
-    if (unit_cosine) { radius_scale = 0.5f; }
+    auto const n_probes = std::clamp<std::int64_t>(_request.n_probes, 1, _n_clusters);
+    // Every cluster probed is the exact join through lists. A cosine join over lists of rows as
+    // they are (not unit rows) then ranks as the exhaustive fold does: the probe and each chunk
+    // normalized in FP32, L2 from the differences between them, halved at the end. No coded
+    // search takes such lists, so only plain FP32 slices are affected.
+    bool const direct_cosine =
+      !unit_cosine && _request.metric == "cosine" && n_probes >= _n_clusters;
+    if (unit_cosine || direct_cosine) { radius_scale = 0.5f; }
     auto const search_metric = unit_cosine ? cuvs::distance::DistanceType::L2Expanded : metric;
-    auto const search_radius = unit_cosine ? 2.f * radius_eps : radius_eps;
+    auto const search_radius = unit_cosine || direct_cosine ? 2.f * radius_eps : radius_eps;
     std::optional<rmm::device_uvector<float>> unit_probe;
-    if (unit_cosine) {
+    if (unit_cosine || direct_cosine) {
       unit_probe.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
       vss::normalize_rows(queries.data_handle(), n_left, dim, unit_probe->data(), stream);
     }
-    auto const search_queries = unit_cosine ? raft::make_device_matrix_view<const float, int64_t>(
-                                                unit_probe->data(), n_left, dim)
-                                            : queries;
+    auto const search_queries =
+      unit_cosine || direct_cosine
+        ? raft::make_device_matrix_view<const float, int64_t>(unit_probe->data(), n_left, dim)
+        : queries;
 
-    auto const n_probes = std::clamp<std::int64_t>(_request.n_probes, 1, _n_clusters);
+    // Rows that a plain FP32 search ranks (FP32 lists, or rows the coded searches below do not
+    // take) then rank as the exhaustive fold's do, L2 from the differences; the coded searches
+    // keep their own FP32 re-score.
+    auto const ranked_metric = [&] {
+      if (n_probes < _n_clusters) { return search_metric; }
+      if (direct_cosine) { return cuvs::distance::DistanceType::L2Unexpanded; }
+      if (search_metric == cuvs::distance::DistanceType::L2Expanded) {
+        return cuvs::distance::DistanceType::L2Unexpanded;
+      }
+      if (search_metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
+        return cuvs::distance::DistanceType::L2SqrtUnexpanded;
+      }
+      return search_metric;
+    }();
 
     // Each probe row picks its own n_probes nearest centroids, the way an IVF index routes a
     // query. Routing a whole probe cluster through its centroid's nearest centroids kept a
@@ -2566,21 +2612,73 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // % of its GPU time in the FP32 GEMM and the top-k selection of the ranked search this
     // replaces. With one probe sweep 0 is the whole search already, and sweep 1 would only repeat
     // it.
-    bool const scan_f16 = _lists == nullptr && !int8_search && gemm_search_enabled() &&
-                          bound_gemm_enabled && l2 && !radius_join && earlier_cut == nullptr &&
-                          n_probes > 1 && vss::bound_filter_f16_supports(dim) &&
-                          scan_bounded_enabled();
-    bool const f16_bounded =
-      scan_f16 || (!int8_search && gemm_search_enabled() && _lists != nullptr &&
-                   _lists->encoding == vss::list_encoding::float16 && _lists->has_exact_rows() &&
-                   (search_metric == cuvs::distance::DistanceType::L2Expanded ||
-                    search_metric == cuvs::distance::DistanceType::L2SqrtExpanded || ip) &&
-                   vss::bound_filter_f16_supports(dim) && bound_gemm_enabled);
+    bool const scan_f16_shape = _lists == nullptr && !int8_search && gemm_search_enabled() &&
+                                bound_gemm_enabled && l2 && !radius_join &&
+                                earlier_cut == nullptr && n_probes > 1 &&
+                                vss::bound_filter_f16_supports(dim) && scan_bounded_enabled();
+    bool const f16_lists_shape =
+      !int8_search && gemm_search_enabled() && _lists != nullptr &&
+      _lists->encoding == vss::list_encoding::float16 && _lists->has_exact_rows() &&
+      (search_metric == cuvs::distance::DistanceType::L2Expanded ||
+       search_metric == cuvs::distance::DistanceType::L2SqrtExpanded || ip) &&
+      vss::bound_filter_f16_supports(dim) && bound_gemm_enabled;
+    // The probe is rounded like the rows, with its rounded norms and its own rounding error. A
+    // probe row past half's range (a component of 65520 or more becomes infinite) would make its
+    // pairs' filter values infinite or NaN, which no limit admits: its true pairs would be dropped
+    // with no error. So the probe rows are held to the rows' own check (kmeans_functions.cpp: a
+    // norm under 65504), and a batch with one outside it is searched in FP32 instead: a scanned
+    // corpus from its staged FP32 chunks, FLOAT16 lists from their kept FP32 rows.
+    std::optional<rmm::device_uvector<std::uint16_t>> probe_f16;
+    std::optional<rmm::device_uvector<float>> probe_sqf, probe_half_error;
+    bool probe_in_f16_range = true;
+    if (scan_f16_shape || f16_lists_shape) {
+      probe_f16.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
+      probe_sqf.emplace(static_cast<std::size_t>(n_left), stream, mr);
+      probe_half_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
+      rmm::device_uvector<unsigned int> max_sq_bits(1, stream, mr);
+      CUDF_CUDA_TRY(cudaMemsetAsync(max_sq_bits.data(), 0, sizeof(unsigned int), stream.value()));
+      vss::narrow_to_float16(search_queries.data_handle(), n_left * dim, probe_f16->data(), stream);
+      vss::half_rows_norms(search_queries.data_handle(),
+                           probe_f16->data(),
+                           n_left,
+                           dim,
+                           probe_sqf->data(),
+                           probe_half_error->data(),
+                           nullptr,
+                           max_sq_bits.data(),
+                           stream);
+      unsigned int bits = 0;
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        &bits, max_sq_bits.data(), sizeof(bits), cudaMemcpyDeviceToHost, stream.value()));
+      stream.synchronize();
+      float max_sq = 0;
+      std::memcpy(&max_sq, &bits, sizeof(max_sq));
+      float const probe_norm_max = std::sqrt(max_sq);
+      probe_in_f16_range         = probe_norm_max < 65504.f;
+      if (!probe_in_f16_range) {
+        SIRIUS_LOG_INFO(
+          "[sirius_physical_vector_join_stream] a probe row norm of {} is outside float16's "
+          "range; searching this batch of {} rows in FP32",
+          probe_norm_max,
+          n_left);
+        probe_f16.reset();
+        probe_sqf.reset();
+        probe_half_error.reset();
+      }
+    }
+    bool const scan_f16    = scan_f16_shape && probe_in_f16_range;
+    bool const f16_bounded = scan_f16 || (f16_lists_shape && probe_in_f16_range);
+    // FLOAT16 lists searched without the bounded search for such a probe: their chunks are staged
+    // from the kept FP32 rows (in layout order), so the FP32 search scores what the rows hold.
+    std::optional<cluster_lists_chunk_source> exact_lists_corpus;
+    if (f16_lists_shape && !probe_in_f16_range) {
+      exact_lists_corpus.emplace(*_lists, /*exact_rows=*/true);
+    }
     // An inner-product join reads FLOAT16 lists only through the bounded search, which re-scores
-    // every pair from the FP32 rows; ranked on the half rows alone its scores would be the half
-    // rows' inner products.
+    // every pair from the FP32 rows, or from the FP32 rows themselves (above); ranked on the half
+    // rows alone its scores would be the half rows' inner products.
     if (ip && _lists != nullptr && _lists->encoding == vss::list_encoding::float16 &&
-        !f16_bounded) {
+        !f16_bounded && !exact_lists_corpus) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_stream] an inner-product join reads float16 cluster lists "
         "only through the bounded search (vector width a multiple of 16, the FP32 rows kept, "
@@ -2598,8 +2696,6 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // the pair is inside the radius, and re-scores only the rest.
     bool const skip_certain = radius_join && rescore && !_request.score_read && !best_only;
     std::optional<rmm::device_uvector<float>> certain_limit;
-    std::optional<rmm::device_uvector<std::uint16_t>> probe_f16;
-    std::optional<rmm::device_uvector<float>> probe_sqf, probe_half_error;
     std::optional<rmm::device_uvector<float>> ip_probe_zero_sq, ip_row_zero_sq;
     // The FLOAT16 rows' largest rounding error and norm, which the filter limit allows for: the
     // lists' own, or for a scanned corpus the staged chunk's, set as each chunk is coded.
@@ -2662,38 +2758,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       routed_sqf.emplace(static_cast<std::size_t>(max_routed), stream, mr);
     }
     if (f16_bounded) {
-      // The probe is rounded like the rows, with its rounded norms and its own rounding error.
-      probe_f16.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
-      probe_sqf.emplace(static_cast<std::size_t>(n_left), stream, mr);
-      probe_half_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
-      vss::narrow_to_float16(search_queries.data_handle(), n_left * dim, probe_f16->data(), stream);
-      vss::half_rows_norms(search_queries.data_handle(),
-                           probe_f16->data(),
-                           n_left,
-                           dim,
-                           probe_sqf->data(),
-                           probe_half_error->data(),
-                           nullptr,
-                           nullptr,
-                           stream);
+      // The probe was rounded above, and is within half's range.
       if (ip) {
-        // A probe component past half's range becomes infinite, and its pairs' filter values
-        // infinite or NaN, which no limit admits: refused rather than silently dropped. (The
-        // rows' own range is checked when their lists are built.)
-        std::vector<float> host_sq(static_cast<std::size_t>(n_left));
-        CUDF_CUDA_TRY(cudaMemcpyAsync(host_sq.data(),
-                                      probe_sqf->data(),
-                                      host_sq.size() * sizeof(float),
-                                      cudaMemcpyDeviceToHost,
-                                      stream.value()));
-        stream.synchronize();
-        for (auto const v : host_sq) {
-          if (!std::isfinite(v)) {
-            throw std::runtime_error(
-              "[sirius_physical_vector_join_stream] a probe row is outside float16's range for "
-              "the inner-product join over float16 lists; build them with storage => 'float32'");
-          }
-        }
         // The filter kernels compute |q|^2 + |x|^2 - 2 q.x from the norms they are handed: with
         // zeros on both sides that is -2 q.x, the inner-product distance, exactly.
         ip_probe_zero_sq.emplace(static_cast<std::size_t>(n_left), stream, mr);
@@ -3282,7 +3348,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           return stage_compact(j);
         }
         return direct ? staged_vector_chunk{}
-                      : stage_for_fold(*_corpus, j, *mem_space, stage_on, stream);
+                      : stage_for_fold(exact_lists_corpus ? *exact_lists_corpus : *_corpus,
+                                       j,
+                                       *mem_space,
+                                       stage_on,
+                                       stream);
       };
       prefetched = chunks.empty() ? staged_vector_chunk{} : stage_next(chunks[0]);
       if (sweep == 0 && seed) {
@@ -3401,6 +3471,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         std::byte const* compact     = nullptr;
         std::byte const* chunk_norms = nullptr;
         std::optional<rmm::device_buffer> widened;
+        // A cosine chunk normalized for the every-cluster search (direct_cosine).
+        std::optional<rmm::device_uvector<float>> unit_chunk;
         if (direct) {
           chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
           check_chunk_base(j, chunk_base);
@@ -3425,6 +3497,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           auto const chunk_view = vss::list_column_as_dataset_view(staged.view, dim);
           chunk_data            = chunk_view.data_handle();
           chunk_n               = chunk_view.extent(0);
+          if (direct_cosine && chunk_n > 0) {
+            unit_chunk.emplace(static_cast<std::size_t>(chunk_n * dim), stream, mr);
+            vss::normalize_rows(chunk_data, chunk_n, dim, unit_chunk->data(), stream);
+            chunk_data = unit_chunk->data();
+          }
         }
         // A scanned chunk read by the re-score: sweep 1's candidates carry corpus rows, which the
         // one block below maps onto the chunk (rows_per_block past any row, so block 0 always, its
@@ -3617,7 +3694,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                           slice_view,
                                           queries_view,
                                           search_radius,
-                                          search_metric,
+                                          ranked_metric,
                                           mr,
                                           0,
                                           count_only && !keyed);
@@ -3703,11 +3780,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                 search_metric == cuvs::distance::DistanceType::L2SqrtExpanded && !bounded,
                 mr);
             }
-            return gemm_search_enabled() && vss::gemm_search_supports(search_metric)
-                     ? vss::gemm_topk(res, slice_view, queries_view, k_eff, search_metric, mr)
+            // A re-scored sweep 0 only sets each row's bound, so it keeps the GEMM.
+            auto const ranked = rescore ? search_metric : ranked_metric;
+            return gemm_search_enabled() && vss::gemm_search_supports(ranked)
+                     ? vss::gemm_topk(res, slice_view, queries_view, k_eff, ranked, mr)
                      : vss::brute_force_knn_untrimmed(
                          res,
-                         vss::brute_force_build(res, slice_view, search_metric),
+                         vss::brute_force_build(res, slice_view, ranked),
                          queries_view,
                          k_eff,
                          mr);
@@ -3808,7 +3887,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       best_take_sqrt      = sqrt_at_end;
       emit_best();
     }
-    if (unit_cosine) {
+    if (unit_cosine || direct_cosine) {
       if (radius_join) {
         for (auto& part : radius_distances) {
           vss::scale_in_place(part->mutable_view().data<float>(), part->size(), 0.5f, stream);
@@ -3848,6 +3927,38 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   } else {
     auto const n_chunks = _corpus->num_chunks();
     std::int64_t offset = 0;  // running base of the current chunk in right-table row space
+    // Every exhaustive join is an exact one, and an exact L2 join ranks by the FP32 sum of
+    // (q_j - x_j)^2. The GEMM's |q|^2 + |x|^2 - 2 q.x cancels for rows far from the origin and
+    // close together, so L2 is computed from the differences (cuVS's Unexpanded form) here.
+    // Cosine likewise, on rows normalized in FP32: |q^ - x^|^2 = 2 (1 - cos), so the squared
+    // distance is halved at the end and a radius doubled. The GEMM's 1 - q.x / (|q| |x|) loses
+    // near-duplicates (cosine distances below about 1e-7) to the rounding of the dot product.
+    bool const exhaustive_cosine = _request.metric == "cosine";
+    auto const exhaustive_metric =
+      exhaustive_cosine
+        ? cuvs::distance::DistanceType::L2Unexpanded
+        : vss::join_selection_distance_type_from_metric(_request.metric, /*exact_unexpanded=*/true);
+    auto const exhaustive_radius = exhaustive_cosine ? 2.f * radius_eps : radius_eps;
+    std::optional<rmm::device_uvector<float>> unit_queries;
+    if (exhaustive_cosine) {
+      unit_queries.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
+      vss::normalize_rows(queries.data_handle(), n_left, dim, unit_queries->data(), stream);
+      radius_scale = 0.5f;
+    }
+    auto const fold_queries =
+      exhaustive_cosine
+        ? raft::make_device_matrix_view<const float, int64_t>(unit_queries->data(), n_left, dim)
+        : queries;
+    // A chunk's rows as the search reads them: normalized for cosine, into a buffer that lives
+    // until the next chunk's (its release is ordered behind the searches on the stream).
+    std::optional<rmm::device_uvector<float>> unit_chunk;
+    auto searched_rows = [&](vss::dataset_matrix_view rows) {
+      if (!exhaustive_cosine || rows.extent(0) == 0) { return rows; }
+      unit_chunk.emplace(static_cast<std::size_t>(rows.extent(0) * dim), stream, mr);
+      vss::normalize_rows(rows.data_handle(), rows.extent(0), dim, unit_chunk->data(), stream);
+      return raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+        unit_chunk->data(), rows.extent(0), dim);
+    };
 
     // Staging runs on its own stream so chunk j+1's H2D overlaps chunk j's compute. The
     // converter host-synchronizes at the end of its copy, so what is actually overlapped is
@@ -3944,10 +4055,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         auto edges = searched.extent(0) == 0
                        ? vss::threshold_join_result{nullptr, nullptr, nullptr, 0}
                        : threshold_search(res,
-                                          searched,
-                                          queries,
-                                          radius_eps,
-                                          metric,
+                                          searched_rows(searched),
+                                          fold_queries,
+                                          exhaustive_radius,
+                                          exhaustive_metric,
                                           mr,
                                           kGemmMinProbeRows,
                                           count_only && !keyed);
@@ -4012,8 +4123,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
 
       auto const k_eff = std::min<std::int64_t>(k_join, batch_rows);
 
-      // Expanded L2 and cosine go through the GEMM-ranked search; the unexpanded `exact` mode keeps
-      // cuVS.
+      // Cosine goes through the GEMM-ranked search; L2 (unexpanded, above) through cuVS.
       if (_corpus->is_streaming()) {
         ensure_device_headroom(
           _sirius_ctx,
@@ -4021,10 +4131,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           vss::gemm_search_tile_bytes() + static_cast<std::size_t>(batch_rows) *
                                             static_cast<std::size_t>(dim + 4) * sizeof(float));
       }
-      auto knn =
-        gemm_search_enabled() && vss::gemm_search_supports(metric) && n_left >= kGemmMinProbeRows
-          ? vss::gemm_topk(res, dataset, queries, k_eff, metric, mr)
-          : vss::brute_force_knn(res, dataset, queries, k_eff, metric, mr);
+      auto const rows = searched_rows(dataset);
+      auto knn        = gemm_search_enabled() && vss::gemm_search_supports(exhaustive_metric) &&
+                     n_left >= kGemmMinProbeRows
+                          ? vss::gemm_topk(res, rows, fold_queries, k_eff, exhaustive_metric, mr)
+                          : vss::brute_force_knn(res, rows, fold_queries, k_eff, exhaustive_metric, mr);
 
       // The search above is issued, not finished. Staging the next chunk now runs its H2D
       // while the GPU works on this one; the host blocks inside the converter, the device
@@ -4052,6 +4163,16 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                           stream);
     }
     emit_best();
+    if (exhaustive_cosine) {
+      if (radius_join) {
+        for (auto& part : radius_distances) {
+          vss::scale_in_place(part->mutable_view().data<float>(), part->size(), 0.5f, stream);
+        }
+      } else {
+        vss::scale_in_place(
+          acc_distances->mutable_view().data<float>(), n_left * k_join, 0.5f, stream);
+      }
+    }
   }
 
   // An empty right table joins to nothing: the answer is empty, as DuckDB's is.

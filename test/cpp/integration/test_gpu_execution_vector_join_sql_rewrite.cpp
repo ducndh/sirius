@@ -26,11 +26,15 @@
 #include <catch.hpp>
 #include <duckdb.hpp>
 #include <utils/gpu_execution_fixture.hpp>
+#include <utils/log_test_utils.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -583,8 +587,11 @@ TEST_CASE_METHOD(SqlRewriteFixture,
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
   // No clustering exists for the corpus: the setting has the rewrite fit one and write its lists
-  // inside the statement, then search p of them. The lists stay, so the table function over the
-  // auto-built clustering returns the same answer, and probing every cluster is DuckDB's.
+  // inside the statement, then search ceil(c * sqrt(N)) of them: 4,000 rows get sqrt(4,000) = 63
+  // clusters (no more, which would leave a cluster under 256 rows), and c = 0.25 is
+  // ceil(0.25 * 7.94) = 2 of those. The lists
+  // stay, so the table function over the auto-built clustering returns the same answer, and a c
+  // that reaches every cluster (c >= sqrt(N)) is DuckDB's.
   SqlRewriteTables tables(*this);
   auto const bytes = [](const std::string& seed) {
     return "list_transform(range(16), lambda d: (hash(i * 100 + d + " + seed +
@@ -603,16 +610,17 @@ TEST_CASE_METHOD(SqlRewriteFixture,
   auto const sql =
     "SELECT p.id, n.id, n.d FROM sr_fresh_probe p, LATERAL (SELECT c.id, "
     "array_distance(p.vec, c.vec) AS d FROM sr_fresh c ORDER BY d LIMIT 5) n;";
-  run_ok("SET vector_join_probes = 2;");
+  run_ok("SET vector_join_probes = 0.25;");
   auto const before = sirius::test::get_transparent_execution_stats(*con);
   auto const got    = sorted_rows(*con, sql);
   sirius::test::require_transparent_execution_delta(
     before, sirius::test::get_transparent_execution_stats(*con), 1, 0, 1);
-  auto centroids =
-    con->Query("SELECT count(*) FROM sirius_kmeans_centroids('__sirius_auto_sr_fresh_vec');");
+  auto centroids = con->Query(
+    "SELECT count(DISTINCT cluster_id) FROM "
+    "sirius_kmeans_centroids('__sirius_auto_sr_fresh_vec');");
   REQUIRE_FALSE(centroids->HasError());
   auto const n_clusters = centroids->GetValue(0, 0).GetValue<std::int64_t>();
-  REQUIRE(n_clusters > 2);
+  REQUIRE(n_clusters == 63);
   auto const tvf = sorted_rows(
     *con,
     "SELECT left_id, right_id, distance FROM sirius_knn_join('sr_fresh_probe','vec','sr_fresh',"
@@ -627,10 +635,10 @@ TEST_CASE_METHOD(SqlRewriteFixture,
                  "vector_join_clusters sets the count of an in-query build, and probes follow it",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
-  // 4,000 rows: the reference count is 63. An explicit vector_join_clusters builds that many
-  // lists and searches exactly vector_join_probes of them. With the setting back at 0 the probes
-  // are stated against the reference and scaled to what the kept lists have: 2 of 63 is
-  // ceil(2 * sqrt(252 / 63)) = 4 of 252.
+  // An explicit vector_join_clusters builds that many lists and searches c of them, a count of
+  // clusters rounded up: c = 2 is 2 of 252, c = 2.5 is 3. With the setting back at 0 the kept
+  // lists are Sirius's own, and c is a multiple of the square root of their count:
+  // c = 0.25 is ceil(0.25 * sqrt(252)) = 4 of 252, and c = 16 (past sqrt(252) = 15.9) all of them.
   SqlRewriteTables tables(*this);
   auto const bytes = [](const std::string& seed) {
     return "list_transform(range(16), lambda d: (hash(i * 100 + d + " + seed +
@@ -669,15 +677,107 @@ TEST_CASE_METHOD(SqlRewriteFixture,
       "sirius_kmeans_centroids('__sirius_auto_sr_count_vec');");
   REQUIRE_FALSE(centroids->HasError());
   REQUIRE(centroids->GetValue(0, 0).GetValue<std::int64_t>() == 252);
-  auto const two = tvf(2), four = tvf(4);
+  auto const two = tvf(2), three = tvf(3), four = tvf(4);
   REQUIRE_FALSE(rows_match(two, four));
+  REQUIRE_FALSE(rows_match(two, three));
   CHECK(rows_match(fixed, two));
+  run_ok("SET vector_join_probes = 2.5;");
+  CHECK(rows_match(sorted_rows(*con, sql), three));
 
   run_ok("RESET vector_join_clusters;");
+  run_ok("SET vector_join_probes = 0.25;");
   CHECK(rows_match(sorted_rows(*con, sql), four));
-  // Every reference cluster is still every cluster.
-  run_ok("SET vector_join_probes = 63;");
+  run_ok("SET vector_join_probes = 16;");
   require_gpu_matches_duckdb(*con, sql);
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "vector_join_probes = c visits ceil(c * sqrt(N)) of the N clusters Sirius sized",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // 4,096 clusters of 65,536 rows, built under vector_join_clusters (c = 8 is then 8 clusters)
+  // and kept under Sirius's own name. With vector_join_clusters back at 0 the rewrite takes N
+  // from the lists: c = 0.5 visits ceil(0.5 * sqrt(4096)) = 32 of them, c = 64 (= sqrt(4096))
+  // every one, the exact answer. A negative c is refused and leaves the setting as it was; c = 0 is
+  // the exact join, with no lists searched approximately. The rows are not bytes, so the lists are
+  // FLOAT16 with their FP32 rows, every candidate re-scored: no ties to break differently from
+  // DuckDB.
+  SqlRewriteTables tables(*this);
+  auto const floats = [](const std::string& seed) {
+    return "list_transform(range(16), lambda d: ((hash(i * 100 + d + " + seed +
+           ") % 100000) / 977.0)::FLOAT)::FLOAT[16]";
+  };
+  run_ok("CREATE TABLE sr_c4k AS SELECT i::INTEGER AS id, " + floats("0") +
+         " AS vec FROM range(65536) t(i);");
+  run_ok("CREATE TABLE sr_c4k_probe AS SELECT i::INTEGER AS id, " + floats("9999") +
+         " AS vec FROM range(30) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_c4k', tier => 'gpu', format => 'duckdb');");
+  struct reset_on_exit {
+    duckdb::Connection& con;
+    ~reset_on_exit()
+    {
+      con.Query("RESET vector_join_probes;");
+      con.Query("RESET vector_join_clusters;");
+    }
+  } reset{*con};
+  auto const sql =
+    "SELECT p.id, n.id, n.d FROM sr_c4k_probe p, LATERAL (SELECT c.id, "
+    "array_distance(p.vec, c.vec) AS d FROM sr_c4k c ORDER BY d LIMIT 5) n;";
+  // The rewrite's "searching ... through X of the Y clusters" lines while @p run runs.
+  auto const probe_lines = [](auto&& run) {
+    sirius::test::scoped_recording_log_sink log{"info"};
+    run();
+    std::vector<std::string> lines;
+    for (auto const& r : log.records()) {
+      if (r.message.find("(vector_join_probes") != std::string::npos) {
+        lines.push_back(r.message);
+      }
+    }
+    return lines;
+  };
+  auto const require_through = [](std::vector<std::string> const& lines, std::string const& what) {
+    REQUIRE_FALSE(lines.empty());
+    for (auto const& line : lines) {
+      UNSCOPED_INFO("log: " << line);
+      CHECK(line.find("searching 'sr_c4k' through " + what + " clusters") != std::string::npos);
+    }
+  };
+
+  run_ok("SET vector_join_clusters = 4096;");
+  run_ok("SET vector_join_probes = 8;");
+  require_through(probe_lines([&] { (void)sorted_rows(*con, sql); }), "8 of the 4096");
+  auto centroids = con->Query(
+    "SELECT count(DISTINCT cluster_id) FROM sirius_kmeans_centroids('__sirius_auto_sr_c4k_vec');");
+  REQUIRE_FALSE(centroids->HasError());
+  REQUIRE(centroids->GetValue(0, 0).GetValue<std::int64_t>() == 4096);
+  run_ok("RESET vector_join_clusters;");
+
+  run_ok("SET vector_join_probes = 0.5;");
+  std::vector<std::vector<std::string>> half;
+  require_through(probe_lines([&] { half = sorted_rows(*con, sql); }), "32 of the 4096");
+  auto const tvf32 = sorted_rows(
+    *con,
+    "SELECT left_id, right_id, distance FROM sirius_knn_join('sr_c4k_probe','vec','sr_c4k','vec', "
+    "probe_source => 'scan', search_mode => 'approx', clustering => '__sirius_auto_sr_c4k_vec', "
+    "n_probes => 32, k => 5);");
+  CHECK(rows_match(half, tvf32));
+
+  run_ok("SET vector_join_probes = 64;");
+  require_through(probe_lines([&] { require_gpu_matches_duckdb(*con, sql); }), "4096 of the 4096");
+
+  for (auto const* bad : {"-1", "-0.5", "'nan'"}) {
+    auto const r = con->Query(std::string("SET vector_join_probes = ") + bad + ";");
+    REQUIRE(r->HasError());
+    UNSCOPED_INFO("SET vector_join_probes = " << bad << ": " << r->GetError());
+    CHECK(r->GetError().find("vector_join_probes must be a number >= 0") != std::string::npos);
+  }
+  auto const kept = con->Query("SELECT current_setting('vector_join_probes');");
+  REQUIRE_FALSE(kept->HasError());
+  CHECK(kept->GetValue(0, 0).GetValue<double>() == 64.0);
+
+  run_ok("SET vector_join_probes = 0;");
+  CHECK(probe_lines([&] { require_gpu_matches_duckdb(*con, sql); }).empty());
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
@@ -802,6 +902,87 @@ TEST_CASE_METHOD(SqlRewriteFixture,
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a probe row outside float16's range is searched in FP32 over float16 lists",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // Probe row 7 has a component of 70,000, which float16 rounds to infinity: the bounded FP16
+  // search gave its pairs NaN filter values, which no limit admits, and dropped every one of them
+  // without an error. Its batch is searched in FP32 instead, from the kept FP32 rows, so each
+  // answer is DuckDB's: through the exact join's single FLOAT16 list, through partitions all
+  // probed, and for the inner product (which refused such a probe). The corpus's first component
+  // is 15 * id, under 60,000 (inside float16's range, so its lists build), which keeps row 7's
+  // neighbours far apart; the rest are not bytes, so the lists are FLOAT16.
+  SqlRewriteTables tables(*this);
+  run_ok(
+    "CREATE TABLE sr_wide16 AS SELECT i::INTEGER AS id, list_transform(range(16), lambda d: "
+    "(CASE WHEN d = 0 THEN i * 15.0 ELSE (hash(i * 100 + d) % 100000) / 977.0 END)::FLOAT)"
+    "::FLOAT[16] AS vec FROM range(4000) t(i);");
+  run_ok(
+    "CREATE TABLE sr_wide16_probe AS SELECT i::INTEGER AS id, list_transform(range(16), lambda "
+    "d: (CASE WHEN i = 7 AND d = 0 THEN 70000.0 ELSE (hash(i * 100 + d + 9999) % 100000) / 977.0 "
+    "END)::FLOAT)::FLOAT[16] AS vec FROM range(30) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_wide16', tier => 'gpu', format => 'duckdb');");
+  struct reset_on_exit {
+    duckdb::Connection& con;
+    ~reset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_ACCESS_PATH");
+      con.Query("RESET vector_join_probes;");
+    }
+  } reset{*con};
+  auto const lateral =
+    "SELECT p.id, n.id, n.d FROM sr_wide16_probe p, LATERAL (SELECT c.id, "
+    "array_distance(p.vec, c.vec) AS d FROM sr_wide16 c ORDER BY d LIMIT 5) n;";
+  // Row 7 is 10,015 or more from every row, the others mostly under 10,600 from a few hundred.
+  auto const threshold =
+    "SELECT p.id, c.id FROM sr_wide16_probe p, sr_wide16 c WHERE "
+    "array_distance(p.vec, c.vec) <= 10600.0;";
+  auto const lateral_ip =
+    "SELECT p.id, n.id, n.s FROM sr_wide16_probe p, LATERAL (SELECT c.id, "
+    "array_inner_product(p.vec, c.vec) AS s FROM sr_wide16 c ORDER BY s DESC LIMIT 5) n;";
+  auto const fell_back = [](auto&& run) {
+    sirius::test::scoped_recording_log_sink log{"info"};
+    run();
+    for (auto const& r : log.records()) {
+      if (r.message.find("outside float16's range; searching this batch") != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  };
+  auto const has_rows_of_7 = [&](std::string const& sql) {
+    con->Query("SET gpu_execution = false;");
+    auto const rows = sorted_rows(*con, sql);
+    con->Query("SET gpu_execution = true;");
+    return std::any_of(rows.begin(), rows.end(), [](auto const& r) { return r[0] == "7"; });
+  };
+  REQUIRE(has_rows_of_7(lateral));
+  REQUIRE(has_rows_of_7(threshold));
+
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "lists", 1);
+  CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, lateral); }));
+  auto codes = con->Query(
+    "SELECT count(DISTINCT cluster_id) FROM "
+    "sirius_kmeans_centroids('__sirius_auto_codes_sr_wide16_vec');");
+  REQUIRE_FALSE(codes->HasError());
+  CHECK(codes->GetValue(0, 0).GetValue<std::int64_t>() == 1);
+  CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, threshold); }));
+  CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, lateral_ip); }));
+  ::unsetenv("SIRIUS_VSS_ACCESS_PATH");
+
+  // Partitions of the corpus, every one probed: exact too.
+  run_ok("SET vector_join_probes = 1000;");
+  CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, lateral); }));
+  auto partitions = con->Query(
+    "SELECT count(DISTINCT cluster_id) FROM "
+    "sirius_kmeans_centroids('__sirius_auto_sr_wide16_vec');");
+  REQUIRE_FALSE(partitions->HasError());
+  CHECK(partitions->GetValue(0, 0).GetValue<std::int64_t>() > 1);
+  CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, threshold); }));
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
                  "a probe that is a pinned table is read from its pin",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
@@ -824,4 +1005,314 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     *con,
     "SELECT p.id, n.id, n.d FROM sr_probe p, LATERAL (SELECT c.id, array_distance(p.vec, c.vec) "
     "AS d FROM sr_corpus c WHERE c.cat = 3 ORDER BY d LIMIT 4) n;");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a plain-SQL LATERAL over rows far from the origin is DuckDB's",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // Rows [i, i+1, i+2] of width 3 (no codes), so the rewrite takes the exhaustive search. Ranked
+  // by |q|^2 + |x|^2 - 2 q.x (about 7.4e9 a term in FP32, against shells 3 apart) the probe's own
+  // row 49,800 was missed and rows from 49,794 to 49,811 came back instead of 49,796 to 49,804.
+  run_ok(
+    "CREATE TABLE sr_far AS SELECT i::INTEGER AS id, [i::FLOAT, (i + 1)::FLOAT, (i + 2)::FLOAT]"
+    "::FLOAT[3] AS vec FROM range(50000) t(i);");
+  run_ok(
+    "CREATE TABLE sr_far_probe AS SELECT * FROM (VALUES (0, [49800.0, 49801.0, 49802.0]), "
+    "(1, [49890.0, 49891.0, 49892.0]), (2, [49810.0, 49811.0, 49812.0]), (3, [49780.0, "
+    "49781.0, 49782.0]), (4, [49820.0, 49821.0, 49822.0])) t(id, vec);");
+  run_ok(
+    "CREATE TABLE sr_far_p AS SELECT id::INTEGER AS id, vec::FLOAT[3] AS vec FROM "
+    "sr_far_probe;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_far', tier => 'gpu', format => 'duckdb');");
+  require_gpu_matches_duckdb(*con,
+                             "SELECT p.id, n.id, n.d FROM sr_far_p p, LATERAL (SELECT c.id, "
+                             "array_distance(p.vec, c.vec) AS d FROM sr_far c ORDER BY d LIMIT "
+                             "9) n;");
+  require_gpu_matches_duckdb(*con,
+                             "SELECT p.id, c.id FROM sr_far_p p, sr_far c WHERE "
+                             "array_distance(p.vec, c.vec) <= 6.0;");
+  run_ok("SELECT * FROM unpin_table('sr_far');");
+}
+
+namespace {
+
+/// The "[vector_join_rewrite] ..." lines logged while @p run runs.
+template <typename F>
+std::vector<std::string> rewrite_log(F&& run)
+{
+  sirius::test::scoped_recording_log_sink log{"info"};
+  run();
+  std::vector<std::string> lines;
+  for (auto const& r : log.records()) {
+    if (r.message.find("[vector_join_rewrite]") != std::string::npos) {
+      lines.push_back(r.message);
+    }
+  }
+  return lines;
+}
+
+bool any_line_has(std::vector<std::string> const& lines, std::string const& needle)
+{
+  return std::any_of(lines.begin(), lines.end(), [&](std::string const& l) {
+    return l.find(needle) != std::string::npos;
+  });
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "a DELETE or INSERT on a pinned corpus leaves the vector join to DuckDB",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // The pin holds the rows as they were pinned, a deleted row included and an inserted one
+  // missing; ordinary scans reconcile that with DuckDB's visibility, but the vector join reads the
+  // pinned rows as they are. It returned the deleted row 5 and missed the inserted 9999. Now the
+  // rewrite leaves such a statement to DuckDB, the table function refuses to read the pin, and
+  // the table function over a scan (which applies the visibility) answers.
+  auto const floats = [](const std::string& seed) {
+    return "list_transform(range(16), lambda d: ((hash(i * 100 + d + " + seed +
+           ") % 100000) / 977.0)::FLOAT)::FLOAT[16]";
+  };
+  run_ok("CREATE TABLE sr_dml AS SELECT i::INTEGER AS id, " + floats("0") +
+         " AS vec FROM range(4000) t(i);");
+  run_ok("CREATE TABLE sr_dml_probe AS SELECT id, vec FROM sr_dml WHERE id IN (5, 6, 7);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_dml', tier => 'gpu', format => 'duckdb');");
+  struct unpin_on_exit {
+    duckdb::Connection& con;
+    ~unpin_on_exit() { con.Query("SELECT * FROM unpin_table('sr_dml');"); }
+  } unpin{*con};
+  auto const lateral =
+    "SELECT p.id, n.id, n.d FROM sr_dml_probe p, LATERAL (SELECT c.id, array_distance(p.vec, "
+    "c.vec) AS d FROM sr_dml c ORDER BY d LIMIT 2) n;";
+  auto const threshold =
+    "SELECT p.id, c.id FROM sr_dml_probe p, sr_dml c WHERE array_distance(p.vec, c.vec) <= 40.0;";
+  auto const on_duckdb = [&](std::string const& sql) {
+    con->Query("SET gpu_execution = false;");
+    auto rows = sorted_rows(*con, sql);
+    con->Query("SET gpu_execution = true;");
+    return rows;
+  };
+  CHECK(any_line_has(rewrite_log([&] { require_gpu_matches_duckdb(*con, lateral); }),
+                     "rewritten to sirius_knn_join_rel"));
+
+  run_ok("DELETE FROM sr_dml WHERE id = 5;");
+  run_ok("INSERT INTO sr_dml SELECT 9999, vec FROM sr_dml WHERE id = 7;");
+  for (auto const* sql : {lateral, threshold}) {
+    UNSCOPED_INFO("query: " << sql);
+    auto const expected = on_duckdb(sql);
+    std::vector<std::vector<std::string>> got;
+    auto const lines = rewrite_log([&] { got = sorted_rows(*con, sql); });
+    CHECK(rows_match(got, expected));
+    CHECK(any_line_has(lines, "left to DuckDB: the pin of 'sr_dml' no longer holds its rows"));
+  }
+  auto const after = on_duckdb(lateral);
+  REQUIRE(std::any_of(after.begin(), after.end(), [](auto const& r) { return r[1] == "9999"; }));
+
+  auto const pinned_tvf = con->Query(
+    "SELECT * FROM sirius_knn_join('sr_dml_probe','vec','sr_dml','vec', probe_source => 'scan', "
+    "k => 2);");
+  REQUIRE(pinned_tvf->HasError());
+  UNSCOPED_INFO("error: " << pinned_tvf->GetError());
+  CHECK(pinned_tvf->GetError().find("the pin of right table 'sr_dml' no longer holds the "
+                                    "table's rows") != std::string::npos);
+  CHECK(pinned_tvf->GetError().find("build_source => 'scan'") != std::string::npos);
+  auto const scanned_tvf =
+    sorted_rows(*con,
+                "SELECT left_id, right_id, distance FROM sirius_knn_join('sr_dml_probe','vec',"
+                "'sr_dml','vec', probe_source => 'scan', build_source => 'scan', k => 2);");
+  CHECK(rows_match(scanned_tvf, after));
+
+  // A pin taken after a CHECKPOINT answers as DuckDB does too: from its rows, or, while the
+  // deleted rows are still in storage (and so in the pin), by leaving the statement to DuckDB.
+  run_ok("SELECT * FROM unpin_table('sr_dml');");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_dml', tier => 'gpu', format => 'duckdb');");
+  CHECK(rows_match(sorted_rows(*con, lateral), after));
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "lists cached from an earlier pin are not used for a re-pinned table",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // The rewrite keeps the lists it builds for later statements, and found them by table, column
+  // and row count, so a table changed while unpinned and pinned again with as many rows was
+  // searched through the lists of its old rows. Lists now serve only the pin (generation) they
+  // were built from.
+  auto const floats = [](const std::string& seed) {
+    return "list_transform(range(16), lambda d: ((hash(i * 100 + d + " + seed +
+           ") % 100000) / 977.0)::FLOAT)::FLOAT[16]";
+  };
+  run_ok("CREATE TABLE sr_rp AS SELECT i::INTEGER AS id, " + floats("0") +
+         " AS vec FROM range(4000) t(i);");
+  run_ok("CREATE TABLE sr_rp_probe AS SELECT id, vec FROM sr_rp WHERE id IN (5, 6, 7);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_rp', tier => 'gpu', format => 'duckdb');");
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "lists", 1);
+  struct reset_on_exit {
+    duckdb::Connection& con;
+    ~reset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_ACCESS_PATH");
+      con.Query("SELECT * FROM unpin_table('sr_rp');");
+    }
+  } reset{*con};
+  auto const lateral =
+    "SELECT p.id, n.id, n.d FROM sr_rp_probe p, LATERAL (SELECT c.id, array_distance(p.vec, "
+    "c.vec) AS d FROM sr_rp c ORDER BY d LIMIT 2) n;";
+  auto const built = [](std::vector<std::string> const& lines) {
+    return any_line_has(lines, "built lists '__sirius_auto_codes_sr_rp_vec'");
+  };
+  CHECK(built(rewrite_log([&] { require_gpu_matches_duckdb(*con, lateral); })));
+  CHECK_FALSE(built(rewrite_log([&] { require_gpu_matches_duckdb(*con, lateral); })));
+
+  // The same table, as many rows, other vectors: a fresh table, so no deleted rows in its pin.
+  run_ok("SELECT * FROM unpin_table('sr_rp');");
+  run_ok("DROP TABLE sr_rp;");
+  run_ok("CREATE TABLE sr_rp AS SELECT i::INTEGER AS id, " + floats("777") +
+         " AS vec FROM range(4000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_rp', tier => 'gpu', format => 'duckdb');");
+  CHECK(built(rewrite_log([&] { require_gpu_matches_duckdb(*con, lateral); })));
+
+  // An UPDATE while unpinned, then a re-pin: DuckDB updates a vector as a delete and an insert,
+  // so the pin holds the old row too, and the statement is DuckDB's.
+  run_ok("SELECT * FROM unpin_table('sr_rp');");
+  run_ok(
+    "UPDATE sr_rp SET vec = list_transform(range(16), lambda d: 1000.0::FLOAT)::FLOAT[16] "
+    "WHERE id = 6;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_rp', tier => 'gpu', format => 'duckdb');");
+  con->Query("SET gpu_execution = false;");
+  auto const expected = sorted_rows(*con, lateral);
+  con->Query("SET gpu_execution = true;");
+  std::vector<std::vector<std::string>> got;
+  auto const lines = rewrite_log([&] { got = sorted_rows(*con, lateral); });
+  CHECK(rows_match(got, expected));
+  CHECK(
+    std::none_of(got.begin(), got.end(), [](auto const& r) { return r[0] == "6" && r[1] == "6"; }));
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "cosine ranks near-duplicates on rows normalized in FP32",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite][cosine]")
+{
+  // Row i is the probe with its first component moved by (2000 - i) * 1e-4, so the nearest six
+  // are rows 1999 down to 1994, at cosine distances of about 2.5e-10 to 9e-9. The GEMM's
+  // 1 - q.x / (|q| |x|) rounds those to 0 and returned rows 1985..1999 in no order (DuckDB's own
+  // array_cosine_distance, the same formula, returned 1980..1989). An exact cosine join ranks the
+  // rows normalized in FP32 by L2 between them: here every exhaustive and every-cluster search.
+  run_ok(
+    "CREATE TABLE sr_cos AS SELECT i::INTEGER AS id, list_transform(range(16), lambda d: (CASE "
+    "WHEN d = 0 THEN 1.0 + (2000 - i) * 0.0001 ELSE 0.5 + d * 0.07 END)::FLOAT)::FLOAT[16] AS "
+    "vec FROM range(2000) t(i);");
+  run_ok(
+    "CREATE TABLE sr_cos_probe AS SELECT 0::INTEGER AS id, list_transform(range(16), lambda d: "
+    "(CASE WHEN d = 0 THEN 1.0 ELSE 0.5 + d * 0.07 END)::FLOAT)::FLOAT[16] AS vec;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_cos', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'sr_cos_probe', tier => 'gpu', format => 'duckdb');");
+  struct reset_on_exit {
+    duckdb::Connection& con;
+    ~reset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_ACCESS_PATH");
+      ::unsetenv("SIRIUS_VSS_SQL_REWRITE");
+      con.Query("SELECT * FROM unpin_table('sr_cos_probe');");
+      con.Query("SELECT * FROM unpin_table('sr_cos');");
+    }
+  } reset{*con};
+
+  // The cosine distance of row i, in double from the rows as stored.
+  auto const oracle = [](int i) {
+    std::array<double, 16> q{}, x{};
+    for (int d = 0; d < 16; ++d) {
+      q[d] = static_cast<float>(d == 0 ? 1.0 : 0.5 + d * 0.07);
+      x[d] = d == 0 ? static_cast<float>(1.0 + (2000 - i) * 0.0001) : q[d];
+    }
+    double nq = 0, nx = 0, s = 0;
+    for (int d = 0; d < 16; ++d) {
+      nq += q[d] * q[d];
+      nx += x[d] * x[d];
+    }
+    for (int d = 0; d < 16; ++d) {
+      auto const diff = q[d] / std::sqrt(nq) - x[d] / std::sqrt(nx);
+      s += diff * diff;
+    }
+    return s / 2;
+  };
+  std::vector<std::string> const nearest{"1994", "1995", "1996", "1997", "1998", "1999"};
+  // The ids of a result's rows (column @p id_col), sorted, and each row's distance near the
+  // oracle's (column @p d_col, when given): within 10%, the FP32 normalization's rounding.
+  auto const ids_of = [&](std::vector<std::vector<std::string>> const& rows,
+                          std::size_t id_col,
+                          std::optional<std::size_t> d_col) {
+    std::vector<std::string> ids;
+    for (auto const& r : rows) {
+      ids.push_back(r[id_col]);
+      if (d_col) {
+        auto const want = oracle(std::stoi(r[id_col]));
+        auto const got  = std::stod(r[*d_col]);
+        UNSCOPED_INFO("row " << r[id_col] << ": " << got << " vs " << want);
+        CHECK(std::fabs(got - want) <= 0.1 * want);
+      }
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+  };
+  auto const tvf = [&](std::string const& extra) {
+    return sorted_rows(*con,
+                       "SELECT right_id, distance FROM sirius_knn_join('sr_cos_probe','vec',"
+                       "'sr_cos','vec', metric => 'cosine', output_type => 'distance'" +
+                         extra + ");");
+  };
+  auto const lateral =
+    "SELECT n.id, n.d FROM sr_cos_probe p, LATERAL (SELECT c.id, array_cosine_distance(p.vec, "
+    "c.vec) AS d FROM sr_cos c ORDER BY d LIMIT 6) n;";
+
+  // The exhaustive search: top-k, and a threshold between the 6th and 7th distances.
+  CHECK(ids_of(tvf(", k => 6"), 0, 1) == nearest);
+  char eps_text[32];
+  std::snprintf(eps_text, sizeof eps_text, "%.17g", (oracle(1994) + oracle(1993)) / 2);
+  std::string const eps{eps_text};
+  CHECK(ids_of(tvf(", join_mode => 'threshold', eps => " + eps), 0, 1) == nearest);
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "brute", 1);
+  CHECK(ids_of(sorted_rows(*con, lateral), 0, 1) == nearest);
+  // A FLOAT bound: against a DOUBLE one DuckDB compares the distance cast to DOUBLE, which the
+  // rewrite does not match, and the statement stays DuckDB's.
+  auto const within =
+    "SELECT p.id, c.id, array_cosine_distance(p.vec, c.vec) FROM sr_cos_probe p, sr_cos c WHERE "
+    "array_cosine_distance(p.vec, c.vec) <= " +
+    eps + "::FLOAT;";
+  CHECK(ids_of(sorted_rows(*con, within), 1, 2) == nearest);
+  // The coded path (FLOAT16 unit rows, every candidate re-scored in FP32), unchanged.
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "lists", 1);
+  CHECK(ids_of(sorted_rows(*con, lateral), 0, 1) == nearest);
+  ::unsetenv("SIRIUS_VSS_ACCESS_PATH");
+
+  // Every cluster probed: FP32 lists of the rows as they are, and of unit rows.
+  run_ok("SELECT * FROM sirius_kmeans_fit('sr_cos','vec', name => 'sr_cos_c', n_clusters => 4);");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('sr_cos','vec','sr_cos_c', storage => "
+    "'float32');");
+  CHECK(ids_of(tvf(", k => 6, search_mode => 'approx', clustering => 'sr_cos_c', n_probes => 4"),
+               0,
+               1) == nearest);
+  CHECK(ids_of(tvf(", join_mode => 'threshold', eps => " + eps +
+                   ", search_mode => 'approx', clustering => 'sr_cos_c', n_probes => 4"),
+               0,
+               1) == nearest);
+  run_ok("SELECT * FROM sirius_kmeans_fit('sr_cos','vec', name => 'sr_cos_u', n_clusters => 4);");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('sr_cos','vec','sr_cos_u', storage => "
+    "'float32', metric => 'cosine');");
+  CHECK(ids_of(tvf(", k => 6, search_mode => 'approx', clustering => 'sr_cos_u', n_probes => 4"),
+               0,
+               1) == nearest);
+
+  // With the rewrite off, the physical planner's own vector top-k join answers.
+  ::setenv("SIRIUS_VSS_SQL_REWRITE", "0", 1);
+  CHECK(ids_of(sorted_rows(*con, lateral), 0, 1) == nearest);
 }

@@ -24,6 +24,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "vss/bound_gemm.hpp"
 #include "vss/distance_metric.hpp"
 
 #include <cudf/binaryop.hpp>
@@ -45,10 +46,35 @@
 #include <cstdlib>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <vector>
 
 namespace sirius {
 namespace op {
+
+namespace {
+
+/// @p rows normalized in FP32 into @p out, as a view: how an exact cosine join reads its rows,
+/// ranking L2 between unit rows, |q^ - x^|^2 = 2 (1 - cos) (halve_distances turns it back).
+vss::dataset_matrix_view unit_rows_of(vss::dataset_matrix_view rows,
+                                      std::optional<rmm::device_uvector<float>>& out,
+                                      rmm::cuda_stream_view stream,
+                                      rmm::device_async_resource_ref mr)
+{
+  auto const n   = rows.extent(0);
+  auto const dim = rows.extent(1);
+  out.emplace(static_cast<std::size_t>(n * dim), stream, mr);
+  if (n > 0) { vss::normalize_rows(rows.data_handle(), n, dim, out->data(), stream); }
+  return raft::make_device_matrix_view<const float, int64_t, raft::row_major>(out->data(), n, dim);
+}
+
+/// A squared distance between unit rows, halved: the cosine distance 1 - cos.
+void halve_distances(cudf::column& distances, rmm::cuda_stream_view stream)
+{
+  vss::scale_in_place(distances.mutable_view().data<float>(), distances.size(), 0.5f, stream);
+}
+
+}  // namespace
 
 sirius_physical_vector_threshold_join::sirius_physical_vector_threshold_join(
   duckdb::LogicalOperator& op,
@@ -397,8 +423,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_threshold_join::execute(
 
   if (!right_empty) {
     raft::device_resources res{stream};
+    // An exact join: L2 from the differences, not |q|^2 + |x|^2 - 2 q.x, which cancels for rows
+    // far from the origin; cosine the same way on rows normalized in FP32, its cutoff doubled
+    // and its distances halved (see the vector join stream operator's exhaustive search).
+    bool const cosine = metric == "cosine";
+    std::optional<rmm::device_uvector<float>> unit_dataset, unit_queries;
     auto const metric_type =
-      vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/false);
+      cosine ? cuvs::distance::DistanceType::L2Unexpanded
+             : vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/true);
+    auto const search_cutoff = cosine ? 2.f * cutoff : cutoff;
 
     // DuckDB puts the smaller table on the build (right) side. The kernel wants the smaller side as
     // its queries (outer loop) and the larger as its dataset (inner loop), so swap them back here.
@@ -407,11 +440,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_threshold_join::execute(
     bool const swap_sides = n_right < n_left_sz;
     auto const n_queries  = swap_sides ? n_right : n_left_sz;
     auto const n_dataset  = swap_sides ? n_left_sz : n_right;
-    auto const dataset    = vss::list_column_as_dataset_view(
+    auto dataset          = vss::list_column_as_dataset_view(
       swap_sides ? left.column(left_vector_col_idx) : right.column(right_vector_col_idx), dim);
     // The queries are a window into the full query-side column.
-    auto const queries_full = vss::list_column_as_dataset_view(
+    auto queries_full = vss::list_column_as_dataset_view(
       swap_sides ? right.column(right_vector_col_idx) : left.column(left_vector_col_idx), dim);
+    if (cosine) {
+      dataset      = unit_rows_of(dataset, unit_dataset, stream, mr);
+      queries_full = unit_rows_of(queries_full, unit_queries, stream, mr);
+    }
 
     // Bound each threshold call so its edge list can never exceed a cudf column's int32 length.
     // A single query row produces at most n_dataset edges, so keeping query_tile * n_dataset under
@@ -428,8 +465,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_threshold_join::execute(
       auto const qs      = std::min(query_tile, n_queries - s);
       auto const queries = raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
         queries_full.data_handle() + static_cast<int64_t>(s) * dim, static_cast<int64_t>(qs), dim);
-      auto tj = vss::brute_force_threshold(res, dataset, queries, cutoff, metric_type, mr);
+      auto tj = vss::brute_force_threshold(res, dataset, queries, search_cutoff, metric_type, mr);
       if (tj.query_rows->size() == 0) { continue; }
+      if (cosine) { halve_distances(*tj.distances, stream); }
 
       // The kernel numbers query rows within the tile (0..qs); shift them to global query-side
       // indices so the gather map addresses the whole batch.

@@ -27,13 +27,93 @@
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/duck_transaction_manager.hpp"
+#include "duckdb/transaction/local_storage.hpp"
+#include "op/scan/duckdb_mvcc_visibility.hpp"
+#include "scan_manager/duckdb_mvcc_metadata.hpp"
+#include "scan_manager/mvcc_mask_cache.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
+#include <span>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace sirius::vss {
+
+namespace {
+
+std::mutex written_mutex;
+std::unordered_set<std::uint64_t> written_pins;
+
+}  // namespace
+
+void note_pinned_table_written(std::uint64_t pin_generation)
+{
+  std::lock_guard lock{written_mutex};
+  written_pins.insert(pin_generation);
+}
+
+std::optional<std::string> pinned_rows_mismatch(duckdb::ClientContext& context,
+                                                sirius::scan_manager::pinned_entry const& pin,
+                                                duckdb::DuckTableEntry& table)
+{
+  if (pin.mvcc == nullptr) { return std::nullopt; }
+  {
+    std::lock_guard lock{written_mutex};
+    if (written_pins.contains(pin.generation)) { return "a statement wrote to it after pin_table"; }
+  }
+  auto const& meta = *pin.mvcc;
+  auto& storage    = table.GetStorage();
+  auto& attached   = storage.GetAttached();
+  auto& txn        = duckdb::DuckTransaction::Get(context, attached);
+  auto& manager    = duckdb::DuckTransactionManager::Get(attached);
+  if (txn.start_time < meta.v_base) { return "this transaction began before pin_table"; }
+  if (duckdb::LocalStorage::Get(context, attached).GetStorage(storage)) {
+    return "this transaction inserted rows into it";
+  }
+  auto const n_cache = meta.n_cache();
+  auto const live    = static_cast<std::size_t>(storage.GetTotalRows());
+  if (live > n_cache) {
+    return std::to_string(live - n_cache) + " rows were inserted after pin_table";
+  }
+  if (live < n_cache) { return "rows the pin holds were compacted out of the table"; }
+
+  // Deleted rows: the walk the scans' keep-masks come from, and the same rule for reusing its
+  // answer across statements (mvcc_mask_cache_reusable: no commit since, no writes of our own).
+  scan_manager::mvcc_mask_snapshot_key const key{
+    manager.GetLastCommit(), txn.start_time, txn.ChangesMade()};
+  static std::mutex clean_mutex;
+  static std::unordered_map<std::uint64_t, scan_manager::mvcc_mask_snapshot_key> clean;
+  {
+    std::lock_guard lock{clean_mutex};
+    auto const it = clean.find(pin.generation);
+    if (it != clean.end() && scan_manager::mvcc_mask_cache_reusable(it->second, key)) {
+      return std::nullopt;
+    }
+  }
+  bool dropped = false;
+  {
+    auto const checkpoint_lock = manager.SharedCheckpointLock();
+    auto const plan            = op::scan::capture_mvcc_visibility_plan(storage, context, meta);
+    for (std::size_t c = 0; c < plan.mvcc_row_groups.size() && !dropped; ++c) {
+      if (!plan.chunk_has_version_state[c]) { continue; }
+      std::vector<std::uint32_t> words((meta.base_row_count_per_chunk[c] + 31) / 32, 0);
+      dropped = op::scan::fill_keep_mask_for_row_groups(
+        plan.mvcc_row_groups[c], plan.transaction, std::span<std::uint32_t>(words));
+    }
+  }
+  if (dropped) { return "rows were deleted from it, and the pin still holds them"; }
+  if (scan_manager::mvcc_mask_cache_publishable(key)) {
+    std::lock_guard lock{clean_mutex};
+    clean[pin.generation] = key;
+  }
+  return std::nullopt;
+}
 
 duckdb::BoundStatement bind_view_select(duckdb::ClientContext& context,
                                         const vector_join_side& side)
@@ -139,6 +219,19 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   if (pin == nullptr && require_pin) {
     throw duckdb::BinderException("sirius_knn_join: " + label + " table '" + side.table +
                                   "' must be pinned");
+  }
+  // A side read straight out of its pin must be what the table holds now.
+  if (pin != nullptr && require_pin && !is_view) {
+    if (auto const why =
+          pinned_rows_mismatch(context, *pin, entry_base.Cast<duckdb::DuckTableEntry>())) {
+      throw duckdb::BinderException(
+        "sirius_knn_join: the pin of " + label + " table '" + side.table +
+        "' no longer holds the table's rows (" + *why +
+        "), and the join reads the pinned rows as they were pinned. Read it through a scan "
+        "instead (" +
+        (label == "left" ? std::string{"probe_source"} : std::string{"build_source"}) +
+        " => 'scan'), which applies DuckDB's visibility");
+    }
   }
   auto const emittable = [&](const std::string& col) {
     if (pin == nullptr || !require_pin) { return true; }

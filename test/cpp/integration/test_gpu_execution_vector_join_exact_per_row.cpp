@@ -17,8 +17,8 @@
 /**
  * @file test_gpu_execution_vector_join_exact_per_row.cpp
  * @brief End-to-end tests for the sirius_knn_join() table function, scoped to the
- *        exact per-row top-k vector join (search_mode exact / exact-gemm). Both sides
- *        must be pinned.
+ *        exact per-row top-k vector join (search_mode 'exact', with 'exact-gemm' and
+ *        'exact-direct' accepted as the same). Both sides must be pinned.
  */
 
 #include <catch.hpp>
@@ -69,8 +69,10 @@ void expect_error(duckdb::Connection& con, const std::string& sql, const std::st
 }  // namespace
 
 // -----------------------------------------------------------------------------
-// Adversarial large-magnitude L2: `exact` (unexpanded) must be bit-correct; this
-// is precisely the input the `exact` mode exists to handle.
+// Adversarial large-magnitude L2: the exact join must be bit-correct. Ranked by
+// |q|^2 + |x|^2 - 2 q.x (about 7.4e9 a term in FP32, against shells 3 apart) these
+// rows came back as other rows at distance 0, so the exhaustive search computes L2
+// from the differences. 'exact-direct' names the same search.
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
                  "sirius_knn_join - exact L2 on large-magnitude vectors",
@@ -104,22 +106,26 @@ TEST_CASE_METHOD(VectorJoinFixture,
   con->Query("SET gpu_execution = true;");
 
   // sirius_knn_join in exact mode must match the reference neighbor set exactly.
-  auto joined = ok_rows(*con,
-                        "SELECT left_id, right_id FROM sirius_knn_join("
-                        "'vj_probe','vec','vj_corpus','vec', "
-                        "search_mode => 'exact', metric => 'l2', k => 9);");
-  REQUIRE(joined == reference);
+  for (auto const* mode : {"exact", "exact-direct", "exact-gemm"}) {
+    UNSCOPED_INFO("search_mode " << mode);
+    auto joined = ok_rows(*con,
+                          std::string("SELECT left_id, right_id FROM sirius_knn_join("
+                                      "'vj_probe','vec','vj_corpus','vec', search_mode => '") +
+                            mode + "', metric => 'l2', k => 9);");
+    REQUIRE(joined == reference);
+  }
 
   run_ok("SELECT * FROM unpin_table('vj_probe');");
   run_ok("SELECT * FROM unpin_table('vj_corpus');");
 }
 
 // -----------------------------------------------------------------------------
-// Well-conditioned corpus: exact and exact-gemm must agree neighbor-for-neighbor,
-// and both must match the CPU exact reference. This is the GEMM happy-path check.
+// Well-conditioned corpus: every name of the exact join ('exact', 'exact-direct',
+// 'exact-gemm') must agree neighbor-for-neighbor, and all must match the CPU exact
+// reference.
 // -----------------------------------------------------------------------------
 TEST_CASE_METHOD(VectorJoinFixture,
-                 "sirius_knn_join - exact and exact-gemm agree on well-conditioned L2",
+                 "sirius_knn_join - exact-direct and exact agree on well-conditioned L2",
                  "[integration][gpu_execution][array][vss][vector_join]")
 {
   // Magnitudes ~1, directions spread over the sphere -> GEMM is well-conditioned.
@@ -152,15 +158,67 @@ TEST_CASE_METHOD(VectorJoinFixture,
                      mode + "', metric => 'l2', k => 10);");
   };
 
+  auto direct_ids     = join_ids("exact-direct");
   auto exact_ids      = join_ids("exact");
   auto exact_gemm_ids = join_ids("exact-gemm");
 
-  // exact-gemm agrees with exact, and both match the CPU reference.
-  REQUIRE(exact_ids == reference);
+  // All three agree, and all match the CPU reference.
+  REQUIRE(direct_ids == reference);
+  REQUIRE(exact_ids == direct_ids);
   REQUIRE(exact_gemm_ids == exact_ids);
 
   run_ok("SELECT * FROM unpin_table('gemm_probe');");
   run_ok("SELECT * FROM unpin_table('gemm_corpus');");
+}
+
+// -----------------------------------------------------------------------------
+// 'exact' is the GEMM join and 'exact-gemm' its alias: the same rows, scores
+// included, for every join mode and metric, and the same as leaving search_mode
+// out. An unknown mode names the accepted ones.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - search_mode 'exact' and 'exact-gemm' return the same answer",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  run_ok("CREATE TABLE eg_corpus (id INTEGER, vec FLOAT[8]);");
+  run_ok(
+    "INSERT INTO eg_corpus SELECT i, list_transform(range(8), lambda d: ((hash(i * 100 + d) % "
+    "2000)::FLOAT / 1000.0 - 1.0))::FLOAT[8] FROM range(20000) t(i);");
+  run_ok("CREATE TABLE eg_probe (id INTEGER, vec FLOAT[8]);");
+  run_ok(
+    "INSERT INTO eg_probe SELECT i, list_transform(range(8), lambda d: ((hash(i * 100 + d + "
+    "31337) % 2000)::FLOAT / 1000.0 - 1.0))::FLOAT[8] FROM range(40) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'eg_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'eg_probe', tier => 'gpu', format => 'duckdb');");
+
+  auto const join = [&](const std::string& mode, const std::string& args) {
+    return ok_rows(*con,
+                   "SELECT left_id, right_id, distance FROM sirius_knn_join('eg_probe','vec',"
+                   "'eg_corpus','vec'" +
+                     (mode.empty() ? std::string{} : ", search_mode => '" + mode + "'") + ", " +
+                     args + ");");
+  };
+  for (std::string const args : {"metric => 'l2', k => 7",
+                                 "metric => 'cosine', k => 7, output_type => 'distance'",
+                                 "metric => 'l2', join_mode => 'global', k => 25",
+                                 "metric => 'l2', join_mode => 'threshold', eps => 0.6",
+                                 "metric => 'cosine', join_mode => 'threshold', eps => 0.05, "
+                                 "output_type => 'distance'"}) {
+    UNSCOPED_INFO("args: " << args);
+    auto const exact = join("exact", args);
+    REQUIRE_FALSE(exact.empty());
+    CHECK(join("exact-gemm", args) == exact);
+    CHECK(join("", args) == exact);
+  }
+
+  expect_error(*con,
+               "SELECT * FROM sirius_knn_join('eg_probe','vec','eg_corpus','vec', "
+               "search_mode => 'exact_gemm', k => 3);",
+               "search_mode must be 'exact' or 'approx'");
+
+  run_ok("SELECT * FROM unpin_table('eg_probe');");
+  run_ok("SELECT * FROM unpin_table('eg_corpus');");
 }
 
 // -----------------------------------------------------------------------------
@@ -261,7 +319,8 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM pin_table(name => 'mb_probe', tier => 'gpu', format => 'duckdb');");
 
   // k=9 lands on complete, tie-free shells ({P, P+-1..P+-4}); compare neighbor ids
-  // to DuckDB's own per-row top-9.
+  // to DuckDB's own per-row top-9. Rows this far from the origin (|q| ~ 450,000) are
+  // what the GEMM form |q|^2 + |x|^2 - 2 q.x could not rank.
   con->Query("SET gpu_execution = false;");
   auto reference = ok_rows(*con,
                            "SELECT p.id, n.id FROM mb_probe p, LATERAL ("
@@ -1061,6 +1120,9 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // so p_i's six nearest are at 0.5, 0.5, 1.5, 1.5, 2.5, 2.5 -- and four of the six are within
 // 2.0. Probe 0 sits at the edge of the corpus and has only one neighbour below it, giving
 // 0.5, 0.5, 1.5, 2.5, 3.5, 4.5 and so three within 2.0: 63*4 + 3 = 255 surviving pairs.
+//
+// At |q| ~ 2,000 the GEMM form |q|^2 + |x|^2 - 2 q.x would cancel, a pair 0.5 apart coming back
+// at 0: these joins also check that the exact join does not rank by it.
 namespace {
 
 void create_halves_dataset(sirius::test::GpuExecutionFixture& fx)
@@ -1226,6 +1288,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM pin_table(name => 'xp', tier => 'gpu', format => 'duckdb');");
   run_ok("SELECT * FROM pin_table(name => 'xc', tier => 'gpu', format => 'duckdb');");
 
+  // The halves dataset's rows (see create_halves_dataset).
   const std::string args = "'xp','vec','xc','vec', search_mode => 'exact', metric => 'l2', k => 6";
 
   // The reference pair set, built once on the CPU. Same columns the TVF emits, same names.

@@ -17,6 +17,7 @@
 #include "vss/vector_join_rewrite.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/types.hpp"
@@ -115,6 +116,14 @@ const char* metric_name(distance_kind k)
 bool is_similarity(distance_kind k)
 {
   return k == distance_kind::cosine_similarity || k == distance_kind::inner_product;
+}
+
+/// Whether the join answering a call of kind @p k emits a similarity (the cosine similarity, or
+/// the inner product) rather than a distance. A cosine distance is emitted as one: as 1 - the
+/// similarity in FLOAT it would round a near-duplicate's distance (below about 6e-8) to 0.
+bool score_is_similarity(distance_kind k)
+{
+  return k != distance_kind::l2 && k != distance_kind::cosine_distance;
 }
 
 bool same_metric(distance_kind a, distance_kind b)
@@ -348,9 +357,14 @@ unique_ptr<Expression> score_expression(duckdb::ClientContext& context,
 {
   auto ref = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(duckdb::LogicalType::FLOAT, score);
   if (!same_metric(requested, joined)) { return nullptr; }
-  // The l2 join emits the distance; the cosine join the similarity; the inner-product join the
-  // inner product.
-  if (requested == distance_kind::l2 || is_similarity(requested)) { return ref; }
+  // The l2 join emits the distance; the cosine join the similarity or the distance, whichever the
+  // call it answers asked for (score_is_similarity); the inner-product join the inner product.
+  bool const joined_similarity = score_is_similarity(joined);
+  if (requested == distance_kind::l2 || requested == distance_kind::inner_product ||
+      (requested == distance_kind::cosine_similarity && joined_similarity) ||
+      (requested == distance_kind::cosine_distance && !joined_similarity)) {
+    return ref;
+  }
   duckdb::vector<unique_ptr<Expression>> args;
   if (requested == distance_kind::negative_inner_product) {
     // -q.x, exactly: a multiplication by -1 (an operator the GPU projection runs).
@@ -869,21 +883,22 @@ class rewriter {
     return copy;
   }
 
-  /// `SET vector_join_probes = p` makes a join that can go through cluster lists approximate, as
-  /// `ivfflat.probes` does in pgvector: each probe row searches its p nearest clusters. The lists
-  /// are those of the clustering `vector_join_clustering` names, when it is one of this column's,
-  /// or else lists that would answer exactly. With no such lists they are built inside the query
-  /// (build_lists_in_query) and kept for later statements, the way a hash join builds its table:
-  /// a join amortizes its index over one statement, so the build is charged to it. The setting
-  /// does not apply when the build is refused or disabled (SIRIUS_VSS_BUILD_IN_QUERY=0).
+  /// `SET vector_join_probes = c` (c > 0) makes a join that can go through cluster lists
+  /// approximate, as `ivfflat.probes` does in pgvector: each probe row searches its n_p nearest
+  /// clusters. The lists are those of the clustering `vector_join_clustering` names, when it is
+  /// one of this column's, or else lists that would answer exactly. With no such lists they are
+  /// built inside the query (build_lists_in_query) and kept for later statements, the way a hash
+  /// join builds its table: a join amortizes its index over one statement, so the build is
+  /// charged to it. The setting does not apply when the build is refused or disabled
+  /// (SIRIUS_VSS_BUILD_IN_QUERY=0). c = 0, the default, is the exact join.
   ///
-  /// How many clusters such a build makes is `vector_join_clusters`, or when that is 0 the count
-  /// with the least estimated build plus search time for @p probe_rows (choose_cluster_count):
-  /// the reference count for a few thousand probe rows, more for a probe side in the millions.
-  /// p is then stated against the reference count and scaled to the count the lists have
-  /// (scaled_probes), so the same setting gives about the same recall whichever count was built.
-  /// Against lists the user built or named, and under an explicit vector_join_clusters, p is
-  /// the number of clusters searched.
+  /// How many clusters N such a build makes is `vector_join_clusters`, or when that is 0 the
+  /// count with the least estimated build plus search time for @p probe_rows
+  /// (choose_cluster_count): sqrt(rows) clusters (at most 1,024) for a few thousand probe rows,
+  /// more for a probe side in the millions. On lists Sirius sized itself n_p is then
+  /// min(ceil(c * sqrt(N)), N) (scaled_probes), so the same c gives about the same recall
+  /// whichever N was built. Against lists the user built or named, and under an explicit
+  /// vector_join_clusters, c is the number of clusters searched, rounded up (literal_probes).
   bool use_approximate_lists(vector_join_request& req,
                              duckdb::SiriusContext& ctx,
                              const std::string& catalog,
@@ -897,8 +912,9 @@ class rewriter {
     if (!_context.TryGetCurrentSetting("vector_join_probes", setting) || setting.IsNull()) {
       return false;
     }
-    auto const probes = setting.GetValue<std::int64_t>();
-    if (probes <= 0) { return false; }
+    // Negative and NaN values are refused by the SET; any that reach here run the exact join.
+    auto const c = setting.GetValue<double>();
+    if (!(c > 0.0)) { return false; }
     bool const cosine           = req.metric == "cosine";
     bool const ip               = req.metric == "ip";
     auto const n_rows           = static_cast<std::int64_t>(rows);
@@ -930,7 +946,7 @@ class rewriter {
         shape.dim                  = static_cast<double>(req.dim);
         shape.list_bytes_per_value = cosine || ip ? 2 : 1;
         n_clusters =
-          choose_cluster_count(access_path_cost{current_device_scale()}, shape, probes).n_clusters;
+          choose_cluster_count(access_path_cost{current_device_scale()}, shape, c).n_clusters;
       }
       choice = build_lists_in_query(ctx,
                                     req,
@@ -947,16 +963,16 @@ class rewriter {
     req.clustering  = choice->clustering;
     req.n_probes =
       fixed_clusters == 0 && choice->clustering == auto_lists_name(table, column, req.metric)
-        ? scaled_probes(
-            probes, choice->n_clusters, reference_cluster_count(static_cast<double>(rows)))
-        : std::min(probes, choice->n_clusters);
+        ? scaled_probes(c, choice->n_clusters)
+        : literal_probes(c, choice->n_clusters);
     SIRIUS_LOG_INFO(
       "[vector_join_rewrite] searching '{}' through {} of the {} clusters of '{}' "
-      "(vector_join_probes)",
+      "(vector_join_probes = {})",
       table,
       req.n_probes,
       choice->n_clusters,
-      choice->clustering);
+      choice->clustering,
+      c);
     return true;
   }
 
@@ -1657,15 +1673,14 @@ class rewriter {
   {
     SiriusVectorJoinBindData bind;
     auto& req        = bind.req;
-    // Every metric but l2 emits a similarity (for ip, the inner product).
-    bool const cos   = call.kind != distance_kind::l2;
+    // Every metric but l2 and the cosine distance emits a similarity (for ip, the inner product).
+    bool const cos   = score_is_similarity(call.kind);
     req.mode         = mode;
     req.probe_scalar = probe_scalar;
     if (mode == vector_join_mode::threshold) {
       // Unbounded: every pair passes (a cosine similarity is never below -1, an inner product
       // never below FLOAT's lowest).
-      req.eps = call.kind == distance_kind::l2
-                  ? static_cast<double>(std::numeric_limits<float>::max())
+      req.eps = !cos ? static_cast<double>(std::numeric_limits<float>::max())
                 : std::string_view{metric_name(call.kind)} == "ip"
                   ? -std::numeric_limits<double>::infinity()
                   : -2.0;
@@ -2184,7 +2199,7 @@ class rewriter {
 
     SiriusVectorJoinBindData bind;
     auto& req       = bind.req;
-    bool const cos  = pred.call.kind != distance_kind::l2;
+    bool const cos  = score_is_similarity(pred.call.kind);
     req.mode        = vector_join_mode::threshold;
     req.metric      = metric_name(pred.call.kind);
     req.search_mode = vector_join_search_mode::exact_gemm;
@@ -2549,7 +2564,7 @@ class rewriter {
       right_names.clear();
     }
 
-    bool const cos  = pred.call.kind != distance_kind::l2;
+    bool const cos  = score_is_similarity(pred.call.kind);
     req.mode        = vector_join_mode::threshold;
     req.metric      = metric_name(pred.call.kind);
     req.search_mode = vector_join_search_mode::exact_gemm;
@@ -2712,8 +2727,9 @@ class rewriter {
 
   static double req_eps_in_score_space(const threshold_predicate& pred)
   {
+    // A cosine distance is compared as one (score_is_similarity), like an l2 distance.
     if (pred.call.kind == distance_kind::negative_inner_product) { return -pred.bound; }
-    return pred.call.kind == distance_kind::cosine_distance ? 1.0 - pred.bound : pred.bound;
+    return pred.bound;
   }
 
   static const char* req_metric_name(const threshold_predicate& pred)
@@ -2753,6 +2769,35 @@ bool expression_has_vector_distance(Expression& e)
 
 }  // namespace
 
+namespace {
+
+/// A table @p op reads whose pin no longer holds its rows (pinned_rows_mismatch), and why.
+std::optional<std::string> stale_pinned_table(duckdb::ClientContext& context,
+                                              duckdb::SiriusContext& ctx,
+                                              LogicalOperator& op)
+{
+  if (op.type == LogicalOperatorType::LOGICAL_GET) {
+    auto table = op.Cast<duckdb::LogicalGet>().GetTable();
+    if (table && table->IsDuckTable()) {
+      auto const pin = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
+        table->ParentCatalog().GetName(), table->ParentSchema().name, table->name);
+      if (pin != nullptr) {
+        if (auto const why =
+              pinned_rows_mismatch(context, *pin, table->Cast<duckdb::DuckTableEntry>())) {
+          return "'" + table->name + "' no longer holds its rows (" + *why + ")";
+        }
+      }
+    }
+  }
+  for (auto& child : op.children) {
+    if (!child) { continue; }
+    if (auto why = stale_pinned_table(context, ctx, *child)) { return why; }
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
 bool plan_has_vector_distance(LogicalOperator& plan)
 {
   bool found = false;
@@ -2771,6 +2816,14 @@ std::size_t rewrite_plain_sql_vector_joins(duckdb::ClientContext& context,
 {
   if (!plan || !rewrite_enabled(context)) { return 0; }
   try {
+    // The rewritten join reads pinned rows as they were pinned, which a DELETE or INSERT since
+    // (or a CHECKPOINT) leaves behind the table; such a statement stays DuckDB's.
+    if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
+      if (auto const why = stale_pinned_table(context, *sirius_ctx, *plan)) {
+        SIRIUS_LOG_INFO("[vector_join_rewrite] left to DuckDB: the pin of {}", *why);
+        return 0;
+      }
+    }
     rewriter r(context, binder, plan);
     auto const n = r.run();
     if (inlined_ctes != nullptr) { *inlined_ctes = r.inlined(); }
