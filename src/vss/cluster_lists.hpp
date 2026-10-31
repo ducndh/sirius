@@ -22,6 +22,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/common.hpp>
@@ -456,6 +457,74 @@ void float16_seed_upper_bound(float* bound,
                               std::int64_t n,
                               rmm::cuda_stream_view stream,
                               bool inner_product = false);
+
+/// What int8_seed_upper_bound (@p int8) or float16_seed_upper_bound turns a code distance into an
+/// FP32 bound with, which int8_code_limit / float16_bound_limit widen a bound by: per probe row
+/// @p probe_error (and for FP16 @p probe_sq, |half(q)|^2), and the rows' largest error
+/// @p row_error (code_error for INT8 codes, the rounding error for FLOAT16 rows), with the INT8
+/// codes' @p scale or the FLOAT16 rows' largest norm @p row_norm.
+struct code_bound_terms {
+  bool int8{false};
+  float const* probe_error{nullptr};
+  float row_error{0};
+  float scale{1};
+  float const* probe_sq{nullptr};
+  float row_norm{0};
+  std::int64_t d{0};
+  bool inner_product{false};
+};
+
+/**
+ * @brief The gap check's bound for a top-k stretch before its FP32 re-score: out[r] = the smallest
+ * of bound[r], acc_distances[r k + k - 1] and, for j = 1 .. min(k, n_r),
+ * max(acc_(k-j), U_r(c_(j))), where c_(1) <= c_(2) <= ... are the codes of row r's n_r candidates
+ * among the @p n triples (rows, codes), acc_(i) is the i-th of row r's k accumulator distances
+ * (nearest first, acc_(0) = -inf) and U_r is the code-to-FP32 bound of the seeds (@p terms).
+ *
+ * Each term bounds row r's k-th FP32 distance: the j best candidates and the k - j best
+ * accumulator entries are k distinct pairs (no candidate repeats an accumulator pair), each
+ * within it. So no candidate whose code exceeds the filter limit of out[r] can be in the row's
+ * top-k, and those are dropped unread (keep_within_row_limit).
+ */
+void gap_rescore_bound(std::int32_t const* rows,
+                       float const* codes,
+                       std::int64_t n,
+                       float const* acc_distances,
+                       std::int64_t n_rows,
+                       std::int64_t k,
+                       float const* bound,
+                       code_bound_terms const& terms,
+                       float* out,
+                       rmm::cuda_stream_view stream,
+                       rmm::device_async_resource_ref mr);
+
+/// Totals of keep_within_row_limit's trims (debug and tests). Per row with candidates, the
+/// literal m k rule -- re-score the first 2k when c_(2k) is past the limit, else the first 4k when
+/// c_(4k) is, else all -- has fewer than 2k (short_rows), trims at m = 2 or m = 4, or falls back;
+/// literal_rescored is what it would re-score, kept what the limit keeps.
+struct gap_rescore_stats {
+  unsigned long long candidates{0}, kept{0}, rows{0}, short_rows{0}, m2_rows{0}, m4_rows{0},
+    fallback_rows{0}, literal_rescored{0};
+};
+
+/// Keeps the first @p n triples (rows, ids, codes) whose code is at most limit[row], moved to the
+/// front in their order, and returns how many. Blocks for the count.
+/// With @p stats, also adds the trim's totals (see gap_rescore_stats; @p k is the join's k).
+std::int64_t keep_within_row_limit(std::int32_t* rows,
+                                   std::int64_t* ids,
+                                   float* codes,
+                                   std::int64_t n,
+                                   float const* limit,
+                                   std::int64_t n_rows,
+                                   std::int64_t k,
+                                   gap_rescore_stats* stats,
+                                   rmm::cuda_stream_view stream,
+                                   rmm::device_async_resource_ref mr);
+
+/// Process-wide gap_rescore_stats of the joins run with SIRIUS_VSS_GAP_RESCORE_STATS=1 (tests).
+gap_rescore_stats gap_rescore_totals();
+void add_gap_rescore_totals(gap_rescore_stats const& s);
+void reset_gap_rescore_totals();
 
 /// |x|^2 per row of shifted int8 rows, exact in int32.
 void int8_row_sq_norms(std::int8_t const* x,

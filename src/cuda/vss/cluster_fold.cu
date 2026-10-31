@@ -21,6 +21,9 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <rmm/device_uvector.hpp>
+
+#include <cub/device/device_scan.cuh>
 #include <cub/device/device_select.cuh>
 #include <thrust/iterator/counting_iterator.h>
 
@@ -31,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <vector>
 
@@ -578,6 +582,38 @@ __global__ void float16_bound_limit_kernel(float const* bound,
   }
 }
 
+// A finite INT8 code distance b as an FP32 bound (see int8_seed_upper_bound): the decoded pair is
+// within probe_error + code_error of the true one, and the code distance is scale^-2 times the
+// decoded pair's squared distance, exactly (int32 dot products).
+__device__ __forceinline__ float int8_upper_bound_of(float b,
+                                                     float probe_error,
+                                                     float code_error,
+                                                     float scale)
+{
+  float const reach = scale * sqrtf(fmaxf(b, 0.f)) + probe_error + code_error;
+  return reach * reach * (1.f + 1e-6f);
+}
+
+// A finite FP16-computed distance b as an FP32 bound (see float16_seed_upper_bound): the FP32
+// sums' error of float16_bound_limit_kernel, then the triangle inequality the other way.
+__device__ __forceinline__ float float16_upper_bound_of(float b,
+                                                        float probe_sq,
+                                                        float probe_error,
+                                                        float row_error,
+                                                        float row_norm,
+                                                        float d,
+                                                        bool inner_product)
+{
+  if (inner_product) {
+    float const s = inner_product_half_slack(sqrtf(probe_sq), probe_error, row_error, row_norm, d);
+    return b + s + 1e-6f * (fabsf(b) + s);
+  }
+  float const norms = sqrtf(probe_sq) + row_norm;
+  float const sums  = 2.f * d * 5.9604645e-8f * norms * norms;
+  float const reach = sqrtf(fmaxf(b + sums, 0.f)) + probe_error + row_error;
+  return reach * reach * (1.f + 1e-6f);
+}
+
 __global__ void int8_seed_upper_bound_kernel(
   float* bound, float const* probe_error, float code_error, float scale, int64_t n)
 {
@@ -585,8 +621,7 @@ __global__ void int8_seed_upper_bound_kernel(
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     float const b = bound[i];
     if (!(b < INFINITY)) { continue; }
-    float const reach = scale * sqrtf(fmaxf(b, 0.f)) + probe_error[i] + code_error;
-    bound[i]          = reach * reach * (1.f + 1e-6f);
+    bound[i] = int8_upper_bound_of(b, probe_error[i], code_error, scale);
   }
 }
 
@@ -603,16 +638,158 @@ __global__ void float16_seed_upper_bound_kernel(float* bound,
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     float const b = bound[i];
     if (!(b < INFINITY)) { continue; }
-    if (inner_product) {
-      float const s = inner_product_half_slack(
-        sqrtf(probe_sq[i]), probe_error[i], row_error, row_norm, static_cast<float>(d));
-      bound[i] = b + s + 1e-6f * (fabsf(b) + s);
-      continue;
+    bound[i] = float16_upper_bound_of(
+      b, probe_sq[i], probe_error[i], row_error, row_norm, static_cast<float>(d), inner_product);
+  }
+}
+
+// One warp per row r, whose candidates' codes are by_row[before[r] .. before[r + 1]) in no order,
+// and whose accumulator acc[r k ...] holds k re-scored FP32 distances nearest first (+inf for a
+// miss). With c_(1) <= c_(2) <= ... the codes in order and U_r the code-to-FP32 bound the seeds use:
+// no candidate repeats a pair the accumulator holds, so the j best candidates and the k - j best
+// accumulator entries are k distinct pairs within max(acc_(k-j), U_r(c_(j))) of r, and the smallest
+// of that over j, and bound[r] (already a bound), bounds r's k-th distance. The codes are taken in
+// order a distinct value at a time (a warp minimum past the last, then how many equal it), and only
+// while U_r(c_(j)) can still lower the bound: it and acc_(k-j)'s successors only grow from there.
+__global__ void gap_rescore_bound_kernel(float const* by_row,
+                                         int64_t const* before,
+                                         float const* acc,
+                                         int64_t n_rows,
+                                         int64_t k,
+                                         float const* bound,
+                                         code_bound_terms const terms,
+                                         float* out)
+{
+  int const lane   = threadIdx.x % 32;
+  auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
+  for (int64_t r = blockIdx.x * static_cast<int64_t>(blockDim.x / 32) + threadIdx.x / 32; r < n_rows;
+       r += warps) {
+    float best    = fminf(bound[r], acc[r * k + k - 1]);
+    auto const s  = before[r];
+    auto const nr = before[r + 1] - s;
+    int64_t j     = 0;  // codes taken so far
+    float last    = -INFINITY;
+    while (j < k && j < nr) {
+      // The smallest code above the last one taken, and how many candidates hold it.
+      float m = INFINITY;
+      for (int64_t i = lane; i < nr; i += 32) {
+        float const c = by_row[s + i];
+        if (c > last && c < m) { m = c; }
+      }
+      for (int o = 16; o > 0; o /= 2) {
+        m = fminf(m, __shfl_xor_sync(0xffffffffu, m, o));
+      }
+      if (!(m < INFINITY)) { break; }
+      int t = 0;
+      for (int64_t i = lane; i < nr; i += 32) {
+        t += by_row[s + i] == m;
+      }
+      for (int o = 16; o > 0; o /= 2) {
+        t += __shfl_xor_sync(0xffffffffu, t, o);
+      }
+      float const u =
+        terms.int8 ? int8_upper_bound_of(m, terms.probe_error[r], terms.row_error, terms.scale)
+                   : float16_upper_bound_of(m,
+                                            terms.probe_sq[r],
+                                            terms.probe_error[r],
+                                            terms.row_error,
+                                            terms.row_norm,
+                                            static_cast<float>(terms.d),
+                                            terms.inner_product);
+      if (!(u < best)) { break; }
+      // c_(j + 1) = ... = c_(j + t) = m; of those positions the last one pairs with the nearest
+      // accumulator entry, so it gives the smallest max.
+      auto const cap = k < nr ? k : nr;
+      j              = j + t < cap ? j + t : cap;
+      float const a = j < k ? acc[r * k + k - 1 - j] : -INFINITY;
+      best          = fminf(best, fmaxf(a, u));
+      last          = m;
     }
-    float const norms = sqrtf(probe_sq[i]) + row_norm;
-    float const sums  = 2.f * static_cast<float>(d) * 5.9604645e-8f * norms * norms;
-    float const reach = sqrtf(fmaxf(b + sums, 0.f)) + probe_error[i] + row_error;
-    bound[i]          = reach * reach * (1.f + 1e-6f);
+    if (lane == 0) { out[r] = best; }
+  }
+}
+
+__global__ void gap_count_kernel(int32_t const* rows, int64_t n, int32_t* per_row)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    atomicAdd(per_row + rows[i], 1);
+  }
+}
+
+// Each code to its row's range, counting the row's count back down to zero.
+__global__ void gap_scatter_kernel(
+  int32_t const* rows, float const* codes, int64_t n, int64_t const* before, int32_t* per_row, float* by_row)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const r = rows[i];
+    by_row[before[r] + atomicSub(per_row + r, 1) - 1] = codes[i];
+  }
+}
+
+struct within_row_limit {
+  int32_t const* rows;
+  float const* codes;
+  float const* limit;
+  __device__ bool operator()(int64_t i) const { return codes[i] <= limit[rows[i]]; }
+};
+
+__global__ void gap_take_kernel(int64_t const* picked,
+                                int64_t n,
+                                int32_t const* rows,
+                                int64_t const* ids,
+                                float const* codes,
+                                int32_t* out_rows,
+                                int64_t* out_ids,
+                                float* out_codes)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const src = picked[i];
+    out_rows[i]    = rows[src];
+    out_ids[i]     = ids[src];
+    out_codes[i]   = codes[src];
+  }
+}
+
+__global__ void gap_row_counts_kernel(int32_t const* rows,
+                                      float const* codes,
+                                      int64_t n,
+                                      float const* limit,
+                                      int32_t* total,
+                                      int32_t* kept)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    atomicAdd(total + rows[i], 1);
+    if (codes[i] <= limit[rows[i]]) { atomicAdd(kept + rows[i], 1); }
+  }
+}
+
+// Per row with candidates, what the literal m k rule (re-score the first m k when c_(m k) is past
+// the limit, m = 2 then 4, else all) does, given that the limit keeps j of the row's n: slots
+// [rows, n < 2k, m = 2, m = 4, fallback, re-scored by the literal rule].
+__global__ void gap_stats_kernel(
+  int32_t const* total, int32_t const* kept, int64_t n_rows, int64_t k, unsigned long long* out)
+{
+  for (int64_t r = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; r < n_rows;
+       r += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const n = static_cast<int64_t>(total[r]);
+    if (n == 0) { continue; }
+    auto const j = static_cast<int64_t>(kept[r]);
+    int slot     = 4;
+    auto literal = n;
+    if (n < 2 * k) {
+      slot = 1;
+    } else if (j < 2 * k) {
+      slot = 2, literal = 2 * k;
+    } else if (n >= 4 * k && j < 4 * k) {
+      slot = 3, literal = 4 * k;
+    }
+    atomicAdd(out, 1ull);
+    atomicAdd(out + slot, 1ull);
+    atomicAdd(out + 5, static_cast<unsigned long long>(literal));
   }
 }
 
@@ -1125,6 +1302,149 @@ void float16_seed_upper_bound(float* bound,
   float16_seed_upper_bound_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
     bound, probe_sq, probe_error, row_error, row_norm, d, n, inner_product);
   CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+namespace {
+std::mutex gap_totals_mutex;
+gap_rescore_stats gap_totals;
+}  // namespace
+
+gap_rescore_stats gap_rescore_totals()
+{
+  std::lock_guard<std::mutex> lock(gap_totals_mutex);
+  return gap_totals;
+}
+
+void add_gap_rescore_totals(gap_rescore_stats const& s)
+{
+  std::lock_guard<std::mutex> lock(gap_totals_mutex);
+  gap_totals.candidates += s.candidates;
+  gap_totals.kept += s.kept;
+  gap_totals.rows += s.rows;
+  gap_totals.short_rows += s.short_rows;
+  gap_totals.m2_rows += s.m2_rows;
+  gap_totals.m4_rows += s.m4_rows;
+  gap_totals.fallback_rows += s.fallback_rows;
+  gap_totals.literal_rescored += s.literal_rescored;
+}
+
+void reset_gap_rescore_totals()
+{
+  std::lock_guard<std::mutex> lock(gap_totals_mutex);
+  gap_totals = gap_rescore_stats{};
+}
+
+void gap_rescore_bound(int32_t const* rows,
+                       float const* codes,
+                       int64_t n,
+                       float const* acc_distances,
+                       int64_t n_rows,
+                       int64_t k,
+                       float const* bound,
+                       code_bound_terms const& terms,
+                       float* out,
+                       rmm::cuda_stream_view stream,
+                       rmm::device_async_resource_ref mr)
+{
+  if (n_rows == 0) { return; }
+  // The codes grouped by row: a count, a scan and a scatter.
+  auto const items = static_cast<std::size_t>(std::max<int64_t>(n, 1));
+  rmm::device_uvector<float> by_row(items, stream, mr);
+  rmm::device_uvector<int32_t> per_row(static_cast<std::size_t>(n_rows + 1), stream, mr);
+  rmm::device_uvector<int64_t> before(static_cast<std::size_t>(n_rows + 1), stream, mr);
+  CUDF_CUDA_TRY(
+    cudaMemsetAsync(per_row.data(), 0, per_row.size() * sizeof(int32_t), stream.value()));
+  if (n > 0) {
+    gap_count_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+      rows, n, per_row.data());
+    CUDF_CUDA_TRY(cudaGetLastError());
+  }
+  std::size_t scan_bytes = 0;
+  CUDF_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
+    nullptr, scan_bytes, per_row.data(), before.data(), n_rows + 1, stream.value()));
+  rmm::device_buffer temp(std::max<std::size_t>(scan_bytes, 1), stream, mr);
+  CUDF_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
+    temp.data(), scan_bytes, per_row.data(), before.data(), n_rows + 1, stream.value()));
+  if (n > 0) {
+    gap_scatter_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+      rows, codes, n, before.data(), per_row.data(), by_row.data());
+    CUDF_CUDA_TRY(cudaGetLastError());
+  }
+  auto const warp_grid =
+    static_cast<int>(std::clamp<int64_t>((n_rows + kBlock / 32 - 1) / (kBlock / 32), 1, 65535));
+  gap_rescore_bound_kernel<<<warp_grid, kBlock, 0, stream.value()>>>(
+    by_row.data(), before.data(), acc_distances, n_rows, k, bound, terms, out);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+int64_t keep_within_row_limit(int32_t* rows,
+                              int64_t* ids,
+                              float* codes,
+                              int64_t n,
+                              float const* limit,
+                              int64_t n_rows,
+                              int64_t k,
+                              gap_rescore_stats* stats,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref mr)
+{
+  if (n == 0) { return 0; }
+  if (stats != nullptr) {
+    rmm::device_uvector<int32_t> counts(static_cast<std::size_t>(2 * n_rows), stream, mr);
+    rmm::device_uvector<unsigned long long> slots(6, stream, mr);
+    CUDF_CUDA_TRY(
+      cudaMemsetAsync(counts.data(), 0, counts.size() * sizeof(int32_t), stream.value()));
+    CUDF_CUDA_TRY(cudaMemsetAsync(
+      slots.data(), 0, slots.size() * sizeof(unsigned long long), stream.value()));
+    gap_row_counts_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+      rows, codes, n, limit, counts.data(), counts.data() + n_rows);
+    gap_stats_kernel<<<std::min(grid_for(n_rows), 65535), kBlock, 0, stream.value()>>>(
+      counts.data(), counts.data() + n_rows, n_rows, k, slots.data());
+    CUDF_CUDA_TRY(cudaGetLastError());
+    unsigned long long host[6] = {};
+    CUDF_CUDA_TRY(
+      cudaMemcpyAsync(host, slots.data(), sizeof(host), cudaMemcpyDeviceToHost, stream.value()));
+    stream.synchronize();
+    stats->rows += host[0];
+    stats->short_rows += host[1];
+    stats->m2_rows += host[2];
+    stats->m4_rows += host[3];
+    stats->fallback_rows += host[4];
+    stats->literal_rescored += host[5];
+  }
+  rmm::device_uvector<int64_t> picked(static_cast<std::size_t>(n), stream, mr);
+  rmm::device_uvector<int64_t> n_picked(1, stream, mr);
+  thrust::counting_iterator<int64_t> const all(0);
+  within_row_limit const keep{rows, codes, limit};
+  std::size_t temp_bytes = 0;
+  CUDF_CUDA_TRY(cub::DeviceSelect::If(
+    nullptr, temp_bytes, all, picked.data(), n_picked.data(), n, keep, stream.value()));
+  rmm::device_buffer temp(std::max<std::size_t>(temp_bytes, 1), stream, mr);
+  CUDF_CUDA_TRY(cub::DeviceSelect::If(
+    temp.data(), temp_bytes, all, picked.data(), n_picked.data(), n, keep, stream.value()));
+  int64_t kept = 0;
+  CUDF_CUDA_TRY(
+    cudaMemcpyAsync(&kept, n_picked.data(), sizeof(kept), cudaMemcpyDeviceToHost, stream.value()));
+  stream.synchronize();
+  if (stats != nullptr) {
+    stats->candidates += static_cast<unsigned long long>(n);
+    stats->kept += static_cast<unsigned long long>(kept);
+  }
+  if (kept == n || kept == 0) { return kept; }
+  // Gathered out of place and copied back: the kept triples move to the front, in buffer order.
+  rmm::device_uvector<int32_t> out_rows(static_cast<std::size_t>(kept), stream, mr);
+  rmm::device_uvector<int64_t> out_ids(static_cast<std::size_t>(kept), stream, mr);
+  rmm::device_uvector<float> out_codes(static_cast<std::size_t>(kept), stream, mr);
+  gap_take_kernel<<<std::min(grid_for(kept), 65535), kBlock, 0, stream.value()>>>(
+    picked.data(), kept, rows, ids, codes, out_rows.data(), out_ids.data(), out_codes.data());
+  CUDF_CUDA_TRY(cudaGetLastError());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    rows, out_rows.data(), kept * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream.value()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    ids, out_ids.data(), kept * sizeof(int64_t), cudaMemcpyDeviceToDevice, stream.value()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    codes, out_codes.data(), kept * sizeof(float), cudaMemcpyDeviceToDevice, stream.value()));
+  return kept;
 }
 
 void half_rows_norms(float const* x,

@@ -2539,24 +2539,29 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // A radius join is the same search with the radius as every row's bound, in one sweep: there
     // is no k-th distance to seed, and a pair under the bound is final when found.
     // Lists on the device can seed sweep 0 (below), which makes even one probe a bounded search.
-    bool const seed_enabled = [] {
+    // SIRIUS_VSS_SEED=0 turns the seed off (sweep 0 then ranks each row's nearest cluster in full);
+    // SIRIUS_VSS_SEED=force seeds INT8 lists on the device past the partition-size test below.
+    std::string_view const seed_switch = [] {
       auto const* v = std::getenv("SIRIUS_VSS_SEED");
-      return v == nullptr || std::string_view{v} != "0";
+      return v == nullptr ? std::string_view{} : std::string_view{v};
     }();
-    // A seed for inexact rows (INT8 codes, FLOAT16) is raised by the coding error and its survivors
-    // are re-scored, so a sample of a large cluster seeds too loosely to pay: past ~20 samples'
-    // worth of rows per cluster (Deep100M, ~97k rows a cluster: 0.39 -> 0.86 s at 10k probes) the
-    // GEMM sweep's exact k-th is cheaper. Lossless UINT8 rows seed exactly at any cluster size.
-    bool const small_clusters =
-      _lists != nullptr && !_lists->offsets.empty() &&
-      _lists->offsets.back() <=
-        static_cast<std::int64_t>(_lists->offsets.size() - 1) * 20 * vss::kSeedSample;
-    // The sample is scored on CUDA cores, so past a small batch the GEMM sweep (tensor cores) is
-    // cheaper even when the bound is good (470k DataComp rows, d = 768, k = 2: 1.07 s seeded vs
-    // 0.76 s). The A5000's 2^21 probe values moves with the device's CUDA-core : INT8 tensor ratio.
-    auto const& scale      = vss::current_device_scale();
-    bool const small_batch = static_cast<double>(n_left) * static_cast<double>(dim) <=
-                             static_cast<double>(std::int64_t{1} << 21) * scale.fp32 / scale.int8;
+    bool const seed_enabled = seed_switch != "0";
+    bool const seed_forced  = seed_switch == "force";
+    // A seeded sweep 0 is each row's exact join with its nearest cluster, filtered in stretches
+    // that double from the seed's sample and merged in between (stretch_sweep0, below), so its cost
+    // grows with the number of stretches -- the log of the partition -- while the unseeded pass
+    // ranks the whole partition on CUDA cores, linear in it. FLOAT16 lists take the seed at every
+    // partition size measured (Deep10M, 1M and 10k probes, ~2.4k-19.5k rows a partition: 0.69-0.92x
+    // the unseeded pass). INT8 codes pass about 2k pairs a row a stretch (FLOAT16 about 1k), so for
+    // INT8 the seed pays only once a partition is large: per 1M probes 1.04x the unseeded pass at
+    // ~2.4k rows a partition, 0.99x at ~4.9k, 0.82x at ~9.8k, 0.84x at ~19.5k (10-30
+    // nearest-as-join, RTX A5000). INT8 lists averaging under kSeedInt8Rows rows a partition keep
+    // the unseeded pass. Lossless UINT8 rows seed exactly at any size.
+    constexpr std::int64_t kSeedInt8Rows = 5'000;
+    bool const large_partitions =
+      _lists != nullptr && _lists->offsets.size() > 1 &&
+      _lists->offsets.back() >=
+        static_cast<std::int64_t>(_lists->offsets.size() - 1) * kSeedInt8Rows;
     // A single list -- the exact join's compact layout, no partitioning -- lowers each row's bound
     // as its bounded sweep goes: every slice is cut into pieces whose merge points double from the
     // first piece, and what passes is merged before the next, so after the first pieces the filter
@@ -2594,8 +2599,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // rank every row first, a full GEMM and selection.
     bool const seedable =
       int8_search && !radius_join &&
-      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) &&
-      seed_enabled && (!codes_int8 || (small_clusters && small_batch) || running_bound_rows > 0);
+      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && seed_enabled &&
+      (!codes_int8 || large_partitions || running_bound_rows > 0 || seed_forced);
     bool const bounded = int8_search && (n_probes > 1 || radius_join || codes_int8 || seedable) &&
                          vss::bound_filter_int8_supports(dim) && bound_gemm_enabled;
     // FLOAT16 lists that kept their FP32 rows get the same two sweeps with the half-precision
@@ -2739,8 +2744,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // exact k-th and need not search that cluster again. SIRIUS_VSS_SEED=0 keeps the GEMM.
     bool const seed_f16 =
       f16_bounded && _lists != nullptr && !radius_join &&
-      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) &&
-      seed_enabled && ((small_clusters && small_batch) || running_bound_rows > 0);
+      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && seed_enabled;
     bool const seed = (bounded && seedable) || seed_f16;
     // Unseeded, sweep 0 ranks each row's nearest cluster on the half-precision tensor cores from
     // the stored rows; only the bound it leaves is used, and that is re-scored in FP32 first.
@@ -2791,11 +2795,102 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                 ? search_radius * search_radius
                                 : search_radius;
     // Debug only (they synchronize): time spent re-scoring candidates and taking/merging them.
-    double rescore_seconds = 0, take_seconds = 0;
+    double rescore_seconds = 0, take_seconds = 0, trim_seconds = 0;
+    // Gap-checked re-score (top-k joins over inexact rows only): before a stretch's candidates are
+    // re-scored, each row's k-th FP32 distance is bounded from its k best codes and its running
+    // top-k, and the candidates past the filter limit of that bound -- which cannot be in the row's
+    // top-k -- are dropped without reading their FP32 rows. SIRIUS_VSS_GAP_RESCORE=0 re-scores every
+    // candidate; SIRIUS_VSS_GAP_RESCORE_STATS=1 counts what it trims (also under the phase debug).
+    bool const gap_rescore = rescore && !radius_join && [] {
+      auto const* v = std::getenv("SIRIUS_VSS_GAP_RESCORE");
+      return v == nullptr || std::string_view{v} != "0";
+    }();
+    bool const gap_stats_on = gap_rescore && (dbg || [] {
+                                auto const* v = std::getenv("SIRIUS_VSS_GAP_RESCORE_STATS");
+                                return v != nullptr && std::string_view{v} == "1";
+                              }());
+    vss::gap_rescore_stats gap_stats{};
+    std::int64_t gap_rescored = 0;
+    std::optional<rmm::device_uvector<float>> gap_limit;
+    // The terms the filter limit widens by (code_limits), turned around: a code distance as an
+    // FP32 bound, exactly as the seeds raise theirs.
+    auto code_terms = [&] {
+      vss::code_bound_terms t{};
+      if (codes_int8) {
+        t.int8        = true;
+        t.probe_error = probe_code_error->data();
+        t.row_error   = _lists->code_error;
+        t.scale       = _lists->code_scale;
+      } else {
+        t.probe_error   = probe_half_error->data();
+        t.row_error     = row_half_error;
+        t.probe_sq      = probe_sqf->data();
+        t.row_norm      = row_norm_max;
+        t.d             = dim;
+        t.inner_product = ip;
+      }
+      return t;
+    };
+    // Exactness, in the notation of the lemma (sections/3-motiv.tex, "Error-bounded filtering").
+    // For probe row r and build row s let c(r, s) be the filter value (the code distance) and
+    // delta(r, s) the re-scored FP32 distance. b_r, the row's bound (the k-th re-scored distance it
+    // holds, or the seed's), never falls below delta*_r, its true k-th FP32 distance. The lemma's
+    // widened limit (code_limits: float16_bound_limit, int8_code_limit)
+    //   L_r(b) = ((sqrt(b) + e_r + e)^2 + eta_r)(1 + 2^-20)
+    // keeps every pair within b:  delta(r, s) <= b  =>  c(r, s) <= L_r(b).  Its converse, the bound
+    // the seeds raise a k-th code distance to (float16_seed_upper_bound, int8_seed_upper_bound),
+    //   U_r(c) = (sqrt(c + eta_r) + e_r + e)^2 (1 + 2^-20),
+    // gives  c(r, s) <= c  =>  delta(r, s) <= U_r(c),  from the same e_r, e and eta_r (INT8: eta_r = 0,
+    // codes exact in int32, and c in units of the codes' scale squared). Let a stretch hold row r's
+    // candidates with codes c_(1) <= c_(2) <= ..., none of them a pair r's accumulator holds, and
+    // acc_(i) its i-th re-scored distance (acc_(0) = -inf). Each of b_r and max(acc_(k-j), U_r(c_(j)))
+    // for j = 0..k has k distinct pairs within it, so
+    //   B_r = min(b_r, min_j max(acc_(k-j), U_r(c_(j))))  >=  delta*_r,
+    // and a candidate with  c > L_r(B_r)  has delta > B_r >= delta*_r: strictly past the k-th, not
+    // in r's top-k under any order of ties. It is dropped without reading its FP32 row.
+    // The gap check: the first m k candidates are all that can be in r's top-k when
+    // c_(mk) > L_r(B_r), which, as B_r <= U_r(c_(k)), holds whenever
+    //   c_(mk) > L_r(U_r(c_(k))) ~ (sqrt(c_(k) + eta_r) + 2 (e_r + e))^2 + eta_r,
+    // i.e. "c_(mk) - e_r > c_(k) + e_r" in distance units with e_r + e the error of a pair.
+    // Comparing every candidate with L_r(B_r) applies that test at every m at once: it keeps fewer
+    // than m k exactly where the check passes for m (2, then 4), and where both fail it still drops
+    // what lies past L_r(B_r) instead of re-scoring all. Nothing within B_r is dropped, so the merge
+    // keeps the same pairs as without the trim, up to which of several pairs tied at exactly the k-th
+    // distance it keeps -- which the filter's appends, in no fixed order, already leave open from one
+    // run to the next. (The kernels use 1 + 1e-6 for 1 + 2^-20, in the limits and seeds alike.)
     auto debug_mark = [&] {
       if (!dbg) { return std::chrono::steady_clock::time_point{}; }
       stream.synchronize();
       return std::chrono::steady_clock::now();
+    };
+    auto gap_trim = [&] {
+      if (!gap_rescore || pending == 0) { return; }
+      auto const t0 = debug_mark();
+      if (!gap_limit) { gap_limit.emplace(static_cast<std::size_t>(n_left), stream, mr); }
+      vss::gap_rescore_bound(candidates->rows.data(),
+                             candidates->distances.data(),
+                             pending,
+                             acc_distances->view().data<float>(),
+                             n_left,
+                             k_join,
+                             bound->data(),
+                             code_terms(),
+                             gap_limit->data(),
+                             stream,
+                             mr);
+      // In place: each row's limit is computed from its own bound alone.
+      code_limits(gap_limit->data(), gap_limit->data(), false);
+      pending = vss::keep_within_row_limit(candidates->rows.data(),
+                                           candidates->ids.data(),
+                                           candidates->distances.data(),
+                                           pending,
+                                           gap_limit->data(),
+                                           n_left,
+                                           k_join,
+                                           gap_stats_on ? &gap_stats : nullptr,
+                                           stream,
+                                           mr);
+      if (dbg) { trim_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
     };
     auto flush = [&] {
       if (pending == 0) { return; }
@@ -2930,6 +3025,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         done();
         return;
       }
+      if (!radius_join) { gap_trim(); }
+      gap_rescored += rescore ? pending : 0;
+      auto const t_rescore = debug_mark();
       if (rescore) {
         vss::exact_distances(search_queries.data_handle(),
                              candidates->rows.data(),
@@ -2946,7 +3044,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                              ip);
       }
       auto const t1 = debug_mark();
-      if (dbg) { rescore_seconds += std::chrono::duration<double>(t1 - t0).count(); }
+      if (dbg) { rescore_seconds += std::chrono::duration<double>(t1 - t_rescore).count(); }
       if (radius_join) {
         // FP16 survivors were re-scored above and are held to the radius again in FP32; int8
         // distances are already exact. Their ids stay layout rows until here.
@@ -3308,6 +3406,33 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         refresh_code_limit(bound->data());
       }
     };
+    // A seeded sweep 0 over lists on the device is each row's exact join with its nearest cluster,
+    // run as the exact join runs: the sample's seed bounds the first stretch of the cluster (the
+    // sample itself), and what passes is merged before the next stretch, so each row's bound falls
+    // to the k-th of all the cluster rows filtered so far. Each stretch is as long as all those
+    // before it, so about k pairs a row pass each one; under the seed alone a cluster's every
+    // sample's worth of rows passes about k (Deep10M at 4,096 clusters, 1M probes: 1.7x (FP16) and
+    // 2.3x (INT8) the pairs of the unseeded sweep). Stretch i of every cluster is filtered in one
+    // round of grouped launches, and the rounds merge in between. SIRIUS_VSS_SEED_TIGHTEN=0 filters
+    // each cluster whole under the seed. Lists in host memory, and the running bound, keep their own
+    // schedule.
+    bool const stretch_sweep0 = seed && !lists_on_host && running_bound_rows == 0 && [] {
+      auto const* v = std::getenv("SIRIUS_VSS_SEED_TIGHTEN");
+      return v == nullptr || std::string_view{v} != "0";
+    }();
+    // Where each stretch of a cluster of @p size rows ends, in rows from its start: the sample,
+    // then doubling; a last stretch under a quarter of the one before it joins that one.
+    auto stretch_ends = [&](std::int64_t size) {
+      std::vector<std::int64_t> ends;
+      for (auto e = seed_rows(size);; e *= 2) {
+        if (size - e < e / 4 + 1) {
+          ends.push_back(size);
+          return ends;
+        }
+        ends.push_back(e);
+      }
+    };
+    std::vector<std::int64_t> stretch_pairs;  // debug only: pairs each stretch passed
     for (int sweep = radius_join && any_bounded ? 1 : 0; sweep < (any_bounded ? 2 : 1); ++sweep) {
       if (sweep == 1 && !kept.empty()) {
         for (auto const& entry : kept) {
@@ -3338,6 +3463,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                     return v == nullptr || std::string_view{v} != "0";
                                   }();
       std::vector<chunk_cluster_run> const no_runs;
+      // The stretched sweep 0's pieces, by stretch (see stretch_sweep0).
+      std::vector<std::vector<bounded_slice>> stretches;
       auto stage_next = [&](std::size_t j) {
         if (copy_compact) {
           if (auto it = kept.find(j); it != kept.end()) {
@@ -3373,6 +3500,18 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         if (seed) {
           check_group();
           flush();
+        }
+        if (dbg && seed) {
+          std::string per_stretch;
+          for (auto const p : stretch_pairs) {
+            per_stretch += " " + std::to_string(p);
+          }
+          std::fprintf(stderr,
+                       "[vecjoin-phase] sweep 0: %lld pairs passed, %lld merges, %zu stretches:%s\n",
+                       static_cast<long long>(bounded_emitted),
+                       static_cast<long long>(bounded_merges),
+                       stretch_pairs.size(),
+                       per_stretch.c_str());
         }
         phase("nearest-cluster sweep");
         bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
@@ -3648,6 +3787,28 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                 rescore ? nullptr : id_map,
                                 rows_c,
                                 m};
+            if (stretch_sweep0 && sweep == 0) {
+              // The slice's rows, from row `at` of its cluster, cut where the cluster's stretches
+              // end; each piece waits for its stretch's round (after this loop).
+              auto const c    = static_cast<std::size_t>(slice.cluster);
+              auto const at   = id_base - _lists->offsets[c];
+              auto const ends = stretch_ends(_lists->offsets[c + 1] - _lists->offsets[c]);
+              if (stretches.size() < ends.size()) { stretches.resize(ends.size()); }
+              for (std::size_t i = 0; i < ends.size(); ++i) {
+                auto const from = std::max(i == 0 ? std::int64_t{0} : ends[i - 1], at);
+                auto const to   = std::min(ends[i], at + slice_rows);
+                if (from >= to) { continue; }
+                auto const o = from - at;
+                auto piece   = sl;
+                piece.x    = static_cast<std::byte const*>(sl.x) + o * dim * (f16_bounded ? 2 : 1);
+                piece.x_sq = static_cast<std::byte const*>(sl.x_sq) + o * 4;
+                piece.n    = to - from;
+                piece.id_base += o;
+                if (piece.id_map != nullptr) { piece.id_map += o; }
+                stretches[i].push_back(piece);
+              }
+              continue;
+            }
             if (running_bound_rows > 0) {
               for (std::int64_t o = 0; o < slice_rows;) {
                 auto const n = std::min(slice_rows - o, running_piece - since_merge);
@@ -3846,6 +4007,34 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           release_staged(staged);
         }
       }
+      // The stretched sweep 0: round i filters stretch i of every cluster, under the bounds the
+      // merge after round i - 1 left (the seed for round 0). The device lists stay put, so the
+      // pieces' rows are where the slices left them. A group grows past kBoundedGroup slices while
+      // even all of its pairs would fit the buffer, so it cannot overflow: with few probe rows a
+      // round is a few launches, not one per kBoundedGroup clusters (10k probes, 4,096 clusters:
+      // 16 checks a round, each reading the buffer's fill back).
+      for (auto const& round : stretches) {
+        auto const emitted_before = bounded_emitted;
+        std::int64_t group_pairs  = 0;  // the group's pairs, were every one to pass
+        for (auto const& piece : round) {
+          if (group_launch && (piece.m <= group_m_max || piece.m * piece.n <= group_work_max)) {
+            deferred.push_back(piece);
+          } else {
+            launch_bounded(piece);
+          }
+          ++bounded_launches;
+          bounded_padded += ((piece.n + 127) / 128) * ((piece.m + 127) / 128);
+          group.push_back(piece);
+          group_pairs += piece.m * piece.n;
+          if (group.size() >= kBoundedGroup && group_pairs > candidates->capacity() - pending) {
+            check_group();
+            group_pairs = 0;
+          }
+        }
+        check_group();
+        flush();
+        if (dbg) { stretch_pairs.push_back(bounded_emitted - emitted_before); }
+      }
     }
     if (any_bounded && !kept.empty()) { check_group(); }
     for (auto& entry : kept) {
@@ -3877,7 +4066,23 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                        "[vecjoin-phase] best match: %lld of those pairs re-scored\n",
                        static_cast<long long>(best_rescored));
         }
+        if (gap_rescore) {
+          std::fprintf(stderr,
+                       "[vecjoin-phase] gap re-score: %lld of %lld candidates re-scored (trim %.3f s); "
+                       "row-stretches %llu: %llu under 2k, %llu trimmed at m=2, %llu at m=4, %llu "
+                       "fall back; the m-rule would re-score %llu\n",
+                       static_cast<long long>(gap_rescored),
+                       static_cast<long long>(bounded_emitted),
+                       trim_seconds,
+                       gap_stats.rows,
+                       gap_stats.short_rows,
+                       gap_stats.m2_rows,
+                       gap_stats.m4_rows,
+                       gap_stats.fallback_rows,
+                       gap_stats.literal_rescored);
+        }
       }
+      if (gap_stats_on) { vss::add_gap_rescore_totals(gap_stats); }
       if (sqrt_at_end && !radius_join) {
         vss::sqrt_in_place(acc_distances->mutable_view().data<float>(), n_left * k_join, stream);
       }

@@ -1118,6 +1118,105 @@ TEST_CASE_METHOD(KMeansFixture,
 }
 
 TEST_CASE_METHOD(KMeansFixture,
+                 "the gap-checked re-score trims rows with a gap, keeps near ties, and changes no answer",
+                 "[integration][gpu_execution][array][vss][kmeans][lists][gap_rescore]")
+{
+  // 64 probe rows, k = 10. An even probe has 10 corpus rows within ~0.05 of it and 50 more at
+  // ~1.4: a gap far wider than the codes' error, so its check passes at m = 2 and the 50 are
+  // dropped unread. An odd probe has 60 corpus rows at distances 0.5, 0.5001, ..., 0.5059 (along
+  // +-30 axes): near ties, all within the codes' error of each other, so its check fails at m = 2
+  // and m = 4 and all 60 are re-scored. 2,000 far rows (components in [3, 4)) come first, so a
+  // seed's sample is loose and every probe row's own rows reach the re-score in its first stretch.
+  // No two of a row's distances tie exactly (an exact tie at the k-th distance may keep either
+  // pair, with or without the trim), so the answer must be the untrimmed one exactly, ids and
+  // distances: over one list and over four, per row and global, lists on device or host.
+  auto const storage  = GENERATE(std::string("float16"), std::string("int8"));
+  auto const tier     = GENERATE(std::string("auto"), std::string("host"));
+  auto const clusters = GENERATE(1, 4);
+  auto const prefix   = "kmg_" + storage + "_" + tier + "_" + std::to_string(clusters);
+  auto const center   = [](const std::string& p) {
+    return "((hash(" + p + " * 1000 + d + 12345) % 1000)::FLOAT / 1000.0)";
+  };
+  run_ok("CREATE TABLE " + prefix +
+         "_probe AS SELECT p::INTEGER AS id, list_transform(range(64), lambda d: " + center("p") +
+         ")::FLOAT[64] AS vec FROM range(64) t(p);");
+  auto const offset = std::string(
+    "CASE WHEN p % 2 = 1 THEN (CASE WHEN d = t // 2 THEN (0.5 + t * 0.0001) * (CASE WHEN t % 2 = 0 "
+    "THEN 1 ELSE -1 END) ELSE 0.0 END) ELSE (CASE WHEN t < 10 THEN 0.01 ELSE 0.3 END) * ((hash(p * 100000 + t * "
+    "100 + d) % 2000)::FLOAT / 1000.0 - 1.0) END");
+  run_ok("CREATE TABLE " + prefix +
+         "_corpus AS SELECT * FROM (SELECT i::INTEGER AS id, list_transform(range(64), lambda d: "
+         "3.0 + (hash(i * 1000 + d + 999) % 1000)::FLOAT / 1000.0)::FLOAT[64] AS vec FROM "
+         "range(2000) t(i) UNION ALL SELECT (2000 + p * 60 + t)::INTEGER AS id, "
+         "list_transform(range(64), lambda d: " +
+         center("p") + " + " + offset +
+         ")::FLOAT[64] AS vec FROM range(64) a(p), range(60) b(t)) ORDER BY id;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_probe', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + prefix +
+         "_c', n_clusters => " + std::to_string(clusters) + ");");
+  run_ok("SELECT * FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" + prefix +
+         "_c', storage => '" + storage + "', tier => '" + (tier == "auto" ? "auto" : "host") +
+         "');");
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_GAP_RESCORE");
+      ::unsetenv("SIRIUS_VSS_GAP_RESCORE_STATS");
+      ::unsetenv("SIRIUS_VSS_SEED");
+    }
+  } unset_env;
+  // INT8 lists over four ~1,460-row partitions are under the seed's partition-size test
+  // (kSeedInt8Rows): their nearest-cluster pass is the unseeded one, which leaves sweep 1 a bound
+  // as tight as host lists start from. On the device they also run seeded (SIRIUS_VSS_SEED=force),
+  // so the trim is checked inside the seeded sweep's stretches for INT8 as well as FLOAT16.
+  bool const int8_unseeded = storage == "int8" && clusters == 4;
+  std::vector<std::string> seed_modes{""};
+  if (int8_unseeded && tier == "auto") { seed_modes.push_back("force"); }
+  for (auto const& seed_mode : seed_modes)
+    for (auto const* mode : {"", ", join_mode => 'global'"}) {
+      if (seed_mode.empty()) {
+        ::unsetenv("SIRIUS_VSS_SEED");
+      } else {
+        ::setenv("SIRIUS_VSS_SEED", seed_mode.c_str(), 1);
+      }
+      auto const join = "SELECT left_id, right_id, distance FROM sirius_knn_join('" + prefix +
+                        "_probe','vec','" + prefix +
+                        "_corpus','vec', metric => 'l2', k => 10, search_mode => 'approx', "
+                        "clustering => '" +
+                        prefix + "_c', n_probes => " + std::to_string(clusters) + mode + ");";
+      ::setenv("SIRIUS_VSS_GAP_RESCORE", "0", 1);
+      auto const untrimmed = ok_rows(*con, join);
+      ::unsetenv("SIRIUS_VSS_GAP_RESCORE");
+      ::setenv("SIRIUS_VSS_GAP_RESCORE_STATS", "1", 1);
+      sirius::vss::reset_gap_rescore_totals();
+      auto const trimmed = ok_rows(*con, join);
+      auto const totals  = sirius::vss::gap_rescore_totals();
+      ::unsetenv("SIRIUS_VSS_GAP_RESCORE_STATS");
+      INFO(prefix << mode << " seed '" << seed_mode << "': " << totals.kept << " of "
+                  << totals.candidates << " re-scored, " << totals.m2_rows
+                  << " rows trimmed at m = 2, " << totals.m4_rows << " at m = 4, "
+                  << totals.fallback_rows << " fell back");
+      REQUIRE(untrimmed.size() == (std::string(mode).empty() ? 640u : 10u));
+      CHECK(trimmed == untrimmed);
+      // Each even probe's 50 rows at ~1.4 are dropped; each odd probe keeps its 60 near ties. Host
+      // lists over four partitions, and unseeded INT8 lists, start sweep 1 from each row's nearest
+      // partition, a bound that already lets through only the rows' own 10 and 60: nothing is left
+      // to trim there.
+      if ((tier == "auto" && !(int8_unseeded && seed_mode.empty())) || clusters == 1) {
+        CHECK(totals.kept < totals.candidates);
+        CHECK(totals.m2_rows > 0);
+        CHECK(totals.fallback_rows > 0);
+      } else {
+        CHECK(totals.kept == totals.candidates);
+      }
+    }
+}
+
+TEST_CASE_METHOD(KMeansFixture,
                  "int8 lists over a component 300x wider than the rest give the exact answer",
                  "[integration][gpu_execution][array][vss][kmeans][lists][running_bound]")
 {
@@ -2174,18 +2273,48 @@ TEST_CASE_METHOD(KMeansFixture,
     std::sort(out.begin(), out.end());
     return out;
   };
+  // Seeded, each ~4,400-row cluster is filtered in three stretches (1,024 sample rows, 1,024, the
+  // rest) with a merge between them; SIRIUS_VSS_SEED_TIGHTEN=0 filters it whole under the seed.
+  // FLOAT16 lists are seeded by default; INT8 lists of partitions this small (under kSeedInt8Rows
+  // rows) are not, so they are seeded with SIRIUS_VSS_SEED=force, and their default is the GEMM.
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_SEED");
+      ::unsetenv("SIRIUS_VSS_SEED_TIGHTEN");
+    }
+  } unset_env;
+  auto const seed_on = [&] {
+    if (storage == "int8") {
+      ::setenv("SIRIUS_VSS_SEED", "force", 1);
+    } else {
+      ::unsetenv("SIRIUS_VSS_SEED");
+    }
+  };
   for (auto const probes : {1, 4, 16}) {
     for (auto const k : {1, 10}) {
-      auto const args   = "n_probes => " + std::to_string(probes) + ", k => " + std::to_string(k);
+      auto const args = "n_probes => " + std::to_string(probes) + ", k => " + std::to_string(k);
+      seed_on();
       auto const seeded = fetch(args);
+      ::setenv("SIRIUS_VSS_SEED_TIGHTEN", "0", 1);
+      auto const whole = fetch(args);
+      ::unsetenv("SIRIUS_VSS_SEED_TIGHTEN");
       ::setenv("SIRIUS_VSS_SEED", "0", 1);
       auto const gemm = fetch(args);
       ::unsetenv("SIRIUS_VSS_SEED");
+      auto const by_default = fetch(args);
       REQUIRE(seeded.size() == gemm.size());
+      REQUIRE(whole.size() == gemm.size());
+      REQUIRE(by_default.size() == gemm.size());
       REQUIRE(seeded.size() == static_cast<std::size_t>(50 * k));
       for (std::size_t i = 0; i < seeded.size(); ++i) {
         CHECK(seeded[i].first == gemm[i].first);
         CHECK(std::abs(seeded[i].second - gemm[i].second) <= 1e-5 * std::max(1.0, gemm[i].second));
+        CHECK(whole[i].first == gemm[i].first);
+        CHECK(std::abs(whole[i].second - gemm[i].second) <= 1e-5 * std::max(1.0, gemm[i].second));
+        CHECK(by_default[i].first == gemm[i].first);
+        CHECK(std::abs(by_default[i].second - gemm[i].second) <=
+              1e-5 * std::max(1.0, gemm[i].second));
       }
     }
   }
