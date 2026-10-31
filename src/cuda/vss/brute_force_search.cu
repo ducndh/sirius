@@ -142,6 +142,8 @@ brute_force_index brute_force_build(raft::device_resources const& res,
                                     dataset_matrix_view dataset,
                                     cuvs::distance::DistanceType metric)
 {
+  CUDF_EXPECTS(metric != cuvs::distance::DistanceType::InnerProduct,
+               "brute_force_build: an inner-product join searches through gemm_topk only");
   bf::index_params index_params;
   index_params.metric = metric;
   // With the non-owning dataset view this stores a reference to Sirius-owned memory and
@@ -242,6 +244,12 @@ knn_result brute_force_knn(raft::device_resources const& res,
     return brute_force_knn_faiss(res, dataset, queries, k, metric, mr);
   }
 #endif
+  // cuVS ranks an inner product largest first and reports it as a similarity; the join folds
+  // distances smallest first, so an inner-product search always takes the GEMM form, whose
+  // distance is -2 q.x.
+  if (metric == cuvs::distance::DistanceType::InnerProduct) {
+    return gemm_topk(res, dataset, queries, k, metric, mr);
+  }
   auto const index = brute_force_build(res, dataset, metric);
   return brute_force_knn(res, index, queries, k, mr);
 }

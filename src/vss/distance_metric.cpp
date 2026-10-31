@@ -53,6 +53,9 @@ cuvs::distance::DistanceType join_selection_distance_type_from_metric(std::strin
                             : cuvs::distance::DistanceType::L2SqrtExpanded;
   }
   if (metric == "cosine") { return cuvs::distance::DistanceType::CosineExpanded; }
+  // The join ranks by -2 q.x, which only its GEMM search and its FP16 bounded search compute;
+  // cuVS's own InnerProduct (largest first) is never asked for it.
+  if (metric == "ip") { return cuvs::distance::DistanceType::InnerProduct; }
   throw std::invalid_argument("join_selection_distance_type_from_metric: unsupported metric '" +
                               std::string(metric) + "'");
 }

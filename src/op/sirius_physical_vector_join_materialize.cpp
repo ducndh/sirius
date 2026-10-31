@@ -782,7 +782,8 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::materializ
                                   mr);
   }
 
-  // Score: distance, or cosine similarity = max(0, 1 - distance).
+  // Score: distance, or cosine similarity = max(0, 1 - distance), or for an inner product q.x (or
+  // -q.x) from the join's -2 q.x.
   std::unique_ptr<cudf::column> score;
   if (_request.metric == "cosine") {
     cudf::numeric_scalar<float> const lo(0.0F, true, stream);
@@ -799,6 +800,19 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::materializ
     } else {
       score = std::move(distance);
     }
+  } else if (_request.metric == "ip") {
+    // The join ranked by -2 q.x; the score is the inner product (similarity) or DuckDB's negative
+    // inner product (distance), both exact rescalings of it.
+    cudf::numeric_scalar<float> const factor(
+      _request.output_type == sirius::vss::vector_join_output_type::similarity ? -0.5F : 0.5F,
+      true,
+      stream);
+    score = cudf::binary_operation(distance_view,
+                                   factor,
+                                   cudf::binary_operator::MUL,
+                                   cudf::data_type{cudf::type_id::FLOAT32},
+                                   stream,
+                                   mr);
   } else {
     score = std::make_unique<cudf::column>(distance_view, stream, mr);
   }

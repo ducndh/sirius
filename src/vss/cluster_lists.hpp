@@ -243,8 +243,9 @@ struct exact_lists_choice {
 /// answer cosine joins and only those; INT8 codes are left out (their search refuses too many
 /// shapes to pick them unasked). A single list (the exact join's compact layout, searched whole
 /// with its bound lowered as it goes) is preferred when there is one, and skipped below
-/// @p min_clusters, which an approximate join sets to 2: one list prunes nothing. Nullopt when
-/// there is none.
+/// @p min_clusters, which an approximate join sets to 2: one list prunes nothing. With
+/// @p float_rows_only, UINT8 lists are left out too: an inner-product join searches FLOAT16 rows
+/// (re-scored from the kept FP32 rows) or FP32 rows only. Nullopt when there is none.
 [[nodiscard]] std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
                                                                  const std::string& catalog,
                                                                  const std::string& schema,
@@ -252,7 +253,8 @@ struct exact_lists_choice {
                                                                  const std::string& column,
                                                                  bool cosine,
                                                                  std::int64_t n_rows,
-                                                                 std::int64_t min_clusters = 1);
+                                                                 std::int64_t min_clusters = 1,
+                                                                 bool float_rows_only     = false);
 
 /// The lists of the clustering @p clustering when it is one of (@p catalog, @p schema, @p table,
 /// @p column)'s and they hold all @p n_rows rows, unit rows exactly when @p cosine: what a join
@@ -422,6 +424,9 @@ void half_rows_norms(float const* x,
 /// its FP16-computed distance within (sqrt(bound[r]) + probe_error[r] + row_error)^2 plus the
 /// FP32 sums' error for norms up to sqrt(probe_sq[r]) and @p row_norm. With @p lower, the largest
 /// FP16-computed distance that proves a pair is within bound[r] (-inf when none).
+/// With @p inner_product the distance is -2 q.x (any sign) and the filter's is -2 half(q).half(x),
+/// computed with zero norms; the limit is bound[r] plus (or, with @p lower, minus) a Cauchy-Schwarz
+/// slack in the same errors and norms (see inner_product_half_slack in cluster_fold.cu).
 void float16_bound_limit(float const* bound,
                          float const* probe_sq,
                          float const* probe_error,
@@ -431,11 +436,14 @@ void float16_bound_limit(float const* bound,
                          std::int64_t n,
                          float* limit,
                          rmm::cuda_stream_view stream,
-                         bool lower = false);
+                         bool lower         = false,
+                         bool inner_product = false);
 
 /// A FLOAT16 seed (seed_bound_f16's k-th FP16-computed distance) as an FP32 bound, in place: the
 /// rounded pair's distance is within the FP32 sums' error of the computed one (as in
 /// float16_bound_limit), and the true pair within probe_error[r] + row_error of the rounded one.
+/// With @p inner_product, the seed is a k-th -2 half(q).half(x) and the bound it gives is that plus
+/// the inner-product slack of float16_bound_limit.
 void float16_seed_upper_bound(float* bound,
                               float const* probe_sq,
                               float const* probe_error,
@@ -443,7 +451,8 @@ void float16_seed_upper_bound(float* bound,
                               float row_norm,
                               std::int64_t d,
                               std::int64_t n,
-                              rmm::cuda_stream_view stream);
+                              rmm::cuda_stream_view stream,
+                              bool inner_product = false);
 
 /// |x|^2 per row of shifted int8 rows, exact in int32.
 void int8_row_sq_norms(std::int8_t const* x,
