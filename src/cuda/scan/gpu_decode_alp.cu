@@ -103,6 +103,8 @@ namespace sirius::cuda::scan {
 namespace {
 
 constexpr uint32_t ALP_BLOCK_DIM = 256;
+//! ALP codes are int64 for every T: their bitpacked width is at most 64, for FLOAT too.
+constexpr uint32_t ALP_MAX_BIT_WIDTH = sizeof(uint64_t) * CHAR_BIT;
 constexpr uint8_t ALP_MAX_FACTOR =
   static_cast<uint8_t>(std::extent_v<decltype(duckdb::AlpConstants::FACT_ARR)> - 1);
 
@@ -254,8 +256,6 @@ __device__ alp_vector_meta parse_alp_metadata(uint8_t const* seg_base,
                                               uint32_t vec_idx,
                                               uint32_t fill_rows)
 {
-  constexpr uint32_t T_BITS = sizeof(T) * CHAR_BIT;
-
   alp_vector_meta meta{};
   meta.status = alp_parse_status::invalid;
 
@@ -294,7 +294,11 @@ __device__ alp_vector_meta parse_alp_metadata(uint8_t const* seg_base,
   auto const exceptions_count = ld_unaligned<uint16_t>(vector_p + 2);
   auto const for_value        = ld_unaligned<uint64_t>(vector_p + 4);
   auto const bw               = vector_p[12];
-  if (bw > T_BITS) return meta;
+  // ALP encodes FLOAT as well as DOUBLE values into int64 codes and bitpacks their offsets from
+  // the FOR value as uint64, so a FLOAT vector's width can exceed 32 bits (exponent 10 on values
+  // past ~0.43 needs 33 or more; DuckDB picks that for small tables of full-precision floats).
+  // DuckDB's own scan bounds it by 64 (AlpScanState::LoadVector), and so does this.
+  if (bw > ALP_MAX_BIT_WIDTH) return meta;
   if (exp > duckdb::AlpTypedConstants<T>::MAX_EXPONENT || fac > ALP_MAX_FACTOR) return meta;
 
   auto const packed_bytes = bp_required_bytes(fill_rows, bw);
@@ -401,7 +405,9 @@ void launch_alp_typed(detail::cta_block_desc const* h_descs,
                       ::cuda::stream_ref stream,
                       rmm::device_async_resource_ref mr)
 {
-  constexpr uint32_t MAX_PACKED_BYTES = duckdb::AlpConstants::ALP_VECTOR_SIZE * sizeof(T);
+  // The packed codes are up to 64 bits wide for FLOAT too (see parse_alp_metadata).
+  constexpr uint32_t MAX_PACKED_BYTES =
+    duckdb::AlpConstants::ALP_VECTOR_SIZE * ALP_MAX_BIT_WIDTH / CHAR_BIT;
   // Two guard words past the live data for the 64-bit straddle case.
   constexpr uint32_t MAX_PACKED_WORDS = ::cuda::ceil_div(MAX_PACKED_BYTES, sizeof(uint32_t)) + 2;
 

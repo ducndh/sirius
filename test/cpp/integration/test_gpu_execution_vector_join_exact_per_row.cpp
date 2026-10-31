@@ -1660,3 +1660,68 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("SELECT * FROM unpin_table('gk_corpus');");
   run_ok("SELECT * FROM unpin_table('gk_probe');");
 }
+
+// -----------------------------------------------------------------------------
+// A pinned FLOAT column that DuckDB stores as ALP with codes wider than 32 bits.
+//
+// ALP codes FLOAT values as int64, so a vector of full-precision floats coded with exponent 10
+// packs 33-36 bits a value. DuckDB writes those for small tables (20 rows of Deep1B's FLOAT[96]
+// rows: ALP, two vectors of widths 36 and 34), and the GPU decoder bounded the width by 32 and
+// zero-filled such vectors without an error: the pin read them as zero vectors, on the probe
+// side and on the build side alike, and the join answered from them. force_compression makes
+// the codec choice independent of DuckDB's analyzer; the values (24-bit binary fractions in
+// [-1, 1)) need exponent 10.
+// -----------------------------------------------------------------------------
+TEST_CASE_METHOD(VectorJoinFixture,
+                 "sirius_knn_join - pinned float array columns stored as wide ALP codes read exactly",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  auto const vec = [](const std::string& seed) {
+    return "list_transform(range(16), lambda d: ((hash(i * 100 + d + " + seed +
+           ") % 16777216)::DOUBLE / 8388608.0 - 1.0)::FLOAT)::FLOAT[16]";
+  };
+  run_ok("SET force_compression = 'alp';");
+  run_ok("CREATE TABLE alpw_corpus AS SELECT i::INTEGER AS id, " + vec("0") +
+         " AS vec FROM range(2000) t(i);");
+  run_ok("CREATE TABLE alpw_probe AS SELECT i::INTEGER AS id, " + vec("777") +
+         " AS vec FROM range(20) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SET force_compression = 'auto';");
+  for (auto const* t : {"alpw_corpus", "alpw_probe"}) {
+    auto const codecs = ok_rows(*con,
+                                std::string("SELECT DISTINCT compression FROM pragma_storage_info('") +
+                                  t + "') WHERE column_path = '[1, 1]';");
+    REQUIRE(codecs == std::vector<std::vector<std::string>>{{"ALP"}});
+    run_ok(std::string("SELECT * FROM pin_table(name => '") + t +
+           "', tier => 'gpu', format => 'duckdb');");
+  }
+
+  // Ids only, as above; the rows are hash-generated floats, so no two neighbours tie.
+  auto const cpu = [&](const std::string& probe, const std::string& corpus, int k) {
+    con->Query("SET gpu_execution = false;");
+    auto rows = ok_rows(*con,
+                        "SELECT p.id, n.id FROM " + probe + " p, LATERAL (SELECT c.id FROM " +
+                          corpus + " c ORDER BY array_distance(p.vec, c.vec) LIMIT " +
+                          std::to_string(k) + ") n;");
+    con->Query("SET gpu_execution = true;");
+    return rows;
+  };
+  auto const gpu = [&](const std::string& probe, const std::string& corpus, int k) {
+    return ok_rows(*con,
+                   "SELECT left_id, right_id FROM sirius_knn_join('" + probe + "', 'vec', '" +
+                     corpus + "', 'vec', metric => 'l2', k => " + std::to_string(k) + ");");
+  };
+  // The 20-row table as the probe side, then as the build side.
+  CHECK(gpu("alpw_probe", "alpw_corpus", 3) == cpu("alpw_probe", "alpw_corpus", 3));
+  CHECK(gpu("alpw_corpus", "alpw_probe", 1) == cpu("alpw_corpus", "alpw_probe", 1));
+  // Zero vectors would put every probe row at its corpus row of least norm.
+  CHECK(single_float(*con,
+                     "SELECT min(distance) FROM sirius_knn_join('alpw_probe', 'vec', "
+                     "'alpw_corpus', 'vec', metric => 'l2', k => 1);") <
+        single_float(*con,
+                     "SELECT max(distance) FROM sirius_knn_join('alpw_probe', 'vec', "
+                     "'alpw_corpus', 'vec', metric => 'l2', k => 1);"));
+
+  run_ok("SELECT * FROM unpin_table('alpw_probe');");
+  run_ok("SELECT * FROM unpin_table('alpw_corpus');");
+}

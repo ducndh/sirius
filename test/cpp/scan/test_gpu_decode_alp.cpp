@@ -32,6 +32,7 @@
 #include <duckdb/common/enums/compression_type.hpp>
 #include <duckdb/storage/compression/alp/alp_constants.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -208,6 +209,47 @@ TEST_CASE("gpu_decode_table ALP - single compressed vector with exceptions, floa
       REQUIRE(out[i] == Approx(expected).epsilon(1e-6F));
     }
   }
+}
+
+TEST_CASE("gpu_decode_table ALP - float codes wider than 32 bits decode",
+          "[scan][decode][alp]")
+{
+  // ALP codes FLOAT values as int64 too, so a FLOAT vector's packed width can pass 32 bits:
+  // exponent 10 (x 10^10) on values up to a few units needs 33-36. DuckDB writes such vectors for
+  // small tables of full-precision floats (a 20-row FLOAT[96] table: 1,920 values, two vectors of
+  // widths 36 and 34). The decoder used to bound the width by sizeof(T) * 8 and zero-filled them.
+  // Values here span [-1, 2.4] (FOR = -10^10, mantissas below 2^35).
+  uint64_t const for_value = static_cast<uint64_t>(int64_t{-10000000000});
+  std::vector<alp_vector<float>> vecs;
+  std::vector<uint32_t> const rows{1024u, 896u};
+  std::vector<uint8_t> const widths{36u, 34u};
+  std::vector<std::vector<uint64_t>> mantissas(2);
+  for (std::size_t v = 0; v < 2; ++v) {
+    mantissas[v].resize(rows[v]);
+    uint64_t const mask = (uint64_t{1} << widths[v]) - 1u;
+    for (uint32_t i = 0; i < rows[v]; ++i) {
+      mantissas[v][i] = ((uint64_t{i} * 2654435761ULL + v * 40503ULL) * 97ULL) % 34359738368ULL & mask;
+    }
+    mantissas[v][rows[v] - 1] = mask;  // the widest code each vector holds
+    alp_compressed_vector<float> cv;
+    cv.exponent     = 10;
+    cv.factor       = 0;
+    cv.frame_of_ref = for_value;
+    cv.bit_width    = widths[v];
+    cv.row_count    = rows[v];
+    cv.mantissas    = mantissas[v];
+    vecs.emplace_back(std::move(cv));
+  }
+  auto bytes = make_alp_block<float>(vecs);
+  auto out   = decode_one_alp<float>(bytes, F32, 1024u + 896u);
+  for (std::size_t v = 0; v < 2; ++v) {
+    for (uint32_t i = 0; i < rows[v]; ++i) {
+      float const expected = alp_decode_f32_ref(for_value, mantissas[v][i], 0, 10);
+      REQUIRE(out[v * 1024u + i] == Approx(expected).epsilon(1e-6F));
+    }
+  }
+  // Not the zero fill of a rejected vector.
+  CHECK(std::any_of(out.begin(), out.end(), [](float x) { return x > 1.0F; }));
 }
 
 TEST_CASE("gpu_decode_table ALP - uncompressed-sentinel vector double", "[scan][decode][alp]")
@@ -452,11 +494,11 @@ TEST_CASE("gpu_decode_table ALP - vector pointer below segment header zero-fills
     REQUIRE(out[i] == 0.0F);
 }
 
-TEST_CASE("gpu_decode_table ALP - bit_width > sizeof(T)*8 zero-fills",
-          "[scan][decode][alp][defensive]")
+TEST_CASE("gpu_decode_table ALP - bit_width > 64 zero-fills", "[scan][decode][alp][defensive]")
 {
   // Build a legitimate-looking ALP block but corrupt bit_width to 65 — the
-  // kernel must refuse and zero-fill rather than reading past the buffer.
+  // kernel must refuse and zero-fill rather than reading past the buffer. The codes are int64
+  // for FLOAT and DOUBLE alike, so 64 is the bound for both (the float case follows).
   uint32_t const N = 32;
   std::vector<uint64_t> m(N, 0u);
   alp_compressed_vector<double> cv;
@@ -485,6 +527,34 @@ TEST_CASE("gpu_decode_table ALP - bit_width > sizeof(T)*8 zero-fills",
   auto out = decode_alp_invalid_with_canary<double>(stream, mr, run, F64, N);
   for (uint32_t i = 0; i < N; ++i)
     REQUIRE(out[i] == 0.0);
+}
+
+TEST_CASE("gpu_decode_table ALP - bit_width > 64 zero-fills, float",
+          "[scan][decode][alp][defensive]")
+{
+  uint32_t const N = 32;
+  alp_compressed_vector<float> cv;
+  cv.exponent     = 0;
+  cv.factor       = 0;
+  cv.frame_of_ref = 0;
+  cv.bit_width    = 40;  // valid for FLOAT (int64 codes)
+  cv.row_count    = N;
+  cv.mantissas    = std::vector<uint64_t>(N, 0u);
+  std::vector<alp_vector<float>> vecs;
+  vecs.emplace_back(std::move(cv));
+  auto bytes    = make_alp_block<float>(vecs);
+  bytes[4 + 12] = 65;
+
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  rmm::device_buffer d_seg(bytes.data(), bytes.size(), stream);
+  gpu_codec_run run{
+    CompressionType::COMPRESSION_ALP,
+    {gpu_segment_desc{
+      static_cast<uint8_t const*>(d_seg.data()), static_cast<uint32_t>(d_seg.size()), 0, N}}};
+  auto out = decode_alp_invalid_with_canary<float>(stream, mr, run, F32, N);
+  for (uint32_t i = 0; i < N; ++i)
+    REQUIRE(out[i] == 0.0F);
 }
 
 TEST_CASE("gpu_decode_table ALP - exception payload past metadata_end zero-fills",
@@ -813,6 +883,27 @@ TEST_CASE("gpu_decode_table ALP bench-scale - f32 bw=32 verify", "[scan][decode]
     one_codec_column(F32, ROWS, CompressionType::COMPRESSION_ALP, {segment(d_seg, 0, ROWS)});
 
   // bw=32 covers the full f32 mantissa width; no mask needed.
+  verify_decoded_column<float>(stream, mr, col, [](uint32_t row) {
+    uint32_t const v = row >> 10;
+    uint32_t const i = row & 1023u;
+    return static_cast<float>(static_cast<int64_t>(uint64_t{i} ^ uint64_t{v}));
+  });
+}
+
+TEST_CASE("gpu_decode_table ALP bench-scale - f32 bw=48 verify", "[scan][decode][alp][verify]")
+{
+  // FLOAT codes past 32 bits (int64 codes, as DuckDB writes them), at scale.
+  rmm::cuda_stream stream;
+  rmm::mr::cuda_async_memory_resource mr;
+  constexpr uint32_t N_VECS   = 1024u;
+  constexpr uint32_t ROWS     = N_VECS * 1024u;
+  constexpr uint8_t BIT_WIDTH = 48u;
+
+  auto seg_bytes = synth_alp_segment<float>(N_VECS, BIT_WIDTH);
+  auto d_seg     = upload(seg_bytes, stream);
+  auto col =
+    one_codec_column(F32, ROWS, CompressionType::COMPRESSION_ALP, {segment(d_seg, 0, ROWS)});
+
   verify_decoded_column<float>(stream, mr, col, [](uint32_t row) {
     uint32_t const v = row >> 10;
     uint32_t const i = row & 1023u;
