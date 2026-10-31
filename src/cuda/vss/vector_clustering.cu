@@ -65,6 +65,22 @@ namespace {
   return static_cast<std::int64_t>(chunk.size());
 }
 
+/// sum[j] += component j summed over @p rows rows of @p d floats, one thread per component.
+__global__ void add_column_sums_kernel(float const* x,
+                                       std::int64_t rows,
+                                       std::int64_t d,
+                                       double* sum)
+{
+  for (std::int64_t j = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x; j < d;
+       j += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
+    double s = 0;
+    for (std::int64_t r = 0; r < rows; ++r) {
+      s += x[r * d + j];
+    }
+    sum[j] += s;
+  }
+}
+
 }  // namespace
 
 strided_rows strided_row_sample(std::int64_t rows, std::int64_t take, std::uint64_t seed)
@@ -193,6 +209,55 @@ std::unique_ptr<cudf::column> train_centroids(std::vector<cudf::column_view> con
                                  std::move(centroid_values),
                                  0,
                                  rmm::device_buffer{});
+}
+
+std::unique_ptr<cudf::column> mean_centroid(std::vector<cudf::column_view> const& chunks,
+                                            std::int64_t dim,
+                                            rmm::cuda_stream_view stream,
+                                            rmm::device_async_resource_ref mr)
+{
+  if (dim <= 0) { throw std::invalid_argument("mean_centroid: dim must be >= 1"); }
+  rmm::device_uvector<double> sum(static_cast<std::size_t>(dim), stream, mr);
+  CUDF_CUDA_TRY(cudaMemsetAsync(sum.data(), 0, sum.size() * sizeof(double), stream.value()));
+  std::int64_t n_rows = 0;
+  for (auto const& chunk : chunks) {
+    auto const rows = chunk_row_count(chunk);
+    if (rows == 0) { continue; }
+    add_column_sums_kernel<<<static_cast<unsigned>((dim + 127) / 128), 128, 0, stream.value()>>>(
+      list_column_as_dataset_view(chunk, dim).data_handle(), rows, dim, sum.data());
+    CUDF_CHECK_CUDA(stream.value());
+    n_rows += rows;
+  }
+  if (n_rows == 0) { throw std::invalid_argument("mean_centroid: no rows"); }
+
+  std::vector<double> total(static_cast<std::size_t>(dim));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(total.data(),
+                                sum.data(),
+                                total.size() * sizeof(double),
+                                cudaMemcpyDeviceToHost,
+                                stream.value()));
+  stream.synchronize();
+  std::vector<float> mean(total.size());
+  for (std::size_t j = 0; j < total.size(); ++j) {
+    mean[j] = static_cast<float>(total[j] / static_cast<double>(n_rows));
+  }
+  auto values = cudf::make_numeric_column(cudf::data_type{cudf::type_id::FLOAT32},
+                                          static_cast<cudf::size_type>(dim),
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(values->mutable_view().data<float>(),
+                                mean.data(),
+                                mean.size() * sizeof(float),
+                                cudaMemcpyHostToDevice,
+                                stream.value()));
+  cudf::numeric_scalar<std::int32_t> const zero(0, true, stream);
+  cudf::numeric_scalar<std::int32_t> const width(static_cast<std::int32_t>(dim), true, stream);
+  auto offsets = cudf::sequence(2, zero, width, stream, mr);
+  auto out =
+    cudf::make_lists_column(1, std::move(offsets), std::move(values), 0, rmm::device_buffer{});
+  stream.synchronize();  // `mean` is read by the copy above
+  return out;
 }
 
 cluster_assignment assign_to_centroids(raft::device_resources const& res,

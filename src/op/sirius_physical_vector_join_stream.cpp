@@ -2504,10 +2504,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       constexpr std::int64_t kFirstPiecePairs = std::int64_t{1} << 24;
       auto const rows                         = std::max<std::int64_t>(n_left, 1);
       auto const at_least                     = std::max<std::int64_t>(4 * k_join, 64);
+      // The seed is the k-th of max(kSeedSample, 8k) sample rows (seed_rows), so about k / that of
+      // a piece's rows pass it.
+      auto const sample = std::max<std::int64_t>(vss::kSeedSample, 8 * k_join);
       // The upper bounds give way to at_least for a large k (std::clamp needs lo <= hi).
       return _lists->tier == cucascade::memory::Tier::GPU
                ? std::clamp<std::int64_t>(
-                   kFirstPiecePairs / rows * vss::kSeedSample / std::max<std::int64_t>(k_join, 1),
+                   kFirstPiecePairs / rows * sample / std::max<std::int64_t>(k_join, 1),
                    at_least,
                    std::max<std::int64_t>(at_least, 10'000))
                : std::clamp<std::int64_t>(kFirstPiecePairs / rows,
@@ -2516,9 +2519,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     }();
     // Lists in host memory have no device rows to sample; with the bound lowered as it goes, their
     // sweep starts from an unbounded first piece instead, which serves as the sample.
+    // The seed's sample grows with k (seed_rows), so any k is seeded; unseeded, the sweep would
+    // rank every row first, a full GEMM and selection.
     bool const seedable =
       int8_search && !radius_join &&
-      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && k_join <= 64 &&
+      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) &&
       seed_enabled && (!codes_int8 || (small_clusters && small_batch) || running_bound_rows > 0);
     bool const bounded = int8_search && (n_probes > 1 || radius_join || codes_int8 || seedable) &&
                          vss::bound_filter_int8_supports(dim) && bound_gemm_enabled;
@@ -2601,7 +2606,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // exact k-th and need not search that cluster again. SIRIUS_VSS_SEED=0 keeps the GEMM.
     bool const seed_f16 =
       f16_bounded && _lists != nullptr && !radius_join &&
-      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && k_join <= 64 &&
+      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) &&
       seed_enabled && ((small_clusters && small_batch) || running_bound_rows > 0);
     bool const seed = (bounded && seedable) || seed_f16;
     // Unseeded, sweep 0 ranks each row's nearest cluster on the half-precision tensor cores from
@@ -3046,8 +3051,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       }
     };
 
-    // A sample is at most a quarter of its cluster (kSeedSample rows at most, a few times k at
-    // least): a sample near the whole cluster is the sweep again, on CUDA cores.
+    // A sample is a quarter of its cluster, at least eight times k rows (and 64) and at most the
+    // larger of that and kSeedSample: a sample near the whole cluster is the sweep again, on CUDA
+    // cores. Past kSeedSample rows the seed ranks it through device memory, not shared memory.
     auto seed_rows = [&](std::int64_t size) {
       auto const floor = std::max<std::int64_t>(64, 8 * k_join);
       return std::min(
@@ -3057,12 +3063,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto seed_bound = [&] {
       std::vector<std::int64_t> first(static_cast<std::size_t>(n_left));
       std::vector<std::int32_t> count(static_cast<std::size_t>(n_left));
+      std::int64_t max_count = 0;
       for (std::int64_t r = 0; r < n_left; ++r) {
         auto const c = static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]);
         auto const lo                      = _lists->offsets[c];
         first[static_cast<std::size_t>(r)] = lo;
         count[static_cast<std::size_t>(r)] =
           static_cast<std::int32_t>(seed_rows(_lists->offsets[c + 1] - lo));
+        max_count = std::max<std::int64_t>(max_count, count[static_cast<std::size_t>(r)]);
       }
       // Probe rows by nearest cluster, so the kernel reads one cluster's sample at a time.
       std::vector<std::int64_t> order(static_cast<std::size_t>(n_left));
@@ -3107,8 +3115,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                             n_left,
                             dim,
                             static_cast<int>(k_join),
+                            max_count,
                             bound->data(),
-                            stream);
+                            stream,
+                            mr);
         vss::float16_seed_upper_bound(bound->data(),
                                       probe_sqf->data(),
                                       probe_half_error->data(),
@@ -3128,8 +3138,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                              n_left,
                              dim,
                              static_cast<int>(k_join),
+                             max_count,
                              bound->data(),
-                             stream);
+                             stream,
+                             mr);
         if (codes_int8) {
           vss::int8_seed_upper_bound(bound->data(),
                                      probe_code_error->data(),

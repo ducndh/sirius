@@ -96,6 +96,23 @@ TEST_CASE("rotate_rows is an in-order fmaf chain per output whatever the batch",
       REQUIRE(cudaMemcpy(e.data(), hi2.data(), d * 4, cudaMemcpyDeviceToHost) == cudaSuccess);
       REQUIRE(a == b);
       REQUIRE(c == e);
+
+      // Asked to keep the rows as well, it writes exactly what rotate_rows writes, and the range.
+      rmm::device_uvector<float> kept(x.size(), stream);
+      REQUIRE(cudaMemsetAsync(lo2.data(), 0xff, d * 4, stream.value()) == cudaSuccess);
+      REQUIRE(cudaMemsetAsync(hi2.data(), 0, d * 4, stream.value()) == cudaSuccess);
+      REQUIRE(sirius::vss::rotate_rows_min_max(
+        dx.data(), rows, d, dr.data(), lo2.data(), hi2.data(), stream, kept.data()));
+      std::vector<float> got_kept(x.size());
+      stream.synchronize();
+      REQUIRE(
+        cudaMemcpy(got_kept.data(), kept.data(), got_kept.size() * 4, cudaMemcpyDeviceToHost) ==
+        cudaSuccess);
+      REQUIRE(cudaMemcpy(b.data(), lo2.data(), d * 4, cudaMemcpyDeviceToHost) == cudaSuccess);
+      REQUIRE(cudaMemcpy(e.data(), hi2.data(), d * 4, cudaMemcpyDeviceToHost) == cudaSuccess);
+      REQUIRE(std::memcmp(got_kept.data(), got.data(), got.size() * 4) == 0);
+      REQUIRE(a == b);
+      REQUIRE(c == e);
     } else {
       REQUIRE(d % 16 != 0);  // the fused path covers every width a multiple of 16
     }

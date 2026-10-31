@@ -269,7 +269,8 @@ struct exact_lists_choice {
 /// Drop the lists built for @p clustering, if any; a re-fit makes them stale.
 void erase_cluster_lists(duckdb::SiriusContext& ctx, const std::string& clustering);
 
-/// row_ids[dest[i]] = row_base + i for i in [0, n): the row map of one scattered chunk.
+/// row_ids[dest[i]] = row_base + i for i in [0, n): the row map of one scattered chunk. A null
+/// @p dest is the identity, row_ids[row_base + i] = row_base + i: a chunk of one list.
 void scatter_row_ids(std::int64_t const* dest,
                      std::int64_t n,
                      std::int64_t row_base,
@@ -343,15 +344,17 @@ void rotate_rows(float const* x,
                  float* out,
                  rmm::cuda_stream_view stream);
 
-/// column_min_max over the rows rotate_rows would write, without writing them: false (nothing
-/// done) when that path does not apply (a width not a multiple of 16, or unaligned pointers).
+/// column_min_max over the rows rotate_rows would write, without writing them unless @p out is
+/// given, which then receives exactly what rotate_rows writes: false (nothing done) when that path
+/// does not apply (a width not a multiple of 16, or unaligned pointers).
 [[nodiscard]] bool rotate_rows_min_max(float const* x,
                                        std::int64_t rows,
                                        std::int64_t d,
                                        float const* rotation,
                                        unsigned int* min_bits,
                                        unsigned int* max_bits,
-                                       rmm::cuda_stream_view stream);
+                                       rmm::cuda_stream_view stream,
+                                       float* out = nullptr);
 
 /// How far rotate_rows' result for a row x may sit from the exact rotation, as a multiple of |x|:
 /// each component is a d-term FP32 dot product with an orthonormal row (error at most about

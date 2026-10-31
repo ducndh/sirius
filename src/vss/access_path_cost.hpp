@@ -36,6 +36,7 @@ struct access_path_shape {
   bool lists_on_device{true};
   double n_clusters{1024};
   bool inexact_unseeded{false};  ///< FLOAT16 rows in clusters too large to seed (a fixed sweep 0)
+  bool unit_rows{false};         ///< cosine lists: unit rows, with their FP32 copy kept on the host
 };
 
 /// Seconds for an exact join, by an analytic model fitted on the A5000 grid (RTX A5000 24 GB,
@@ -59,8 +60,8 @@ struct access_path_cost {
       fit_per_value{3.7e-9 / d.fp32},
       write_per_value_u8{0.55e-9 / d.hbm},
       write_per_value_f16{1.55e-9 / d.hbm},
-      codes_per_value_device{0.3e-9 / d.hbm},
-      codes_per_value_host{0.62e-9 / d.pcie}
+      codes_per_value_device{0.05e-9 / d.hbm},
+      codes_per_value_host{0.155e-9 / d.pcie}
   {
   }
 
@@ -74,8 +75,8 @@ struct access_path_cost {
   double fit_per_value;
   double write_per_value_u8;
   double write_per_value_f16;
-  double codes_per_value_device;
-  double codes_per_value_host;
+  double codes_per_value_device;  ///< the one-list build from a pin on the device, both passes
+  double codes_per_value_host;    ///< one pass of it over a pin in host memory: a PCIe copy
 
   [[nodiscard]] double brute(access_path_shape const& s) const
   {
@@ -129,13 +130,20 @@ struct access_path_cost {
            (s.list_bytes_per_value == 1 ? write_per_value_u8 : write_per_value_f16) * values;
   }
 
-  /// Writing the exact join's compact layout: one list of codes, with no clustering to fit and no
-  /// rows to assign, so one pass over the rows. Fitted 2026-10-17 on 1M-100M-row single-list
-  /// builds: ~0.3 ns a value into device lists, ~0.6 ns into host lists, plus the one-centroid fit.
+  /// Writing the exact join's compact layout: one list of codes in pin order, whose centroid is
+  /// a sample's mean, with no clustering to fit and no rows to assign, sort or move. A statement's
+  /// own build reads the rows twice, once to check that every value is a byte (UINT8 codes, else
+  /// FLOAT16) and once to code them; cosine lists skip the check but copy their unit rows to the
+  /// host in FP32. Fitted 2026-10-21 on that build: from a pin on the device ~0.05 ns a value
+  /// (Deep10M 0.055 s, GIST1M 0.027 s, SIFT1M 0.005 s), the cosine copy ~0.19 s for 10M x 96;
+  /// from a pin in host memory a pass is a PCIe copy of the rows (two: SIFT100M 3.99 s, Deep100M
+  /// 3.00 s).
   [[nodiscard]] double codes(access_path_shape const& s) const
   {
     double const values = s.corpus_rows * s.dim;
-    return 0.06 + values * (s.lists_on_device ? codes_per_value_device : codes_per_value_host);
+    double const copy   = s.unit_rows ? 4.0 * values / pcie : 0.0;
+    if (s.corpus_on_device) { return 0.005 + std::max(copy, values * codes_per_value_device); }
+    return 0.005 + (s.unit_rows ? 1.0 : 2.0) * values * codes_per_value_host + copy;
   }
 };
 

@@ -263,7 +263,7 @@ __global__ void scatter_row_ids_kernel(int64_t const* dest,
 {
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    row_ids[dest[i]] = row_base + i;
+    row_ids[dest != nullptr ? dest[i] : row_base + i] = row_base + i;
   }
 }
 
@@ -841,8 +841,8 @@ __global__ void rotate_rows_kernel(
 /// int8 lists (10M x 96, rotated twice): 41 ms a pass in rotate_rows_kernel on an RTX A5000.
 constexpr int kWideRowsPerThread = 8;  // rows per thread of the wide kernel (block: 16 x that)
 
-// With kMinMax the rotated rows are not written: each component's minimum and maximum over them
-// go to min_b / max_b (order-preserving bits, as column_min_max), the values those rows would hold.
+// With kMinMax each component's minimum and maximum over the rotated rows go to min_b / max_b
+// (order-preserving bits, as column_min_max), and the rows are written only if @p out is given.
 template <int Q, int R, bool kMinMax = false>
 __global__ void __launch_bounds__(256) rotate_rows_wide_kernel(float const* __restrict__ x,
                                                                int64_t rows,
@@ -937,7 +937,8 @@ __global__ void __launch_bounds__(256) rotate_rows_wide_kernel(float const* __re
       atomicMin(min_b + col0 + c, ordered_bits(lo));
       atomicMax(max_b + col0 + c, ordered_bits(hi));
     }
-  } else {
+  }
+  if (!kMinMax || out != nullptr) {
 #pragma unroll
     for (int p = 0; p < R; ++p) {
       auto const i = row0 + R * ty + p;
@@ -1019,12 +1020,13 @@ bool rotate_rows_min_max(float const* x,
                          float const* rotation,
                          unsigned int* min_bits,
                          unsigned int* max_bits,
-                         rmm::cuda_stream_view stream)
+                         rmm::cuda_stream_view stream,
+                         float* out)
 {
   auto const q = wide_rotation_q(d, x, rotation);
   if (q == 0) { return false; }
   if (rows > 0) {
-    launch_wide_rotation<true>(q, x, rows, d, rotation, nullptr, min_bits, max_bits, stream);
+    launch_wide_rotation<true>(q, x, rows, d, rotation, out, min_bits, max_bits, stream);
   }
   return true;
 }

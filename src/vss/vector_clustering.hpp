@@ -166,6 +166,18 @@ struct strided_rows {
   rmm::device_async_resource_ref mr);
 
 /**
+ * @brief The one centroid of a single cluster over the rows of @p chunks (shaped as for
+ * @ref train_centroids, every row taken): their mean, which is where k-means' only centroid settles
+ * under any metric, in one pass instead of k-means' iterations. A @p dim-wide FLOAT32 LIST column
+ * of one row, synchronized on @p stream before returning.
+ */
+[[nodiscard]] std::unique_ptr<cudf::column> mean_centroid(
+  std::vector<cudf::column_view> const& chunks,
+  std::int64_t dim,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/**
  * @brief Attach every vector in @p vectors to its nearest centroids.
  *
  * This is a brute-force k-NN of the vectors against the centroid matrix, which is cheap
