@@ -47,8 +47,8 @@ std::vector<std::vector<std::string>> sorted_rows(duckdb::Connection& con, const
   REQUIRE(r);
   if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
   REQUIRE_FALSE(r->HasError());
-  return sirius::test::GpuExecutionFixture::collect_rows(
-    r->Cast<duckdb::MaterializedQueryResult>(), /*sort=*/true);
+  return sirius::test::GpuExecutionFixture::collect_rows(r->Cast<duckdb::MaterializedQueryResult>(),
+                                                         /*sort=*/true);
 }
 
 /// Equal rows, numbers within 1e-4 relative (of at least 1): the GPU and DuckDB sum the inner
@@ -152,7 +152,8 @@ class InnerProductTables {
     f.run_ok("CHECKPOINT;");
     if (_pin) {
       for (auto const& t : {_prefix + "_corpus", _prefix + "_probe"}) {
-        f.run_ok("SELECT * FROM pin_table(name => '" + t + "', tier => 'gpu', format => 'duckdb');");
+        f.run_ok("SELECT * FROM pin_table(name => '" + t +
+                 "', tier => 'gpu', format => 'duckdb');");
       }
     }
   }
@@ -250,7 +251,8 @@ TEST_CASE_METHOD(InnerProductFixture,
   } reset{*con};
   require_gpu_matches_duckdb(*con, kLateralIp);
   auto partitions = con->Query(
-    "SELECT count(DISTINCT cluster_id) FROM sirius_kmeans_centroids('__sirius_auto_ip_corpus_vec_ip');");
+    "SELECT count(DISTINCT cluster_id) FROM "
+    "sirius_kmeans_centroids('__sirius_auto_ip_corpus_vec_ip');");
   REQUIRE_FALSE(partitions->HasError());
   CHECK(partitions->GetValue(0, 0).GetValue<std::int64_t>() == 8);
 }
@@ -293,7 +295,7 @@ TEST_CASE_METHOD(InnerProductFixture,
   auto const join         = [&](const std::string& extra, std::int64_t k = 7) {
     return sorted_rows(*con,
                        "SELECT left_id, right_id, similarity FROM sirius_knn_join('ip_probe', "
-                       "'vec', 'ip_corpus', 'vec', metric => 'ip', k => " +
+                               "'vec', 'ip_corpus', 'vec', metric => 'ip', k => " +
                          std::to_string(k) + extra + ");");
   };
   auto const via = [&](const std::string& clustering) {
@@ -310,39 +312,45 @@ TEST_CASE_METHOD(InnerProductFixture,
 
   // One list (the exact join's layout, its bound lowered as it goes), FLOAT16 and FP32.
   run_ok("SELECT * FROM sirius_kmeans_fit('ip_corpus', 'vec', name => 'ip1', n_clusters => 1);");
-  run_ok("SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ip1', storage => "
-         "'float16');");
-  CHECK(rows_match(join(", search_mode => 'approx', clustering => 'ip1', n_probes => 1"),
-                   expected));
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ip1', storage => "
+    "'float16');");
+  CHECK(
+    rows_match(join(", search_mode => 'approx', clustering => 'ip1', n_probes => 1"), expected));
   // The single list in host memory: its first piece is unbounded and serves as the sample.
   run_ok("SELECT * FROM sirius_kmeans_fit('ip_corpus', 'vec', name => 'ip1h', n_clusters => 1);");
-  run_ok("SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ip1h', storage => "
-         "'float16', tier => 'host');");
-  CHECK(rows_match(join(", search_mode => 'approx', clustering => 'ip1h', n_probes => 1"),
-                   expected));
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ip1h', storage => "
+    "'float16', tier => 'host');");
+  CHECK(
+    rows_match(join(", search_mode => 'approx', clustering => 'ip1h', n_probes => 1"), expected));
   run_ok("SELECT * FROM sirius_kmeans_fit('ip_corpus', 'vec', name => 'ip1f', n_clusters => 1);");
-  run_ok("SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ip1f', storage => "
-         "'float32');");
-  CHECK(rows_match(join(", search_mode => 'approx', clustering => 'ip1f', n_probes => 1"),
-                   expected));
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ip1f', storage => "
+    "'float32');");
+  CHECK(
+    rows_match(join(", search_mode => 'approx', clustering => 'ip1f', n_probes => 1"), expected));
 
   // Eight clusters, all probed: exact. FLOAT16 on the device (seeded), FLOAT16 unseeded (sweep 0
   // ranked by the FP32 GEMM), FLOAT16 in host memory, and FP32.
   run_ok("SELECT * FROM sirius_kmeans_fit('ip_corpus', 'vec', name => 'ip8', n_clusters => 8);");
-  run_ok("SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ip8', storage => "
-         "'float16');");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ip8', storage => "
+    "'float16');");
   CHECK(rows_match(join(via("ip8")), expected));
   {
     scoped_env unseeded("SIRIUS_VSS_SEED", "0");
     CHECK(rows_match(join(via("ip8")), expected));
   }
   run_ok("SELECT * FROM sirius_kmeans_fit('ip_corpus', 'vec', name => 'ip8h', n_clusters => 8);");
-  run_ok("SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ip8h', storage => "
-         "'float16', tier => 'host');");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ip8h', storage => "
+    "'float16', tier => 'host');");
   CHECK(rows_match(join(via("ip8h")), expected));
   run_ok("SELECT * FROM sirius_kmeans_fit('ip_corpus', 'vec', name => 'ip8f', n_clusters => 8);");
-  run_ok("SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ip8f', storage => "
-         "'float32');");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ip8f', storage => "
+    "'float32');");
   CHECK(rows_match(join(via("ip8f")), expected));
 
   // Approximate: two of eight clusters, routed by the inner product to their centroids. Every
@@ -365,7 +373,8 @@ TEST_CASE_METHOD(InnerProductFixture,
 
   // Global top-k and a threshold, over the pin and over the FLOAT16 list.
   for (std::string const extra :
-       {std::string{}, std::string{", search_mode => 'approx', clustering => 'ip1', n_probes => 1"}}) {
+       {std::string{},
+        std::string{", search_mode => 'approx', clustering => 'ip1', n_probes => 1"}}) {
     CHECK(rows_match(join(", join_mode => 'global'" + extra, 20),
                      on_duckdb(*con,
                                "SELECT p.id, c.id, array_inner_product(p.vec, c.vec) AS s FROM "
@@ -384,8 +393,9 @@ TEST_CASE_METHOD(InnerProductFixture,
 {
   InnerProductTables tables(*this);
   run_ok("SELECT * FROM sirius_kmeans_fit('ip_corpus', 'vec', name => 'ipi8', n_clusters => 1);");
-  run_ok("SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ipi8', storage => "
-         "'int8');");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('ip_corpus', 'vec', 'ipi8', storage => "
+    "'int8');");
   expect_error(*con,
                "SELECT count(*) FROM sirius_knn_join('ip_probe', 'vec', 'ip_corpus', 'vec', "
                "metric => 'ip', k => 5, search_mode => 'approx', clustering => 'ipi8', n_probes "
@@ -411,10 +421,11 @@ std::string pair_list(const std::vector<std::vector<std::string>>& rows)
 
 /// DuckDB's own inner product (or negative inner product) of every (probe id, corpus id) pair in
 /// the first two columns of @p rows: an approximate join's pairs must carry exactly these scores.
-std::vector<std::vector<std::string>> duckdb_scores(duckdb::Connection& con,
-                                                    const std::string& prefix,
-                                                    const std::vector<std::vector<std::string>>& rows,
-                                                    const std::string& fn = "array_inner_product")
+std::vector<std::vector<std::string>> duckdb_scores(
+  duckdb::Connection& con,
+  const std::string& prefix,
+  const std::vector<std::vector<std::string>>& rows,
+  const std::string& fn = "array_inner_product")
 {
   if (rows.empty()) { return {}; }
   return on_duckdb(con,
@@ -467,14 +478,14 @@ std::string lateral_on(const std::string& prefix,
 
 std::string global_on(const std::string& prefix, const std::string& fn, const std::string& order)
 {
-  return "SELECT p.id, c.id, " + fn + "(p.vec, c.vec) AS s FROM " + prefix + "_probe p, " +
-         prefix + "_corpus c ORDER BY s " + order + " LIMIT 20;";
+  return "SELECT p.id, c.id, " + fn + "(p.vec, c.vec) AS s FROM " + prefix + "_probe p, " + prefix +
+         "_corpus c ORDER BY s " + order + " LIMIT 20;";
 }
 
 std::string threshold_on(const std::string& prefix, const std::string& fn, const std::string& bound)
 {
-  return "SELECT p.id, c.id, " + fn + "(p.vec, c.vec) AS s FROM " + prefix + "_probe p, " +
-         prefix + "_corpus c WHERE " + fn + "(p.vec, c.vec) " + bound + ";";
+  return "SELECT p.id, c.id, " + fn + "(p.vec, c.vec) AS s FROM " + prefix + "_probe p, " + prefix +
+         "_corpus c WHERE " + fn + "(p.vec, c.vec) " + bound + ";";
 }
 
 }  // namespace
@@ -483,16 +494,16 @@ TEST_CASE_METHOD(InnerProductFixture,
                  "inner-product global top-k and thresholds over FP32, FLOAT16 and UINT8 lists",
                  "[integration][gpu_execution][array][vss][vector_join][inner_product]")
 {
-  auto const knn = [&](const std::string& prefix,
-                       const std::string& select,
-                       const std::string& extra) {
-    return sorted_rows(*con,
-                       "SELECT " + select + " FROM sirius_knn_join('" + prefix + "_probe', 'vec', '" +
-                         prefix + "_corpus', 'vec', metric => 'ip'" + extra + ");");
-  };
+  auto const knn =
+    [&](const std::string& prefix, const std::string& select, const std::string& extra) {
+      return sorted_rows(*con,
+                         "SELECT " + select + " FROM sirius_knn_join('" + prefix +
+                           "_probe', 'vec', '" + prefix + "_corpus', 'vec', metric => 'ip'" +
+                           extra + ");");
+    };
   auto const via = [](const std::string& clustering, int n_probes) {
-    return ", search_mode => 'approx', clustering => '" + clustering +
-           "', n_probes => " + std::to_string(n_probes);
+    return ", search_mode => 'approx', clustering => '" + clustering + "', n_probes => " +
+           std::to_string(n_probes);
   };
   auto const lists = [&](const std::string& prefix,
                          const std::string& name,
@@ -507,9 +518,10 @@ TEST_CASE_METHOD(InnerProductFixture,
   SECTION("FP32 and FLOAT16 lists (rows of varied norm)")
   {
     InnerProductTables tables(*this, "ipg");
-    auto const global_ip  = on_duckdb(*con, global_on("ipg", "array_inner_product", "DESC"));
-    auto const global_neg = on_duckdb(*con, global_on("ipg", "array_negative_inner_product", "ASC"));
-    auto const thresh_ip  = on_duckdb(*con, threshold_on("ipg", "array_inner_product", ">= 150.0"));
+    auto const global_ip = on_duckdb(*con, global_on("ipg", "array_inner_product", "DESC"));
+    auto const global_neg =
+      on_duckdb(*con, global_on("ipg", "array_negative_inner_product", "ASC"));
+    auto const thresh_ip = on_duckdb(*con, threshold_on("ipg", "array_inner_product", ">= 150.0"));
     auto const thresh_neg =
       on_duckdb(*con, threshold_on("ipg", "array_negative_inner_product", "<= -150.0"));
     REQUIRE(global_ip.size() == 20);
@@ -523,13 +535,15 @@ TEST_CASE_METHOD(InnerProductFixture,
          std::vector<std::pair<std::string, int>>{{"ipg32", 1}, {"ipg32x8", 8}, {"ipg16x8", 8}}) {
       UNSCOPED_INFO("lists " << clustering);
       auto const v = via(clustering, n_probes);
-      CHECK(rows_match(knn("ipg", "left_id, right_id, similarity", ", k => 20, join_mode => 'global'" + v),
-                       global_ip));
+      CHECK(rows_match(
+        knn("ipg", "left_id, right_id, similarity", ", k => 20, join_mode => 'global'" + v),
+        global_ip));
       CHECK(rows_match(knn("ipg",
                            "left_id, right_id, distance",
                            ", k => 20, join_mode => 'global', output_type => 'distance'" + v),
                        global_neg));
-      CHECK(rows_match(knn("ipg", "left_id, right_id, similarity", ", eps => 150.0" + v), thresh_ip));
+      CHECK(
+        rows_match(knn("ipg", "left_id, right_id, similarity", ", eps => 150.0" + v), thresh_ip));
       // output_type => 'distance': eps bounds the negative inner product.
       CHECK(rows_match(
         knn("ipg", "left_id, right_id, distance", ", eps => -150.0, output_type => 'distance'" + v),
@@ -559,9 +573,10 @@ TEST_CASE_METHOD(InnerProductFixture,
     lists("ipu", "ipu8x8", "uint8", 8);
     // Inner products of byte rows are whole numbers, so rows can tie: the top-k answers are
     // compared on (probe, score), and the threshold sits half-way between two whole numbers.
-    auto const per_row =
-      on_duckdb(*con, lateral_on("ipu", "array_inner_product", "DESC", 7, /*with_corpus_id=*/false));
-    auto const global = without_column(on_duckdb(*con, global_on("ipu", "array_inner_product", "DESC")), 1);
+    auto const per_row = on_duckdb(
+      *con, lateral_on("ipu", "array_inner_product", "DESC", 7, /*with_corpus_id=*/false));
+    auto const global =
+      without_column(on_duckdb(*con, global_on("ipu", "array_inner_product", "DESC")), 1);
     auto const thirtieth = on_duckdb(*con,
                                      "SELECT array_inner_product(p.vec, c.vec) AS s FROM ipu_probe "
                                      "p, ipu_corpus c ORDER BY s DESC LIMIT 1 OFFSET 29;");
@@ -575,13 +590,15 @@ TEST_CASE_METHOD(InnerProductFixture,
       auto const v = via(clustering, n_probes);
       CHECK(rows_match(knn("ipu", "left_id, similarity", ", k => 7" + v), per_row));
       CHECK(rows_match(
-        without_column(knn("ipu", "left_id, right_id, similarity", ", k => 20, join_mode => 'global'" + v), 1),
+        without_column(
+          knn("ipu", "left_id, right_id, similarity", ", k => 20, join_mode => 'global'" + v), 1),
         global));
       CHECK(rows_match(knn("ipu", "left_id, right_id, similarity", ", eps => " + eps + v), thresh));
-      CHECK(rows_match(knn("ipu", "left_id, right_id, distance", ", eps => -" + eps +
-                                                                    ", output_type => 'distance'" + v),
-                       on_duckdb(*con,
-                                 threshold_on("ipu", "array_negative_inner_product", "<= -" + eps))));
+      CHECK(rows_match(
+        knn("ipu",
+            "left_id, right_id, distance",
+            ", eps => -" + eps + ", output_type => 'distance'" + v),
+        on_duckdb(*con, threshold_on("ipu", "array_negative_inner_product", "<= -" + eps))));
     }
     auto const approx = knn("ipu", "left_id, right_id, similarity", ", k => 7" + via("ipu8x8", 2));
     REQUIRE(approx.size() == 40 * 7);
@@ -652,7 +669,8 @@ TEST_CASE_METHOD(InnerProductFixture,
     if (probes == 16) { CHECK(rows_match(thr, exact_thr)); }
   }
   auto partitions = con->Query(
-    "SELECT count(DISTINCT cluster_id) FROM sirius_kmeans_centroids('__sirius_auto_ipa_corpus_vec_ip');");
+    "SELECT count(DISTINCT cluster_id) FROM "
+    "sirius_kmeans_centroids('__sirius_auto_ipa_corpus_vec_ip');");
   REQUIRE_FALSE(partitions->HasError());
   CHECK(partitions->GetValue(0, 0).GetValue<std::int64_t>() == 16);
 }
@@ -668,12 +686,16 @@ TEST_CASE_METHOD(InnerProductFixture,
   require_gpu_matches_duckdb(*con, lateral_on("ips", "array_negative_inner_product", "ASC", 5));
   require_gpu_matches_duckdb(*con, global_on("ips", "array_inner_product", "DESC"));
   require_gpu_matches_duckdb(*con, threshold_on("ips", "array_inner_product", ">= 150.0"));
-  require_gpu_matches_duckdb(*con, threshold_on("ips", "array_negative_inner_product", "<= -150.0"));
+  require_gpu_matches_duckdb(*con,
+                             threshold_on("ips", "array_negative_inner_product", "<= -150.0"));
   auto const tvf = [&](const std::string& corpus, const std::string& extra) {
     return sorted_rows(*con,
                        "SELECT left_id, right_id, similarity FROM sirius_knn_join('ips_probe', "
-                       "'vec', '" + corpus + "', 'vec', metric => 'ip', probe_source => 'scan', "
-                       "build_source => 'scan'" + extra + ");");
+                       "'vec', '" +
+                         corpus +
+                         "', 'vec', metric => 'ip', probe_source => 'scan', "
+                         "build_source => 'scan'" +
+                         extra + ");");
   };
   auto const exact = on_duckdb(*con, lateral_on("ips", "array_inner_product", "DESC", 7));
   CHECK(rows_match(tvf("ips_corpus", ", k => 7"), exact));
@@ -686,10 +708,12 @@ TEST_CASE_METHOD(InnerProductFixture,
   // every cluster probed is exact; two of eight are scored exactly.
   run_ok("SELECT * FROM pin_table(name => 'ips_corpus', tier => 'gpu', format => 'duckdb');");
   run_ok("SELECT * FROM sirius_kmeans_fit('ips_corpus', 'vec', name => 'ips8', n_clusters => 8);");
-  run_ok("CREATE TABLE ips_asg AS SELECT * FROM sirius_kmeans_assign('ips_corpus', 'vec', 'ips8', "
-         "n_probes => 1);");
-  run_ok("CREATE TABLE ips_ordered AS SELECT r.id, r.vec, a.cluster_id FROM ips_corpus r JOIN "
-         "ips_asg a ON r.rowid = a.row_id ORDER BY a.cluster_id;");
+  run_ok(
+    "CREATE TABLE ips_asg AS SELECT * FROM sirius_kmeans_assign('ips_corpus', 'vec', 'ips8', "
+    "n_probes => 1);");
+  run_ok(
+    "CREATE TABLE ips_ordered AS SELECT r.id, r.vec, a.cluster_id FROM ips_corpus r JOIN "
+    "ips_asg a ON r.rowid = a.row_id ORDER BY a.cluster_id;");
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM unpin_table('ips_corpus');");
   auto const clustered = [&](int n_probes) {

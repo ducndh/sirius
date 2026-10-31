@@ -1672,9 +1672,10 @@ TEST_CASE_METHOD(VectorJoinFixture,
 // the codec choice independent of DuckDB's analyzer; the values (24-bit binary fractions in
 // [-1, 1)) need exponent 10.
 // -----------------------------------------------------------------------------
-TEST_CASE_METHOD(VectorJoinFixture,
-                 "sirius_knn_join - pinned float array columns stored as wide ALP codes read exactly",
-                 "[integration][gpu_execution][array][vss][vector_join]")
+TEST_CASE_METHOD(
+  VectorJoinFixture,
+  "sirius_knn_join - pinned float array columns stored as wide ALP codes read exactly",
+  "[integration][gpu_execution][array][vss][vector_join]")
 {
   auto const vec = [](const std::string& seed) {
     return "list_transform(range(16), lambda d: ((hash(i * 100 + d + " + seed +
@@ -1688,9 +1689,10 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("CHECKPOINT;");
   run_ok("SET force_compression = 'auto';");
   for (auto const* t : {"alpw_corpus", "alpw_probe"}) {
-    auto const codecs = ok_rows(*con,
-                                std::string("SELECT DISTINCT compression FROM pragma_storage_info('") +
-                                  t + "') WHERE column_path = '[1, 1]';");
+    auto const codecs =
+      ok_rows(*con,
+              std::string("SELECT DISTINCT compression FROM pragma_storage_info('") + t +
+                "') WHERE column_path = '[1, 1]';");
     REQUIRE(codecs == std::vector<std::vector<std::string>>{{"ALP"}});
     run_ok(std::string("SELECT * FROM pin_table(name => '") + t +
            "', tier => 'gpu', format => 'duckdb');");
@@ -1699,10 +1701,10 @@ TEST_CASE_METHOD(VectorJoinFixture,
   // Ids only, as above; the rows are hash-generated floats, so no two neighbours tie.
   auto const cpu = [&](const std::string& probe, const std::string& corpus, int k) {
     con->Query("SET gpu_execution = false;");
-    auto rows = ok_rows(*con,
-                        "SELECT p.id, n.id FROM " + probe + " p, LATERAL (SELECT c.id FROM " +
-                          corpus + " c ORDER BY array_distance(p.vec, c.vec) LIMIT " +
-                          std::to_string(k) + ") n;");
+    auto rows =
+      ok_rows(*con,
+              "SELECT p.id, n.id FROM " + probe + " p, LATERAL (SELECT c.id FROM " + corpus +
+                " c ORDER BY array_distance(p.vec, c.vec) LIMIT " + std::to_string(k) + ") n;");
     con->Query("SET gpu_execution = true;");
     return rows;
   };

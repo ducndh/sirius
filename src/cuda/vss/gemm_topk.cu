@@ -78,7 +78,7 @@ __global__ void prepare_dataset_kernel(
 {
   bool const cosine = kind == static_cast<int>(score_kind::cosine) ||
                       kind == static_cast<int>(score_kind::cosine_raw);
-  bool const ip      = kind == static_cast<int>(score_kind::inner_product);
+  bool const ip    = kind == static_cast<int>(score_kind::inner_product);
   auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / kWarp);
   auto const lane  = static_cast<int64_t>(threadIdx.x % kWarp);
   for (int64_t r = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp; r < n; r += warps) {
@@ -114,7 +114,7 @@ __global__ void prepare_queries_kernel(
 {
   bool const cosine = kind == static_cast<int>(score_kind::cosine) ||
                       kind == static_cast<int>(score_kind::cosine_raw);
-  bool const ip      = kind == static_cast<int>(score_kind::inner_product);
+  bool const ip    = kind == static_cast<int>(score_kind::inner_product);
   auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / kWarp);
   auto const lane  = static_cast<int64_t>(threadIdx.x % kWarp);
   for (int64_t r = blockIdx.x * (blockDim.x / kWarp) + threadIdx.x / kWarp; r < m; r += warps) {

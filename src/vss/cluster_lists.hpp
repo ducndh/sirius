@@ -258,7 +258,7 @@ struct exact_lists_choice {
                                                                  bool cosine,
                                                                  std::int64_t n_rows,
                                                                  std::int64_t min_clusters = 1,
-                                                                 bool float_rows_only     = false);
+                                                                 bool float_rows_only      = false);
 
 /// The lists of the clustering @p clustering when it is one of (@p catalog, @p schema, @p table,
 /// @p column)'s and they hold all @p n_rows rows, unit rows exactly when @p cosine: what a join

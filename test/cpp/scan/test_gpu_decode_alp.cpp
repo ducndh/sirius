@@ -211,8 +211,7 @@ TEST_CASE("gpu_decode_table ALP - single compressed vector with exceptions, floa
   }
 }
 
-TEST_CASE("gpu_decode_table ALP - float codes wider than 32 bits decode",
-          "[scan][decode][alp]")
+TEST_CASE("gpu_decode_table ALP - float codes wider than 32 bits decode", "[scan][decode][alp]")
 {
   // ALP codes FLOAT values as int64 too, so a FLOAT vector's packed width can pass 32 bits:
   // exponent 10 (x 10^10) on values up to a few units needs 33-36. DuckDB writes such vectors for
@@ -228,7 +227,8 @@ TEST_CASE("gpu_decode_table ALP - float codes wider than 32 bits decode",
     mantissas[v].resize(rows[v]);
     uint64_t const mask = (uint64_t{1} << widths[v]) - 1u;
     for (uint32_t i = 0; i < rows[v]; ++i) {
-      mantissas[v][i] = ((uint64_t{i} * 2654435761ULL + v * 40503ULL) * 97ULL) % 34359738368ULL & mask;
+      mantissas[v][i] =
+        ((uint64_t{i} * 2654435761ULL + v * 40503ULL) * 97ULL) % 34359738368ULL & mask;
     }
     mantissas[v][rows[v] - 1] = mask;  // the widest code each vector holds
     alp_compressed_vector<float> cv;

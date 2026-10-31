@@ -1101,7 +1101,7 @@ __global__ void merge_keys_kernel(float const* acc_d,
     // join's distances are negative); for d >= 0 (+inf included) the order is the bits' own.
     auto const bits = __float_as_uint(d);
     keys[i]         = (row << 32) | ((bits & 0x80000000u) != 0 ? ~bits : (bits | 0x80000000u));
-    order[i] = i;
+    order[i]        = i;
   }
 }
 
@@ -1510,10 +1510,9 @@ void exact_distances(float const* probe,
   auto const warps_per_block = 8;
   auto const grid            = static_cast<int>(
     std::clamp<int64_t>((n_pairs + warps_per_block - 1) / warps_per_block, 1, 65535));
-  (inner_product ? exact_distances_kernel<true> : exact_distances_kernel<false>)<<<grid,
-                                                                                warps_per_block * 32,
-                                                                                0,
-                                                                                stream.value()>>>(
+  (inner_product
+     ? exact_distances_kernel<true>
+     : exact_distances_kernel<false>)<<<grid, warps_per_block * 32, 0, stream.value()>>>(
     probe,
     rows,
     k,
@@ -1859,7 +1858,7 @@ __global__ void __launch_bounds__(kSeedWarps * 32)
     float* my     = out + j * stride;
     for (int i0 = 0; i0 < stride; i0 += 32 / W) {
       int const i = i0 + sub;
-      if (i0 >= cnt) {   // the whole group is past the sample (i0 is the same for every lane)
+      if (i0 >= cnt) {  // the whole group is past the sample (i0 is the same for every lane)
         if (sl == 0 && i < stride) { my[i] = inf; }
         continue;
       }
@@ -1991,13 +1990,26 @@ void seed_bound_sorted(void const* x,
   rmm::device_buffer temp(temp_bytes, stream, mr);
   auto const words = F16 ? dim / 2 : dim / 4;
   for (int64_t b0 = 0; b0 < n; b0 += batch) {
-    auto const nb   = std::min(batch, n - b0);
-    auto const grid = static_cast<int>(std::clamp<int64_t>((nb + kSeedWarps - 1) / kSeedWarps, 1, 65535));
+    auto const nb = std::min(batch, n - b0);
+    auto const grid =
+      static_cast<int>(std::clamp<int64_t>((nb + kSeedWarps - 1) / kSeedWarps, 1, 65535));
     launch_seed_width(seed_width(words), [&](auto w) {
-      seed_distances_kernel<decltype(w)::value, F16><<<grid, kSeedWarps * 32, 0, stream.value()>>>(
-        x, x_sq, probe, probe_sq, first, count, order, b0, nb, static_cast<int>(dim), stride, dist.data());
+      seed_distances_kernel<decltype(w)::value, F16>
+        <<<grid, kSeedWarps * 32, 0, stream.value()>>>(x,
+                                                       x_sq,
+                                                       probe,
+                                                       probe_sq,
+                                                       first,
+                                                       count,
+                                                       order,
+                                                       b0,
+                                                       nb,
+                                                       static_cast<int>(dim),
+                                                       stride,
+                                                       dist.data());
     });
-    segment_offsets_kernel<<<grid_for(nb + 1), 256, 0, stream.value()>>>(offsets.data(), nb, stride);
+    segment_offsets_kernel<<<grid_for(nb + 1), 256, 0, stream.value()>>>(
+      offsets.data(), nb, stride);
     cub::DeviceSegmentedRadixSort::SortKeys(temp.data(),
                                             temp_bytes,
                                             dist.data(),

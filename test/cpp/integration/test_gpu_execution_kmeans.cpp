@@ -22,7 +22,6 @@
  */
 
 #include <cudf/lists/lists_column_view.hpp>
-
 #include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/cuda_stream.hpp>
@@ -1117,9 +1116,10 @@ TEST_CASE_METHOD(KMeansFixture,
   CHECK(mismatched == 0);
 }
 
-TEST_CASE_METHOD(KMeansFixture,
-                 "the gap-checked re-score trims rows with a gap, keeps near ties, and changes no answer",
-                 "[integration][gpu_execution][array][vss][kmeans][lists][gap_rescore]")
+TEST_CASE_METHOD(
+  KMeansFixture,
+  "the gap-checked re-score trims rows with a gap, keeps near ties, and changes no answer",
+  "[integration][gpu_execution][array][vss][kmeans][lists][gap_rescore]")
 {
   // 64 probe rows, k = 10. An even probe has 10 corpus rows within ~0.05 of it and 50 more at
   // ~1.4: a gap far wider than the codes' error, so its check passes at m = 2 and the 50 are
@@ -1142,7 +1142,8 @@ TEST_CASE_METHOD(KMeansFixture,
          ")::FLOAT[64] AS vec FROM range(64) t(p);");
   auto const offset = std::string(
     "CASE WHEN p % 2 = 1 THEN (CASE WHEN d = t // 2 THEN (0.5 + t * 0.0001) * (CASE WHEN t % 2 = 0 "
-    "THEN 1 ELSE -1 END) ELSE 0.0 END) ELSE (CASE WHEN t < 10 THEN 0.01 ELSE 0.3 END) * ((hash(p * 100000 + t * "
+    "THEN 1 ELSE -1 END) ELSE 0.0 END) ELSE (CASE WHEN t < 10 THEN 0.01 ELSE 0.3 END) * ((hash(p * "
+    "100000 + t * "
     "100 + d) % 2000)::FLOAT / 1000.0 - 1.0) END");
   run_ok("CREATE TABLE " + prefix +
          "_corpus AS SELECT * FROM (SELECT i::INTEGER AS id, list_transform(range(64), lambda d: "
