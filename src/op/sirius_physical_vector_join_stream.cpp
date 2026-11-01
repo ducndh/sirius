@@ -1382,6 +1382,16 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
   }
   block_rows = std::min<std::int64_t>(
     block_rows, static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) / k_join);
+  // A block's probe rows are joined into one list column whose child holds rows x dim values, and
+  // cudf::concatenate refuses a child past size_type's range: 3M-row blocks of 1024-d rows failed
+  // ("Total number of concatenated rows exceeds the column size limit"). With wide vectors a large
+  // device reaches this before its memory budget does (a third of a 186 GB device plans ~4M rows).
+  if (_request.dim > 0) {
+    block_rows = std::min<std::int64_t>(
+      block_rows,
+      static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) /
+        static_cast<std::int64_t>(_request.dim));
+  }
   if (block_rows <= 0) { return; }
   // Blocks of even size, so the last is not a sliver that pays for a whole read of the lists alone.
   std::int64_t total = 0;
