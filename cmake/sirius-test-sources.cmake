@@ -275,6 +275,7 @@ set(TEST_SOURCES
     test/cpp/vss/test_enn_top_k.cpp
     test/cpp/vss/test_ivf_flat_index.cpp
     test/cpp/vss/test_pinned_column.cpp
+    test/cpp/vss/test_spilled_read.cpp
     test/cpp/vss/test_vector_search.cpp
     test/cpp/vss/test_vector_clustering.cpp
     test/cpp/unittest.cpp
