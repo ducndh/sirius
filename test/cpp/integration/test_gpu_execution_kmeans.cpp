@@ -2817,6 +2817,81 @@ TEST_CASE_METHOD(KMeansFixture,
   run_ok("SELECT * FROM unpin_table('kgs_many');");
 }
 
+TEST_CASE_METHOD(KMeansFixture,
+                 "probe blocks and the ranked sweep 0 over device lists answer as seeded chunks do",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  // The probe rows are pinned in ~10 MB chunks (~40k rows each); 50,000-row blocks cut chunks and
+  // join pieces of neighbouring ones, and the answer is split back by chunk.
+  auto const gen = [](const std::string& seed) {
+    return "list_transform(range(64), lambda d: ((hash(i * 1000 + d + " + seed +
+           ") % 1000)::FLOAT / 1000.0))::FLOAT[64]";
+  };
+  run_ok("CREATE TABLE kdb_corpus AS SELECT i::INTEGER AS id, " + gen("0") +
+         " AS vec FROM range(70000) t(i);");
+  run_ok("CREATE TABLE kdb_probe AS SELECT i::INTEGER AS id, " + gen("100000000") +
+         " AS vec FROM range(130000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'kdb_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SET scan_task_batch_size = 10000000;");
+  run_ok("SELECT * FROM pin_table(name => 'kdb_probe', tier => 'gpu', format => 'duckdb');");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_fit('kdb_corpus','vec', name => 'kdb_c', n_clusters => 16, "
+    "seed => 3);");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('kdb_corpus','vec','kdb_c', storage => 'float16');");
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_DEVICE_BLOCKS");
+      ::unsetenv("SIRIUS_VSS_PROBE_BLOCK_ROWS");
+      ::unsetenv("SIRIUS_VSS_SWEEP0");
+    }
+  } unset_env;
+  auto const set_or_unset = [](char const* name, char const* value) {
+    if (value == nullptr) {
+      ::unsetenv(name);
+    } else {
+      ::setenv(name, value, 1);
+    }
+  };
+  auto const count = [&](std::string const& sql) {
+    return std::stoll(ok_rows(*con, sql).at(0).at(0));
+  };
+  struct mode {
+    char const* device_blocks;
+    char const* block_rows;
+    char const* sweep0;
+  };
+  // The first is one seeded task per probe chunk; the last is whatever the planner picks.
+  std::vector<mode> const modes{{"0", nullptr, "seed"},
+                                {"0", nullptr, "ranked"},
+                                {nullptr, "50000", "seed"},
+                                {nullptr, "50000", "ranked"},
+                                {nullptr, nullptr, nullptr}};
+  for (auto const probes : {1, 4, 16}) {
+    auto const join =
+      "SELECT left_id, distance FROM sirius_knn_join('kdb_probe','vec','kdb_corpus','vec', "
+      "metric => 'l2', k => 10, search_mode => 'approx', clustering => 'kdb_c', n_probes => " +
+      std::to_string(probes) + ")";
+    for (std::size_t m = 0; m < modes.size(); ++m) {
+      set_or_unset("SIRIUS_VSS_DEVICE_BLOCKS", modes[m].device_blocks);
+      set_or_unset("SIRIUS_VSS_PROBE_BLOCK_ROWS", modes[m].block_rows);
+      set_or_unset("SIRIUS_VSS_SWEEP0", modes[m].sweep0);
+      run_ok("CREATE OR REPLACE TABLE kdb_" + std::to_string(m) + " AS " + join + ";");
+    }
+    INFO("n_probes " << probes);
+    REQUIRE(count("SELECT count(*) FROM kdb_0") == 130000 * 10);
+    for (std::size_t m = 1; m < modes.size(); ++m) {
+      auto const other = "kdb_" + std::to_string(m);
+      INFO("mode " << m);
+      CHECK(count("SELECT count(*) FROM " + other) == 130000 * 10);
+      CHECK(count("SELECT count(*) FROM (SELECT * FROM kdb_0 EXCEPT SELECT * FROM " + other +
+                  ")") == 0);
+    }
+  }
+}
+
 namespace {
 
 // A clustered corpus of 32-wide rows (float in [0, 1), or bytes 0..255 as floats), stored in

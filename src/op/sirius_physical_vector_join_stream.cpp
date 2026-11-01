@@ -98,6 +98,13 @@ namespace sirius::op {
 
 namespace {
 
+// Mean seed work per (task, nearest cluster) slice, in multiply-adds, from which a task over
+// clustered FLOAT16 device lists ranks its nearest clusters on tensor cores instead of seeding
+// them. On an RTX A5000 the ranked pass costs 2-5x the seed below ~3e6, 1.03x at 1.0e7, 0.94x at
+// 2.7e7 and 0.79-0.84x from 8e7. 2^24 stays within 10 % of the faster method at every point
+// measured.
+constexpr double kSweep0RankedSliceMacs = 0x1p24;
+
 /// A task's place under vector_join_admission: released, it makes room and asks the task creator
 /// for this join's next tasks, as a streaming source does when data arrives (schedule() only
 /// enqueues, so any thread may call it).
@@ -1317,6 +1324,13 @@ void sirius_physical_vector_join_stream::initialize_locked()
       for (std::size_t i = 0; i < _num_left; ++i) {
         need = std::max(need, per_left_batch_estimate(i));
       }
+      // Probe blocks are the tasks when there are any.
+      if (!_blocks.empty()) {
+        need = 0;
+        for (auto const& b : _blocks) {
+          need = std::max(need, estimate_for_rows(static_cast<std::size_t>(b.rows)));
+        }
+      }
       need += need / 4;
       auto const room = 0.9 * static_cast<double>(spaces.front()->get_available_memory());
       _admission->limit =
@@ -1326,7 +1340,7 @@ void sirius_physical_vector_join_stream::initialize_locked()
                      "[vecjoin-phase] admission: %zu of %zu tasks at once (%.2f GiB free on the "
                      "device beside the lists, %.2f GiB a task)\n",
                      _admission->limit,
-                     _num_left,
+                     num_tasks(),
                      room / 0.9 / 1073741824.0,
                      static_cast<double>(need) / 1073741824.0);
       }
@@ -1347,7 +1361,20 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
   // one larger than the host pool: SIFT100M from disk, 1M probes, ~5 passes as probe chunks.
   bool const reread = (_lists != nullptr && _lists->tier == cucascade::memory::Tier::HOST) ||
                       (_lists == nullptr && _build_side != nullptr);
-  bool const wanted = reread && _request.mode != vss::vector_join_mode::threshold &&
+  // Clustered lists on the device are read in place, so a task's size costs no re-read there; it
+  // sets how many probe rows each (task, cluster) slice carries. Both sweeps pay a fixed cost per
+  // slice (a GEMM and a selection, or a seed and its stretches), so pin-chunk tasks spread a large
+  // probe side thin: 1M x 1,024-d over 1,024 clusters, sweep 0 ranked on tensor cores took 0.61 s
+  // over 9 pin-chunk tasks and 0.23 s over 2 tasks of 500k rows. A probe side of more
+  // than one chunk is cut into blocks there too, sized to the room beside the lists (below).
+  // SIRIUS_VSS_DEVICE_BLOCKS=0 keeps one task per probe chunk.
+  bool const device_lists = _lists != nullptr && _lists->tier == cucascade::memory::Tier::GPU &&
+                            _lists->offsets.size() > 2 && _num_left > 1 && [] {
+                              auto const* v = std::getenv("SIRIUS_VSS_DEVICE_BLOCKS");
+                              return v == nullptr || std::string_view{v} != "0";
+                            }();
+  bool const wanted = (reread || device_lists) &&
+                      _request.mode != vss::vector_join_mode::threshold &&
                       _request.earlier_by.empty() && !_request.probe_scalar && _num_left > 0;
   if (!wanted) { return; }
   auto const k_join = std::max<std::int64_t>(
@@ -1374,11 +1401,32 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
       widest_chunk = std::max(widest_chunk, _probe->chunk_rows(i));
     }
     auto const chunk_need = fixed + per_row * static_cast<double>(widest_chunk);
-    auto const budget =
-      chunk_need <= 0.8 * device ? std::max(device / 3, chunk_need) : 0.8 * device;
+    auto budget = chunk_need <= 0.8 * device ? std::max(device / 3, chunk_need) : 0.8 * device;
+    if (device_lists && !reread) {
+      // Beside device lists the room is what is free now (the lists, the pins and the other
+      // operators already hold the rest), shared by SIRIUS_VSS_DEVICE_BLOCK_TASKS tasks at once.
+      // Default 2 when the FP32 re-score reads device rows: one task's host-side steps (routing
+      // edges, slice setup, read-backs) overlap the other's kernels. Default 1 when it reads host
+      // memory (a host pin, or FP32 rows kept in host blocks): each row it fetches over PCIe then
+      // serves the most probe rows, as host lists' blocks do (10M x 768-d, host pin, 1 thread, p4:
+      // 38.9 s at 1 against 46.7 at 2). Only blocks larger than a chunk are worth cutting.
+      bool const exact_on_host =
+        _lists->exact_vectors || (_lists->exact_pin && _lists->pin != nullptr &&
+                                  _lists->pin->tier == cucascade::memory::Tier::HOST);
+      auto const* v    = std::getenv("SIRIUS_VSS_DEVICE_BLOCK_TASKS");
+      auto const tasks = v != nullptr ? std::max(1.0, std::atof(v)) : (exact_on_host ? 1.0 : 2.0);
+      // As the admission cap below counts it: 90 % of the free room, a quarter on top of each
+      // task's estimate for the materialize stage, so that `tasks` blocks are admitted together.
+      auto const room = 0.9 * static_cast<double>(spaces.front()->get_available_memory());
+      budget          = room / (1.25 * tasks);
+      if (budget <= chunk_need) { return; }
+    }
     block_rows =
       budget > fixed ? static_cast<std::int64_t>((budget - fixed) / per_row) : std::int64_t{0};
     block_rows = std::max<std::int64_t>(block_rows, std::int64_t{1} << 14);
+    if (device_lists && !reread && block_rows <= static_cast<std::int64_t>(widest_chunk)) {
+      return;
+    }
   }
   block_rows = std::min<std::int64_t>(
     block_rows, static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) / k_join);
@@ -2752,9 +2800,55 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // by both sides' coding or rounding error so it bounds the FP32 distance. What passes is merged
     // (re-scored in FP32 where the rows are inexact), so sweep 1 starts from the nearest cluster's
     // exact k-th and need not search that cluster again. SIRIUS_VSS_SEED=0 keeps the GEMM.
+    // The seed is CUDA-core work per probe row (a warp per row against a quarter of its nearest
+    // cluster, at most kSeedSample rows); ranking each row's nearest cluster on the tensor cores
+    // instead (gemm_f16_topk below, as host lists do) costs a GEMM and a selection per (task,
+    // cluster) slice plus a second search of that cluster in sweep 1. So the seed pays while the
+    // slices carry little seed work -- few probe rows a cluster, as in a small probe batch -- and
+    // the ranked pass once they carry much. A task over clustered FLOAT16 lists on the device ranks
+    // when its mean seed work per slice (nearest-cluster probe rows x sample rows x width) reaches
+    // SIRIUS_VSS_SWEEP0_SLICE_MACS. SIRIUS_VSS_SWEEP0=seed | ranked forces either;
+    // SIRIUS_VSS_SEED=0 still means the grouped CUDA-core ranking (nearest_cluster_topk).
+    bool ranked_sweep0 = false;
+    if (f16_bounded && _lists != nullptr && _lists->tier == cucascade::memory::Tier::GPU &&
+        _lists->offsets.size() > 2 && running_bound_rows == 0 && !radius_join && !ip &&
+        seed_enabled && probe_f16) {
+      auto const* sw = std::getenv("SIRIUS_VSS_SWEEP0");
+      std::string_view const how{sw == nullptr ? "auto" : sw};
+      auto const floor    = std::max<std::int64_t>(64, 8 * k_join);
+      double seed_macs    = 0;
+      std::int64_t slices = 0;
+      for (std::size_t c = 0; c + 1 < _lists->offsets.size(); ++c) {
+        auto const rows = nearest_edges[c];
+        if (rows == 0) { continue; }
+        auto const size   = _lists->offsets[c + 1] - _lists->offsets[c];
+        auto const sample = std::min<std::int64_t>(
+          size,
+          std::clamp<std::int64_t>(
+            size / 4, floor, std::max<std::int64_t>(floor, vss::kSeedSample)));
+        seed_macs += static_cast<double>(rows) * static_cast<double>(sample) * dim;
+        ++slices;
+      }
+      auto const* t          = std::getenv("SIRIUS_VSS_SWEEP0_SLICE_MACS");
+      double const threshold = t != nullptr ? std::atof(t) : kSweep0RankedSliceMacs;
+      ranked_sweep0          = how == "ranked" || (how != "seed" && slices > 0 &&
+                                          seed_macs >= threshold * static_cast<double>(slices));
+      if (dbg) {
+        std::fprintf(stderr,
+                     "[vecjoin-phase] sweep-0 rule: %lld probe rows over %lld nearest slices, "
+                     "seed work %.3g MACs a slice (ranked from %.3g, SIRIUS_VSS_SWEEP0=%s): %s\n",
+                     static_cast<long long>(n_left),
+                     static_cast<long long>(slices),
+                     slices > 0 ? seed_macs / static_cast<double>(slices) : 0.0,
+                     threshold,
+                     std::string(how).c_str(),
+                     ranked_sweep0 ? "ranked" : "seed");
+      }
+    }
     bool const seed_f16 =
       f16_bounded && _lists != nullptr && !radius_join &&
-      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && seed_enabled;
+      (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && seed_enabled &&
+      !ranked_sweep0;
     bool const seed = (bounded && seedable) || seed_f16;
     // Unseeded, sweep 0 ranks each row's nearest cluster on the half-precision tensor cores from
     // the stored rows; only the bound it leaves is used, and that is re-scored in FP32 first.
@@ -3467,8 +3561,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       // every cluster in one launch over the device lists (nearest_cluster_topk) instead of one
       // GEMM and top-k call per cluster, whose ~0.18 ms of host setup dwarfs its arithmetic once
       // each cluster has only tens of probe rows. SIRIUS_VSS_GROUPED_SWEEP0=0 keeps the calls.
-      bool const grouped_sweep0 = sweep == 0 && rescore && !seed && !radius_join && !ip &&
-                                  earlier_cut == nullptr && k_join <= 64 && !lists_on_host &&
+      bool const grouped_sweep0 = sweep == 0 && rescore && !seed && !ranked_sweep0 &&
+                                  !radius_join && !ip && earlier_cut == nullptr && k_join <= 64 &&
+                                  !lists_on_host &&
                                   ((int8_search && probe_i8) || (f16_sweep0 && probe_f16)) && [] {
                                     auto const* v = std::getenv("SIRIUS_VSS_GROUPED_SWEEP0");
                                     return v == nullptr || std::string_view{v} != "0";
