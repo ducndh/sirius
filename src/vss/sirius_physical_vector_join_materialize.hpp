@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace sirius::scan_manager {
@@ -129,10 +130,17 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
 
   /// The probe output columns as per-batch views in the probe side's snapshot order, which is
   /// the order the join stage numbered its output partitions by. Probe-scan path only.
-  std::vector<std::vector<cudf::column_view>> probe_side_output_views(
-    std::size_t num_output_columns,
-    rmm::cuda_stream_view stream,
-    ::cucascade::memory::memory_space& space);
+  /// One probe chunk's output columns, and what keeps them alive while a piece is gathered.
+  struct probe_chunk_columns {
+    std::vector<cudf::column_view> views;
+    std::vector<std::unique_ptr<cudf::column>> owned;
+    std::shared_ptr<::cucascade::data_batch> staged;
+    std::optional<::cucascade::read_only_data_batch> reader;
+  };
+
+  probe_chunk_columns probe_chunk_output_columns(std::size_t partition_idx,
+                                                 rmm::cuda_stream_view stream,
+                                                 ::cucascade::memory::memory_space& space);
 
   sirius::vss::vector_join_request _request;
   sirius::scan_manager::sirius_scan_manager* _scan_manager;
@@ -149,18 +157,10 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
 
   std::mutex _init_mutex;  // guards the one-time init below
   bool _initialized{false};
-  //! Left output columns as zero-copy views, indexed [output_col][batch].
+  //! Pinned probe side: left output columns as zero-copy views, indexed [output_col][batch].
   std::vector<std::vector<cudf::column_view>> _left_output_cols;
   //! Keeps staged left copies alive when the pin is HOST-tier; empty for GPU-tier pins.
   std::vector<vss::staged_pinned_column> _staged_left;
-  //! Probe-scan path: the borrows and re-staged copies backing _left_output_cols. Unlike the
-  //! corpus columns, which are concatenated once and then owned outright, the left views point
-  //! into these for the operator's whole life, so they are held rather than released per call.
-  std::vector<::cucascade::read_only_data_batch> _probe_readers;
-  std::vector<std::shared_ptr<::cucascade::data_batch>> _probe_restaged;
-  std::vector<std::shared_ptr<::cucascade::memory::reservation>> _probe_reservations;
-  //! Probe-side output columns read straight from a spilled batch's file.
-  std::vector<std::unique_ptr<cudf::column>> _probe_from_disk;
   //! Build path: right output columns concatenated across batches; row i == global right id i.
   std::unique_ptr<cudf::table> _right_output_concat;
   //! Pinned corpus: the pin, and where each of its chunks ends in pin row space.

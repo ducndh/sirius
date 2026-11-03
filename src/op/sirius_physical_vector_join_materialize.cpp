@@ -249,17 +249,7 @@ sirius_physical_vector_join_materialize::build_side_output_columns(
       throw std::runtime_error(
         "[sirius_physical_vector_join_materialize] build-side batch has no data representation");
     }
-    auto data_rep    = data->cast<cucascade::host_data_representation>().slice(out_cols);
-    auto const bytes = data_rep->get_size_in_bytes();
-    std::shared_ptr<cucascade::memory::reservation> reservation{
-      space.make_reservation_or_null(bytes)};
-    if (!reservation) {
-      // An OOM rather than a plain error: the task is retried after a downgrade, and batches
-      // this loop has already released are what that downgrade can spill.
-      throw rmm::out_of_memory(
-        "[sirius_physical_vector_join_materialize] build-side output columns need " +
-        std::to_string(bytes) + " bytes device-side");
-    }
+    auto data_rep       = data->cast<cucascade::host_data_representation>().slice(out_cols);
     auto const batch_id = sirius::get_next_batch_id();
     auto staged         = cucascade::data_batch::make(
       batch_id,
@@ -268,7 +258,8 @@ sirius_physical_vector_join_materialize::build_side_output_columns(
     {
       auto mut = staged->to_mutable();
       mut.convert_to<cucascade::gpu_table_representation>(
-        sirius::converter_registry::get(), *reservation, stream);
+        sirius::converter_registry::get(), &space, stream);
+      mut.rebind_stream(stream);
     }
     auto const table = sirius::get_cudf_table_view(*staged);
     for (std::size_t c = 0; c < num_output_columns; ++c) {
@@ -296,12 +287,13 @@ sirius_physical_vector_join_materialize::build_side_output_columns(
   return cols;
 }
 
-std::vector<std::vector<cudf::column_view>>
-sirius_physical_vector_join_materialize::probe_side_output_views(
-  std::size_t num_output_columns,
-  rmm::cuda_stream_view stream,
-  ::cucascade::memory::memory_space& space)
+sirius_physical_vector_join_materialize::probe_chunk_columns
+sirius_physical_vector_join_materialize::probe_chunk_output_columns(
+  std::size_t partition_idx, rmm::cuda_stream_view stream, ::cucascade::memory::memory_space& space)
 {
+  auto const num_output_columns = _request.left.output_columns.size();
+  probe_chunk_columns out;
+  if (num_output_columns == 0) { return out; }
   auto const ids = _probe_side->batch_ids();
   auto* repo     = _probe_side->repo();
   if (repo == nullptr) {
@@ -318,66 +310,54 @@ sirius_physical_vector_join_materialize::probe_side_output_views(
     out_cols[c] = positions.empty() ? c + 1 : positions.at(c);
   }
 
-  std::vector<std::vector<cudf::column_view>> per_column(num_output_columns);
-  for (auto const id : ids) {
-    auto batch = repo->get_data_batch_by_id(id, /*partition_idx=*/0);
-    if (!batch) {
-      throw std::runtime_error("[sirius_physical_vector_join_materialize] probe-side batch " +
-                               std::to_string(id) + " is no longer in the repository");
-    }
-    auto ro = batch->to_read_only();
-    if (ro.get_current_tier() == cucascade::memory::Tier::DISK) {
-      if (auto cols = read_spilled_columns(ro, out_cols, stream, space.get_default_allocator())) {
-        for (std::size_t c = 0; c < num_output_columns; ++c) {
-          per_column[c].push_back((*cols)[c]->view());
-          _probe_from_disk.push_back(std::move((*cols)[c]));
-        }
-        continue;
-      }
-    }
-    ro = host_or_device_resident(
-      batch, std::move(ro), _sirius_ctx, ::cuda::stream_ref{stream.value()}, "a probe-side batch");
-    cudf::table_view table;
-    bool resident = false;
-    if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
-      table    = sirius::get_cudf_table_view(ro);
-      resident = true;
-    } else {
-      const auto* data = ro.get_data();
-      if (data == nullptr) {
-        throw std::runtime_error(
-          "[sirius_physical_vector_join_materialize] probe-side batch has no data representation");
-      }
-      auto data_rep    = data->cast<cucascade::host_data_representation>().slice(out_cols);
-      auto const bytes = data_rep->get_size_in_bytes();
-      std::shared_ptr<cucascade::memory::reservation> reservation{
-        space.make_reservation_or_null(bytes)};
-      if (!reservation) {
-        vss::throw_staging_shortfall(
-          space, bytes, "[sirius_physical_vector_join_materialize] probe-side output columns");
-      }
-      auto const batch_id = sirius::get_next_batch_id();
-      auto staged         = cucascade::data_batch::make(
-        batch_id,
-        std::move(data_rep),
-        telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
-      {
-        auto mut = staged->to_mutable();
-        mut.convert_to<cucascade::gpu_table_representation>(
-          sirius::converter_registry::get(), *reservation, stream);
-      }
-      table = sirius::get_cudf_table_view(*staged);
-      _probe_restaged.push_back(std::move(staged));
-      _probe_reservations.push_back(std::move(reservation));
-    }
-    // A resident batch holds every column; a restaged one holds only out_cols, in order.
-    for (std::size_t c = 0; c < num_output_columns; ++c) {
-      per_column[c].push_back(
-        table.column(static_cast<cudf::size_type>(resident ? out_cols[c] : c)));
-    }
-    _probe_readers.push_back(std::move(ro));
+  auto batch = repo->get_data_batch_by_id(ids.at(partition_idx), /*partition_idx=*/0);
+  if (!batch) {
+    throw std::runtime_error("[sirius_physical_vector_join_materialize] probe-side batch " +
+                             std::to_string(ids.at(partition_idx)) +
+                             " is no longer in the repository");
   }
-  return per_column;
+  auto ro = batch->to_read_only();
+  if (ro.get_current_tier() == cucascade::memory::Tier::DISK) {
+    if (auto cols = read_spilled_columns(ro, out_cols, stream, space.get_default_allocator())) {
+      out.owned = std::move(*cols);
+      for (auto const& col : out.owned) {
+        out.views.push_back(col->view());
+      }
+      return out;
+    }
+  }
+  ro = host_or_device_resident(
+    batch, std::move(ro), _sirius_ctx, ::cuda::stream_ref{stream.value()}, "a probe-side batch");
+  if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
+    auto const table = sirius::get_cudf_table_view(ro);
+    for (auto const c : out_cols) {
+      out.views.push_back(table.column(static_cast<cudf::size_type>(c)));
+    }
+  } else {
+    const auto* data = ro.get_data();
+    if (data == nullptr) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_materialize] probe-side batch has no data representation");
+    }
+    auto data_rep       = data->cast<cucascade::host_data_representation>().slice(out_cols);
+    auto const batch_id = sirius::get_next_batch_id();
+    out.staged          = cucascade::data_batch::make(
+      batch_id,
+      std::move(data_rep),
+      telemetry::quent_data_batch_probe::create(batch_telemetry(), batch_id));
+    {
+      auto mut = out.staged->to_mutable();
+      mut.convert_to<cucascade::gpu_table_representation>(
+        sirius::converter_registry::get(), &space, stream);
+      mut.rebind_stream(stream);
+    }
+    auto const table = sirius::get_cudf_table_view(*out.staged);
+    for (std::size_t c = 0; c < num_output_columns; ++c) {
+      out.views.push_back(table.column(static_cast<cudf::size_type>(c)));
+    }
+  }
+  out.reader.emplace(std::move(ro));
+  return out;
 }
 
 void sirius_physical_vector_join_materialize::ensure_initialized(
@@ -405,9 +385,7 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
   // Staged rather than aliased so a HOST-tier pin works: output columns are the small
   // non-vector columns, and the right side is concatenated on device below regardless, so
   // staging does not change the memory profile for a GPU-tier pin (where it is zero-copy).
-  if (_probe_side) {
-    _left_output_cols = probe_side_output_views(left.output_columns.size(), stream, space);
-  } else {
+  if (!_probe_side) {
     _left_output_cols.resize(left.output_columns.size());
     for (std::size_t c = 0; c < left.output_columns.size(); ++c) {
       auto staged = vss::stage_pinned_column(
@@ -757,9 +735,15 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::materializ
   // `SELECT count(*)`, or a query reading only the score -- and gathering a table of no columns
   // is not something cudf defines, so the gather is skipped rather than fed an empty table.
   std::vector<cudf::column_view> left_batch_cols;
-  left_batch_cols.reserve(_left_output_cols.size());
-  for (auto const& per_batch : _left_output_cols) {
-    left_batch_cols.push_back(per_batch[partition_idx]);
+  std::optional<probe_chunk_columns> probe_chunk;
+  if (_probe_side) {
+    probe_chunk     = probe_chunk_output_columns(partition_idx, stream, space);
+    left_batch_cols = probe_chunk->views;
+  } else {
+    left_batch_cols.reserve(_left_output_cols.size());
+    for (auto const& per_batch : _left_output_cols) {
+      left_batch_cols.push_back(per_batch[partition_idx]);
+    }
   }
   std::unique_ptr<cudf::table> left_repeated;
   if (!left_batch_cols.empty()) {
@@ -768,6 +752,12 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::materializ
                                  cudf::out_of_bounds_policy::DONT_CHECK,
                                  stream,
                                  mr);
+  }
+  // The chunk goes back to the engine as soon as its columns are copied: in a self-join it is a
+  // corpus batch, which has to stay spillable for the blocks after this one.
+  if (probe_chunk) {
+    stream.synchronize();
+    probe_chunk.reset();
   }
 
   // Right columns gathered by the global neighbor id.

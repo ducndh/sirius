@@ -3025,6 +3025,79 @@ TEST_CASE_METHOD(KMeansFixture,
 
 TEST_CASE_METHOD(
   KMeansFixture,
+  "a scanned self-join answers the same whatever its probe blocks",
+  "[integration][gpu_execution][array][vss][kmeans][approx][scan_bounded][self_join]")
+{
+  // Blocks that cut a chunk and blocks that span chunks are both copied into one probe matrix, and
+  // each piece of their answer fetches its chunk's output columns. One block at a time or two at
+  // once. Three row groups give three chunks.
+  create_wide_clustered_join(*this, "sjb", false, false, 16, 300000, 10);
+  run_ok("CREATE TABLE sjb_t AS SELECT id, vec, cluster_id FROM sjb_corpus ORDER BY cluster_id;");
+  run_ok("CHECKPOINT;");
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_PROBE_BLOCK_ROWS");
+      ::unsetenv("SIRIUS_VSS_DEVICE_BLOCK_TASKS");
+    }
+  } unset;
+  auto const multiset_of = [](std::vector<std::vector<std::string>> const& rows, int stride) {
+    std::vector<std::pair<std::string, long long>> out;
+    for (auto const& r : rows) {
+      if (std::stoll(r.at(0)) % stride == 0) {
+        out.emplace_back(r.at(0), std::llround(std::stod(r.at(1)) * 1000.0));
+      }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+  // DuckDB's array_distance on the CPU over the whole table, every 3000th probe.
+  auto const oracle = distance_multiset(
+    *con,
+    "SELECT left_id, distance FROM (SELECT p.id AS left_id, array_distance(p.vec, c.vec) AS "
+    "distance, row_number() OVER (PARTITION BY p.id ORDER BY array_distance(p.vec, c.vec)) AS rk "
+    "FROM sjb_t p, sjb_t c WHERE p.id % 3000 = 0) WHERE rk <= 3;");
+  REQUIRE(oracle.size() == 100u * 3u);
+  std::string const sql =
+    "SELECT left_id, distance, right_id FROM sirius_knn_join('sjb_t','vec','sjb_t','vec', metric "
+    "=> "
+    "'l2', k => 3, search_mode => 'approx', clustering => 'sjb_c', cluster_column => 'cluster_id', "
+    "n_probes => 16, left_output_columns => ['id'], right_output_columns => ['id'], probe_source "
+    "=> "
+    "'scan', build_source => 'scan');";
+  struct mode {
+    char const* block_rows;
+    char const* tasks;
+  };
+  std::vector<std::pair<std::string, long long>> reference;
+  for (auto const& m : {mode{nullptr, nullptr},
+                        mode{"50000", nullptr},
+                        mode{"170000", nullptr},
+                        mode{"50000", "2"}}) {
+    INFO("blocks " << (m.block_rows ? m.block_rows : "planned") << " tasks "
+                   << (m.tasks ? m.tasks : "default"));
+    auto const set_or_unset = [](char const* name, char const* value) {
+      if (value != nullptr) {
+        ::setenv(name, value, 1);
+      } else {
+        ::unsetenv(name);
+      }
+    };
+    set_or_unset("SIRIUS_VSS_PROBE_BLOCK_ROWS", m.block_rows);
+    set_or_unset("SIRIUS_VSS_DEVICE_BLOCK_TASKS", m.tasks);
+    auto const rows = ok_rows(*con, sql);
+    REQUIRE(rows.size() == 300000u * 3u);
+    CHECK(distance_mismatches(multiset_of(rows, 3000), oracle) == 0);
+    if (reference.empty()) {
+      reference = multiset_of(rows, 1);
+    } else {
+      CHECK(distance_mismatches(multiset_of(rows, 1), reference) == 0);
+    }
+  }
+}
+
+TEST_CASE_METHOD(
+  KMeansFixture,
   "a self-join over one scanned table reads it once and answers as two scans do",
   "[integration][gpu_execution][array][vss][kmeans][approx][scan_bounded][self_join]")
 {
