@@ -205,6 +205,17 @@ struct strided_rows {
                                                      rmm::cuda_stream_view stream,
                                                      rmm::device_async_resource_ref mr);
 
+/// The same over a flat row-major matrix, which unlike a list column can hold 2^31 values or more.
+[[nodiscard]] cluster_assignment assign_to_centroids(raft::device_resources const& res,
+                                                     dataset_matrix_view queries,
+                                                     cudf::column_view const& centroids,
+                                                     std::int64_t dim,
+                                                     assignment_spec const& spec,
+                                                     std::int64_t row_id_base,
+                                                     cuvs::distance::DistanceType metric,
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr);
+
 /**
  * @brief Each row's nearest centroid, for the many chunks one list build assigns to one clustering.
  *

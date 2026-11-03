@@ -270,7 +270,27 @@ cluster_assignment assign_to_centroids(raft::device_resources const& res,
                                        rmm::cuda_stream_view stream,
                                        rmm::device_async_resource_ref mr)
 {
-  auto const queries    = list_column_as_dataset_view(vectors, dim);
+  return assign_to_centroids(res,
+                             list_column_as_dataset_view(vectors, dim),
+                             centroids,
+                             dim,
+                             spec,
+                             row_id_base,
+                             metric,
+                             stream,
+                             mr);
+}
+
+cluster_assignment assign_to_centroids(raft::device_resources const& res,
+                                       dataset_matrix_view queries,
+                                       cudf::column_view const& centroids,
+                                       std::int64_t dim,
+                                       assignment_spec const& spec,
+                                       std::int64_t row_id_base,
+                                       cuvs::distance::DistanceType metric,
+                                       rmm::cuda_stream_view stream,
+                                       rmm::device_async_resource_ref mr)
+{
   auto const centers    = list_column_as_dataset_view(centroids, dim);
   auto const n_rows     = static_cast<std::int64_t>(queries.extent(0));
   auto const n_clusters = static_cast<std::int64_t>(centers.extent(0));

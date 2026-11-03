@@ -105,6 +105,16 @@ namespace {
 // measured.
 constexpr double kSweep0RankedSliceMacs = 0x1p24;
 
+/// Share of the device one probe block over a scanned corpus may plan for.
+constexpr double kScannedBlockDeviceShare = 0.8;
+
+/// Probe blocks at once over a scanned corpus (SIRIUS_VSS_DEVICE_BLOCK_TASKS, default 1).
+std::size_t scanned_block_tasks()
+{
+  auto const* v = std::getenv("SIRIUS_VSS_DEVICE_BLOCK_TASKS");
+  return v != nullptr ? static_cast<std::size_t>(std::max(1.0, std::atof(v))) : 1;
+}
+
 /// A task's place under vector_join_admission: released, it makes room and asks the task creator
 /// for this join's next tasks, as a streaming source does when data arrives (schedule() only
 /// enqueues, so any thread may call it).
@@ -1315,6 +1325,9 @@ void sirius_physical_vector_join_stream::initialize_locked()
   // in the same task after the search has freed its scratch, so a task needs the search's estimate;
   // the quarter on top is for what that stage stages once for all tasks, outside any of them.
   _admission->pipeline = get_pipeline();
+  if (_lists == nullptr && _build_side != nullptr && !_blocks.empty()) {
+    _admission->limit = scanned_block_tasks();
+  }
   if (_lists != nullptr && _lists->tier == cucascade::memory::Tier::GPU && _sirius_ctx != nullptr &&
       _num_left > 1) {
     auto const spaces =
@@ -1402,6 +1415,15 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
     }
     auto const chunk_need = fixed + per_row * static_cast<double>(widest_chunk);
     auto budget = chunk_need <= 0.8 * device ? std::max(device / 3, chunk_need) : 0.8 * device;
+    if (_lists == nullptr && _build_side != nullptr) {
+      // A scanned corpus is read whole for every block, from disk once it outgrows host memory, and
+      // blocks in flight each read it themselves. The rows one read serves set the cost, so one
+      // block takes most of the device (113.5M x 1024-d on one NVMe: GPU busy 13 % with ~3 blocks).
+      budget = std::max(
+        budget,
+        std::max(kScannedBlockDeviceShare * device / static_cast<double>(scanned_block_tasks()),
+                 chunk_need));
+    }
     if (device_lists && !reread) {
       // Beside device lists the room is what is free now (the lists, the pins and the other
       // operators already hold the rest), shared by SIRIUS_VSS_DEVICE_BLOCK_TASKS tasks at once.
@@ -1430,16 +1452,6 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
   }
   block_rows = std::min<std::int64_t>(
     block_rows, static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) / k_join);
-  // A block's probe rows are joined into one list column whose child holds rows x dim values, and
-  // cudf::concatenate refuses a child past size_type's range: 3M-row blocks of 1024-d rows failed
-  // ("Total number of concatenated rows exceeds the column size limit"). With wide vectors a large
-  // device reaches this before its memory budget does (a third of a 186 GB device plans ~4M rows).
-  if (_request.dim > 0) {
-    block_rows = std::min<std::int64_t>(
-      block_rows,
-      static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) /
-        static_cast<std::int64_t>(_request.dim));
-  }
   if (block_rows <= 0) { return; }
   // Blocks of even size, so the last is not a sliver that pays for a whole read of the lists alone.
   std::int64_t total = 0;
@@ -1939,29 +1951,35 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // Held for the whole task: every corpus chunk is searched against this probe chunk. A copy
   // staged back from the host is freed on the compute stream (the chunk sources rebind it), so
   // dropping it as execute returns, before the task's stream sync, is ordered behind the searches.
-  // A block's pieces are cut from their chunks into one probe matrix, and the chunks dropped.
+  // A block's pieces are copied into one probe matrix, each chunk dropped once copied. A flat
+  // buffer because rows x dim can pass what a list column's child holds (a third of a 186 GB device
+  // plans ~4M rows, past 2^31 values at 1,024-d).
   probe_block const* const block = join_in->block() ? &_blocks[*join_in->block()] : nullptr;
   staged_vector_chunk staged_probe;
-  std::unique_ptr<cudf::column> block_probe;
+  std::optional<rmm::device_uvector<float>> block_probe;
   if (block == nullptr) {
     staged_probe = _probe->stage_for_task(left_idx, *mem_space, stream);
   } else {
-    std::vector<staged_vector_chunk> chunks;
-    std::vector<cudf::column_view> cuts;
-    chunks.reserve(block->pieces.size());
+    block_probe.emplace(static_cast<std::size_t>(block->rows * dim), stream, mr);
+    std::size_t at = 0;
     for (auto const& piece : block->pieces) {
-      chunks.push_back(_probe->stage_for_task(piece.chunk, *mem_space, stream));
-      cuts.push_back(cudf::slice(chunks.back().view,
-                                 {static_cast<cudf::size_type>(piece.begin),
-                                  static_cast<cudf::size_type>(piece.end)},
-                                 stream)
-                       .front());
+      auto const chunk  = _probe->stage_for_task(piece.chunk, *mem_space, stream);
+      auto const rows   = vss::list_column_as_dataset_view(chunk.view, dim);
+      auto const values = static_cast<std::size_t>((piece.end - piece.begin) * dim);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(block_probe->data() + at,
+                                    rows.data_handle() + piece.begin * dim,
+                                    values * sizeof(float),
+                                    cudaMemcpyDeviceToDevice,
+                                    stream.value()));
+      stream.synchronize();
+      at += values;
     }
-    block_probe = cudf::concatenate(cuts, stream, mr);
   }
-  auto const probe_view = block != nullptr ? block_probe->view() : staged_probe.view;
-  auto const queries    = vss::list_column_as_dataset_view(probe_view, dim);
-  auto const n_left     = static_cast<std::int64_t>(queries.extent(0));
+  vss::dataset_matrix_view const queries =
+    block != nullptr ? raft::make_device_matrix_view<float const, std::int64_t>(
+                         block_probe->data(), block->rows, dim)
+                     : vss::list_column_as_dataset_view(staged_probe.view, dim);
+  auto const n_left = static_cast<std::int64_t>(queries.extent(0));
   // An empty probe batch joins to nothing; the search libraries refuse a zero-row query matrix.
   if (n_left == 0) {
     std::vector<std::unique_ptr<cudf::column>> empty_cols;
@@ -2363,7 +2381,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     vss::assignment_spec routing;
     routing.n_probes = n_probes;
     auto assignment  = vss::assign_to_centroids(
-      res, probe_view, _centroids->view(), dim, routing, 0, metric, stream, mr);
+      res, queries, _centroids->view(), dim, routing, 0, metric, stream, mr);
     auto const n_edges = n_left * n_probes;  // row-major [n_left x n_probes]
     phase("assign probe->clusters");
 
@@ -4713,7 +4731,12 @@ std::size_t sirius_physical_vector_join_stream::estimate_for_rows(std::size_t n_
     for (std::size_t i = 0; _corpus && i < _corpus->num_chunks(); ++i) {
       max_chunk_rows = std::max(max_chunk_rows, _corpus->chunk_rows(i));
     }
-    gemm_scratch = vss::gemm_search_tile_bytes() + max_chunk_rows * row_bytes + n_left * row_bytes;
+    // A clustered search over a scanned corpus prepares one slice's probes at a time, a small part
+    // of a block (1,024-d, k 10, p32: measured peak ~1.7 GB + 10 KB a probe row).
+    auto const prepared_probe_rows =
+      _centroids != nullptr && _lists == nullptr ? std::min(n_left, max_chunk_rows) : n_left;
+    gemm_scratch =
+      vss::gemm_search_tile_bytes() + max_chunk_rows * row_bytes + prepared_probe_rows * row_bytes;
     if (_request.mode == vss::vector_join_mode::threshold) {
       gemm_scratch += (std::size_t{1} << 20) * (2 * sizeof(std::int64_t) + sizeof(float));
     }
