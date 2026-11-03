@@ -25,6 +25,7 @@
 #include "data/sirius_converter_registry.hpp"
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
+#include "op/sirius_physical_passthrough_sink.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -4783,6 +4784,9 @@ std::string_view sirius_physical_vector_join_stream::input_port_for(
 {
   if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
     return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+  }
+  if (producer.type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK) {
+    return producer.Cast<sirius_physical_passthrough_sink>().union_port_label();
   }
   return sirius_physical_operator::input_port_for(producer);
 }

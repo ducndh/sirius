@@ -1498,6 +1498,70 @@ TEST_CASE_METHOD(plan_tree_shape_fixture,
 }
 
 TEST_CASE_METHOD(plan_tree_shape_fixture,
+                 "plan tree shape - a vector join's whole-table side goes straight into its port",
+                 "[plan_tree_shape][vector_join]")
+{
+  // A corpus past host memory is parked twice if it goes through PARTITION -> CONCAT. Which feeder
+  // a side gets is decided from the child's operator type and every answer is the same either way,
+  // so only the plan can show the decision stopped firing.
+  for (auto const* table : {"vj_left", "vj_right"}) {
+    auto const created = con->Query(std::string{"CREATE TABLE "} + table +
+                                    " AS SELECT range::BIGINT AS id, [range::FLOAT, "
+                                    "1.0::FLOAT]::FLOAT[2] AS vec FROM range(3000)");
+    REQUIRE_FALSE(created->HasError());
+  }
+  REQUIRE_FALSE(con->Query("CHECKPOINT")->HasError());
+  struct unset_on_exit {
+    ~unset_on_exit() { unsetenv("SIRIUS_VSS_CORPUS_CHAIN"); }
+  } unset;
+  std::string const corpus =
+    "'vec', 'vj_right', 'vec', build_source => 'scan', metric => 'l2', k => 1, search_mode => "
+    "'exact-gemm'";
+  auto const plan_of = [&](std::string const& query) {
+    auto plan = generate_sirius_plan(*con, query);
+    INFO(tree_to_string(plan.get()));
+    REQUIRE(find_first(plan.get(), SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM) != nullptr);
+    return plan;
+  };
+  std::string const tables =
+    "SELECT left_id FROM sirius_knn_join('vj_left', " + corpus + ", probe_source => 'scan')";
+
+  SECTION("two tables")
+  {
+    auto plan = plan_of(tables);
+    INFO(tree_to_string(plan.get()));
+    auto* join = find_first(plan.get(), SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM);
+    REQUIRE(join->children.size() == 2);
+    for (auto& side : join->children) {
+      REQUIRE(side->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
+      REQUIRE(side->children.at(0)->type == SiriusPhysicalOperatorType::GPU_SCAN);
+    }
+  }
+  SECTION("the old chain on request")
+  {
+    setenv("SIRIUS_VSS_CORPUS_CHAIN", "1", 1);
+    auto plan = plan_of(tables);
+    INFO(tree_to_string(plan.get()));
+    auto* join = find_first(plan.get(), SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM);
+    REQUIRE(join->children.size() == 2);
+    for (auto& side : join->children) {
+      REQUIRE(side->type == SiriusPhysicalOperatorType::CONCAT);
+    }
+  }
+  SECTION("a relation side keeps the chain")
+  {
+    auto plan = plan_of(
+      "SELECT left_id FROM sirius_knn_join_rel((SELECT id, vec FROM vj_left WHERE id >= 1500), " +
+      corpus + ", left_output_columns => ['id'], right_output_columns => ['id'])");
+    INFO(tree_to_string(plan.get()));
+    auto* join = find_first(plan.get(), SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM);
+    REQUIRE(join->children.size() == 2);
+    CHECK(join->children.at(0)->type == SiriusPhysicalOperatorType::CONCAT);
+    CHECK(join->children.at(1)->type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK);
+  }
+}
+
+TEST_CASE_METHOD(plan_tree_shape_fixture,
                  "plan tree shape - UNION arm sinks declare the union's schema, not the arm's",
                  "[plan_tree_shape][union_all][isolated_context]")
 {

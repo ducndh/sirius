@@ -74,7 +74,9 @@
 
 #include <cudf/cudf_utils.hpp>
 
+#include <cstdlib>
 #include <numeric>
+#include <string_view>
 #include <utility>
 
 namespace sirius::planner {
@@ -762,6 +764,37 @@ void wrap_dense_count_join(sirius::op::sirius_physical_operator& dense_count_op,
 //! Wrap whichever of the vector join's sides are fed by a scan. create_plan_knn_join pushes
 //! the probe first and the corpus second, so the children follow wrap_join's probe / build
 //! order; a side still read from its pin contributes no child.
+//! Feed one scanned side of a vector join. A whole table's scan goes straight into the join's port:
+//! the join reads a batch's rows by position, so it needs no partition, and the scan already sizes
+//! its batches. PARTITION -> CONCAT would bring each batch back from wherever spilling left it just
+//! to park it again, writing a corpus larger than host memory to disk twice. A relation or a view
+//! always arrives under a projection and keeps that chain, whose CONCAT coalesces the small batches
+//! a filter leaves.
+void wrap_vector_join_child(sirius::op::sirius_physical_operator& join_op,
+                            std::size_t child_idx,
+                            bool is_build,
+                            const sirius::operator_params& op_params,
+                            duckdb::SiriusContext* compressed_materialization_observer)
+{
+  auto const* chain = std::getenv("SIRIUS_VSS_CORPUS_CHAIN");
+  if (join_op.children[child_idx]->type != sirius::op::SiriusPhysicalOperatorType::GPU_SCAN ||
+      (chain != nullptr && std::string_view{chain} != "0")) {
+    wrap_join_child(join_op, child_idx, is_build, op_params, compressed_materialization_observer);
+    return;
+  }
+  wrap_child(
+    join_op, child_idx, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child_orig) {
+      auto est_card       = child_orig->estimated_cardinality;
+      auto child_physical = child_orig->has_physical_overrides() ? child_orig->get_physical_types()
+                                                                 : std::vector<cudf::data_type>{};
+      auto sink           = duckdb::make_uniq<sirius::op::sirius_physical_passthrough_sink>(
+        child_orig->types, est_card, is_build ? "build" : "default");
+      if (!child_physical.empty()) { sink->set_physical_types(std::move(child_physical)); }
+      sink->children.push_back(std::move(child_orig));
+      return sink;
+    });
+}
+
 void wrap_vector_join(sirius::op::sirius_physical_operator& join_op,
                       const sirius::operator_params& op_params,
                       duckdb::SiriusContext* compressed_materialization_observer)
@@ -769,11 +802,11 @@ void wrap_vector_join(sirius::op::sirius_physical_operator& join_op,
   auto const& req       = join_op.Cast<sirius::op::sirius_physical_vector_join_stream>().request();
   std::size_t child_idx = 0;
   if (req.probe_from_scan && !req.probe_shares_build) {
-    wrap_join_child(
+    wrap_vector_join_child(
       join_op, child_idx++, /*is_build=*/false, op_params, compressed_materialization_observer);
   }
   if (req.build_from_scan) {
-    wrap_join_child(
+    wrap_vector_join_child(
       join_op, child_idx++, /*is_build=*/true, op_params, compressed_materialization_observer);
   }
 }
