@@ -32,9 +32,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <random>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -274,17 +276,266 @@ TEST_CASE("the bounded int8 search returns exactly the pairs under each row's bo
 
 TEST_CASE("the bounded half search returns the pairs under each row's bound", "[vss]")
 {
-  for (int64_t const d : {16, 48, 96, 128, 256}) {
+  // Widths on and off the CUTLASS mainloop's 32-component step, one to many stages.
+  for (int64_t const d : {16, 32, 48, 64, 96, 128, 256, 512, 1024}) {
     check_single(300, 1500, d, true, false, 21 + static_cast<uint32_t>(d));
   }
   check_single(17, 129, 960, true, false, 9);
+  // Both tile kernels' tiles: exact multiples, one row past, one row short, one tile.
+  for (int64_t const d : {64, 512}) {
+    check_single(128, 256, d, true, false, 41);
+    check_single(256, 512, d, true, false, 42);
+    check_single(129, 257, d, true, false, 43);
+    check_single(127, 255, d, true, false, 44);
+    check_single(1000, 300, d, true, false, 45);
+    check_single(33, 3000, d, true, false, 46);
+  }
+}
+
+TEST_CASE("the half tile search runs CUTLASS only at widths its mainloop covers", "[vss]")
+{
+  using sirius::vss::bound_filter_f16_uses_cutlass;
+  // A width ending inside a 32-component step would multiply stale shared memory.
+  for (int64_t const d : {16, 48, 80, 112, 144, 1008, 3056}) {
+    REQUIRE_FALSE(bound_filter_f16_uses_cutlass(d));
+  }
+  auto const* impl = std::getenv("SIRIUS_VSS_BOUND_IMPL");
+  int device = 0, major = 0;
+  REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+  REQUIRE(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess);
+  std::string_view const forced{impl == nullptr ? "" : impl};
+  // By default compute capability 8 only; forced, whatever the kernel can run on.
+  bool const served = forced == "cutlass" ? major >= 8 : forced != "fused" && major == 8;
+  // Narrow rows stay on the fused kernel by rule; forced, they take CUTLASS, as this suite then
+  // tests.
+  REQUIRE(bound_filter_f16_uses_cutlass(128) == (forced == "cutlass" && major >= 8));
+  REQUIRE(bound_filter_f16_uses_cutlass(1024) == served);
+  REQUIRE(bound_filter_f16_uses_cutlass(3072) == served);
+  // The route the rule names is the route taken.
+  auto const before = sirius::vss::f16_filter_launch_counts();
+  check_single(300, 600, 1024, true, false, 77);
+  auto const after = sirius::vss::f16_filter_launch_counts();
+  REQUIRE(after.cutlass_single - before.cutlass_single == (served ? 1 : 0));
+  REQUIRE(after.fused_single - before.fused_single == (served ? 0 : 1));
+}
+
+TEST_CASE("a half tile search keeps no pair of a padding row or column", "[vss]")
+{
+  // Accumulators of rows past the slice are whatever shared memory holds, so the previous launch
+  // leaves +inf and NaN there; 128 x 256 tiles at these sizes all have padding on both sides.
+  int64_t const d = 1024;
+  std::mt19937 gen(51);
+  auto const p     = make_side(150, d, true, gen);
+  auto const x     = make_side(300, d, true, gen);
+  auto const bound = make_bounds(p, x, d, 0.02);
+  std::vector<int64_t> rows(130);
+  std::iota(rows.begin(), rows.end(), 0);
+  auto const mr = cudf::get_current_device_resource_ref();
+  auto const dx = to_device(x.f16), dp = to_device(p.f16);
+  auto const dxs = to_device(x.sq_f16), dps = to_device(p.sq_f16);
+  auto const d_rows  = to_device(rows);
+  auto const d_bound = to_device(bound);
+  // Half infinity in every component of both sides; all pairs "pass" under an infinite bound.
+  auto const inf_rows = to_device(std::vector<uint16_t>(static_cast<std::size_t>(512 * d), 0x7c00));
+  auto const zero_sq  = to_device(std::vector<float>(512, 0.f));
+  auto const inf_bound = to_device(std::vector<float>(512, std::numeric_limits<float>::infinity()));
+  auto const all_rows  = [] {
+    std::vector<int64_t> r(512);
+    std::iota(r.begin(), r.end(), 0);
+    return r;
+  }();
+  auto const d_all = to_device(all_rows);
+  bound_candidates out(150 * 300 + 1024, stream(), mr);
+  bound_candidates poison(1024, stream(), mr);
+  for (int round = 0; round < 32; ++round) {
+    REQUIRE(cudaMemsetAsync(poison.count.data(), 0, sizeof(unsigned long long), stream().value()) ==
+            cudaSuccess);
+    sirius::vss::bound_filter_f16(inf_rows.data(),
+                                  zero_sq.data(),
+                                  512,
+                                  0,
+                                  inf_rows.data(),
+                                  zero_sq.data(),
+                                  d_all.data(),
+                                  512,
+                                  d,
+                                  inf_bound.data(),
+                                  sirius::vss::float16_slack{},
+                                  poison,
+                                  stream());
+    REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().value()) ==
+            cudaSuccess);
+    if (round % 2 == 0) {
+      sirius::vss::bound_filter_f16(dx.data(),
+                                    dxs.data(),
+                                    300,
+                                    0,
+                                    dp.data(),
+                                    dps.data(),
+                                    d_rows.data(),
+                                    130,
+                                    d,
+                                    d_bound.data(),
+                                    sirius::vss::float16_slack{},
+                                    out,
+                                    stream());
+    } else {
+      std::vector<bound_slice> slices{
+        bound_slice{dx.data(), dxs.data(), 300, 0, nullptr, d_rows.data(), 130}};
+      auto const before = sirius::vss::f16_filter_launch_counts();
+      sirius::vss::bound_filter_group(
+        slices, true, dp.data(), dps.data(), d, d_bound.data(), out, stream(), mr);
+      auto const after = sirius::vss::f16_filter_launch_counts();
+      REQUIRE(after.cutlass_group - before.cutlass_group ==
+              (sirius::vss::bound_filter_f16_uses_cutlass(d) ? 1 : 0));
+    }
+    auto const got = read_out(out);
+    std::map<pair_key, float> seen;
+    check_pairs(got, p, rows, x, 0, 300, d, bound, true, [](int64_t j) { return j; }, seen);
+    REQUIRE(seen.size() == got.size());
+  }
+}
+
+TEST_CASE("a half search adds the slack to each row's bound", "[vss]")
+{
+  for (int64_t const d : {128, 512}) {
+    INFO("d " << d);
+    std::mt19937 gen(61);
+    auto const p      = make_side(300, d, true, gen);
+    auto const x      = make_side(1000, d, true, gen);
+    auto const target = make_bounds(p, x, d, 0.02);
+    sirius::vss::float16_slack const slack{0.01f, 0.02f, 0.03f, 5.f};
+    // The bound handed in sits below the target by exactly the row's slack.
+    std::vector<float> bound(target.size());
+    for (std::size_t r = 0; r < target.size(); ++r) {
+      auto const qn = std::sqrt(p.sq_f16[r]);
+      bound[r]      = target[r] -
+                 (slack.a * qn * slack.x_max + slack.b * (qn + slack.x_max) * (qn + slack.x_max) +
+                  slack.c * (qn + slack.x_max));
+    }
+    std::vector<int64_t> rows(p.rows);
+    std::iota(rows.begin(), rows.end(), 0);
+    auto const mr = cudf::get_current_device_resource_ref();
+    auto const dx = to_device(x.f16), dp = to_device(p.f16);
+    auto const dxs = to_device(x.sq_f16), dps = to_device(p.sq_f16);
+    auto const d_rows  = to_device(rows);
+    auto const d_bound = to_device(bound);
+    bound_candidates out(p.rows * x.rows / 4 + 1024, stream(), mr);
+    REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().value()) ==
+            cudaSuccess);
+    sirius::vss::bound_filter_f16(dx.data(),
+                                  dxs.data(),
+                                  x.rows,
+                                  0,
+                                  dp.data(),
+                                  dps.data(),
+                                  d_rows.data(),
+                                  p.rows,
+                                  d,
+                                  d_bound.data(),
+                                  slack,
+                                  out,
+                                  stream());
+    auto const got = read_out(out);
+    std::map<pair_key, float> seen;
+    check_pairs(got, p, rows, x, 0, x.rows, d, target, true, [](int64_t j) { return j; }, seen);
+    REQUIRE(seen.size() == got.size());
+  }
+}
+
+// Hidden: 10 GB of device memory. Probe and corpus offsets past 2^31 values, single and grouped: an
+// iterator offset held in 32 bits would read the wrong rows or fault.
+TEST_CASE("a half tile search reads rows past 2^31 values of either side", "[.][vss_big]")
+{
+  int64_t const d = 4096, total = 600'000, live = 256;
+  std::mt19937 gen(71);
+  auto const p     = make_side(live, d, true, gen);
+  auto const x     = make_side(live, d, true, gen);
+  auto const bound = make_bounds(p, x, d, 0.05);
+  auto const mr    = cudf::get_current_device_resource_ref();
+  // The live rows sit at the end of each side. The other corpus rows hold 2.125 (half 0x4040) in
+  // every component, far past every live probe row's bound.
+  rmm::device_uvector<uint16_t> dx(static_cast<std::size_t>(total * d), stream());
+  rmm::device_uvector<uint16_t> dp(static_cast<std::size_t>(total * d), stream());
+  REQUIRE(cudaMemsetAsync(dx.data(), 0x40, dx.size() * 2, stream().value()) == cudaSuccess);
+  REQUIRE(cudaMemsetAsync(dp.data(), 0, dp.size() * 2, stream().value()) == cudaSuccess);
+  auto const at = (total - live) * d;
+  REQUIRE(
+    cudaMemcpyAsync(
+      dx.data() + at, x.f16.data(), x.f16.size() * 2, cudaMemcpyHostToDevice, stream().value()) ==
+    cudaSuccess);
+  REQUIRE(
+    cudaMemcpyAsync(
+      dp.data() + at, p.f16.data(), p.f16.size() * 2, cudaMemcpyHostToDevice, stream().value()) ==
+    cudaSuccess);
+  std::vector<float> xsq(total, 2.125f * 2.125f * d), psq(total, 0.f), lim(total, -1.f);
+  std::vector<int64_t> rows(live);
+  std::copy(x.sq_f16.begin(), x.sq_f16.end(), xsq.end() - live);
+  std::copy(p.sq_f16.begin(), p.sq_f16.end(), psq.end() - live);
+  std::copy(bound.begin(), bound.end(), lim.end() - live);
+  std::iota(rows.begin(), rows.end(), total - live);
+  auto const d_xsq = to_device(xsq), d_psq = to_device(psq), d_lim = to_device(lim);
+  auto const d_rows = to_device(rows);
+  for (bool const grouped : {false, true}) {
+    INFO((grouped ? "grouped" : "single"));
+    bound_candidates out(live * live + 1024, stream(), mr);
+    REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().value()) ==
+            cudaSuccess);
+    if (grouped) {
+      std::vector<bound_slice> slices{
+        bound_slice{dx.data(), d_xsq.data(), total, 0, nullptr, d_rows.data(), live}};
+      sirius::vss::bound_filter_group(
+        slices, true, dp.data(), d_psq.data(), d, d_lim.data(), out, stream(), mr);
+    } else {
+      sirius::vss::bound_filter_f16(dx.data(),
+                                    d_xsq.data(),
+                                    total,
+                                    0,
+                                    dp.data(),
+                                    d_psq.data(),
+                                    d_rows.data(),
+                                    live,
+                                    d,
+                                    d_lim.data(),
+                                    sirius::vss::float16_slack{},
+                                    out,
+                                    stream());
+    }
+    auto got = read_out(out);
+    // Back to the live rows' own numbering for the oracle, which holds only those.
+    std::map<pair_key, float> local;
+    for (auto const& [key, dist] : got) {
+      REQUIRE(key.first >= total - live);
+      REQUIRE(key.second >= total - live);
+      local.emplace(
+        pair_key{static_cast<int32_t>(key.first - (total - live)), key.second - (total - live)},
+        dist);
+    }
+    std::vector<int64_t> local_rows(live);
+    std::iota(local_rows.begin(), local_rows.end(), 0);
+    std::map<pair_key, float> seen;
+    check_pairs(
+      local, p, local_rows, x, 0, live, d, bound, true, [](int64_t j) { return j; }, seen);
+    REQUIRE(seen.size() == local.size());
+  }
 }
 
 TEST_CASE("a grouped bounded search answers each slice as a search of its own", "[vss]")
 {
-  for (bool const f16 : {false, true}) {
-    INFO((f16 ? "half" : "int8"));
-    int64_t const d = 96;
+  struct grouped_case {
+    bool f16;
+    int64_t d;
+    bool with_map;
+  };
+  for (auto const& c : std::vector<grouped_case>{{false, 96, false},
+                                                 {true, 96, false},
+                                                 {true, 96, true},
+                                                 {true, 256, false},
+                                                 {true, 512, false},
+                                                 {true, 512, true}}) {
+    bool const f16 = c.f16, with_map = c.with_map;
+    int64_t const d = c.d;
+    INFO((f16 ? "half" : "int8") << " d " << d << (with_map ? " id_map" : ""));
     std::mt19937 gen(f16 ? 31 : 32);
     auto const p     = make_side(400, d, f16, gen);
     auto const x     = make_side(2000, d, f16, gen);
@@ -311,6 +562,11 @@ TEST_CASE("a grouped bounded search answers each slice as a search of its own", 
     auto const dxs_f   = to_device(x.sq_f16);
     auto const dps_f   = to_device(p.sq_f16);
     auto const d_bound = to_device(bound);
+    std::vector<int64_t> map(x.rows);
+    for (int64_t j = 0; j < x.rows; ++j) {
+      map[j] = 7 * j + 3;
+    }
+    auto const d_map = to_device(map);
     std::vector<rmm::device_uvector<int64_t>> d_rows;
     std::vector<bound_slice> slices;
     for (auto const& c : cuts) {
@@ -323,7 +579,7 @@ TEST_CASE("a grouped bounded search answers each slice as a search of its own", 
                                    xsq,
                                    c.n,
                                    10 * c.first,
-                                   nullptr,
+                                   with_map ? d_map.data() + c.first : nullptr,
                                    d_rows.back().data(),
                                    static_cast<int64_t>(c.rows.size())});
     }
@@ -354,7 +610,7 @@ TEST_CASE("a grouped bounded search answers each slice as a search of its own", 
         d,
         bound,
         f16,
-        [&](int64_t j) { return 10 * first + j; },
+        [&](int64_t j) { return with_map ? map[first + j] : 10 * first + j; },
         seen);
     }
     REQUIRE(seen.size() == got.size());

@@ -3224,8 +3224,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // each slice launches at once.
     // SIRIUS_VSS_GROUP=0 launches each slice on its own.
     // A scanned chunk stays staged until its group is checked, so its slices group too.
+    // With the CUTLASS tile kernel, lists staged from the host group as well: a chunk's slices are
+    // launched together before the next chunk's copy starts, and checked before the chunk goes.
+    bool const cutlass_tiles = f16_bounded && vss::bound_filter_f16_uses_cutlass(dim);
     bool const group_launch =
-      (scan_f16 || (_lists != nullptr && _lists->tier == cucascade::memory::Tier::GPU)) && [] {
+      (scan_f16 ||
+       (_lists != nullptr && (_lists->tier == cucascade::memory::Tier::GPU || cutlass_tiles))) &&
+      [] {
         auto const* v = std::getenv("SIRIUS_VSS_GROUP");
         return v == nullptr || std::string_view{v} != "0";
       }();
@@ -3236,13 +3241,21 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // 16 lists (156 probes x 977 rows per slice) went 15 -> 8 ms grouped, SIFT100M (98k-row lists)
     // and a 1M-probe self-join over 64 lists (250k probes x 15k rows) lost 3-13 % grouped. So a
     // wide slice joins the group when probes x rows is at most 4M. SIRIUS_VSS_GROUP_M_MAX and
-    // SIRIUS_VSS_GROUP_WORK_MAX override.
+    // SIRIUS_VSS_GROUP_WORK_MAX override. The CUTLASS kernel's grouped launch keeps a slice's rows
+    // in L2 itself while they fit, so such a slice joins at any size; past that it reads them again
+    // for every probe tile. 1M rows, 256-1,536 wide: slices up to half the L2 ran 0.98-1.03x their
+    // lone launches, from 4 MB (6 MB L2) alone won by 1-15 %.
     auto const env_i64 = [](char const* name, std::int64_t dflt) {
       auto const* v = std::getenv(name);
       return v == nullptr ? dflt : std::max<std::int64_t>(0, std::atoll(v));
     };
     std::int64_t const group_m_max    = env_i64("SIRIUS_VSS_GROUP_M_MAX", 128);
     std::int64_t const group_work_max = env_i64("SIRIUS_VSS_GROUP_WORK_MAX", 4'000'000);
+    std::int64_t const group_slice_rows =
+      cutlass_tiles ? vss::bound_filter_f16_group_slice_bytes() / (dim * 2) : 0;
+    auto const joins_group = [&](std::int64_t m, std::int64_t n) {
+      return group_launch && (m <= group_m_max || m * n <= group_work_max || n <= group_slice_rows);
+    };
     std::vector<bounded_slice> group, deferred;
     auto launch_bounded = [&](bounded_slice const& sl) {
       if (f16_bounded) {
@@ -3287,8 +3300,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       CUDF_CUDA_TRY(cudaMemcpyAsync(
         candidates->count.data(), &keep, sizeof(keep), cudaMemcpyHostToDevice, stream.value()));
     };
-    auto check_group = [&] {
-      if (group.empty()) { return; }
+    auto launch_deferred = [&] {
       if (!deferred.empty()) {
         vss::bound_filter_group(deferred,
                                 f16_bounded,
@@ -3303,6 +3315,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                 mr);
         deferred.clear();
       }
+    };
+    auto check_group = [&] {
+      if (group.empty()) { return; }
+      launch_deferred();
       auto total = read_count();
       if (total > candidates->capacity()) {
         rollback();
@@ -3961,7 +3977,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
               }
               continue;
             }
-            if (group_launch && (m <= group_m_max || m * slice_rows <= group_work_max)) {
+            if (joins_group(m, slice_rows)) {
               deferred.push_back(sl);
             } else {
               launch_bounded(sl);
@@ -4116,6 +4132,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
 
         // The searches above are issued, not finished. Staging the next needed chunk now runs its
         // H2D while the GPU works on this one.
+        if (lists_on_host) { launch_deferred(); }
         prefetched = ci + 1 < chunks.size() ? stage_next(chunks[ci + 1]) : staged_vector_chunk{};
         if (keep_chunks && sweep == 0 && can_keep()) {
           kept.emplace(j, std::move(staged));
@@ -4143,7 +4160,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         auto const emitted_before = bounded_emitted;
         std::int64_t group_pairs  = 0;  // the group's pairs, were every one to pass
         for (auto const& piece : round) {
-          if (group_launch && (piece.m <= group_m_max || piece.m * piece.n <= group_work_max)) {
+          if (joins_group(piece.m, piece.n)) {
             deferred.push_back(piece);
           } else {
             launch_bounded(piece);
@@ -4187,6 +4204,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                      static_cast<long long>(bounded_padded),
                      rescore_seconds,
                      take_seconds);
+        if (f16_bounded) {
+          auto const l = vss::f16_filter_launch_counts();
+          std::fprintf(stderr,
+                       "[vecjoin-phase] FP16 filter launches so far in this process: CUTLASS %lld "
+                       "single, %lld grouped; fused %lld single\n",
+                       static_cast<long long>(l.cutlass_single),
+                       static_cast<long long>(l.cutlass_group),
+                       static_cast<long long>(l.fused_single));
+        }
         if (best_only) {
           std::fprintf(stderr,
                        "[vecjoin-phase] best match: %lld of those pairs re-scored\n",

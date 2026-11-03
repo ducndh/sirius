@@ -103,6 +103,26 @@ void bound_filter_group(std::vector<bound_slice> const& slices,
 /// True when bound_filter_f16 can search vectors of this width.
 bool bound_filter_f16_supports(int64_t dim);
 
+/**
+ * @brief Whether bound_filter_f16 and bound_filter_group run their FP16 tiles on the CUTLASS kernel
+ * (bound_gemm_cutlass.hpp) at this width, rather than the fused one; same contract either way. By
+ * default it does on compute capability 8 from a minimum width. SIRIUS_VSS_BOUND_IMPL=fused forces
+ * the fused kernel, =cutlass the CUTLASS one at every width it can serve (a multiple of 32, sm_80
+ * or newer).
+ */
+bool bound_filter_f16_uses_cutlass(int64_t dim);
+
+/// The largest slice (its corpus rows, in bytes) that stays in L2 through a CUTLASS grouped launch,
+/// which runs each slice's corpus tiles fastest: half the L2, room for the running blocks' probe
+/// tiles.
+int64_t bound_filter_f16_group_slice_bytes();
+
+/// FP16 filter launches so far in this process, by kernel. The join's phase debug prints them.
+struct f16_filter_launches {
+  int64_t cutlass_single, cutlass_group, fused_single;
+};
+f16_filter_launches f16_filter_launch_counts();
+
 /// The per-row slack a bounded FP16 search adds to its bound; see bound_filter_f16.
 struct float16_slack {
   float a{0}, b{0}, c{0}, x_max{0};

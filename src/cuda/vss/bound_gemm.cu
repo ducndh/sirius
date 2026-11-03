@@ -15,6 +15,7 @@
  */
 
 #include "vss/bound_gemm.hpp"
+#include "vss/bound_gemm_cutlass.hpp"
 
 #include <cudf/utilities/error.hpp>
 
@@ -31,6 +32,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +40,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <string_view>
 #include <type_traits>
 
 namespace sirius::vss {
@@ -48,6 +51,14 @@ namespace {
 constexpr int kTileM = 128;
 constexpr int kTileN = 128;
 constexpr int kWarps = 8;
+
+// Below this width the fused tile kernel stays. Against it end to end on an RTX A5000 (1M rows, top
+// 10): the exact join 0.76x / 0.96x / 1.04x / 1.08x / 1.13x / 1.34x at 32 / 128 / 192 / 256 / 384 /
+// 3,072 wide; the approximate join 0.97-1.00x at 128, 0.96-1.03x at 192 and 256, 1.04-1.10x at 512,
+// 1.08-1.24x from 768.
+constexpr int64_t kCutlassMinDim = 192;
+
+std::atomic<int64_t> n_cutlass_single{0}, n_cutlass_group{0}, n_fused_single{0};
 
 template <class T>
 struct mma_traits;
@@ -820,14 +831,14 @@ tile_launch plan_tiles(int64_t m_tiles, int64_t n_tiles, int64_t row_bytes)
 /// read again for every corpus tile. On an RTX A5000 (6 MB L2), 2048 lists of 2000 rows x 800
 /// probe rows: int8 96 wide 13.6 -> 8.3 ms walking, half 128 wide 20.6 -> 17.7 ms, but half 768
 /// wide 104 -> 132 ms. Below sm_80 the kernel takes one tile per block.
-int group_walk(int64_t row_bytes)
+int group_walk(int64_t row_bytes, int blocks_per_sm)
 {
   int device = 0, major = 0, sms = 0, l2 = 0;
   CUDF_CUDA_TRY(cudaGetDevice(&device));
   CUDF_CUDA_TRY(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
   CUDF_CUDA_TRY(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
   CUDF_CUDA_TRY(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device));
-  return major >= 8 && int64_t{2} * sms * kTileM * row_bytes <= l2 ? 8 : 1;
+  return major >= 8 && int64_t{blocks_per_sm} * sms * kTileM * row_bytes <= l2 ? 8 : 1;
 }
 
 /// Probe-row counts up to this go to bound_filter_small_kernel (SIRIUS_VSS_SMALL_M overrides).
@@ -1293,14 +1304,16 @@ void bound_filter_group(std::vector<bound_slice> const& slices,
   }
   // The slice table and each slice's first block, copied beside each other; freed on the stream
   // once the launch that reads them is done.
-  auto launch = [&](std::vector<bound_slice> const& v, bool tile, auto&& go) {
+  bool const cutlass = f16 && bound_filter_f16_uses_cutlass(dim);
+  auto launch        = [&](std::vector<bound_slice> const& v, bool tile, auto&& go) {
     if (v.empty()) { return; }
-    int const walk = tile ? group_walk(dim * (f16 ? 2 : 1)) : 1;
+    int const tile_m = cutlass ? kCutlassTileM : kTileM, tile_n = cutlass ? kCutlassTileN : kTileN;
+    int const walk = tile ? group_walk(dim * (f16 ? 2 : 1), cutlass ? 1 : 2) : 1;
     std::vector<int64_t> prefix(v.size() + 1, 0);
     for (std::size_t i = 0; i < v.size(); ++i) {
-      auto const n_tiles = (v[i].n + kTileN - 1) / kTileN;
-      auto const blocks  = tile ? ((v[i].m + kTileM - 1) / kTileM) * ((n_tiles + walk - 1) / walk)
-                                : (v[i].n + kSmallThreads - 1) / kSmallThreads;
+      auto const n_tiles = (v[i].n + tile_n - 1) / tile_n;
+      auto const blocks  = tile ? ((v[i].m + tile_m - 1) / tile_m) * ((n_tiles + walk - 1) / walk)
+                                       : (v[i].n + kSmallThreads - 1) / kSmallThreads;
       prefix[i + 1]      = prefix[i] + blocks;
     }
     CUDF_EXPECTS(prefix.back() <= std::numeric_limits<int>::max(),
@@ -1316,6 +1329,7 @@ void bound_filter_group(std::vector<bound_slice> const& slices,
                                   prefix.size() * sizeof(int64_t),
                                   cudaMemcpyHostToDevice,
                                   stream.value()));
+    if (tile && cutlass) { ++n_cutlass_group; }
     go(static_cast<unsigned>(prefix.back()),
        group_view{static_cast<bound_slice const*>(table.data()),
                   device_prefix,
@@ -1356,6 +1370,28 @@ void bound_filter_group(std::vector<bound_slice> const& slices,
     small(2, bound_filter_small_kernel<T, 4, true>);
     small(3, bound_filter_small_kernel<T, 8, true>);
     small(4, bound_filter_small_kernel<T, 16, true>);
+    if (cutlass) {
+      launch(classes[5], true, [&](unsigned blocks, group_view g) {
+        bound_filter_f16_cutlass_group(
+          g.slices,
+          g.prefix,
+          g.n_slices,
+          blocks,
+          g.walk,
+          cutlass_filter_args{probe,
+                              static_cast<float const*>(probe_sq),
+                              bound,
+                              float16_slack{},
+                              static_cast<int>(dim),
+                              out.rows.data(),
+                              out.ids.data(),
+                              out.distances.data(),
+                              out.count.data(),
+                              static_cast<unsigned long long>(out.capacity())},
+          stream);
+      });
+      return;
+    }
     auto const kernel = accumulator_layout_is_m16n8<typename mma_traits<T>::accumulator>()
                           ? bound_filter_kernel<T, true, true>
                           : bound_filter_kernel<T, false, true>;
@@ -1391,6 +1427,36 @@ void bound_filter_group(std::vector<bound_slice> const& slices,
 
 bool bound_filter_f16_supports(int64_t dim) { return dim > 0 && dim % 16 == 0; }
 
+int64_t bound_filter_f16_group_slice_bytes()
+{
+  int device = 0, l2 = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device));
+  return l2 / 2;
+}
+
+f16_filter_launches f16_filter_launch_counts()
+{
+  return {n_cutlass_single.load(), n_cutlass_group.load(), n_fused_single.load()};
+}
+
+bool bound_filter_f16_uses_cutlass(int64_t dim)
+{
+  static std::string_view const impl = [] {
+    auto const* v = std::getenv("SIRIUS_VSS_BOUND_IMPL");
+    return v == nullptr ? std::string_view{} : std::string_view{v};
+  }();
+  // CUTLASS's mainloop steps 32 components and leaves what an access past the row would load
+  // stale (its kNone clear option): a tail of 16 would be multiplied in as garbage.
+  if (impl == "fused" || dim % 32 != 0) { return false; }
+  int device = 0, major = 0;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+  CUDF_CUDA_TRY(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+  // By default only compute capability 8: kCutlassMinDim and the launch policy come from an sm_86
+  // part, and no newer generation has run this kernel.
+  return impl == "cutlass" ? major >= 8 : major == 8 && dim >= kCutlassMinDim;
+}
+
 void bound_filter_f16(std::uint16_t const* x,
                       float const* x_sq,
                       int64_t n,
@@ -1423,6 +1489,23 @@ void bound_filter_f16(std::uint16_t const* x,
                    stream)) {
     return;
   }
+  if (bound_filter_f16_uses_cutlass(dim)) {
+    ++n_cutlass_single;
+    bound_filter_f16_cutlass(bound_slice{x, x_sq, n, id_base, nullptr, rows, m},
+                             cutlass_filter_args{probe,
+                                                 probe_sq,
+                                                 bound,
+                                                 slack,
+                                                 static_cast<int>(dim),
+                                                 out.rows.data(),
+                                                 out.ids.data(),
+                                                 out.distances.data(),
+                                                 out.count.data(),
+                                                 static_cast<unsigned long long>(out.capacity())},
+                             stream);
+    return;
+  }
+  ++n_fused_single;
   CUDF_EXPECTS((n + kTileN - 1) / kTileN <= 65535, "bound_filter_f16: too many corpus rows");
   auto const plan   = plan_tiles((m + kTileM - 1) / kTileM,
                                (n + kTileN - 1) / kTileN,
