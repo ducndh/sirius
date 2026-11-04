@@ -1460,18 +1460,18 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
       block_rows,
       static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) /
         std::max<std::int64_t>(_request.n_probes, 1));
-    // The rows sit outside the host pool, beside it. Half the pool's size leaves the rest of the
-    // process and the limit it runs under some room.
+    // The rows sit outside the host pool, beside it. Half the pool's size, shared by the blocks in
+    // flight, leaves the rest of the process and the limit it runs under some room.
     if (_sirius_ctx != nullptr) {
       auto const hosts = _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(
         cucascade::memory::Tier::HOST);
       if (!hosts.empty()) {
         block_rows = std::max<std::int64_t>(
           1,
-          std::min<std::int64_t>(block_rows,
-                                 static_cast<std::int64_t>(hosts.front()->get_max_memory() / 2 /
-                                                           (static_cast<std::size_t>(_request.dim) *
-                                                            sizeof(float)))));
+          std::min<std::int64_t>(
+            block_rows,
+            static_cast<std::int64_t>(hosts.front()->get_max_memory() / 2 / scanned_block_tasks() /
+                                      (static_cast<std::size_t>(_request.dim) * sizeof(float)))));
       }
     }
   }
