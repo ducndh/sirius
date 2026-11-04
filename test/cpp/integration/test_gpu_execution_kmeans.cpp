@@ -21,18 +21,24 @@
  *        cluster-ordered copy of the table is built from.
  */
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/lists/lists_column_view.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 #include <rmm/cuda_stream.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/error.hpp>
 
 #include <cuda_runtime_api.h>
 
 #include <catch.hpp>
+#include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <data/data_batch_utils.hpp>
 #include <duckdb.hpp>
+#include <helper/type_conversions.hpp>
 #include <scan_manager/sirius_scan_manager.hpp>
 #include <telemetry/data_batch_probe.hpp>
 #include <utils/gpu_execution_fixture.hpp>
@@ -41,9 +47,11 @@
 #include <utils/transparent_execution_test_utils.hpp>
 #include <vss/cluster_lists.hpp>
 #include <vss/pinned_column.hpp>
+#include <vss/sirius_physical_vector_join_materialize.hpp>
 #include <vss/vector_clustering.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -3074,6 +3082,113 @@ TEST_CASE_METHOD(KMeansFixture,
   REQUIRE(blocks.size() == 200u * 10u);
   ::setenv("SIRIUS_VSS_SCAN_BOUNDED", "0", 1);
   CHECK(distance_mismatches(blocks, distance_multiset(*con, join)) == 0);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "vector join materialize keeps nothing from an init that ran out of memory",
+                 "[integration][gpu_execution][array][vss][vector_join]")
+{
+  // A host pin's output columns are staged once for all tasks. The first fits and the second does
+  // not, and a retried task stages both again, so the first must not stay behind.
+  run_ok(
+    "CREATE TABLE mst AS SELECT i::INTEGER AS id, i::BIGINT * 1000000007 AS payload FROM "
+    "range(10000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'mst', tier => 'host', format => 'duckdb');");
+  struct unpin_on_exit {
+    duckdb::Connection& connection;
+    ~unpin_on_exit() { connection.Query("SELECT * FROM unpin_table('mst');"); }
+  } unpin{*con};
+
+  auto ctx = sirius::test::get_registered_sirius_context(*con);
+  auto const gpu_spaces =
+    ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  REQUIRE_FALSE(gpu_spaces.empty());
+  auto& space = *const_cast<cucascade::memory::memory_space*>(gpu_spaces.front());
+
+  auto const* pin = ctx->get_scan_manager().find_pinned_entry("mst");
+  REQUIRE(pin != nullptr);
+  REQUIRE(pin->host_chunks.size() == 1);
+  REQUIRE(pin->cache_info.column_names().at(1) == "payload");
+  auto const* host =
+    dynamic_cast<cucascade::host_data_representation const*>(pin->host_chunks.front().get());
+  REQUIRE(host != nullptr);
+  auto const bytes_of = [&](std::size_t column) {
+    std::array<std::size_t, 1> const columns{column};
+    return host->slice(columns)->get_size_in_bytes();
+  };
+  // Staging `id` takes its reservation and its copy, leaving half of what `payload` asks for.
+  auto const room = 2 * bytes_of(0) + bytes_of(1) / 2;
+
+  rmm::cuda_stream stream;
+  auto const mr        = space.get_default_allocator();
+  auto const one_value = [&](auto value, cudf::type_id type) {
+    auto column = cudf::make_fixed_width_column(
+      cudf::data_type{type}, 1, cudf::mask_state::UNALLOCATED, stream.view(), mr);
+    REQUIRE(
+      cudaMemcpy(column->mutable_view().head(), &value, sizeof(value), cudaMemcpyHostToDevice) ==
+      cudaSuccess);
+    return column;
+  };
+  // One pair: left row 3, right row 5, distance 1.5.
+  std::vector<std::unique_ptr<cudf::column>> pair;
+  pair.push_back(one_value(std::int32_t{3}, cudf::type_id::INT32));
+  pair.push_back(one_value(std::int64_t{5}, cudf::type_id::INT64));
+  pair.push_back(one_value(1.5F, cudf::type_id::FLOAT32));
+  sirius::op::partitioned_operator_data const input(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{sirius::make_data_batch(
+      cudf::table{std::move(pair)}, space, stream, sirius::telemetry::batch_telemetry_info{})},
+    0);
+
+  sirius::vss::vector_join_request request;
+  request.mode                = sirius::vss::vector_join_mode::per_row_top_k;
+  request.metric              = "l2";
+  request.left.catalog        = attach_alias;
+  request.left.schema         = "main";
+  request.left.table          = "mst";
+  request.left.output_columns = {"id", "payload"};
+  request.right               = request.left;
+  request.right.output_columns.clear();
+  sirius::op::sirius_physical_vector_join_materialize materialize(
+    sirius::from_duckdb_vec(
+      {duckdb::LogicalType::INTEGER, duckdb::LogicalType::BIGINT, duckdb::LogicalType::FLOAT}),
+    1,
+    request,
+    &ctx->get_scan_manager(),
+    nullptr,
+    nullptr,
+    ctx.get());
+
+  auto const free_at_start = space.get_available_memory();
+  REQUIRE(free_at_start > room);
+  auto blocker = space.make_reservation_or_null(free_at_start - room);
+  REQUIRE(blocker != nullptr);
+  auto const free_blocked = space.get_available_memory();
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    CHECK_THROWS_AS(materialize.execute(input, stream), rmm::out_of_memory);
+    stream.synchronize();
+    CHECK(space.get_available_memory() == free_blocked);
+  }
+
+  // With the room back the same operator finishes its init.
+  blocker.reset();
+  auto const output = materialize.execute(input, stream);
+  stream.synchronize();
+  auto const* out = dynamic_cast<sirius::op::pipelineable_operator_data const*>(output.get());
+  REQUIRE(out != nullptr);
+  auto const batches = out->get_data_batches();
+  REQUIRE(batches.size() == 1);
+  auto const table = sirius::get_cudf_table_view(*batches.front());
+  REQUIRE(table.num_rows() == 1);
+  REQUIRE(table.num_columns() == 3);
+  std::int32_t id      = -1;
+  std::int64_t payload = -1;
+  REQUIRE(cudaMemcpy(&id, table.column(0).head(), sizeof(id), cudaMemcpyDeviceToHost) ==
+          cudaSuccess);
+  REQUIRE(cudaMemcpy(&payload, table.column(1).head(), sizeof(payload), cudaMemcpyDeviceToHost) ==
+          cudaSuccess);
+  CHECK(id == 3);
+  CHECK(payload == 3 * std::int64_t{1000000007});
 }
 
 TEST_CASE_METHOD(
