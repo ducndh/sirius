@@ -650,7 +650,9 @@ void downgrade_executor::monitor_loop()
             amount,
             issued);
           // Fire-and-forget: monitor does not wait for the result
-          _request_queue.push(std::move(req));
+          if (!_request_queue.push(std::move(req))) {
+            _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+          }
         }
       } else if (!backed_off) {
         SIRIUS_LOG_WARN(
@@ -674,6 +676,9 @@ void downgrade_executor::monitor_loop()
 void downgrade_executor::cancel_pending_requests()
 {
   while (auto req = _request_queue.try_pop()) {
+    if (req->is_monitor_request) {
+      _monitor_request_enqueued.store(false, std::memory_order_relaxed);
+    }
     try {
       req->result.set_exception(
         std::make_exception_ptr(std::runtime_error("downgrade executor shutting down")));
