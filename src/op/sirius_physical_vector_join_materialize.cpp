@@ -385,13 +385,17 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
   // Staged rather than aliased so a HOST-tier pin works: output columns are the small
   // non-vector columns, and the right side is concatenated on device below regardless, so
   // staging does not change the memory profile for a GPU-tier pin (where it is zero-copy).
+  // Kept only once the whole init has succeeded: an out-of-memory retry stages everything again,
+  // so what this attempt staged has to go back with it.
+  std::vector<std::vector<cudf::column_view>> left_output_cols;
+  std::vector<vss::staged_pinned_column> staged_left;
   if (!_probe_side) {
-    _left_output_cols.resize(left.output_columns.size());
-    for (std::size_t c = 0; c < left.output_columns.size(); ++c) {
-      auto staged = vss::stage_pinned_column(
-        *left_pin, left.output_columns[c], space, stream, batch_telemetry());
-      _left_output_cols[c] = staged.views;
-      _staged_left.push_back(std::move(staged));
+    left_output_cols.reserve(left.output_columns.size());
+    staged_left.reserve(left.output_columns.size());
+    for (auto const& column : left.output_columns) {
+      auto staged = vss::stage_pinned_column(*left_pin, column, space, stream, batch_telemetry());
+      left_output_cols.push_back(staged.views);
+      staged_left.push_back(std::move(staged));
     }
   }
 
@@ -425,7 +429,9 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
     }
   }
 
-  _initialized = true;
+  _left_output_cols = std::move(left_output_cols);
+  _staged_left      = std::move(staged_left);
+  _initialized      = true;
 }
 
 std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::gather_right_on_host(
