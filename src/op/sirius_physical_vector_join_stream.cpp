@@ -3015,12 +3015,34 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       !ranked_sweep0;
     bool const seed = (bounded && seedable) || seed_f16;
     // Unseeded, sweep 0 ranks each row's nearest cluster on the half-precision tensor cores from
-    // the stored rows; only the bound it leaves is used, and that is re-scored in FP32 first.
+    // the stored rows; only the bound it leaves is used.
     // SIRIUS_VSS_F16_GEMM=0 widens the rows and ranks them with the FP32 GEMM instead.
     // An inner-product join keeps to the searches it was verified on: the seed, the bounded
     // filter, and the FP32 GEMM ranking of an unseeded sweep 0.
     bool const f16_sweep0 = f16_bounded && !scan_f16 && !seed && !ip && [] {
       auto const* v = std::getenv("SIRIUS_VSS_F16_GEMM");
+      return v == nullptr || std::string_view{v} != "0";
+    }();
+    // That bound comes from the codes alone, with no FP32 read, across PCIe when the rows are in
+    // host memory. Row r's k pairs of sweep 0 are distinct, and the largest of their codes is
+    // c_(k), so all k have c(r, s) <= c_(k), hence delta(r, s) <= U_r(c_(k)) (the lemma above
+    // gap_trim), which therefore bounds delta*_r and may stand as b_r wherever their re-scored k-th
+    // did. It is never below that k-th, so what a re-scored bound keeps it keeps too. U_r holds for
+    // sweep 0's codes as for the filter's, in all of its kernels, with N = |q^| + max|x^|:
+    //  1. A product of two halves has at most 22 significant bits and is at least 2^-48: exact in
+    //     FP32, with no denormal.
+    //  2. Any summation tree over d terms has depth at most d - 1, so a dot's error is at most
+    //     1.001 d u |q^| |x^|, u = 2^-24, whatever the order.
+    //  3. c doubles that, adds the two FP32 norms' errors and the last additions: at most
+    //     (d/2 + d/32 + 8) u N^2 with 4 |q^| |x^| <= N^2, inside eta_r = 2 d u N^2. Clamping at 0
+    //     only raises c. So |q^ - x^|^2 <= c + eta_r, with room left of about 1.47 d u N^2.
+    //  4. |q - x| <= |q^ - x^| + e_r + e by the triangle inequality.
+    //  5. The re-score is at most |q - x|^2 (1 + (d/32 + 7) u), one lane's FMA chain, 5 shuffle
+    //     additions and the subtraction, which 2^-20 and the room in (3) cover for d >= 16.
+    // A row with a miss in sweep 0 has an infinite c_(k), which stays infinite.
+    // SIRIUS_VSS_SWEEP0_CODE_BOUND=0 re-scores the k pairs instead.
+    bool const sweep0_bound_from_codes = f16_sweep0 && !radius_join && [] {
+      auto const* v = std::getenv("SIRIUS_VSS_SWEEP0_CODE_BOUND");
       return v == nullptr || std::string_view{v} != "0";
     }();
     std::optional<rmm::device_uvector<std::uint16_t>> routed_f16;
@@ -3875,7 +3897,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           vss::fill_bound(bound->data(), n_left, radius_bound, stream);
         } else if (rescore && !seed) {
           // A scanned corpus re-scored sweep 0's answers chunk by chunk, while each was staged.
-          if (_lists != nullptr) {
+          if (_lists != nullptr && !sweep0_bound_from_codes) {
             vss::exact_distances(search_queries.data_handle(),
                                  nullptr,
                                  k_join,
@@ -3892,6 +3914,17 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           }
           vss::row_max_bound(
             acc_distances->view().data<float>(), n_left, k_join, bound->data(), stream);
+          if (sweep0_bound_from_codes) {
+            vss::float16_seed_upper_bound(bound->data(),
+                                          probe_sqf->data(),
+                                          probe_half_error->data(),
+                                          _lists->half_error,
+                                          _lists->max_row_norm,
+                                          dim,
+                                          n_left,
+                                          stream,
+                                          false);
+          }
           vss::fill_misses(acc_distances->mutable_view().data<float>(),
                            acc_neighbors->mutable_view().data<std::int64_t>(),
                            n_left * k_join,

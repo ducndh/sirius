@@ -2963,19 +2963,59 @@ void create_wide_clustered_join(KMeansFixture& fixture,
                  "_probe', tier => 'gpu', format => 'duckdb');");
 }
 
+std::string cpu_top_k_sql(const std::string& prefix, int k, int stride)
+{
+  return "SELECT left_id, distance FROM (SELECT p.id AS left_id, array_distance(p.vec, c.vec) AS "
+         "distance, row_number() OVER (PARTITION BY p.id ORDER BY array_distance(p.vec, c.vec)) AS "
+         "rk FROM " +
+         prefix + "_probe p, " + prefix + "_corpus c WHERE p.id % " + std::to_string(stride) +
+         " = 0) WHERE rk <= " + std::to_string(k) + ";";
+}
+
 // Probe id and k nearest distances by DuckDB's array_distance on the CPU, every stride-th probe.
 std::vector<std::pair<std::string, long long>> cpu_top_k(duckdb::Connection& con,
                                                          const std::string& prefix,
                                                          int k,
                                                          int stride)
 {
-  return distance_multiset(
-    con,
-    "SELECT left_id, distance FROM (SELECT p.id AS left_id, array_distance(p.vec, c.vec) AS "
-    "distance, row_number() OVER (PARTITION BY p.id ORDER BY array_distance(p.vec, c.vec)) AS rk "
-    "FROM " +
-      prefix + "_probe p, " + prefix + "_corpus c WHERE p.id % " + std::to_string(stride) +
-      " = 0) WHERE rk <= " + std::to_string(k) + ";");
+  return distance_multiset(con, cpu_top_k_sql(prefix, k, stride));
+}
+
+// (probe id, distance) pairs, sorted and not rounded.
+std::vector<std::pair<std::string, double>> exact_distances(duckdb::Connection& con,
+                                                            const std::string& sql)
+{
+  auto const rows = ok_rows(con, sql);
+  std::vector<std::pair<std::string, double>> out;
+  out.reserve(rows.size());
+  for (auto const& r : rows) {
+    out.emplace_back(r.at(0), std::stod(r.at(1)));
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+std::vector<std::pair<std::string, double>> cpu_exact_top_k(duckdb::Connection& con,
+                                                            const std::string& prefix,
+                                                            int k,
+                                                            int stride)
+{
+  return exact_distances(con, cpu_top_k_sql(prefix, k, stride));
+}
+
+// A rounded compare cannot see a dropped pair at distances near its tolerance. 4e-6 of the distance
+// is well past what FP32 rounding moves it by at these widths.
+std::size_t relative_mismatches(std::vector<std::pair<std::string, double>> const& a,
+                                std::vector<std::pair<std::string, double>> const& b)
+{
+  REQUIRE(a.size() == b.size());
+  std::size_t mismatched = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    auto const x = a[i].second, y = b[i].second;
+    mismatched += a[i].first != b[i].first || !std::isfinite(x) || !std::isfinite(y) ||
+                  std::abs(x - y) > 4e-6 * std::max(x, y);
+  }
+  return mismatched;
 }
 
 std::size_t distance_mismatches(std::vector<std::pair<std::string, long long>> const& a,
@@ -2990,6 +3030,118 @@ std::size_t distance_mismatches(std::vector<std::pair<std::string, long long>> c
 }
 
 }  // namespace
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "a ranked float16 sweep 0 keeps the nearest row its code overstates",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][vector_join]")
+{
+  // In half's denormal band, units of 2^-24 here, the spacing is uniform and eta_r is negligible,
+  // so the bound's raise from a row's k-th code to what that code can mean decides. The probes are
+  // 0.499 a component and round to 0. k rows at -10.499 round to -10: true distance 43.99, code 40.
+  // One row at 11.501 with its first component at 0.499 rounds to 12: true 42.61, code 46.48. It is
+  // the true nearest, and its code is past the others' k-th, so the raw k-th code drops it. The
+  // 2,000 other rows are farther by both. Distances near 2.6e-6 need the relative compare.
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_SWEEP0"); }
+  } unset_env;
+  ::setenv("SIRIUS_VSS_SWEEP0", "ranked", 1);
+  for (int const k : {1, 5}) {
+    auto const p = "dnb" + std::to_string(k);
+    auto const n = std::to_string(k);
+    run_ok("CREATE TABLE " + p +
+           "_corpus AS SELECT i::INTEGER AS id, list_transform(range(16), lambda d: ((CASE WHEN i "
+           "< " +
+           n + " THEN -10.499::DOUBLE WHEN i = " + n +
+           " AND d = 0 THEN 0.499::DOUBLE WHEN i = " + n +
+           " THEN 11.501::DOUBLE ELSE (16 + hash(i * 1000 + d) % 14)::DOUBLE END) * "
+           "pow(2.0, -24))::FLOAT)::FLOAT[16] AS vec FROM range(2001 + " +
+           n + ") t(i) ORDER BY hash(i);");
+    run_ok("CREATE TABLE " + p +
+           "_probe AS SELECT i::INTEGER AS id, list_transform(range(16), lambda d: (0.499::DOUBLE "
+           "* pow(2.0, -24))::FLOAT)::FLOAT[16] AS vec FROM range(64) t(i);");
+    run_ok("CREATE TABLE " + p +
+           "_cent AS SELECT i::BIGINT AS id, list_transform(range(16), lambda d: i::FLOAT)"
+           "::FLOAT[16] AS vec FROM range(2) t(i);");
+    run_ok("CHECKPOINT;");
+    for (auto const* t : {"_corpus", "_probe", "_cent"}) {
+      run_ok("SELECT * FROM pin_table(name => '" + p + t +
+             "', tier => 'gpu', format => 'duckdb');");
+    }
+    run_ok("SELECT * FROM sirius_kmeans_fit('" + p + "_cent','vec', name => '" + p +
+           "_c', rows_are_centroids => true);");
+    run_ok("SELECT * FROM sirius_kmeans_build_lists('" + p + "_corpus','vec','" + p +
+           "_c', storage => 'float16');");
+    INFO("k " << k);
+    CHECK(relative_mismatches(
+            exact_distances(*con,
+                            "SELECT left_id, distance FROM sirius_knn_join('" + p +
+                              "_probe','vec','" + p + "_corpus','vec', metric => 'l2', k => " + n +
+                              ", search_mode => 'approx', clustering => '" + p +
+                              "_c', n_probes => 2);"),
+            cpu_exact_top_k(*con, p, k, 1)) == 0);
+    for (auto const* t : {"_corpus", "_probe", "_cent"}) {
+      run_ok("SELECT * FROM unpin_table('" + p + t + "');");
+    }
+  }
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "a ranked float16 sweep 0 bounds each row from its codes, exactly",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][vector_join]")
+{
+  // Every cluster probed is the exact join, so DuckDB's array_distance on the CPU is the reference.
+  // Components 8000 + j / 4, j < 16, round to 8000 or 8004 in half, so a row's codes nearly all tie
+  // or sit far from its FP32 distances: a bound from its k-th code that fell short of the true
+  // k-th FP32 distance would drop true pairs. The second table is uniform in [0, 1).
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_SWEEP0");
+      ::unsetenv("SIRIUS_VSS_SWEEP0_CODE_BOUND");
+    }
+  } unset_env;
+  ::setenv("SIRIUS_VSS_SWEEP0", "ranked", 1);
+  struct set_shape {
+    std::string prefix, value;
+  };
+  std::vector<set_shape> const sets{
+    {"cbr", "(8000.0 + (hash(i * 1000 + d + SEED) % 16)::FLOAT * 0.25)::FLOAT"},
+    {"cbu", "((hash(i * 1000 + d + SEED) % 1000)::FLOAT / 1000.0)::FLOAT"}};
+  for (auto const& set : sets) {
+    auto const gen = [&](std::string const& seed) {
+      auto value = set.value;
+      value.replace(value.find("SEED"), 4, seed);
+      return "list_transform(range(16), lambda d: " + value + ")::FLOAT[16]";
+    };
+    auto const& p = set.prefix;
+    run_ok("CREATE TABLE " + p + "_corpus AS SELECT i::INTEGER AS id, " + gen("0") +
+           " AS vec FROM range(3000) t(i);");
+    run_ok("CREATE TABLE " + p + "_probe AS SELECT i::INTEGER AS id, " + gen("7777777") +
+           " AS vec FROM range(200) t(i);");
+    run_ok("CHECKPOINT;");
+    run_ok("SELECT * FROM pin_table(name => '" + p +
+           "_corpus', tier => 'gpu', format => 'duckdb');");
+    run_ok("SELECT * FROM pin_table(name => '" + p +
+           "_probe', tier => 'gpu', format => 'duckdb');");
+    run_ok("SELECT * FROM sirius_kmeans_fit('" + p + "_corpus','vec', name => '" + p +
+           "_c', n_clusters => 4, seed => 3);");
+    run_ok("SELECT * FROM sirius_kmeans_build_lists('" + p + "_corpus','vec','" + p +
+           "_c', storage => 'float16');");
+    auto const join = "SELECT left_id, distance FROM sirius_knn_join('" + p + "_probe','vec','" +
+                      p + "_corpus','vec', metric => 'l2', k => 10, search_mode => 'approx', " +
+                      "clustering => '" + p + "_c', n_probes => 4);";
+    auto const reference = cpu_exact_top_k(*con, p, 10, 1);
+    ::unsetenv("SIRIUS_VSS_SWEEP0_CODE_BOUND");
+    auto const from_codes = exact_distances(*con, join);
+    ::setenv("SIRIUS_VSS_SWEEP0_CODE_BOUND", "0", 1);
+    auto const read = exact_distances(*con, join);
+    INFO("table " << p);
+    CHECK(relative_mismatches(from_codes, reference) == 0);
+    CHECK(relative_mismatches(read, reference) == 0);
+    run_ok("SELECT * FROM unpin_table('" + p + "_probe');");
+    run_ok("SELECT * FROM unpin_table('" + p + "_corpus');");
+  }
+}
 
 TEST_CASE_METHOD(KMeansFixture,
                  "an approximate join over a corpus without lists filters it in float16 exactly",
