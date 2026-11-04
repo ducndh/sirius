@@ -3023,6 +3023,36 @@ TEST_CASE_METHOD(KMeansFixture,
   CHECK(distance_mismatches(scanned, oracle) == 0);
 }
 
+TEST_CASE_METHOD(KMeansFixture,
+                 "a probe block with a row past float16's range is searched in FP32",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][scan_bounded]")
+{
+  // A block keeps its FP32 rows on the host and filters with their FP16 copy. A row too large for
+  // half has no FP16 copy, so the block's rows go back to the device for the FP32 ranked search.
+  create_wide_clustered_join(*this, "sbr", false, false, 16, 250000, 200);
+  run_ok(
+    "CREATE TABLE sbr_big AS SELECT id, list_transform(vec, lambda x: x * 1000000.0)::FLOAT[32] AS "
+    "vec FROM sbr_probe;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sbr_big', tier => 'gpu', format => 'duckdb');");
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_PROBE_BLOCK_ROWS");
+      ::unsetenv("SIRIUS_VSS_SCAN_BOUNDED");
+    }
+  } unset_env;
+  ::setenv("SIRIUS_VSS_PROBE_BLOCK_ROWS", "50", 1);
+  std::string const join =
+    "SELECT left_id, distance FROM sirius_knn_join('sbr_big','vec','sbr_corpus','vec', search_mode "
+    "=> 'approx', metric => 'l2', k => 10, clustering => 'sbr_c', cluster_column => 'cluster_id', "
+    "n_probes => 4, build_source => 'scan');";
+  auto const blocks = distance_multiset(*con, join);
+  REQUIRE(blocks.size() == 200u * 10u);
+  ::setenv("SIRIUS_VSS_SCAN_BOUNDED", "0", 1);
+  CHECK(distance_mismatches(blocks, distance_multiset(*con, join)) == 0);
+}
+
 TEST_CASE_METHOD(
   KMeansFixture,
   "a scanned self-join answers the same whatever its probe blocks",

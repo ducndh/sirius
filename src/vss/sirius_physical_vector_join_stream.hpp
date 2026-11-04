@@ -377,7 +377,11 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   [[nodiscard]] std::size_t per_left_batch_estimate(std::size_t left_idx,
                                                     bool with_routing = true) const;
   /// The same estimate for a task over @p n_left probe rows.
-  [[nodiscard]] std::size_t estimate_for_rows(std::size_t n_left, bool with_routing = true) const;
+  [[nodiscard]] std::size_t estimate_for_rows(std::size_t n_left,
+                                              bool with_routing      = true,
+                                              bool planning_a_block = false) const;
+  /// Whether a probe block over this join keeps its FP32 rows on the host (see the block's load).
+  [[nodiscard]] bool block_rows_on_host() const;
 
   /// Group the probe chunks into blocks of probe rows when that pays (lists in host memory, which
   /// a task reads across PCIe once per sweep); leaves @c _blocks empty otherwise. Caller holds
