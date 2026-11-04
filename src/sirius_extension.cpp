@@ -2826,6 +2826,20 @@ static unique_ptr<GlobalTableFunctionState> SiriusKMeansAssignInit(ClientContext
       "sirius_kmeans_assign requires the Sirius context to be initialized");
   }
 
+  // Here and not at bind: a prepared statement binds once, and a DELETE does not rebind it.
+  auto const& req = bind_data.req;
+  if (auto const pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
+        req.catalog, req.schema, req.table)) {
+    auto& entry =
+      Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, req.catalog, req.schema, req.table);
+    if (auto const why =
+          sirius::vss::pinned_rows_mismatch(context, *pin, entry.Cast<DuckTableEntry>())) {
+      throw InvalidInputException("sirius_kmeans_assign: the pin of table '" + req.table +
+                                  "' no longer holds the table's rows (" + *why +
+                                  "), and this function reads the pinned rows as they were pinned");
+    }
+  }
+
   auto state       = make_uniq<KMeansAssignGlobalState>();
   state->host_repr = sirius::vss::run_kmeans_assign(*sirius_ctx, bind_data.req);
   state->reader    = std::make_unique<sirius::op::result::host_table_chunk_reader>(

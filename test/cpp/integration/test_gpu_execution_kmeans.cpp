@@ -305,6 +305,28 @@ TEST_CASE_METHOD(KMeansFixture,
 }
 
 TEST_CASE_METHOD(KMeansFixture,
+                 "sirius_kmeans_assign refuses a pin that no longer holds the table's rows",
+                 "[integration][gpu_execution][array][vss][kmeans]")
+{
+  create_two_group_table(*this, "kms_corpus");
+  run_ok("SELECT * FROM sirius_kmeans_fit('kms_corpus','vec', name => 'kms_c', n_clusters => 2);");
+  auto const assign =
+    "SELECT * FROM sirius_kmeans_assign('kms_corpus','vec','kms_c', n_probes => 1);";
+  CHECK(query_ok(*con, assign)->RowCount() == 400);
+
+  // Bound before the delete, so it takes a check at execution to see it.
+  auto prepared = con->Prepare(assign);
+  REQUIRE_FALSE(prepared->HasError());
+
+  run_ok("DELETE FROM kms_corpus WHERE id < 10;");
+  expect_error(*con, assign, "no longer holds the table's rows");
+  auto const stale = prepared->Execute();
+  REQUIRE(stale->HasError());
+  UNSCOPED_INFO("error was: " << stale->GetError());
+  CHECK(stale->GetError().find("no longer holds the table's rows") != std::string::npos);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
                  "sirius_kmeans_assign rejects a clustering trained on a different width",
                  "[integration][gpu_execution][array][vss][kmeans]")
 {
