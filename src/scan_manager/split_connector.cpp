@@ -89,7 +89,7 @@ bool split_connector::is_draining(std::size_t quiet_ms) const
 bool split_connector::is_closed() const
 {
   std::lock_guard<std::mutex> lock(_mutex);
-  return _closed && _splits.empty();
+  return _closed && _splits.empty() && !_exception;
 }
 
 [[nodiscard]] bool split_connector::has_more_splits() const
