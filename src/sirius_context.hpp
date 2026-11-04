@@ -316,6 +316,19 @@ class SiriusContext : public ClientContextState {
     uint64_t chunks_available = 0;
   };
 
+  /// What the vector join did with probe blocks' FP32 rows in the host pool, over the session. The
+  /// rows' tier and lifetime do not show in a result set, so these are what a test can assert on.
+  struct vector_join_host_rows_stats {
+    /// Batches those rows were put in, and how many times one came back from disk to be read.
+    uint64_t batches_made     = 0;
+    uint64_t batches_restored = 0;
+    /// The most batches the join's repository held at once, and how many were left at finalize.
+    uint64_t repository_peak = 0;
+    uint64_t left_at_finish  = 0;
+    /// Blocks that found no room in the host pool and kept their rows on the device.
+    uint64_t blocks_on_device = 0;
+  };
+
   SiriusContext();
   ~SiriusContext() noexcept override;
 
@@ -659,6 +672,19 @@ class SiriusContext : public ClientContextState {
                                 uint64_t pairs_exhaustive,
                                 uint64_t chunks_staged,
                                 uint64_t chunks_available) noexcept;
+
+  /// \brief Snapshot what the vector join has done with probe rows in the host pool this session.
+  [[nodiscard]] vector_join_host_rows_stats get_vector_join_host_rows_stats() const noexcept;
+
+  /// \brief A block's rows made one more batch, leaving @p in_repository in the join's repository.
+  void record_vector_join_host_batch(uint64_t in_repository) noexcept;
+  /// \brief A batch of a block's rows came back from disk to be read.
+  void record_vector_join_host_restore() noexcept;
+  /// \brief The join's repository held @p batches of block rows when the operator finished.
+  void record_vector_join_host_left(uint64_t batches) noexcept;
+  /// \brief A block found no room in the host pool and kept its rows on the device.
+  void record_vector_join_block_on_device() noexcept;
+
   /// \brief Record a planning attempt declined before the gpu_execution gate.
   void record_transparent_decline(sirius::transparent::decline_reason reason) noexcept;
 
@@ -797,6 +823,11 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> vector_join_pairs_exhaustive_{0};
   std::atomic<uint64_t> vector_join_chunks_staged_{0};
   std::atomic<uint64_t> vector_join_chunks_available_{0};
+  std::atomic<uint64_t> vector_join_host_batches_made_{0};
+  std::atomic<uint64_t> vector_join_host_batches_restored_{0};
+  std::atomic<uint64_t> vector_join_host_repository_peak_{0};
+  std::atomic<uint64_t> vector_join_host_left_at_finish_{0};
+  std::atomic<uint64_t> vector_join_blocks_on_device_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};
   std::atomic<uint64_t> transparent_classification_failure_count_{0};

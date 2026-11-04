@@ -414,6 +414,10 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// is what lets the downgrade executor spill them when the host fills; emptied when the
   /// operator finishes so the manager does not report them as leaked.
   ::cucascade::shared_data_repository* _lists_repo{nullptr};
+  /// Probe blocks' FP32 rows while their tasks run, registered the same way under port "host_rows".
+  /// Each task's vss::block_host_rows owns its entries. The sweep takes this operator's ports in
+  /// name order, so the rows spill after the idle build and probe batches.
+  ::cucascade::shared_data_repository* _host_rows_repo{nullptr};
   void on_finalize_operator() override;
   /// The pinned corpus, when there is one: where pushed-down corpus predicates read their
   /// columns. Null on the build path.

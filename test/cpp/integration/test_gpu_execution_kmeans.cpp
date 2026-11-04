@@ -56,6 +56,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -2899,6 +2900,41 @@ namespace {
 // cluster order (or, with halves, as two cluster-ordered halves back to back, so a chunk holds a
 // cluster as two runs), and a pinned probe table. The corpus is left unpinned for the join's own
 // scan; pinned, its chunks are 256 KB batches, a chunk per row group (122,880 rows).
+void create_wide_clustered_join(duckdb::Connection& con,
+                                const std::string& prefix,
+                                bool bytes,
+                                bool halves,
+                                int n_clusters,
+                                int corpus_rows,
+                                int probe_rows)
+{
+  auto const run_ok = [&](const std::string& sql) { std::ignore = query_ok(con, sql); };
+  run_ok("SET scan_task_batch_size = 262144;");
+  auto const gen = [&](const std::string& seed) {
+    auto const value = "(hash(i * 1000 + d + " + seed + ") % " +
+                       (bytes ? std::string("256)::FLOAT") : std::string("1000)::FLOAT / 1000.0"));
+    return "list_transform(range(32), lambda d: " + value + ")::FLOAT[32]";
+  };
+  run_ok("CREATE TABLE " + prefix + "_raw AS SELECT i::INTEGER AS id, " + gen("0") +
+         " AS vec FROM range(" + std::to_string(corpus_rows) + ") t(i);");
+  run_ok("CREATE TABLE " + prefix + "_probe AS SELECT i::INTEGER AS id, " + gen("7777777") +
+         " AS vec FROM range(" + std::to_string(probe_rows) + ") t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_raw', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_raw','vec', name => '" + prefix +
+         "_c', n_clusters => " + std::to_string(n_clusters) + ");");
+  run_ok("CREATE TABLE " + prefix + "_asg AS SELECT * FROM sirius_kmeans_assign('" + prefix +
+         "_raw','vec','" + prefix + "_c', n_probes => 1);");
+  run_ok("CREATE TABLE " + prefix + "_corpus AS SELECT r.id, r.vec, a.cluster_id FROM " + prefix +
+         "_raw r JOIN " + prefix + "_asg a ON r.rowid = a.row_id ORDER BY " +
+         (halves ? "r.id % 2, a.cluster_id;" : "a.cluster_id;"));
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM unpin_table('" + prefix + "_raw');");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_probe', tier => 'gpu', format => 'duckdb');");
+}
+
 void create_wide_clustered_join(KMeansFixture& fixture,
                                 const std::string& prefix,
                                 bool bytes,
@@ -2907,30 +2943,61 @@ void create_wide_clustered_join(KMeansFixture& fixture,
                                 int corpus_rows,
                                 int probe_rows)
 {
-  fixture.run_ok("SET scan_task_batch_size = 262144;");
-  auto const gen = [&](const std::string& seed) {
-    auto const value = "(hash(i * 1000 + d + " + seed + ") % " +
-                       (bytes ? std::string("256)::FLOAT") : std::string("1000)::FLOAT / 1000.0"));
-    return "list_transform(range(32), lambda d: " + value + ")::FLOAT[32]";
-  };
-  fixture.run_ok("CREATE TABLE " + prefix + "_raw AS SELECT i::INTEGER AS id, " + gen("0") +
-                 " AS vec FROM range(" + std::to_string(corpus_rows) + ") t(i);");
-  fixture.run_ok("CREATE TABLE " + prefix + "_probe AS SELECT i::INTEGER AS id, " + gen("7777777") +
-                 " AS vec FROM range(" + std::to_string(probe_rows) + ") t(i);");
-  fixture.run_ok("CHECKPOINT;");
-  fixture.run_ok("SELECT * FROM pin_table(name => '" + prefix +
-                 "_raw', tier => 'gpu', format => 'duckdb');");
-  fixture.run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_raw','vec', name => '" + prefix +
-                 "_c', n_clusters => " + std::to_string(n_clusters) + ");");
-  fixture.run_ok("CREATE TABLE " + prefix + "_asg AS SELECT * FROM sirius_kmeans_assign('" +
-                 prefix + "_raw','vec','" + prefix + "_c', n_probes => 1);");
-  fixture.run_ok("CREATE TABLE " + prefix + "_corpus AS SELECT r.id, r.vec, a.cluster_id FROM " +
-                 prefix + "_raw r JOIN " + prefix + "_asg a ON r.rowid = a.row_id ORDER BY " +
-                 (halves ? "r.id % 2, a.cluster_id;" : "a.cluster_id;"));
-  fixture.run_ok("CHECKPOINT;");
-  fixture.run_ok("SELECT * FROM unpin_table('" + prefix + "_raw');");
-  fixture.run_ok("SELECT * FROM pin_table(name => '" + prefix +
-                 "_probe', tier => 'gpu', format => 'duckdb');");
+  create_wide_clustered_join(
+    *fixture.con, prefix, bytes, halves, n_clusters, corpus_rows, probe_rows);
+}
+
+// A join's memory configured for one test, on its own SiriusContext: `disk_dir` empty for no disk
+// tier, `host_lines` for more of the host's settings.
+std::filesystem::path write_block_rows_yaml(sirius::test::scratch_dir const& scratch,
+                                            std::uint64_t device_bytes,
+                                            std::uint64_t host_bytes,
+                                            std::string const& disk_dir,
+                                            std::string const& host_lines = "")
+{
+  auto const yaml = scratch.path() / "block_rows.yaml";
+  std::ofstream f(yaml);
+  f << "sirius:\n"
+       "  topology:\n"
+       "    num_gpus: 1\n"
+       "  memory:\n"
+       "    gpu:\n"
+       "      usage_limit_bytes: "
+    << device_bytes
+    << "\n"
+       "      reservation_limit_fraction: 1.0\n"
+       "    host:\n"
+       "      capacity_bytes: "
+    << host_bytes << "\n"
+    << host_lines;
+  f << "      initial_number_pools: 1\n"
+       "      pool_size: 512\n"
+       "      block_size: 1048576\n";
+  if (!disk_dir.empty()) {
+    f << "    disk:\n"
+         "      disk_id: 0\n"
+         "      capacity_bytes: 20000000000\n"
+         "      downgrade_root_dirs: \""
+      << disk_dir << "\"\n";
+  }
+  f << "  executor:\n"
+       "    pipeline:\n"
+       "      num_threads: 4\n"
+       "    task_creator:\n"
+       "      num_threads: 2\n"
+       "    downgrade:\n"
+       "      num_threads: 1\n"
+       "      monitor_period: 1ms\n";
+  return yaml;
+}
+
+std::size_t host_pool_available(duckdb::Connection& con)
+{
+  auto const hosts = sirius::test::get_registered_sirius_context(con)
+                       ->get_memory_manager()
+                       .get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  REQUIRE_FALSE(hosts.empty());
+  return hosts.front()->get_available_memory();
 }
 
 // Probe id and k nearest distances by DuckDB's array_distance on the CPU, every stride-th probe.
@@ -3052,6 +3119,193 @@ TEST_CASE_METHOD(KMeansFixture,
   REQUIRE(blocks.size() == 200u * 10u);
   ::setenv("SIRIUS_VSS_SCAN_BOUNDED", "0", 1);
   CHECK(distance_mismatches(blocks, distance_multiset(*con, join)) == 0);
+}
+
+TEST_CASE("a probe block's rows spilled to disk between reads give the same answer",
+          "[vss][kmeans][approx][scan_bounded][isolated_context]")
+{
+  // The monitor spills whatever idles in a pool past 2 MB, every millisecond, so the rows go to
+  // disk as soon as a block's read lets go of them. 12.8 MB of rows make 3 batches in a 100 MB
+  // pool.
+  sirius::test::scratch_dir scratch{"block_rows_spill"};
+  auto const disk = scratch.path() / "disk";
+  std::filesystem::create_directories(disk);
+  sirius::test::shared_test_env env(write_block_rows_yaml(scratch,
+                                                          4000000000,
+                                                          100000000,
+                                                          disk.string(),
+                                                          "      downgrade_trigger_fraction: 0.02\n"
+                                                          "      downgrade_stop_fraction: 0.01\n"));
+  auto con = env.make_connection();
+  ok_rows(con, "ATTACH " + scratch.file_literal("block_rows_spill.db") + " AS brs;");
+  ok_rows(con, "USE brs;");
+  create_wide_clustered_join(con, "brs", false, false, 16, 150000, 100000);
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_BLOCK_ROWS_ON_HOST");
+      ::unsetenv("SIRIUS_VSS_PROBE_BLOCK_ROWS");
+      ::unsetenv("SIRIUS_VSS_DEVICE_BLOCK_TASKS");
+    }
+  } unset_env;
+  auto const join = [](std::string const& probe) {
+    return "SELECT left_id, distance FROM sirius_knn_join('" + probe +
+           "','vec','brs_corpus','vec', search_mode => 'approx', metric => 'l2', k => 10, "
+           "clustering => 'brs_c', cluster_column => 'cluster_id', n_probes => 4, build_source => "
+           "'scan');";
+  };
+  auto const spill_files = [&] {
+    std::size_t files = 0;
+    for (auto const& entry : std::filesystem::recursive_directory_iterator(disk)) {
+      files += entry.is_regular_file();
+    }
+    return files;
+  };
+
+  ::setenv("SIRIUS_VSS_BLOCK_ROWS_ON_HOST", "0", 1);
+  auto const stats          = sirius::test::get_vector_join_host_rows_stats(con);
+  auto const on_device      = distance_multiset(con, join("brs_probe"));
+  auto const device_batches = sirius::test::get_vector_join_host_rows_stats(con).batches_made;
+  CHECK(device_batches == stats.batches_made);
+  REQUIRE(on_device.size() == 100000u * 10u);
+  ::unsetenv("SIRIUS_VSS_BLOCK_ROWS_ON_HOST");
+
+  auto const pool_before = host_pool_available(con);
+  SECTION("one block")
+  {
+    CHECK(distance_mismatches(distance_multiset(con, join("brs_probe")), on_device) == 0);
+    auto const after = sirius::test::get_vector_join_host_rows_stats(con);
+    CHECK(after.batches_made - stats.batches_made == 3);
+    CHECK(after.batches_restored > stats.batches_restored);
+    CHECK(after.repository_peak == 3);
+    CHECK(after.blocks_on_device == 0);
+  }
+  SECTION("blocks, two at once")
+  {
+    ::setenv("SIRIUS_VSS_PROBE_BLOCK_ROWS", "25000", 1);
+    ::setenv("SIRIUS_VSS_DEVICE_BLOCK_TASKS", "2", 1);
+    CHECK(distance_mismatches(distance_multiset(con, join("brs_probe")), on_device) == 0);
+    auto const after = sirius::test::get_vector_join_host_rows_stats(con);
+    CHECK(after.batches_made - stats.batches_made == 4);
+    CHECK(after.batches_restored > stats.batches_restored);
+    CHECK(after.repository_peak <= 2);
+    CHECK(after.blocks_on_device == 0);
+  }
+  SECTION("a row past float16's range sends the rows back to the device")
+  {
+    ok_rows(con,
+            "CREATE TABLE brs_big AS SELECT id, list_transform(vec, lambda x: x * "
+            "1000000.0)::FLOAT[32] AS vec FROM brs_probe;");
+    ok_rows(con, "CHECKPOINT;");
+    ok_rows(con, "SELECT * FROM pin_table(name => 'brs_big', tier => 'gpu', format => 'duckdb');");
+    ::setenv("SIRIUS_VSS_BLOCK_ROWS_ON_HOST", "0", 1);
+    auto const reference = distance_multiset(con, join("brs_big"));
+    ::unsetenv("SIRIUS_VSS_BLOCK_ROWS_ON_HOST");
+    auto const before = sirius::test::get_vector_join_host_rows_stats(con);
+    CHECK(distance_mismatches(distance_multiset(con, join("brs_big")), reference) == 0);
+    CHECK(sirius::test::get_vector_join_host_rows_stats(con).batches_made > before.batches_made);
+  }
+  // Every batch is gone once the query ends: the operator found none left, the spill files are
+  // deleted and the pool has its blocks back.
+  CHECK(sirius::test::get_vector_join_host_rows_stats(con).left_at_finish == 0);
+  CHECK(spill_files() == 0);
+  CHECK(host_pool_available(con) == pool_before);
+}
+
+TEST_CASE("a retried probe block leaves nothing of its rows behind",
+          "[vss][kmeans][approx][scan_bounded][isolated_context]")
+{
+  // A block of 300,000 rows routed to 1,000 clusters needs a 2.4 GB column on a 2 GB device, past
+  // what the task can be given. So every attempt loads the block's rows and then runs out of
+  // memory, and the engine retries it until its limit. Each attempt has to clear the repository for
+  // the next.
+  sirius::test::scratch_dir scratch{"block_rows_retry"};
+  sirius::test::shared_test_env env(write_block_rows_yaml(scratch, 2000000000, 4000000000, ""));
+  auto con = env.make_connection();
+  ok_rows(con, "ATTACH " + scratch.file_literal("block_rows_retry.db") + " AS brr;");
+  ok_rows(con, "USE brr;");
+  create_wide_clustered_join(con, "brr", false, false, 1024, 100000, 300000);
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_PROBE_BLOCK_ROWS"); }
+  } unset_env;
+  ::setenv("SIRIUS_VSS_PROBE_BLOCK_ROWS", "300000", 1);
+  auto const pool_before = host_pool_available(con);
+  auto const failed      = con.Query(
+    "SELECT left_id, distance FROM sirius_knn_join('brr_probe','vec','brr_corpus','vec', "
+         "search_mode => 'approx', metric => 'l2', k => 10, clustering => 'brr_c', cluster_column => "
+         "'cluster_id', n_probes => 1000, build_source => 'scan');");
+  REQUIRE(failed);
+  INFO("query error: " << (failed->HasError() ? failed->GetError() : std::string("none")));
+  CHECK(failed->HasError());
+  auto const stats = sirius::test::get_vector_join_host_rows_stats(con);
+  CHECK(stats.batches_made > 1);
+  CHECK(stats.repository_peak == 1);
+  CHECK(host_pool_available(con) == pool_before);
+}
+
+TEST_CASE("a probe block too large for the host pool keeps its rows on the device",
+          "[vss][kmeans][approx][scan_bounded][isolated_context]")
+{
+  // 16,384 rows of 32-d are 2.1 MB, over a 1 MB limit on what the host pool may promise, with no
+  // disk tier to spill to. The planner goes no lower than that many rows, so the block finds out as
+  // it loads: the search then runs as SIRIUS_VSS_BLOCK_ROWS_ON_HOST=0 runs it, with no
+  // out-of-memory for the engine to retry. The scan and the pins allocate without a reservation, so
+  // they still have the whole pool.
+  sirius::test::scratch_dir scratch{"block_rows_small_pool"};
+  sirius::test::shared_test_env env(write_block_rows_yaml(
+    scratch, 4000000000, 1000000000, "", "      reservation_limit_bytes: 2000000\n"));
+  auto con = env.make_connection();
+  ok_rows(con, "ATTACH " + scratch.file_literal("block_rows_small_pool.db") + " AS brp;");
+  ok_rows(con, "USE brp;");
+  create_wide_clustered_join(con, "brp", false, false, 16, 2000, 16384);
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_BLOCK_ROWS_ON_HOST"); }
+  } unset_env;
+  std::string const join =
+    "SELECT left_id, distance FROM sirius_knn_join('brp_probe','vec','brp_corpus','vec', "
+    "search_mode => 'approx', metric => 'l2', k => 3, clustering => 'brp_c', cluster_column => "
+    "'cluster_id', n_probes => 4, build_source => 'scan');";
+  auto const tried_host = distance_multiset(con, join);
+  REQUIRE(tried_host.size() == 16384u * 3u);
+  auto const stats = sirius::test::get_vector_join_host_rows_stats(con);
+  CHECK(stats.blocks_on_device == 1);
+  CHECK(stats.batches_made == 0);
+  ::setenv("SIRIUS_VSS_BLOCK_ROWS_ON_HOST", "0", 1);
+  CHECK(distance_mismatches(distance_multiset(con, join), tried_host) == 0);
+}
+
+TEST_CASE("the host pool's share for probe rows is split between the blocks in flight",
+          "[vss][kmeans][approx][scan_bounded][isolated_context]")
+{
+  // A 20 MB limit on what the pool may promise and a disk tier make the plan 60 % of that, 93,750
+  // rows of 32-d: 100,000 probes are 2 blocks, and 3 when two blocks run at once. The device leaves
+  // far more room than that. Each block reports the corpus chunks it could have read. Only the plan
+  // is under test: the scan reader's staging alone is over the limit, so these blocks find no room
+  // when they load and keep their rows on the device.
+  sirius::test::scratch_dir scratch{"block_rows_cap"};
+  auto const disk = scratch.path() / "disk";
+  std::filesystem::create_directories(disk);
+  sirius::test::shared_test_env env(write_block_rows_yaml(
+    scratch, 4000000000, 1000000000, disk.string(), "      reservation_limit_bytes: 20000000\n"));
+  auto con = env.make_connection();
+  ok_rows(con, "ATTACH " + scratch.file_literal("block_rows_cap.db") + " AS brc;");
+  ok_rows(con, "USE brc;");
+  create_wide_clustered_join(con, "brc", false, false, 16, 20000, 100000);
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_DEVICE_BLOCK_TASKS"); }
+  } unset_env;
+  auto const chunks_read = [&] {
+    auto const before = sirius::test::get_vector_join_prune_stats(con).chunks_available;
+    ok_rows(con,
+            "SELECT left_id, distance FROM sirius_knn_join('brc_probe','vec','brc_corpus','vec', "
+            "search_mode => 'approx', metric => 'l2', k => 3, clustering => 'brc_c', "
+            "cluster_column => 'cluster_id', n_probes => 4, build_source => 'scan');");
+    return sirius::test::get_vector_join_prune_stats(con).chunks_available - before;
+  };
+  auto const one_at_a_time = chunks_read();
+  REQUIRE(one_at_a_time > 0);
+  ::setenv("SIRIUS_VSS_DEVICE_BLOCK_TASKS", "2", 1);
+  CHECK(chunks_read() * 2 == one_at_a_time * 3);
 }
 
 TEST_CASE_METHOD(

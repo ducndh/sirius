@@ -1315,6 +1315,41 @@ void SiriusContext::record_vector_join_prune(uint64_t pairs_scored,
   vector_join_chunks_available_.fetch_add(chunks_available, std::memory_order_relaxed);
 }
 
+SiriusContext::vector_join_host_rows_stats SiriusContext::get_vector_join_host_rows_stats()
+  const noexcept
+{
+  return vector_join_host_rows_stats{
+    .batches_made     = vector_join_host_batches_made_.load(std::memory_order_relaxed),
+    .batches_restored = vector_join_host_batches_restored_.load(std::memory_order_relaxed),
+    .repository_peak  = vector_join_host_repository_peak_.load(std::memory_order_relaxed),
+    .left_at_finish   = vector_join_host_left_at_finish_.load(std::memory_order_relaxed),
+    .blocks_on_device = vector_join_blocks_on_device_.load(std::memory_order_relaxed),
+  };
+}
+
+void SiriusContext::record_vector_join_host_batch(uint64_t in_repository) noexcept
+{
+  vector_join_host_batches_made_.fetch_add(1, std::memory_order_relaxed);
+  auto peak = vector_join_host_repository_peak_.load(std::memory_order_relaxed);
+  while (peak < in_repository && !vector_join_host_repository_peak_.compare_exchange_weak(
+                                   peak, in_repository, std::memory_order_relaxed)) {}
+}
+
+void SiriusContext::record_vector_join_host_restore() noexcept
+{
+  vector_join_host_batches_restored_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_vector_join_host_left(uint64_t batches) noexcept
+{
+  vector_join_host_left_at_finish_.fetch_add(batches, std::memory_order_relaxed);
+}
+
+void SiriusContext::record_vector_join_block_on_device() noexcept
+{
+  vector_join_blocks_on_device_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void SiriusContext::record_transparent_rebind_success() noexcept
 {
   transparent_rebind_success_count_.fetch_add(1, std::memory_order_relaxed);

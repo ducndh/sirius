@@ -31,6 +31,7 @@
 #include "pipeline/sirius_pipeline.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
 #include "sirius_context.hpp"
+#include "vss/block_host_rows.hpp"
 #include "vss/bound_gemm.hpp"
 #include "vss/cluster_fold.hpp"
 #include "vss/cluster_lists.hpp"
@@ -108,6 +109,10 @@ constexpr double kSweep0RankedSliceMacs = 0x1p24;
 
 /// Share of the device one probe block over a scanned corpus may plan for.
 constexpr double kScannedBlockDeviceShare = 0.8;
+
+/// Share of the host pool the probe rows of the blocks in flight may plan for. Below the 80 % at
+/// which the host's downgrade monitor stops by default, so they do not spill themselves.
+constexpr double kBlockRowsHostShare = 0.6;
 
 /// Probe blocks at once over a scanned corpus (SIRIUS_VSS_DEVICE_BLOCK_TASKS, default 1).
 std::size_t scanned_block_tasks()
@@ -493,7 +498,7 @@ class materialized_chunk_source : public vector_chunk_source {
       if (auto const layout = spilled_layout(ro, _column_index)) {
         std::shared_ptr<cucascade::memory::reservation> reservation;
         if (own_reservation) {
-          reservation = reserve_or_spill(space, layout->bytes);
+          reservation = vss::reserve_or_spill(_ctx, space, layout->bytes);
           if (!reservation) {
             vss::throw_staging_shortfall(
               space,
@@ -518,7 +523,7 @@ class materialized_chunk_source : public vector_chunk_source {
 
     std::shared_ptr<cucascade::memory::reservation> reservation;
     if (own_reservation) {
-      reservation = reserve_or_spill(space, bytes);
+      reservation = vss::reserve_or_spill(_ctx, space, bytes);
       if (!reservation) {
         vss::throw_staging_shortfall(
           space, bytes, "[sirius_physical_vector_join_stream] batch " + std::to_string(i));
@@ -550,31 +555,6 @@ class materialized_chunk_source : public vector_chunk_source {
   [[nodiscard]] std::size_t row_bytes() const
   {
     return static_cast<std::size_t>(_dim) * sizeof(float);
-  }
-
-  // The device can be full of build-side batches this fold has already read, and nothing but
-  // the downgrade executor will move them: a task's own reservation request does not, and a
-  // blocking wait for memory that no one is freeing never returns. So ask it directly, the way
-  // the pipeline executor does for a short task reservation, until the copy-back fits or
-  // there is nothing left it may spill.
-  std::unique_ptr<cucascade::memory::reservation> reserve_or_spill(
-    cucascade::memory::memory_space& space, std::size_t bytes) const
-  {
-    auto res = space.make_reservation_or_null(bytes);
-    if (res || _ctx == nullptr) { return res; }
-    std::unique_ptr<cucascade::memory::reservation> got;
-    std::mutex m;
-    _ctx->get_downgrade_executor(space.get_id())
-      .request_downgrade([&]() {
-        std::lock_guard<std::mutex> const lock(m);
-        if (!got) {
-          auto r = space.make_reservation_or_null(bytes);
-          if (r && r->size() >= bytes) { got = std::move(r); }
-        }
-        return got != nullptr;
-      })
-      .get();
-    return got;
   }
 
   [[nodiscard]] std::shared_ptr<cucascade::data_batch> fetch(std::uint64_t id) const
@@ -1321,6 +1301,15 @@ void sirius_physical_vector_join_stream::initialize_locked()
     }
   }
   plan_probe_blocks_locked();
+  if (!_blocks.empty() && block_rows_on_host() && _host_rows_repo == nullptr &&
+      _sirius_ctx != nullptr && get_pipeline() != nullptr) {
+    auto manager = _sirius_ctx->get_data_repository_manager(get_pipeline()->get_query_id());
+    if (manager) {
+      auto repo       = std::make_unique<cucascade::shared_data_repository>();
+      _host_rows_repo = repo.get();
+      manager->add_new_repository(get_operator_id(), "host_rows", std::move(repo));
+    }
+  }
   // Lists on the device leave this join's tasks the rest of it, which the engine cannot enlarge by
   // moving anything. As many tasks may hold memory at once as fit there. The materialize stage runs
   // in the same task after the search has freed its scratch, so a task needs the search's estimate;
@@ -1460,18 +1449,25 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
       block_rows,
       static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) /
         std::max<std::int64_t>(_request.n_probes, 1));
-    // The rows sit outside the host pool, beside it. Half the pool's size leaves the rest of the
-    // process and the limit it runs under some room.
+    // The rows live in the host pool. With a disk tier all else there can move out of their way, so
+    // they plan on a share of its size; without one nothing there can leave, so on a share of what
+    // is free now, the rest of which still has to take what the device spills. Never less than the
+    // floor of the budget above: a block that then finds no room keeps its rows on the device.
     if (_sirius_ctx != nullptr) {
-      auto const hosts = _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(
-        cucascade::memory::Tier::HOST);
+      auto& memory      = _sirius_ctx->get_memory_manager();
+      auto const hosts  = memory.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      bool const spills = !memory.get_memory_spaces_for_tier(cucascade::memory::Tier::DISK).empty();
       if (!hosts.empty()) {
-        block_rows = std::max<std::int64_t>(
-          1,
-          std::min<std::int64_t>(block_rows,
-                                 static_cast<std::int64_t>(hosts.front()->get_max_memory() / 2 /
-                                                           (static_cast<std::size_t>(_request.dim) *
-                                                            sizeof(float)))));
+        auto const room =
+          spills ? hosts.front()->get_max_memory()
+                 : std::min(hosts.front()->get_max_memory(), hosts.front()->get_available_memory());
+        auto const per_task = kBlockRowsHostShare * static_cast<double>(room) /
+                              static_cast<double>(scanned_block_tasks());
+        block_rows =
+          std::min(block_rows,
+                   std::max(static_cast<std::int64_t>(
+                              per_task / (static_cast<double>(_request.dim) * sizeof(float))),
+                            std::int64_t{1} << 14));
       }
     }
   }
@@ -1522,6 +1518,21 @@ void sirius_physical_vector_join_stream::on_finalize_operator()
   // The lists outlive the query in the session's index cache; only this query's references go.
   drain(_lists_repo);
   _lists_repo = nullptr;
+  if (_host_rows_repo != nullptr && _sirius_ctx != nullptr) {
+    _sirius_ctx->record_vector_join_host_left(_host_rows_repo->total_size());
+  }
+  drain(_host_rows_repo);
+  if (_host_rows_repo != nullptr && _sirius_ctx != nullptr &&
+      std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
+    auto const stats = _sirius_ctx->get_vector_join_host_rows_stats();
+    std::fprintf(stderr,
+                 "[vecjoin-phase] block rows this session: %llu batches, %llu restored from disk, "
+                 "%llu blocks on the device\n",
+                 static_cast<unsigned long long>(stats.batches_made),
+                 static_cast<unsigned long long>(stats.batches_restored),
+                 static_cast<unsigned long long>(stats.blocks_on_device));
+  }
+  _host_rows_repo = nullptr;
   _corpus_key.reset();
   _layout_key.reset();
   _layout_key_host    = {};
@@ -1983,28 +1994,48 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // Every pass of a block over a scanned corpus reads the corpus again, so the rows a block holds
   // set the cost, and a block's FP32 rows are its largest part on the device (4 KB of ~10 KB a row
   // at 1,024-d). The filter reads their FP16 copy; only routing, rounding and the re-score read
-  // FP32, a piece or a few rows at a time. So they stay on the host, outside the pool: host memory
-  // is the larger side wherever the device is the limit.
-  bool probe_rows_on_host = block != nullptr && block_rows_on_host();
-  std::unique_ptr<float[]> host_probe;
+  // FP32, a piece or a few rows at a time. So they stay on the host, as engine batches in the pool
+  // that are idle between those reads and go with this object however the task ends.
+  bool probe_rows_on_host = false;
+  std::optional<vss::block_host_rows> host_rows;
+  auto const load_start = std::chrono::steady_clock::now();
+  if (block != nullptr && block_rows_on_host() && _host_rows_repo != nullptr) {
+    auto const hosts =
+      _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+    host_rows.emplace(*_host_rows_repo,
+                      const_cast<cucascade::memory::memory_space&>(*hosts.front()),
+                      *_sirius_ctx,
+                      block->rows,
+                      dim,
+                      stream);
+    probe_rows_on_host = host_rows->make_room_for_block();
+    for (auto piece = block->pieces.begin(); probe_rows_on_host && piece != block->pieces.end();
+         ++piece) {
+      auto const chunk = _probe->stage_for_task(piece->chunk, *mem_space, stream);
+      auto const rows  = vss::list_column_as_dataset_view(chunk.view, dim);
+      probe_rows_on_host =
+        host_rows->append(rows.data_handle() + piece->begin * dim, piece->end - piece->begin);
+    }
+    // No room in the pool, even after spilling what the engine may: the search is the same with
+    // the rows on the device, where a real shortage is the engine's to retry.
+    if (!probe_rows_on_host) {
+      host_rows.reset();
+      _sirius_ctx->record_vector_join_block_on_device();
+      SIRIUS_LOG_WARN(
+        "[sirius_physical_vector_join_stream] no room in the host pool for a block of {} probe "
+        "rows; keeping them on the device",
+        block->rows);
+    }
+    if (std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
+      std::fprintf(
+        stderr,
+        "[vecjoin-phase] block rows to host    %8.3f s\n",
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - load_start).count());
+    }
+  }
   if (block == nullptr) {
     staged_probe = _probe->stage_for_task(left_idx, *mem_space, stream);
-  } else if (probe_rows_on_host) {
-    host_probe = std::make_unique_for_overwrite<float[]>(static_cast<std::size_t>(block->rows * dim));
-    std::size_t at = 0;
-    for (auto const& piece : block->pieces) {
-      auto const chunk  = _probe->stage_for_task(piece.chunk, *mem_space, stream);
-      auto const rows   = vss::list_column_as_dataset_view(chunk.view, dim);
-      auto const values = static_cast<std::size_t>((piece.end - piece.begin) * dim);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(host_probe.get() + at,
-                                    rows.data_handle() + piece.begin * dim,
-                                    values * sizeof(float),
-                                    cudaMemcpyDeviceToHost,
-                                    stream.value()));
-      stream.synchronize();
-      at += values;
-    }
-  } else {
+  } else if (!probe_rows_on_host) {
     block_probe.emplace(static_cast<std::size_t>(block->rows * dim), stream, mr);
     std::size_t at = 0;
     for (auto const& piece : block->pieces) {
@@ -2402,18 +2433,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       unit_cosine || direct_cosine
         ? raft::make_device_matrix_view<const float, int64_t>(unit_probe->data(), n_left, dim)
         : queries;
-    // One piece of a block's host rows at a time on the device. The source is pageable, so the copy
-    // has completed when the call returns.
+    // One piece of a block's host rows at a time on the device.
     auto for_each_host_piece = [&](auto&& use) {
       constexpr std::int64_t kPieceRows = std::int64_t{1} << 17;
       for (std::int64_t at = 0; at < n_left; at += kPieceRows) {
         auto const rows = std::min(kPieceRows, n_left - at);
         rmm::device_uvector<float> piece(static_cast<std::size_t>(rows * dim), stream, mr);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(piece.data(),
-                                      host_probe.get() + at * dim,
-                                      piece.size() * sizeof(float),
-                                      cudaMemcpyHostToDevice,
-                                      stream.value()));
+        host_rows->copy_to_device(at, rows, piece.data());
         use(piece.data(), at, rows);
         stream.synchronize();
       }
@@ -2829,15 +2855,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto block_rows_to_device = [&] {
       if (!probe_rows_on_host) { return; }
       block_probe.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(block_probe->data(),
-                                    host_probe.get(),
-                                    block_probe->size() * sizeof(float),
-                                    cudaMemcpyHostToDevice,
-                                    stream.value()));
+      host_rows->copy_to_device(0, n_left, block_probe->data());
       search_queries = raft::make_device_matrix_view<float const, std::int64_t>(
         block_probe->data(), n_left, dim);
       routed_queries.resize(static_cast<std::size_t>(max_routed * dim), stream);
-      host_probe.reset();
+      host_rows.reset();
       probe_rows_on_host = false;
     };
     if (!scan_f16_shape) { block_rows_to_device(); }
@@ -3193,11 +3215,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           rows[to] = slot;
         }
         staged.resize(distinct.size() * static_cast<std::size_t>(dim));
-        for (std::size_t i = 0; i < distinct.size(); ++i) {
-          std::memcpy(staged.data() + i * static_cast<std::size_t>(dim),
-                      host_probe.get() + static_cast<std::int64_t>(distinct[i]) * dim,
-                      row_bytes);
-          host_row_slot[static_cast<std::size_t>(distinct[i])] = -1;
+        host_rows->gather(distinct.data(), distinct.size(), staged.data());
+        for (auto const row : distinct) {
+          host_row_slot[static_cast<std::size_t>(row)] = -1;
         }
         rmm::device_uvector<float> device_rows(staged.size(), stream, mr);
         rmm::device_uvector<std::int32_t> slots(to - from, stream, mr);
@@ -4118,11 +4138,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                             stream.value()));
               stream.synchronize();
               std::vector<float> gathered(static_cast<std::size_t>(m * dim));
-              for (std::size_t i = 0; i < slice_rows_c.size(); ++i) {
-                std::memcpy(gathered.data() + i * static_cast<std::size_t>(dim),
-                            host_probe.get() + slice_rows_c[i] * dim,
-                            static_cast<std::size_t>(dim) * sizeof(float));
-              }
+              host_rows->gather(slice_rows_c.data(), slice_rows_c.size(), gathered.data());
               // From a pageable vector, so the copy has completed when the call returns.
               CUDF_CUDA_TRY(cudaMemcpyAsync(routed_queries.data(),
                                             gathered.data(),
