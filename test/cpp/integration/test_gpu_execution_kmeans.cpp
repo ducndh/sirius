@@ -3748,6 +3748,24 @@ TEST_CASE_METHOD(KMeansFixture,
   CHECK(payload == 3 * std::int64_t{1000000007});
 }
 
+TEST_CASE_METHOD(KMeansFixture,
+                 "a probe row whose clusters hold fewer than k corpus rows is refused",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][scan_bounded]")
+{
+  create_wide_clustered_join(*this, "srt", false, false, 16, 8000, 600);
+  run_ok("SELECT * FROM pin_table(name => 'srt_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM sirius_kmeans_build_lists('srt_corpus','vec','srt_c');");
+  auto const join = [](int n_probes) {
+    return "SELECT left_id, distance FROM sirius_knn_join('srt_probe','vec','srt_corpus','vec', "
+           "search_mode => 'approx', metric => 'l2', k => 1000, clustering => 'srt_c', n_probes "
+           "=> " +
+           std::to_string(n_probes) + ");";
+  };
+  // 16 clusters of about 500 rows: one holds too few for k = 1000, all of them enough.
+  expect_error(*con, join(1), "raise n_probes");
+  CHECK(distance_multiset(*con, join(16)).size() == 600u * 1000u);
+}
+
 TEST_CASE_METHOD(
   KMeansFixture,
   "a scanned self-join answers the same whatever its probe blocks",

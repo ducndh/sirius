@@ -38,6 +38,7 @@
 #include "vss/distance_metric.hpp"
 #include "vss/join_result_shaping.hpp"
 #include "vss/pinned_column.hpp"
+#include "vss/routed_edges.hpp"
 #include "vss/size_limits.hpp"
 #include "vss/spilled_read.hpp"
 #include "vss/staging_shortfall.hpp"
@@ -2564,145 +2565,75 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // run contiguous, but a row at the edge of its cluster has its neighbours next door, and
     // that cost about 3x the probes at equal recall. Contiguity comes back below by sorting
     // the (row, cluster) edges by cluster instead.
-    vss::assignment_spec routing;
-    routing.n_probes = n_probes;
     auto const n_edges = n_left * n_probes;  // row-major [n_left x n_probes]
-    vss::cluster_assignment assignment;
-    if (probe_rows_on_host) {
-      auto const edges       = vss::column_size(n_edges, "vector join routing");
-      assignment.row_ids     = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
-                                                     edges,
-                                                     cudf::mask_state::UNALLOCATED,
-                                                     stream,
-                                                     mr);
-      assignment.cluster_ids = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                                         edges,
-                                                         cudf::mask_state::UNALLOCATED,
-                                                         stream,
-                                                         mr);
+    auto edge_clusters = [&] {
+      if (!probe_rows_on_host) {
+        return vss::nearest_centroid_ids(
+          res, queries, _centroids->view(), dim, n_probes, metric, stream, mr);
+      }
+      rmm::device_uvector<std::int32_t> all(
+        static_cast<std::size_t>(vss::column_size(n_edges, "vector join routing")), stream, mr);
       for_each_host_piece([&](float const* rows, std::int64_t at, std::int64_t n) {
-        auto part = vss::assign_to_centroids(
+        auto const part = vss::nearest_centroid_ids(
           res,
           raft::make_device_matrix_view<float const, std::int64_t>(rows, n, dim),
           _centroids->view(),
           dim,
-          routing,
-          at,
+          n_probes,
           metric,
           stream,
           mr);
-        auto const first = at * n_probes;
-        auto const count = static_cast<std::size_t>(n * n_probes);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(
-          assignment.row_ids->mutable_view().data<std::int64_t>() + first,
-          part.row_ids->view().data<std::int64_t>(),
-          count * sizeof(std::int64_t),
-          cudaMemcpyDeviceToDevice,
-          stream.value()));
-        CUDF_CUDA_TRY(cudaMemcpyAsync(
-          assignment.cluster_ids->mutable_view().data<std::int32_t>() + first,
-          part.cluster_ids->view().data<std::int32_t>(),
-          count * sizeof(std::int32_t),
-          cudaMemcpyDeviceToDevice,
-          stream.value()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(all.data() + at * n_probes,
+                                      part.data(),
+                                      part.size() * sizeof(std::int32_t),
+                                      cudaMemcpyDeviceToDevice,
+                                      stream.value()));
         stream.synchronize();
       });
-    } else {
-      assignment = vss::assign_to_centroids(
-        res, queries, _centroids->view(), dim, routing, 0, metric, stream, mr);
-    }
+      return all;
+    }();
     phase("assign probe->clusters");
 
     // A row whose clusters cannot supply k is refused before a single search is issued, rather
-    // than after the merge has silently padded its answer out with misses. The edge list is
-    // row-major, so a row's clusters are n_probes consecutive entries.
-    std::vector<std::int32_t> host_edges(static_cast<std::size_t>(n_edges));
-    CUDF_CUDA_TRY(cudaMemcpyAsync(host_edges.data(),
-                                  assignment.cluster_ids->view().data<std::int32_t>(),
-                                  host_edges.size() * sizeof(std::int32_t),
-                                  cudaMemcpyDeviceToHost,
-                                  stream.value()));
-    stream.synchronize();
-    std::vector<bool> wanted(static_cast<std::size_t>(_n_clusters), false);
-    std::vector<std::int64_t> edge_begin(static_cast<std::size_t>(_n_clusters) + 1, 0);
-    for (std::int64_t r = 0; r < n_left; ++r) {
+    // than after the merge has silently padded its answer out with misses.
+    auto edge_keys = vss::key_routed_edges(
+      std::move(edge_clusters), n_left, n_probes, _cluster_rows, k_join, stream, mr);
+    if (edge_keys.refused_row >= 0) {
+      auto const r            = edge_keys.refused_row;
       std::int64_t candidates = 0;
-      for (std::int64_t t = 0; t < n_probes; ++t) {
-        auto const c = host_edges[static_cast<std::size_t>(r * n_probes + t)];
+      for (auto const c : edge_keys.refused_clusters) {
         if (c < 0 || c >= _n_clusters) {
           throw std::runtime_error("[sirius_physical_vector_join_stream] probe row " +
                                    std::to_string(r) + " was routed to cluster id " +
                                    std::to_string(c) + ", outside the clustering's " +
                                    std::to_string(_n_clusters) + " clusters");
         }
-        ++edge_begin[static_cast<std::size_t>(c) + 1];
-        auto const rows = _cluster_rows[static_cast<std::size_t>(c)];
-        candidates += rows;
-        if (rows > 0) { wanted[static_cast<std::size_t>(c)] = true; }
+        candidates += _cluster_rows[static_cast<std::size_t>(c)];
       }
       if (candidates == 0) {
         throw std::runtime_error("[sirius_physical_vector_join_stream] probe row " +
                                  std::to_string(r) + " reached no non-empty corpus cluster");
       }
-      if (candidates < k_join) {
-        throw std::runtime_error("[sirius_physical_vector_join_stream] probe row " +
-                                 std::to_string(r) + " reaches only " + std::to_string(candidates) +
-                                 " corpus rows, fewer than k=" + std::to_string(k_join) +
-                                 "; raise n_probes or cluster with fewer, larger clusters");
-      }
+      throw std::runtime_error("[sirius_physical_vector_join_stream] probe row " +
+                               std::to_string(r) + " reaches only " + std::to_string(candidates) +
+                               " corpus rows, fewer than k=" + std::to_string(k_join) +
+                               "; raise n_probes or cluster with fewer, larger clusters");
     }
-    for (std::size_t c = 0; c < static_cast<std::size_t>(_n_clusters); ++c) {
-      edge_begin[c + 1] += edge_begin[c];
-    }
-    std::vector<std::int64_t> nearest_edges(static_cast<std::size_t>(_n_clusters), 0);
-    for (std::int64_t r = 0; r < n_left; ++r) {
-      ++nearest_edges[static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)])];
-    }
+    auto const nearest_cluster = std::move(edge_keys.nearest_cluster);
     phase("edges to host");
 
     // Sorted by cluster, each cluster's rows are one contiguous range of the edge list. That
     // range is what a slice's search gathers its queries from and what its answer folds back
-    // through. Only the per-cluster counts are needed to place the ranges, and those are
-    // already on the host, so the sorted labels never come back.
-    // Within a cluster, the rows for which it is the nearest cluster come first: the bounded search
-    // below seeds every row from its nearest cluster before it searches any of the others. Rows
-    // then run in probe order, which keeps a tile's probe-row loads close together.
-    auto const sorted = [&] {
-      cudf::numeric_scalar<std::int32_t> const edge0(0, true, stream), edge_step(1, true, stream);
-      cudf::numeric_scalar<std::int32_t> const probes_scalar(
-        static_cast<std::int32_t>(n_probes), true, stream);
-      auto const edge_ids =
-        cudf::sequence(static_cast<cudf::size_type>(n_edges), edge0, edge_step, stream, mr);
-      auto const edge_rank = cudf::binary_operation(edge_ids->view(),
-                                                    probes_scalar,
-                                                    cudf::binary_operator::MOD,
-                                                    cudf::data_type{cudf::type_id::INT32},
-                                                    stream,
-                                                    mr);
-      cudf::numeric_scalar<std::int32_t> const rank0(0, true, stream);
-      auto const later_edge = cudf::binary_operation(edge_rank->view(),
-                                                     rank0,
-                                                     cudf::binary_operator::GREATER,
-                                                     cudf::data_type{cudf::type_id::BOOL8},
-                                                     stream,
-                                                     mr);
-      auto const order      = cudf::sorted_order(
-        cudf::table_view{
-               {assignment.cluster_ids->view(), later_edge->view(), assignment.row_ids->view()}},
-        {},
-        {},
-        stream,
-        mr);
-      return cudf::gather(cudf::table_view{{assignment.row_ids->view()}},
-                                       order->view(),
-                                       cudf::out_of_bounds_policy::DONT_CHECK,
-                                       stream,
-                                       mr);
-    }();
-    // The sort's inputs are done with; an edge costs its sorted row from here on.
-    stream.synchronize();
-    assignment = vss::cluster_assignment{};
-    auto const sorted_rows = sorted->get_column(0).view();  // INT64 probe row per edge
+    // through. Within a cluster, the rows for which it is the nearest cluster come first: the
+    // bounded search below seeds every row from its nearest cluster before it searches any of the
+    // others. Rows then run in probe order, which keeps a tile's probe-row loads close together.
+    auto const routed         = vss::sort_routed_edges(std::move(edge_keys), stream, mr);
+    auto const& edge_begin    = routed.edge_begin;
+    auto const& nearest_edges = routed.nearest_edges;
+    std::vector<bool> wanted(static_cast<std::size_t>(_n_clusters));
+    for (std::size_t c = 0; c < wanted.size(); ++c) {
+      wanted[c] = edge_begin[c + 1] > edge_begin[c] && _cluster_rows[c] > 0;
+    }
     phase("sort edges");
 
     // The prune, made explicit: a chunk holding no cluster any row wants is never staged, so
@@ -2737,7 +2668,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                             : *std::max_element(nearest_edges.begin(), nearest_edges.end());
     rmm::device_uvector<float> routed_queries(
       static_cast<std::size_t>((probe_rows_on_host ? max_nearest : max_routed) * dim), stream, mr);
-    auto const* routed_rows = sorted_rows.data<std::int64_t>();
+    auto const* routed_rows = reinterpret_cast<std::int64_t const*>(routed.rows.data());
 
     // Running [n_left x k_join] accumulator in the caller's row order, seeded with misses so
     // a row's first answer merges against nothing. Each slice folds its answer in through the
@@ -4116,7 +4047,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       std::vector<std::int32_t> count(static_cast<std::size_t>(n_left));
       std::int64_t max_count = 0;
       for (std::int64_t r = 0; r < n_left; ++r) {
-        auto const c = static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]);
+        auto const c = static_cast<std::size_t>(nearest_cluster[static_cast<std::size_t>(r)]);
         auto const lo                      = _lists->offsets[c];
         first[static_cast<std::size_t>(r)] = lo;
         count[static_cast<std::size_t>(r)] =
@@ -4128,12 +4059,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       {
         std::vector<std::int64_t> at(_lists->offsets.size(), 0);
         for (std::int64_t r = 0; r < n_left; ++r) {
-          ++at[static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]) + 1];
+          ++at[static_cast<std::size_t>(nearest_cluster[static_cast<std::size_t>(r)]) + 1];
         }
         std::partial_sum(at.begin(), at.end(), at.begin());
         for (std::int64_t r = 0; r < n_left; ++r) {
-          auto const c =
-            static_cast<std::size_t>(host_edges[static_cast<std::size_t>(r * n_probes)]);
+          auto const c = static_cast<std::size_t>(nearest_cluster[static_cast<std::size_t>(r)]);
           order[static_cast<std::size_t>(at[c]++)] = r;
         }
       }

@@ -24,6 +24,7 @@
 #include <raft/core/device_resources.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_uvector.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuvs/distance/distance.hpp>
@@ -215,6 +216,19 @@ struct strided_rows {
                                                      cuvs::distance::DistanceType metric,
                                                      rmm::cuda_stream_view stream,
                                                      rmm::device_async_resource_ref mr);
+
+/// The @p n_probes nearest centroids of each row, row-major and nearest first: what
+/// @ref assign_to_centroids puts in @c cluster_ids, without the row ids and distances it makes
+/// beside them. @p n_probes must be in [1, the number of centroids].
+[[nodiscard]] rmm::device_uvector<std::int32_t> nearest_centroid_ids(
+  raft::device_resources const& res,
+  dataset_matrix_view queries,
+  cudf::column_view const& centroids,
+  std::int64_t dim,
+  std::int64_t n_probes,
+  cuvs::distance::DistanceType metric,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 /**
  * @brief Each row's nearest centroid, for the many chunks one list build assigns to one clustering.
