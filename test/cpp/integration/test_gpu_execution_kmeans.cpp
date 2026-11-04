@@ -3377,6 +3377,178 @@ TEST_CASE_METHOD(KMeansFixture,
 }
 
 TEST_CASE_METHOD(KMeansFixture,
+                 "a single float16 list bounds each row from its codes with no seed, exactly",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][vector_join]")
+{
+  // One list, so the join is exact and DuckDB's array_distance on the CPU the reference. The near
+  // table's components round to 8000 or 8004 in half, so codes say little and a limit that fell
+  // short of the true k-th would drop true pairs; 3,000 rows in pieces from 64, so several trims.
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_F16_NO_SEED");
+      ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    }
+  } unset_env;
+  struct set_shape {
+    std::string prefix, value;
+  };
+  std::vector<set_shape> const sets{
+    {"nsr", "(8000.0 + (hash(i * 1000 + d + SEED) % 16)::FLOAT * 0.25)::FLOAT"},
+    {"nsu", "((hash(i * 1000 + d + SEED) % 1000)::FLOAT / 1000.0)::FLOAT"}};
+  for (auto const& set : sets) {
+    auto const gen = [&](std::string const& seed) {
+      auto value = set.value;
+      value.replace(value.find("SEED"), 4, seed);
+      return "list_transform(range(16), lambda d: " + value + ")::FLOAT[16]";
+    };
+    auto const& p = set.prefix;
+    run_ok("CREATE TABLE " + p + "_corpus AS SELECT i::INTEGER AS id, " + gen("0") +
+           " AS vec FROM range(3000) t(i);");
+    run_ok("CREATE TABLE " + p + "_probe AS SELECT i::INTEGER AS id, " + gen("7777777") +
+           " AS vec FROM range(300) t(i);");
+    run_ok("CHECKPOINT;");
+    run_ok("SELECT * FROM pin_table(name => '" + p +
+           "_corpus', tier => 'gpu', format => 'duckdb');");
+    run_ok("SELECT * FROM pin_table(name => '" + p +
+           "_probe', tier => 'gpu', format => 'duckdb');");
+    run_ok("SELECT * FROM sirius_kmeans_fit('" + p + "_corpus','vec', name => '" + p +
+           "_c', n_clusters => 1);");
+    run_ok("SELECT * FROM sirius_kmeans_build_lists('" + p + "_corpus','vec','" + p +
+           "_c', storage => 'float16');");
+    auto const join = "SELECT left_id, distance FROM sirius_knn_join('" + p + "_probe','vec','" +
+                      p + "_corpus','vec', metric => 'l2', k => 10, search_mode => 'approx', " +
+                      "clustering => '" + p + "_c', n_probes => 1);";
+    auto const reference = cpu_exact_top_k(*con, p, 10, 1);
+    INFO("table " << p);
+    ::setenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG", "1", 1);
+    std::string log;
+    {
+      stderr_to_string capture{log};
+      CHECK(relative_mismatches(exact_distances(*con, join), reference) == 0);
+    }
+    ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    INFO(log);
+    CHECK(log.find("single list without a seed 1") != std::string::npos);
+    ::setenv("SIRIUS_VSS_F16_NO_SEED", "0", 1);
+    CHECK(relative_mismatches(exact_distances(*con, join), reference) == 0);
+    ::unsetenv("SIRIUS_VSS_F16_NO_SEED");
+    run_ok("SELECT * FROM unpin_table('" + p + "_probe');");
+    run_ok("SELECT * FROM unpin_table('" + p + "_corpus');");
+  }
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "read-free float16 bounds stay off where they do not apply",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][vector_join]")
+{
+  // By the phase log: byte and int8 codes, a scanned corpus, a radius (with its keyed and
+  // best-match forms) and an inner product take none of them, whatever the sweep-0 rule says. Their
+  // answers are the older tests' to check.
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_SWEEP0");
+      ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    }
+  } unset_env;
+  ::setenv("SIRIUS_VSS_SWEEP0", "ranked", 1);
+  auto const uniform = [](std::string const& seed, std::string const& scale) {
+    return "list_transform(range(32), lambda d: ((hash(i * 1000 + d + " + seed + ") % 256)::FLOAT" +
+           scale + ")::FLOAT)::FLOAT[32]";
+  };
+  run_ok("CREATE TABLE off_corpus AS SELECT i::INTEGER AS id, i % 7 AS grp, " +
+         uniform("0", " / 256.0") + " AS vec FROM range(4000) t(i);");
+  run_ok("CREATE TABLE off_probe AS SELECT i::INTEGER AS id, " + uniform("7777777", " / 256.0") +
+         " AS vec FROM range(600) t(i);");
+  run_ok("CREATE TABLE off_bytes AS SELECT i::INTEGER AS id, " + uniform("0", "") +
+         " AS vec FROM range(4000) t(i);");
+  run_ok("CREATE TABLE off_bytes_probe AS SELECT i::INTEGER AS id, " + uniform("7777777", "") +
+         " AS vec FROM range(600) t(i);");
+  run_ok("CHECKPOINT;");
+  for (auto const* t : {"off_corpus", "off_probe", "off_bytes", "off_bytes_probe"}) {
+    run_ok("SELECT * FROM pin_table(name => '" + std::string{t} +
+           "', tier => 'gpu', format => 'duckdb');");
+  }
+  auto const lists = [&](std::string const& corpus,
+                         std::string const& name,
+                         int clusters,
+                         std::string const& storage) {
+    run_ok("SELECT * FROM sirius_kmeans_fit('" + corpus + "','vec', name => '" + name +
+           "', n_clusters => " + std::to_string(clusters) + ", seed => 3);");
+    run_ok("SELECT * FROM sirius_kmeans_build_lists('" + corpus + "','vec','" + name +
+           "', storage => '" + storage + "');");
+  };
+  lists("off_corpus", "off_f16", 8, "float16");
+  lists("off_corpus", "off_one", 1, "float16");
+  lists("off_corpus", "off_i8", 8, "int8");
+  lists("off_corpus", "off_i8one", 1, "int8");
+  lists("off_bytes", "off_u8", 8, "uint8");
+  lists("off_bytes", "off_u8one", 1, "uint8");
+  create_wide_clustered_join(*this, "offs", false, false, 16, 20000, 100);
+  auto const paths_of = [&](std::string const& sql) {
+    ::setenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG", "1", 1);
+    std::string log;
+    {
+      stderr_to_string capture{log};
+      ok_rows(*con, sql);
+    }
+    ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    return log;
+  };
+  auto const knn = [](std::string const& probe,
+                      std::string const& corpus,
+                      std::string const& clustering,
+                      int probes,
+                      std::string const& extra) {
+    return "SELECT left_id, right_id FROM sirius_knn_join('" + probe + "','vec','" + corpus +
+           "','vec', k => 10, search_mode => 'approx', clustering => '" + clustering +
+           "', n_probes => " + std::to_string(probes) + extra + ");";
+  };
+  auto const radius = [](std::string const& clustering, int probes, std::string const& extra) {
+    return "SELECT left_id, right_id FROM sirius_knn_join('off_corpus','vec','off_corpus','vec', "
+           "metric => 'l2', join_mode => 'threshold', eps => 1.0, search_mode => 'approx', "
+           "clustering => '" +
+           clustering + "', n_probes => " + std::to_string(probes) + extra + ");";
+  };
+  struct off_case {
+    std::string name, sql;
+  };
+  std::vector<off_case> const cases{
+    {"int8 lists", knn("off_probe", "off_corpus", "off_i8", 8, ", metric => 'l2'")},
+    {"one int8 list", knn("off_probe", "off_corpus", "off_i8one", 1, ", metric => 'l2'")},
+    {"byte lists", knn("off_bytes_probe", "off_bytes", "off_u8", 8, ", metric => 'l2'")},
+    {"one byte list", knn("off_bytes_probe", "off_bytes", "off_u8one", 1, ", metric => 'l2'")},
+    {"scanned corpus",
+     "SELECT left_id, right_id FROM sirius_knn_join('offs_probe','vec','offs_corpus','vec', "
+     "search_mode => 'approx', metric => 'l2', k => 10, clustering => 'offs_c', "
+     "cluster_column => 'cluster_id', n_probes => 4, build_source => 'scan');"},
+    {"inner product", knn("off_probe", "off_corpus", "off_f16", 8, ", metric => 'ip'")},
+    {"radius", radius("off_f16", 8, "")},
+    {"radius over one list", radius("off_one", 1, "")},
+    {"radius, each pair once", radius("off_f16", 8, ", earlier_by => 'id'")},
+    {"radius, best match", radius("off_f16", 8, ", keep => 'best', other_by => 'id'")},
+  };
+  for (auto const& c : cases) {
+    INFO("case " << c.name << ": " << c.sql);
+    auto const log = paths_of(c.sql);
+    INFO(log);
+    CHECK(log.find("paths:") != std::string::npos);
+    CHECK(log.find("sweep-0 bound from codes 1") == std::string::npos);
+    CHECK(log.find("pairs to host 1") == std::string::npos);
+    CHECK(log.find("single list without a seed 1") == std::string::npos);
+  }
+  // That the lines above can fire at all: the same log on the shapes that take them.
+  auto const on = paths_of(knn("off_probe", "off_corpus", "off_f16", 8, ", metric => 'l2'"));
+  INFO(on);
+  CHECK(on.find("sweep-0 bound from codes 1") != std::string::npos);
+  CHECK(on.find("pairs to host 1") != std::string::npos);
+  auto const one = paths_of(knn("off_probe", "off_corpus", "off_one", 1, ", metric => 'l2'"));
+  INFO(one);
+  CHECK(one.find("single list without a seed 1") != std::string::npos);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
                  "an approximate join over a corpus without lists filters it in float16 exactly",
                  "[integration][gpu_execution][array][vss][kmeans][approx][scan_bounded]")
 {
