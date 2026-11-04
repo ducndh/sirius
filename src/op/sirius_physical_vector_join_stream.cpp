@@ -84,6 +84,7 @@
 #include <cstring>
 #include <deque>
 #include <format>
+#include <functional>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -793,6 +794,91 @@ void copy_earlier_keys(cudf::column_view const& keys,
   // The caller drops the staged chunk, and this drops the widened copy, once it returns.
   stream.synchronize();
 }
+
+constexpr std::int64_t kHostBlockPairs = std::int64_t{1} << 22;
+constexpr std::size_t kHostBlockBytes =
+  static_cast<std::size_t>(kHostBlockPairs) *
+  (sizeof(std::int32_t) + sizeof(std::int64_t) + sizeof(float));
+
+/// One block of pairs on the host: rows, ids and codes side by side, each with room for
+/// kHostBlockPairs. Pinned, because a copy to pageable memory runs at a fraction of the link's
+/// rate (2.3 GB/s against about 25 GB/s, RTX A5000).
+struct host_pair_block {
+  std::byte* mem = nullptr;
+  std::int64_t n = 0;
+  [[nodiscard]] std::int32_t* rows() const { return reinterpret_cast<std::int32_t*>(mem); }
+  [[nodiscard]] std::int64_t* ids() const
+  {
+    return reinterpret_cast<std::int64_t*>(mem + static_cast<std::size_t>(kHostBlockPairs) * 4);
+  }
+  [[nodiscard]] float* codes() const
+  {
+    return reinterpret_cast<float*>(mem + static_cast<std::size_t>(kHostBlockPairs) * 12);
+  }
+};
+
+/// A task's pairs on the host, in arrival order. Its blocks go back to the operator however the
+/// task ends.
+class host_pair_queue {
+ public:
+  explicit host_pair_queue(host_pair_block_pool& pool) : _pool(pool) {}
+  ~host_pair_queue()
+  {
+    while (!_held.empty()) {
+      drop_front();
+    }
+    give_back_spare();
+  }
+  host_pair_queue(host_pair_queue const&)            = delete;
+  host_pair_queue& operator=(host_pair_queue const&) = delete;
+
+  [[nodiscard]] bool empty() const { return _held.empty(); }
+  [[nodiscard]] host_pair_block const& front() const { return _held.front(); }
+  /// Blocks with room for @p pairs more, all of it or none: false when the budget would not cover
+  /// them. Taken before any copy is queued, so a failed pin leaves no copy in flight to a block.
+  [[nodiscard]] bool reserve(std::int64_t pairs, std::size_t budget_bytes)
+  {
+    auto room = (_held.empty() ? std::int64_t{0} : kHostBlockPairs - _held.back().n) +
+                static_cast<std::int64_t>(_spare.size()) * kHostBlockPairs;
+    while (room < pairs) {
+      auto* block = static_cast<std::byte*>(_pool.take(budget_bytes));
+      if (block == nullptr) {
+        give_back_spare();
+        return false;
+      }
+      _spare.push_back(block);
+      room += kHostBlockPairs;
+    }
+    return true;
+  }
+  /// The block the next pair goes in, from those reserved.
+  [[nodiscard]] host_pair_block& tail()
+  {
+    if (_held.empty() || _held.back().n == kHostBlockPairs) {
+      _held.push_back(host_pair_block{_spare.back(), 0});
+      _spare.pop_back();
+    }
+    return _held.back();
+  }
+  void drop_front()
+  {
+    _pool.give_back(_held.front().mem);
+    _held.pop_front();
+  }
+
+ private:
+  void give_back_spare()
+  {
+    for (auto* block : _spare) {
+      _pool.give_back(block);
+    }
+    _spare.clear();
+  }
+
+  host_pair_block_pool& _pool;
+  std::deque<host_pair_block> _held;
+  std::vector<std::byte*> _spare;
+};
 
 /// Whether the GEMM-ranked kernels replace cuVS where they can; SIRIUS_VSS_GEMM_TOPK=0 is the
 /// A/B switch back to cuVS for both the top-k and the threshold searches.
@@ -1508,9 +1594,48 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
   }
 }
 
+void* host_pair_block_pool::take(std::size_t budget_bytes)
+{
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (!_free.empty()) {
+      auto* block = _free.back();
+      _free.pop_back();
+      return block;
+    }
+    if ((_pinned + 1) * kHostBlockBytes > budget_bytes) { return nullptr; }
+    ++_pinned;
+  }
+  void* block       = nullptr;
+  auto const status = cudaMallocHost(&block, kHostBlockBytes);
+  if (status != cudaSuccess) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    --_pinned;
+  }
+  CUDF_CUDA_TRY(status);
+  return block;
+}
+
+void host_pair_block_pool::give_back(void* block)
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  _free.push_back(block);
+}
+
+void host_pair_block_pool::release()
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  for (auto* block : _free) {
+    cudaFreeHost(block);
+  }
+  _pinned -= _free.size();
+  _free.clear();
+}
+
 void sirius_physical_vector_join_stream::on_finalize_operator()
 {
   std::lock_guard<std::mutex> lg(_op_mutex);
+  _host_pair_blocks.release();
   auto drain = [](cucascade::shared_data_repository* repo) {
     if (repo == nullptr) { return; }
     for (std::size_t p = 0; p < repo->num_partitions(); ++p) {
@@ -3103,6 +3228,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     vss::gap_rescore_stats gap_stats{};
     std::int64_t gap_rescored = 0;
     std::optional<rmm::device_uvector<float>> gap_limit;
+    // Moved pairs back in the buffer: already counted as passed.
+    std::int64_t pairs_back = 0;
     // The terms the filter limit widens by (code_limits), turned around: a code distance as an
     // FP32 bound, exactly as the seeds raise theirs.
     auto code_terms = [&] {
@@ -3254,7 +3381,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto flush = [&] {
       if (pending == 0) { return; }
       ++bounded_merges;
-      bounded_emitted += pending;
+      bounded_emitted += pending - pairs_back;
+      pairs_back         = 0;
       auto const t0      = debug_mark();
       auto const* c_rows = candidates->rows.data();
       auto const* c_ids  = candidates->ids.data();
@@ -3552,6 +3680,237 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         deferred.clear();
       }
     };
+    // A top-k join's pairs wait in the buffer for their FP32 re-score, and a flush needs far more
+    // than the buffer holds: the re-score's and the merge's working space, about 64 B a pair beside
+    // the buffer's 16. Next to device lists that leave little free, a full buffer cannot flush, and
+    // on a corpus stored in cluster order, where a slice's pairs can themselves overflow the
+    // buffer, the task runs out of memory on every retry. So when a flush would not fit, the
+    // buffer's pairs move to pinned host blocks with no FP32 read and the sweep goes on; they come
+    // back at the end of the task in pieces small enough to flush. A slice that alone would need a
+    // buffer past what the device has is cut in two instead.
+    // Exactness, in the notation of the lemma above gap_trim. A moved pair is not in the
+    // accumulator and keeps its code. moved_codes holds row r's k smallest codes among all moved
+    // pairs, those trimmed since included. They are k distinct pairs, as a row visits a cluster
+    // once and a rollback discards what was not committed, each with delta <= U_r(c_(k)), so
+    // min(b_r, U_r(c_(k))) >= delta*_r may stand as b_r, whether or not earlier flushes filled the
+    // accumulator: those pairs are not in moved_codes, and they only lower b_r. A pair past its
+    // limit has delta > b_r >= delta*_r, strictly past the k-th, and is dropped. One float a row
+    // would not do: j pairs of one move could not count with k - j of a later one, the buffer being
+    // empty between them. Every pair kept goes through flush as any other does, whose merge takes
+    // the k smallest, so the answer is what flushing the whole buffer gives, up to which of several
+    // pairs tied at exactly the k-th it keeps.
+    // What waits on the host can reach probes x rows x 16 B when limits drop nothing, as in a large
+    // group of duplicates, so the blocks have a budget, shared by the join's tasks. Past it the
+    // pairs flush where they are if that fits, which the argument above allows: they stay among
+    // moved_codes' distinct pairs and leave the buffer. If it does not fit the query fails, with
+    // the numbers, instead of pinning until the process is killed.
+    // The shape is an FP16 sweep 1 over lists, which starts from a bound its codes gave and holds
+    // no pair yet. SIRIUS_VSS_PAIRS_TO_HOST=0 turns it off. For tests: =force moves after every
+    // group and cuts every slice that overflows the buffer, =force_no_flush also takes any flush
+    // past the budget not to fit, and SIRIUS_VSS_PAIRS_TO_HOST_BUDGET sets the budget in bytes.
+    constexpr std::size_t kFlushBytesPerPair     = 80;
+    constexpr std::size_t kFlushMargin           = std::size_t{1} << 28;
+    constexpr std::int64_t kBackPiecePairs       = std::int64_t{1} << 23;
+    std::string_view const pairs_to_host_setting = [] {
+      auto const* v = std::getenv("SIRIUS_VSS_PAIRS_TO_HOST");
+      return v == nullptr ? std::string_view{} : std::string_view{v};
+    }();
+    bool const pairs_to_host = sweep0_bound_from_codes && gap_rescore && !keyed && !best_only &&
+                               earlier_cut == nullptr && running_bound_rows == 0 &&
+                               pairs_to_host_setting != "0";
+    bool const budget_flush_refused = pairs_to_host_setting == "force_no_flush";
+    bool const pairs_to_host_forced =
+      pairs_to_host && (pairs_to_host_setting == "force" || budget_flush_refused);
+    std::size_t const pair_budget = pairs_to_host ? host_pair_budget() : 0;
+    host_pair_queue host_pairs{_host_pair_blocks};
+    std::optional<rmm::device_uvector<float>> moved_codes;
+    std::int64_t pair_moves = 0, slice_cuts = 0, pairs_moved = 0, budget_flushes = 0;
+    double host_seconds = 0;
+    auto device_room    = [&] {
+      auto const free_bytes = mem_space->get_available_memory(stream);
+      return free_bytes > kFlushMargin ? free_bytes - kFlushMargin : std::size_t{0};
+    };
+    auto move_pairs_to_host = [&] {
+      if (pending == 0) { return; }
+      auto const t0 = debug_mark();
+      bounded_emitted += pending - pairs_back;
+      pairs_back = 0;
+      if (!moved_codes) {
+        moved_codes.emplace(static_cast<std::size_t>(n_left * k_join), stream, mr);
+        vss::fill_bound(
+          moved_codes->data(), n_left * k_join, std::numeric_limits<float>::infinity(), stream);
+      }
+      vss::code_topk_merge(candidates->rows.data(),
+                           candidates->distances.data(),
+                           pending,
+                           moved_codes->data(),
+                           n_left,
+                           k_join,
+                           bound->data(),
+                           code_terms(),
+                           stream,
+                           mr);
+      refresh_code_limit(bound->data());
+      pending = vss::keep_within_row_limit(candidates->rows.data(),
+                                           candidates->ids.data(),
+                                           candidates->distances.data(),
+                                           pending,
+                                           code_limit->data(),
+                                           n_left,
+                                           k_join,
+                                           nullptr,
+                                           stream,
+                                           mr);
+      if (!host_pairs.reserve(pending, pair_budget)) {
+        pairs_back      = pending;
+        auto const need = static_cast<std::size_t>(pending) * kFlushBytesPerPair;
+        auto const room = device_room();
+        if (budget_flush_refused || need > room) {
+          throw std::runtime_error(
+            std::format("[sirius_physical_vector_join_stream] vector join of '{}' and '{}' (k {}, "
+                        "{} probes): {} pairs of this task wait on the host and {} more in the "
+                        "buffer have nowhere to go. The host budget for waiting pairs is {} MiB "
+                        "(half the host pool, less what the join already holds beside it), and a "
+                        "flush needs about {} MiB with {} MiB free on the device. A larger host "
+                        "pool or a smaller k may let it run.",
+                        _request.left.table,
+                        _request.right.table,
+                        k_join,
+                        _request.n_probes,
+                        pairs_moved,
+                        pending,
+                        pair_budget >> 20,
+                        need >> 20,
+                        room >> 20));
+        }
+        ++budget_flushes;
+        rollback();
+        flush();
+        return;
+      }
+      for (std::int64_t at = 0; at < pending;) {
+        auto& block      = host_pairs.tail();
+        auto const take  = std::min(pending - at, kHostBlockPairs - block.n);
+        auto const count = static_cast<std::size_t>(take);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(block.rows() + block.n,
+                                      candidates->rows.data() + at,
+                                      count * sizeof(std::int32_t),
+                                      cudaMemcpyDeviceToHost,
+                                      stream.value()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(block.ids() + block.n,
+                                      candidates->ids.data() + at,
+                                      count * sizeof(std::int64_t),
+                                      cudaMemcpyDeviceToHost,
+                                      stream.value()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(block.codes() + block.n,
+                                      candidates->distances.data() + at,
+                                      count * sizeof(float),
+                                      cudaMemcpyDeviceToHost,
+                                      stream.value()));
+        block.n += take;
+        at += take;
+      }
+      stream.synchronize();
+      pairs_moved += pending;
+      ++pair_moves;
+      pending = 0;
+      rollback();
+      if (dbg) { host_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
+    };
+    // The task's end: every row's bound is final once the last pairs have moved, and each piece's
+    // flush trims against it.
+    auto bring_pairs_back = [&] {
+      move_pairs_to_host();
+      auto const piece = std::clamp<std::int64_t>(
+        static_cast<std::int64_t>(device_room() / kFlushBytesPerPair),
+        std::min<std::int64_t>(std::int64_t{1} << 16, candidates->capacity()),
+        std::min(kBackPiecePairs, candidates->capacity()));
+      std::int64_t filled = 0;
+      auto flush_piece    = [&] {
+        if (filled == 0) { return; }
+        pending    = filled;
+        pairs_back = filled;
+        rollback();
+        flush();
+        filled = 0;
+      };
+      while (!host_pairs.empty()) {
+        auto const& block = host_pairs.front();
+        for (std::int64_t at = 0; at < block.n;) {
+          auto const take  = std::min(block.n - at, piece - filled);
+          auto const count = static_cast<std::size_t>(take);
+          CUDF_CUDA_TRY(cudaMemcpyAsync(candidates->rows.data() + filled,
+                                        block.rows() + at,
+                                        count * sizeof(std::int32_t),
+                                        cudaMemcpyHostToDevice,
+                                        stream.value()));
+          CUDF_CUDA_TRY(cudaMemcpyAsync(candidates->ids.data() + filled,
+                                        block.ids() + at,
+                                        count * sizeof(std::int64_t),
+                                        cudaMemcpyHostToDevice,
+                                        stream.value()));
+          CUDF_CUDA_TRY(cudaMemcpyAsync(candidates->distances.data() + filled,
+                                        block.codes() + at,
+                                        count * sizeof(float),
+                                        cudaMemcpyHostToDevice,
+                                        stream.value()));
+          stream.synchronize();
+          at += take;
+          filled += take;
+          if (filled == piece) { flush_piece(); }
+        }
+        host_pairs.drop_front();
+      }
+      flush_piece();
+    };
+    auto make_room = [&] {
+      if (pairs_to_host &&
+          (pairs_to_host_forced ||
+           static_cast<std::size_t>(pending) * kFlushBytesPerPair > device_room())) {
+        move_pairs_to_host();
+      } else {
+        flush();
+      }
+    };
+    // The slice is launched again after each change: the buffer's room, and the bound.
+    std::function<void(bounded_slice const&)> replay_slice = [&](bounded_slice const& sl) {
+      while (true) {
+        launch_bounded(sl);
+        auto const total = read_count();
+        if (total <= candidates->capacity()) {
+          pending = total;
+          return;
+        }
+        auto const slice_pairs = total - pending;
+        rollback();
+        if (pending > 0) {
+          make_room();
+          continue;
+        }
+        auto const want = slice_pairs + slice_pairs / 4;
+        if (pairs_to_host && sl.n > 1 &&
+            (pairs_to_host_forced ||
+             static_cast<std::size_t>(want) * kFlushBytesPerPair >
+               device_room() + static_cast<std::size_t>(candidates->capacity()) * 16)) {
+          ++slice_cuts;
+          auto lo = sl;
+          lo.n    = sl.n / 2;
+          auto hi = sl;
+          hi.x    = static_cast<std::byte const*>(sl.x) +
+                 static_cast<std::size_t>(lo.n) * static_cast<std::size_t>(dim) * 2;
+          hi.x_sq = static_cast<std::byte const*>(sl.x_sq) + static_cast<std::size_t>(lo.n) * 4;
+          hi.n    = sl.n - lo.n;
+          hi.id_base += lo.n;
+          if (hi.id_map != nullptr) { hi.id_map += lo.n; }
+          replay_slice(lo);
+          make_room();
+          replay_slice(hi);
+          return;
+        }
+        candidates.reset();
+        candidates.emplace(want, stream, mr);
+      }
+    };
     auto check_group = [&] {
       if (group.empty()) { return; }
       launch_deferred();
@@ -3559,25 +3918,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       if (total > candidates->capacity()) {
         rollback();
         for (auto const& sl : group) {
-          while (true) {
-            launch_bounded(sl);
-            total = read_count();
-            if (total <= candidates->capacity()) { break; }
-            auto const slice_pairs = total - pending;
-            rollback();
-            if (pending > 0) {
-              flush();
-            } else {
-              candidates.reset();
-              candidates.emplace(slice_pairs + slice_pairs / 4, stream, mr);
-            }
-          }
-          pending = total;
+          replay_slice(sl);
         }
+        total = pending;
       }
       pending = total;
       group.clear();
-      if (pending > candidates->capacity() / 2) { flush(); }
+      if (pairs_to_host_forced || pending > candidates->capacity() / 2) { make_room(); }
     };
 
     std::int64_t scanned_pairs = 0;
@@ -4455,7 +4802,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     kept.clear();
     if (any_bounded) {
       check_group();
-      flush();
+      if (host_pairs.empty()) {
+        flush();
+      } else {
+        bring_pairs_back();
+      }
       // Lists hold layout rows; a scanned corpus's candidates already carry corpus rows.
       if (rescore && !radius_join && _lists != nullptr) {
         vss::map_ids(acc_neighbors->mutable_view().data<std::int64_t>(),
@@ -4473,6 +4824,16 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                      static_cast<long long>(bounded_padded),
                      rescore_seconds,
                      take_seconds);
+        if (pair_moves > 0 || slice_cuts > 0 || budget_flushes > 0) {
+          std::fprintf(stderr,
+                       "[vecjoin-phase] pairs to host: %lld moves, %lld pairs, %lld slice cuts, "
+                       "%lld flushes past the budget, %.3f s\n",
+                       static_cast<long long>(pair_moves),
+                       static_cast<long long>(pairs_moved),
+                       static_cast<long long>(slice_cuts),
+                       static_cast<long long>(budget_flushes),
+                       host_seconds);
+        }
         if (f16_bounded) {
           auto const l = vss::f16_filter_launch_counts();
           std::fprintf(stderr,
@@ -4982,6 +5343,30 @@ std::size_t sirius_physical_vector_join_stream::per_left_batch_estimate(std::siz
     _right_total_rows > 0 ? std::min<std::int64_t>(_request.k, _right_total_rows) : _request.k;
   vss::column_size(static_cast<std::int64_t>(n_left) * k_join, "vector join output");
   return estimate_for_rows(n_left, with_routing);
+}
+
+std::size_t sirius_physical_vector_join_stream::host_pair_budget() const
+{
+  if (auto const* v = std::getenv("SIRIUS_VSS_PAIRS_TO_HOST_BUDGET"); v != nullptr) {
+    return static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
+  }
+  if (_sirius_ctx == nullptr) { return 0; }
+  auto const hosts =
+    _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  if (hosts.empty()) { return 0; }
+  // Half the pool's size is all this join may hold beside the pool, so a block's rows there, as
+  // many as may be in flight, come out of it first.
+  std::size_t rows_held = 0;
+  if (block_rows_on_host()) {
+    std::int64_t widest = 0;
+    for (auto const& block : _blocks) {
+      widest = std::max(widest, block.rows);
+    }
+    rows_held = static_cast<std::size_t>(widest) * static_cast<std::size_t>(_request.dim) *
+                sizeof(float) * scanned_block_tasks();
+  }
+  auto const half = hosts.front()->get_max_memory() / 2;
+  return half > rows_held ? half - rows_held : 0;
 }
 
 bool sirius_physical_vector_join_stream::block_rows_on_host() const

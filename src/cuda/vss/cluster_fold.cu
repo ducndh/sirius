@@ -709,6 +709,82 @@ __global__ void gap_rescore_bound_kernel(float const* by_row,
   }
 }
 
+// One warp per row r: the k smallest of its old codes acc[r k ...], in order, and its new codes
+// by_row[before[r] .. before[r + 1]), in no order, a distinct new value at a time as in
+// gap_rescore_bound_kernel. Lane 0 writes them to out[r k ...]; bound[r] falls to U_r of the k-th.
+__global__ void code_topk_merge_kernel(float const* by_row,
+                                       int64_t const* before,
+                                       float const* acc,
+                                       int64_t n_rows,
+                                       int64_t k,
+                                       code_bound_terms const terms,
+                                       float* out,
+                                       float* bound)
+{
+  int const lane   = threadIdx.x % 32;
+  auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
+  for (int64_t r = blockIdx.x * static_cast<int64_t>(blockDim.x / 32) + threadIdx.x / 32;
+       r < n_rows;
+       r += warps) {
+    auto const s  = before[r];
+    auto const nr = before[r + 1] - s;
+    int64_t a = 0, t = 0;
+    float last = -INFINITY;
+    float m    = INFINITY;
+    int count  = 0;
+    bool fresh = false;
+    float kth  = INFINITY;
+    while (t < k) {
+      if (!fresh) {
+        m = INFINITY;
+        for (int64_t i = lane; i < nr; i += 32) {
+          float const c = by_row[s + i];
+          if (c > last && c < m) { m = c; }
+        }
+        for (int o = 16; o > 0; o /= 2) {
+          m = fminf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        }
+        count = 0;
+        if (m < INFINITY) {
+          for (int64_t i = lane; i < nr; i += 32) {
+            count += by_row[s + i] == m;
+          }
+          for (int o = 16; o > 0; o /= 2) {
+            count += __shfl_xor_sync(0xffffffffu, count, o);
+          }
+        }
+        fresh = true;
+      }
+      float const old = a < k ? acc[r * k + a] : INFINITY;
+      if (old <= m) {
+        if (lane == 0) { out[r * k + t] = old; }
+        kth = old;
+        ++t;
+        if (a < k) { ++a; }
+      } else {
+        for (int c = 0; c < count && t < k; ++c, ++t) {
+          if (lane == 0) { out[r * k + t] = m; }
+        }
+        kth   = m;
+        last  = m;
+        fresh = false;
+      }
+    }
+    if (lane == 0 && kth < INFINITY) {
+      float const u =
+        terms.int8 ? int8_upper_bound_of(kth, terms.probe_error[r], terms.row_error, terms.scale)
+                   : float16_upper_bound_of(kth,
+                                            terms.probe_sq[r],
+                                            terms.probe_error[r],
+                                            terms.row_error,
+                                            terms.row_norm,
+                                            static_cast<float>(terms.d),
+                                            terms.inner_product);
+      bound[r] = fminf(bound[r], u);
+    }
+  }
+}
+
 __global__ void gap_count_kernel(int32_t const* rows, int64_t n, int32_t* per_row)
 {
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
@@ -1381,6 +1457,49 @@ void gap_rescore_bound(int32_t const* rows,
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
+void code_topk_merge(int32_t const* rows,
+                     float const* codes,
+                     int64_t n,
+                     float* code_acc,
+                     int64_t n_rows,
+                     int64_t k,
+                     float* bound,
+                     code_bound_terms const& terms,
+                     rmm::cuda_stream_view stream,
+                     rmm::device_async_resource_ref mr)
+{
+  if (n_rows == 0 || n == 0) { return; }
+  rmm::device_uvector<float> by_row(static_cast<std::size_t>(n), stream, mr);
+  rmm::device_uvector<int32_t> per_row(static_cast<std::size_t>(n_rows + 1), stream, mr);
+  rmm::device_uvector<int64_t> before(static_cast<std::size_t>(n_rows + 1), stream, mr);
+  rmm::device_uvector<float> out(static_cast<std::size_t>(n_rows * k), stream, mr);
+  CUDF_CUDA_TRY(
+    cudaMemsetAsync(per_row.data(), 0, per_row.size() * sizeof(int32_t), stream.value()));
+  gap_count_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+    rows, n, per_row.data());
+  CUDF_CUDA_TRY(cudaGetLastError());
+  std::size_t scan_bytes = 0;
+  CUDF_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
+    nullptr, scan_bytes, per_row.data(), before.data(), n_rows + 1, stream.value()));
+  rmm::device_buffer temp(std::max<std::size_t>(scan_bytes, 1), stream, mr);
+  CUDF_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
+    temp.data(), scan_bytes, per_row.data(), before.data(), n_rows + 1, stream.value()));
+  gap_scatter_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+    rows, codes, n, before.data(), per_row.data(), by_row.data());
+  CUDF_CUDA_TRY(cudaGetLastError());
+  auto const warp_grid =
+    static_cast<int>(std::clamp<int64_t>((n_rows + kBlock / 32 - 1) / (kBlock / 32), 1, 65535));
+  code_topk_merge_kernel<<<warp_grid, kBlock, 0, stream.value()>>>(
+    by_row.data(), before.data(), code_acc, n_rows, k, terms, out.data(), bound);
+  CUDF_CUDA_TRY(cudaGetLastError());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(code_acc,
+                                out.data(),
+                                static_cast<std::size_t>(n_rows * k) * sizeof(float),
+                                cudaMemcpyDeviceToDevice,
+                                stream.value()));
+  stream.synchronize();
+}
+
 int64_t keep_within_row_limit(int32_t* rows,
                               int64_t* ids,
                               float* codes,
@@ -1448,6 +1567,9 @@ int64_t keep_within_row_limit(int32_t* rows,
     ids, out_ids.data(), kept * sizeof(int64_t), cudaMemcpyDeviceToDevice, stream.value()));
   CUDF_CUDA_TRY(cudaMemcpyAsync(
     codes, out_codes.data(), kept * sizeof(float), cudaMemcpyDeviceToDevice, stream.value()));
+  // The copies read out_*, which go back to the resource on return, where another stream may get
+  // them.
+  stream.synchronize();
   return kept;
 }
 

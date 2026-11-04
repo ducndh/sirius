@@ -111,6 +111,37 @@ std::vector<std::pair<std::string, long long>> distance_multiset(duckdb::Connect
   return out;
 }
 
+/// While alive, what the process writes to stderr goes to a file, and into @p out at the end.
+class stderr_to_string {
+ public:
+  explicit stderr_to_string(std::string& out) : _out(out)
+  {
+    std::fflush(stderr);
+    _saved = ::dup(STDERR_FILENO);
+    _file  = std::tmpfile();
+    ::dup2(::fileno(_file), STDERR_FILENO);
+  }
+  ~stderr_to_string()
+  {
+    std::fflush(stderr);
+    ::dup2(_saved, STDERR_FILENO);
+    ::close(_saved);
+    std::rewind(_file);
+    char buffer[4096];
+    for (std::size_t n; (n = std::fread(buffer, 1, sizeof(buffer), _file)) > 0;) {
+      _out.append(buffer, n);
+    }
+    std::fclose(_file);
+  }
+  stderr_to_string(stderr_to_string const&)            = delete;
+  stderr_to_string& operator=(stderr_to_string const&) = delete;
+
+ private:
+  std::string& _out;
+  int _saved{-1};
+  std::FILE* _file{nullptr};
+};
+
 void expect_error(duckdb::Connection& con, const std::string& sql, const std::string& needle)
 {
   auto r = con.Query(sql);
@@ -3018,6 +3049,42 @@ std::size_t relative_mismatches(std::vector<std::pair<std::string, double>> cons
   return mismatched;
 }
 
+// 1,000 probes against 6,000 near-identical rows and 5 rows at the origin, with one centroid in
+// each place. Components 8000 + j / 4 round to 8000 or 8004 in half, so no row's limit drops
+// anything and the large slice alone passes 6M pairs, past the buffer's 4M.
+void create_far_rows_join(KMeansFixture& fixture, std::string const& p)
+{
+  auto const near = [](std::string const& seed) {
+    return "list_transform(range(16), lambda d: (8000.0 + (hash(i * 1000 + d + " + seed +
+           ") % 16)::FLOAT * 0.25)::FLOAT)::FLOAT[16]";
+  };
+  fixture.run_ok("CREATE TABLE " + p + "_corpus AS SELECT i::INTEGER AS id, " + near("0") +
+                 " AS vec FROM range(6000) t(i) UNION ALL SELECT (6000 + i)::INTEGER, "
+                 "list_transform(range(16), lambda d: (0.5 * i + d)::FLOAT)::FLOAT[16] FROM "
+                 "range(5) t(i);");
+  fixture.run_ok("CREATE TABLE " + p + "_probe AS SELECT i::INTEGER AS id, " + near("7777777") +
+                 " AS vec FROM range(1000) t(i);");
+  fixture.run_ok("CREATE TABLE " + p +
+                 "_cent AS SELECT i::BIGINT AS id, list_transform(range(16), lambda d: (CASE WHEN "
+                 "i = 0 THEN 8002.0 ELSE 0.0 END)::FLOAT)::FLOAT[16] AS vec FROM range(2) t(i);");
+  fixture.run_ok("CHECKPOINT;");
+  for (auto const* t : {"_corpus", "_probe", "_cent"}) {
+    fixture.run_ok("SELECT * FROM pin_table(name => '" + p + t +
+                   "', tier => 'gpu', format => 'duckdb');");
+  }
+  fixture.run_ok("SELECT * FROM sirius_kmeans_fit('" + p + "_cent','vec', name => '" + p +
+                 "_c', rows_are_centroids => true);");
+  fixture.run_ok("SELECT * FROM sirius_kmeans_build_lists('" + p + "_corpus','vec','" + p +
+                 "_c', storage => 'float16');");
+}
+
+std::string far_rows_join_sql(std::string const& p)
+{
+  return "SELECT left_id, distance FROM sirius_knn_join('" + p + "_probe','vec','" + p +
+         "_corpus','vec', metric => 'l2', k => 10, search_mode => 'approx', clustering => '" + p +
+         "_c', n_probes => 2);";
+}
+
 std::size_t distance_mismatches(std::vector<std::pair<std::string, long long>> const& a,
                                 std::vector<std::pair<std::string, long long>> const& b)
 {
@@ -3141,6 +3208,172 @@ TEST_CASE_METHOD(KMeansFixture,
     run_ok("SELECT * FROM unpin_table('" + p + "_probe');");
     run_ok("SELECT * FROM unpin_table('" + p + "_corpus');");
   }
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "the bound from moved pairs trims them and keeps the join's answer",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][vector_join]")
+{
+  // Uniform rows and a k of 200 over 64 lists: limits drop most pairs here, so a moved bound that
+  // fell short of a row's true k-th would drop true ones. Every list probed makes the join exact;
+  // DuckDB's array_distance on the CPU is the reference, for every 20th probe.
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_SWEEP0");
+      ::unsetenv("SIRIUS_VSS_PAIRS_TO_HOST");
+      ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    }
+  } unset_env;
+  ::setenv("SIRIUS_VSS_SWEEP0", "ranked", 1);
+  auto const uniform = [](std::string const& seed) {
+    return "list_transform(range(16), lambda d: ((hash(i * 1000 + d + " + seed +
+           ") % 1000)::FLOAT / 1000.0)::FLOAT)::FLOAT[16]";
+  };
+  run_ok("CREATE TABLE mvb_corpus AS SELECT i::INTEGER AS id, " + uniform("0") +
+         " AS vec FROM range(20000) t(i);");
+  run_ok("CREATE TABLE mvb_probe AS SELECT i::INTEGER AS id, " + uniform("7777777") +
+         " AS vec FROM range(6000) t(i);");
+  run_ok("CREATE TABLE mvb_cent AS SELECT id::BIGINT AS id, vec FROM mvb_corpus WHERE id < 64;");
+  run_ok("CHECKPOINT;");
+  for (auto const* t : {"mvb_corpus", "mvb_probe", "mvb_cent"}) {
+    run_ok("SELECT * FROM pin_table(name => '" + std::string{t} +
+           "', tier => 'gpu', format => 'duckdb');");
+  }
+  run_ok(
+    "SELECT * FROM sirius_kmeans_fit('mvb_cent','vec', name => 'mvb_c', "
+    "rows_are_centroids => true);");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_build_lists('mvb_corpus','vec','mvb_c', "
+    "storage => 'float16');");
+  auto const stride    = 20;
+  auto const reference = cpu_exact_top_k(*con, "mvb", 200, stride);
+  ::setenv("SIRIUS_VSS_PAIRS_TO_HOST", "force", 1);
+  ::setenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG", "1", 1);
+  std::string log;
+  std::vector<std::pair<std::string, double>> moved;
+  {
+    stderr_to_string capture{log};
+    moved = exact_distances(*con,
+                            "SELECT left_id, distance FROM sirius_knn_join('mvb_probe','vec',"
+                            "'mvb_corpus','vec', metric => 'l2', k => 200, search_mode => "
+                            "'approx', clustering => 'mvb_c', n_probes => 64);");
+  }
+  CHECK(moved.size() == 6000 * 200);
+  std::erase_if(moved, [&](auto const& row) { return std::stoll(row.first) % stride != 0; });
+  CHECK(relative_mismatches(moved, reference) == 0);
+  INFO(log);
+  CHECK(log.find("pairs to host:") != std::string::npos);
+  CHECK(log.find("host: 0 moves") == std::string::npos);
+}
+
+TEST_CASE_METHOD(
+  KMeansFixture,
+  "pairs past the host budget flush where they are or fail the query with the numbers",
+  "[integration][gpu_execution][array][vss][kmeans][approx][vector_join]")
+{
+  // No limit drops a pair of this join, so its 6M pairs would all wait on the host.
+  constexpr long long kBlockBytes = 64LL << 20, kBlockPairs = 1LL << 22;
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_SWEEP0");
+      ::unsetenv("SIRIUS_VSS_PAIRS_TO_HOST");
+      ::unsetenv("SIRIUS_VSS_PAIRS_TO_HOST_BUDGET");
+      ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    }
+  } unset_env;
+  ::setenv("SIRIUS_VSS_SWEEP0", "ranked", 1);
+  create_far_rows_join(*this, "phb");
+  auto const join      = far_rows_join_sql("phb");
+  auto const reference = cpu_exact_top_k(*con, "phb", 10, 1);
+  struct host_counts {
+    long long moves = -1, pairs = -1, cuts = -1, flushes = -1;
+  };
+  auto const forced_with_budget = [&](long long budget) {
+    ::setenv("SIRIUS_VSS_PAIRS_TO_HOST", "force", 1);
+    ::setenv("SIRIUS_VSS_PAIRS_TO_HOST_BUDGET", std::to_string(budget).c_str(), 1);
+    ::setenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG", "1", 1);
+    std::string log;
+    {
+      stderr_to_string capture{log};
+      CHECK(relative_mismatches(exact_distances(*con, join), reference) == 0);
+    }
+    ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    INFO(log);
+    auto const at = log.find("pairs to host:");
+    REQUIRE(at != std::string::npos);
+    host_counts c;
+    REQUIRE(std::sscanf(log.c_str() + at,
+                        "pairs to host: %lld moves, %lld pairs, %lld slice cuts, %lld flushes",
+                        &c.moves,
+                        &c.pairs,
+                        &c.cuts,
+                        &c.flushes) == 4);
+    return c;
+  };
+
+  auto const one_block = forced_with_budget(kBlockBytes);
+  CHECK(one_block.moves > 0);
+  CHECK(one_block.pairs > 0);
+  CHECK(one_block.pairs <= kBlockPairs);
+  CHECK(one_block.flushes > 0);
+
+  auto const none = forced_with_budget(0);
+  CHECK(none.moves == 0);
+  CHECK(none.pairs == 0);
+  CHECK(none.flushes > 0);
+
+  ::setenv("SIRIUS_VSS_PAIRS_TO_HOST", "force_no_flush", 1);
+  ::setenv("SIRIUS_VSS_PAIRS_TO_HOST_BUDGET", std::to_string(kBlockBytes).c_str(), 1);
+  auto const failed = con->Query(join);
+  REQUIRE(failed->HasError());
+  INFO(failed->GetError());
+  CHECK(failed->GetError().find("vector join of 'phb_probe' and 'phb_corpus'") != std::string::npos);
+  CHECK(failed->GetError().find("host budget for waiting pairs is 64 MiB") != std::string::npos);
+
+  ::unsetenv("SIRIUS_VSS_PAIRS_TO_HOST");
+  ::unsetenv("SIRIUS_VSS_PAIRS_TO_HOST_BUDGET");
+  CHECK(relative_mismatches(exact_distances(*con, join), reference) == 0);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "pairs moved to the host give the join's answer, with a slice cut in two",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][vector_join]")
+{
+  // Forced, the pairs move and the slice is cut; DuckDB's array_distance on the CPU is the
+  // reference.
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_SWEEP0");
+      ::unsetenv("SIRIUS_VSS_PAIRS_TO_HOST");
+      ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    }
+  } unset_env;
+  ::setenv("SIRIUS_VSS_SWEEP0", "ranked", 1);
+  create_far_rows_join(*this, "phm");
+  auto const join      = far_rows_join_sql("phm");
+  auto const reference = cpu_exact_top_k(*con, "phm", 10, 1);
+
+  ::setenv("SIRIUS_VSS_PAIRS_TO_HOST", "force", 1);
+  ::setenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG", "1", 1);
+  std::string log;
+  {
+    stderr_to_string capture{log};
+    auto const moved = exact_distances(*con, join);
+    CHECK(relative_mismatches(moved, reference) == 0);
+  }
+  INFO(log);
+  CHECK(log.find("pairs to host:") != std::string::npos);
+  CHECK(log.find("host: 0 moves") == std::string::npos);
+  CHECK(log.find(" 0 slice cuts") == std::string::npos);
+  ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+
+  ::setenv("SIRIUS_VSS_PAIRS_TO_HOST", "0", 1);
+  CHECK(relative_mismatches(exact_distances(*con, join), reference) == 0);
+  ::unsetenv("SIRIUS_VSS_PAIRS_TO_HOST");
+  CHECK(relative_mismatches(exact_distances(*con, join), reference) == 0);
 }
 
 TEST_CASE_METHOD(KMeansFixture,

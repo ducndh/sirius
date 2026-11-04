@@ -63,6 +63,27 @@ struct cluster_lists;
 
 namespace sirius::op {
 
+/// Pinned host blocks a join's waiting pairs move to when a flush would not fit the device, kept
+/// for its later tasks: the first use pays to pin them. They sit outside the host pool, beside it,
+/// and are freed with the operator. All of a join's tasks draw on one count of what is pinned.
+class host_pair_block_pool {
+ public:
+  host_pair_block_pool() = default;
+  ~host_pair_block_pool() { release(); }
+  host_pair_block_pool(host_pair_block_pool const&)            = delete;
+  host_pair_block_pool& operator=(host_pair_block_pool const&) = delete;
+
+  /// A block, or nullptr when pinning another would take what is pinned past @p budget_bytes.
+  [[nodiscard]] void* take(std::size_t budget_bytes);
+  void give_back(void* block);
+  void release();
+
+ private:
+  std::mutex _mutex;
+  std::vector<void*> _free;
+  std::size_t _pinned{0};
+};
+
 /**
  * @brief One corpus chunk made device-resident for the duration of a single fold step.
  *
@@ -382,6 +403,8 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
                                               bool planning_a_block = false) const;
   /// Whether a probe block over this join keeps its FP32 rows on the host (see the block's load).
   [[nodiscard]] bool block_rows_on_host() const;
+  /// What a join's waiting pairs may pin on the host.
+  [[nodiscard]] std::size_t host_pair_budget() const;
 
   /// Group the probe chunks into blocks of probe rows when that pays (lists in host memory, which
   /// a task reads across PCIe once per sweep); leaves @c _blocks empty otherwise. Caller holds
@@ -486,6 +509,7 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
     std::int64_t rows{0};
   };
   std::vector<probe_block> _blocks;
+  host_pair_block_pool _host_pair_blocks;
   /// Probe rows in total, counted only when the probe stands in for a scalar subquery.
   std::size_t _scalar_probe_rows{0};
   std::size_t _next_left{0};

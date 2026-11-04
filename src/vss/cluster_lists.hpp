@@ -498,6 +498,22 @@ void gap_rescore_bound(std::int32_t const* rows,
                        rmm::cuda_stream_view stream,
                        rmm::device_async_resource_ref mr);
 
+/**
+ * @brief Row r's k smallest codes so far (@p code_acc, k per row, nearest first, +inf for a miss)
+ * take in the codes of its candidates among the @p n pairs (rows, codes), none of them a pair
+ * already counted there, and bound[r] falls to U_r of the k-th of them, when the row has k.
+ */
+void code_topk_merge(std::int32_t const* rows,
+                     float const* codes,
+                     std::int64_t n,
+                     float* code_acc,
+                     std::int64_t n_rows,
+                     std::int64_t k,
+                     float* bound,
+                     code_bound_terms const& terms,
+                     rmm::cuda_stream_view stream,
+                     rmm::device_async_resource_ref mr);
+
 /// Totals of keep_within_row_limit's trims (debug and tests). Per row with candidates, the
 /// literal m k rule -- re-score the first 2k when c_(2k) is past the limit, else the first 4k when
 /// c_(4k) is, else all -- has fewer than 2k (short_rows), trims at m = 2 or m = 4, or falls back;
