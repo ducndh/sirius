@@ -1895,7 +1895,7 @@ TEST_CASE_METHOD(KMeansFixture,
        {std::pair<std::string, long long>{"k => 10", 1300000},
         std::pair<std::string, long long>{"k => 100, join_mode => 'global'", 100}}) {
     auto const join =
-      "SELECT left_id, right_id, distance FROM sirius_knn_join('kmpb_probe','vec','kmpb_corpus',"
+      "SELECT left_id, distance FROM sirius_knn_join('kmpb_probe','vec','kmpb_corpus',"
       "'vec', metric => 'l2', search_mode => 'approx', clustering => 'kmpb_c', n_probes => 4, " +
       mode + ")";
     // One task per probe chunk, 50,000-row blocks, and blocks sized by the device.
@@ -1912,7 +1912,8 @@ TEST_CASE_METHOD(KMeansFixture,
     for (std::size_t r = 1; r < block_rows.size(); ++r) {
       auto const other = "kmpb_" + std::to_string(r);
       CHECK(count("SELECT count(*) FROM " + other) == rows);
-      CHECK(count("SELECT count(*) FROM (SELECT * FROM kmpb_0 EXCEPT SELECT * FROM " + other +
+      // Rows at exactly the k-th distance may swap, so the right ids are not compared.
+      CHECK(count("SELECT count(*) FROM (SELECT * FROM kmpb_0 EXCEPT ALL SELECT * FROM " + other +
                   ")") == 0);
     }
   }
