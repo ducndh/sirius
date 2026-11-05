@@ -4735,15 +4735,22 @@ TEST_CASE("a threshold join's count in pair tasks is the pairs one task per prob
   ok_rows(con, "USE ptc;");
   create_wide_clustered_join(con, "ptc", false, false, 16, 40000, 10000);
   ok_rows(con, "SELECT * FROM unpin_table('ptc_probe');");
-  auto const count = "SELECT count(*) FROM " +
-                     threshold_scan_join("ptc_probe", "ptc_corpus", 1.5, ", metric => 'l2'") + ";";
+  auto const join  = threshold_scan_join("ptc_probe", "ptc_corpus", 1.5, ", metric => 'l2'");
+  auto const count = "SELECT count(*) FROM " + join + ";";
+  // Pairs within rounding of the radius: the two shapes may search a chunk with different
+  // kernels and round such a pair to either side.
+  auto const near =
+    "SELECT count(*) FROM " + join + " WHERE abs(distance - 1.5) <= 1e-4 * 1.5;";
   auto const stats = sirius::test::get_vector_join_pair_stats(con);
   ok_rows(con, "SET vector_join_pair_tasks = false;");
-  auto const off = scalar_i64(con, count);
+  auto const off      = scalar_i64(con, count);
+  auto const near_off = scalar_i64(con, near);
   CHECK(sirius::test::get_vector_join_pair_stats(con).pair_attempts == stats.pair_attempts);
   ok_rows(con, "SET vector_join_pair_tasks = true;");
   CHECK(off > 0);
-  CHECK(scalar_i64(con, count) == off);
+  auto const on      = scalar_i64(con, count);
+  auto const near_on = scalar_i64(con, near);
+  CHECK(std::llabs(on - off) <= std::max(near_on, near_off));
   CHECK(sirius::test::get_vector_join_pair_stats(con).pair_attempts > stats.pair_attempts);
 }
 
@@ -4777,6 +4784,11 @@ TEST_CASE(
   ok_rows(con, "CREATE OR REPLACE TABLE ptl_off AS " + select + ";");
   CHECK(sirius::test::get_vector_join_pair_stats(con).blocks_built == before.blocks_built);
   ok_rows(con, "SET vector_join_pair_tasks = true;");
+  // Lists that fit the host pool stay on one task per probe chunk.
+  ok_rows(con, "SELECT count(*) FROM (" + select + ");");
+  CHECK(sirius::test::get_vector_join_pair_stats(con).blocks_built == before.blocks_built);
+  scoped_env vars;
+  vars.set("SIRIUS_VSS_LIST_PAIR_TASKS", "1");
   ok_rows(con, "CREATE OR REPLACE TABLE ptl_on AS " + select + ";");
   auto const after = sirius::test::get_vector_join_pair_stats(con);
   CHECK(after.blocks_built > before.blocks_built);
