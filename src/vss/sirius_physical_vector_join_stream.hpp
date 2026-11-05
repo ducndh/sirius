@@ -415,6 +415,7 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
 
  private:
   struct block_state;
+  class block_task;
 
   /// Resolve both pinned tables and snapshot per-batch views plus right-batch row
   /// offsets. Idempotent; caller holds _op_mutex. On the build path this is a no-op until
