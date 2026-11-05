@@ -193,8 +193,9 @@ TEST_CASE_METHOD(VectorTopkJoinFixture,
   expect_plan_fallback_matches_cpu(
     "SELECT l.id, rr.id FROM l, LATERAL "
     "(SELECT r.id FROM r ORDER BY array_distance(l.v, r.v) DESC LIMIT 3) rr");
-  // A bare count over k = 1 prunes the arg_min away, leaving nothing that marks it as top-k.
-  expect_plan_fallback_matches_cpu(
+  // A bare count over k = 1 prunes the arg_min away, leaving nothing that marks it as top-k: not
+  // the vector join, and an ordinary GPU plan that must match the CPU.
+  compare_gpu_vs_cpu(
     "SELECT count(*) FROM (SELECT l.id FROM l, LATERAL "
     "(SELECT r.id FROM r ORDER BY array_distance(l.v, r.v) LIMIT 1) rr)");
 }
