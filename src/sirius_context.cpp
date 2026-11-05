@@ -1701,6 +1701,40 @@ void SiriusContext::record_vector_join_prune(uint64_t pairs_scored,
   vector_join_chunks_available_.fetch_add(chunks_available, std::memory_order_relaxed);
 }
 
+SiriusContext::vector_join_pair_stats SiriusContext::get_vector_join_pair_stats() const noexcept
+{
+  return vector_join_pair_stats{
+    .corpus_stages      = vector_join_corpus_stages_.load(std::memory_order_relaxed),
+    .corpus_moved       = vector_join_corpus_moved_.load(std::memory_order_relaxed),
+    .corpus_bytes_moved = vector_join_corpus_bytes_moved_.load(std::memory_order_relaxed),
+    .blocks_built       = vector_join_blocks_built_.load(std::memory_order_relaxed),
+    .pair_attempts      = vector_join_pair_attempts_.load(std::memory_order_relaxed),
+    .pairs_finished     = vector_join_pairs_finished_.load(std::memory_order_relaxed),
+    .pairs_cut_short    = vector_join_pairs_cut_short_.load(std::memory_order_relaxed),
+  };
+}
+
+void SiriusContext::record_vector_join_corpus_stage(uint64_t bytes_moved) noexcept
+{
+  vector_join_corpus_stages_.fetch_add(1, std::memory_order_relaxed);
+  if (bytes_moved > 0) {
+    vector_join_corpus_moved_.fetch_add(1, std::memory_order_relaxed);
+    vector_join_corpus_bytes_moved_.fetch_add(bytes_moved, std::memory_order_relaxed);
+  }
+}
+
+void SiriusContext::record_vector_join_block_built() noexcept
+{ vector_join_blocks_built_.fetch_add(1, std::memory_order_relaxed); }
+
+void SiriusContext::record_vector_join_pair_attempt() noexcept
+{ vector_join_pair_attempts_.fetch_add(1, std::memory_order_relaxed); }
+
+void SiriusContext::record_vector_join_pair_finished() noexcept
+{ vector_join_pairs_finished_.fetch_add(1, std::memory_order_relaxed); }
+
+void SiriusContext::record_vector_join_pair_cut_short() noexcept
+{ vector_join_pairs_cut_short_.fetch_add(1, std::memory_order_relaxed); }
+
 SiriusContext::vector_join_host_rows_stats SiriusContext::get_vector_join_host_rows_stats()
   const noexcept
 {

@@ -415,6 +415,7 @@ static void from_yaml(const YAML::Node& node, operator_params& opt)
              yaml::fraction<double>{});
   r.optional(
     "dynamic_filter_keep_threshold", opt.dynamic_filter_keep_threshold, yaml::fraction<double>{});
+  r.optional("vector_join_pair_tasks", opt.vector_join_pair_tasks);
   r.optional("enable_pinned_zone_map_pruning", opt.enable_pinned_zone_map_pruning);
   r.optional("enable_decimal_sum_stats_bound", opt.enable_decimal_sum_stats_bound);
   r.optional("enable_compressed_materialization", opt.enable_compressed_materialization);

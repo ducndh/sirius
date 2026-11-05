@@ -462,6 +462,22 @@ class SiriusContext : public ClientContextState {
     uint64_t blocks_on_device = 0;
   };
 
+  /// What the vector join read of its corpus, and what its pair tasks did, over the session.
+  /// Neither shows in a result set.
+  struct vector_join_pair_stats {
+    /// Corpus chunks made available to a search; those moved to the device, and the bytes moved.
+    /// The rest were read in place.
+    uint64_t corpus_stages      = 0;
+    uint64_t corpus_moved       = 0;
+    uint64_t corpus_bytes_moved = 0;
+    uint64_t blocks_built       = 0;
+    /// Attempts at a pair task, retries included, and the ones that finished all they were given or
+    /// stopped early to let their pairs out.
+    uint64_t pair_attempts   = 0;
+    uint64_t pairs_finished  = 0;
+    uint64_t pairs_cut_short = 0;
+  };
+
   SiriusContext();
   ~SiriusContext() noexcept override;
 
@@ -895,6 +911,13 @@ class SiriusContext : public ClientContextState {
   /// \brief A block found no room in the host pool and kept its rows on the device.
   void record_vector_join_block_on_device() noexcept;
 
+  [[nodiscard]] vector_join_pair_stats get_vector_join_pair_stats() const noexcept;
+  void record_vector_join_corpus_stage(uint64_t bytes_moved) noexcept;
+  void record_vector_join_block_built() noexcept;
+  void record_vector_join_pair_attempt() noexcept;
+  void record_vector_join_pair_finished() noexcept;
+  void record_vector_join_pair_cut_short() noexcept;
+
   /// \brief Record a fresh split rejected because it belongs to another scan contract.
   void record_transparent_certificate_mismatch() noexcept;
   void record_transparent_certificate_incomplete() noexcept;
@@ -1048,6 +1071,13 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> vector_join_host_batches_restored_{0};
   std::atomic<uint64_t> vector_join_host_repository_peak_{0};
   std::atomic<uint64_t> vector_join_host_left_at_finish_{0};
+  std::atomic<uint64_t> vector_join_corpus_stages_{0};
+  std::atomic<uint64_t> vector_join_corpus_moved_{0};
+  std::atomic<uint64_t> vector_join_corpus_bytes_moved_{0};
+  std::atomic<uint64_t> vector_join_blocks_built_{0};
+  std::atomic<uint64_t> vector_join_pair_attempts_{0};
+  std::atomic<uint64_t> vector_join_pairs_finished_{0};
+  std::atomic<uint64_t> vector_join_pairs_cut_short_{0};
   std::atomic<uint64_t> vector_join_blocks_on_device_{0};
   std::atomic<uint64_t> transparent_provider_internal_skip_count_{0};
   std::atomic<uint64_t> transparent_hidden_catalog_skip_count_{0};

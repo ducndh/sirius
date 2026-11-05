@@ -52,6 +52,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -61,10 +63,12 @@
 #include <iomanip>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -4506,4 +4510,398 @@ TEST_CASE_METHOD(
     CHECK(distance_mismatches(multiset_of(shared, 1), multiset_of(separate, 1)) == 0);
     if (sql != approx(4)) { CHECK(distance_mismatches(multiset_of(shared, 3000), oracle) == 0); }
   }
+}
+
+namespace {
+
+/// A threshold join over a scanned corpus, reporting ids and distance.
+std::string threshold_scan_join(std::string const& left,
+                                std::string const& right,
+                                double eps,
+                                std::string const& extra = "")
+{
+  return "sirius_knn_join('" + left + "','vec','" + right +
+         "','vec', probe_source => 'scan', build_source => 'scan', join_mode => 'threshold', k => "
+         "1, eps => " +
+         std::to_string(eps) + ", left_output_columns => ['id'], right_output_columns => ['id']" +
+         extra + ")";
+}
+
+/// Pairs one table has and the other does not, and pairs both have at a distance further apart than
+/// rounding, ignoring those within rounding of the radius: there the two runs' searches can round
+/// a pair to either side, as they do between any two shapes of the same search.
+std::int64_t pairs_differing(duckdb::Connection& con,
+                             std::string const& a,
+                             std::string const& b,
+                             double eps)
+{
+  auto const radius = std::to_string(eps);
+  return scalar_i64(
+    con,
+    "SELECT count(*) FROM " + a + " a FULL JOIN " + b +
+      " b USING (left_id, right_id) WHERE (a.distance IS NULL AND abs(b.distance - " + radius +
+      ") > 1e-4 * " + radius + ") OR (b.distance IS NULL AND abs(a.distance - " + radius +
+      ") > 1e-4 * " + radius +
+      ") OR abs(a.distance - b.distance) > 1e-4 * greatest(abs(a.distance), 1.0);");
+}
+
+/// Whether any (left_id, right_id) appears twice: what a replay would leave.
+std::int64_t pairs_twice(duckdb::Connection& con, std::string const& table)
+{
+  return scalar_i64(con,
+                    "SELECT count(*) FROM (SELECT left_id, right_id FROM " + table +
+                      " GROUP BY 1, 2 HAVING count(*) > 1);");
+}
+
+/// A database for one test whose scans come in many chunks of 2,048 rows, as the current one.
+void attach_with_small_chunks(duckdb::Connection& con,
+                              sirius::test::scratch_dir const& scratch,
+                              std::string const& file,
+                              std::string const& alias)
+{
+  ok_rows(con,
+          "ATTACH " + scratch.file_literal(file) + " AS " + alias + " (ROW_GROUP_SIZE 2048, " +
+            "STORAGE_VERSION 'v1.4.0');");
+}
+
+/// Sets environment variables for one scope and puts each back as it was.
+class scoped_env {
+ public:
+  void set(char const* name, std::string const& value)
+  {
+    auto const* old = std::getenv(name);
+    _saved.emplace_back(name, old != nullptr ? std::optional<std::string>{old} : std::nullopt);
+    ::setenv(name, value.c_str(), 1);
+  }
+  ~scoped_env()
+  {
+    for (auto it = _saved.rbegin(); it != _saved.rend(); ++it) {
+      if (it->second) {
+        ::setenv(it->first, it->second->c_str(), 1);
+      } else {
+        ::unsetenv(it->first);
+      }
+    }
+  }
+
+ private:
+  std::vector<std::pair<char const*, std::optional<std::string>>> _saved;
+};
+
+}  // namespace
+
+TEST_CASE("a threshold join in pair tasks finds what one task per probe chunk finds",
+          "[vss][kmeans][approx][pair_tasks][isolated_context]")
+{
+  sirius::test::scratch_dir scratch{"pair_tasks_same"};
+  auto const disk = scratch.path() / "disk";
+  std::filesystem::create_directories(disk);
+  // Idle batches leave the device and the host as soon as they can, so the corpus is read from
+  // disk.
+  sirius::test::shared_test_env env(write_block_rows_yaml(scratch,
+                                                          2000000000,
+                                                          200000000,
+                                                          disk.string(),
+                                                          "      downgrade_trigger_fraction: 0.02\n"
+                                                          "      downgrade_stop_fraction: 0.01\n"));
+  auto con = env.make_connection();
+  attach_with_small_chunks(con, scratch, "pair_tasks_same.db", "pts");
+  ok_rows(con, "USE pts;");
+  create_wide_clustered_join(con, "pts", false, false, 16, 40000, 10000);
+  // The joins scan their probes too, and a checkpoint below would leave a pin stale.
+  ok_rows(con, "SELECT * FROM unpin_table('pts_probe');");
+  ok_rows(con, "CREATE TABLE pts_small AS SELECT * FROM pts_corpus WHERE id % 500 = 0;");
+  ok_rows(con, "CHECKPOINT;");
+
+  auto const approx = std::string(
+    ", search_mode => 'approx', clustering => 'pts_c', cluster_column => 'cluster_id', n_probes => "
+    "4");
+  struct join_case {
+    std::string name;
+    std::string sql;
+    double eps;
+    /// The probe comes in several chunks, so one task per chunk reads the corpus several times.
+    bool probe_chunks{true};
+  };
+  std::vector<join_case> const joins{
+    {"exact self", threshold_scan_join("pts_corpus", "pts_corpus", 1.2, ", metric => 'l2'"), 1.2},
+    {"exact self, every pair close",
+     threshold_scan_join("pts_small", "pts_corpus", 2.2, ", metric => 'l2'"),
+     2.2,
+     false},
+    {"exact two tables",
+     threshold_scan_join("pts_probe", "pts_corpus", 1.5, ", metric => 'l2'"),
+     1.5},
+    {"exact small probe",
+     threshold_scan_join("pts_small", "pts_corpus", 1.5, ", metric => 'l2'"),
+     1.5,
+     false},
+    {"clustered self",
+     threshold_scan_join("pts_corpus", "pts_corpus", 1.3, ", metric => 'l2'" + approx),
+     1.3},
+    {"clustered two tables",
+     threshold_scan_join("pts_probe", "pts_corpus", 1.6, ", metric => 'l2'" + approx),
+     1.6},
+    {"cosine",
+     threshold_scan_join(
+       "pts_probe", "pts_corpus", 0.1, ", metric => 'cosine', output_type => 'distance'"),
+     0.1},
+  };
+  auto const join = GENERATE(0, 1, 2, 3, 4, 5, 6);
+  auto const& c   = joins[static_cast<std::size_t>(join)];
+  INFO(c.name);
+  auto const select = "SELECT left_id, right_id, distance FROM " + c.sql;
+
+  ok_rows(con, "SET vector_join_pair_tasks = false;");
+  auto const before_off = sirius::test::get_vector_join_pair_stats(con);
+  ok_rows(con, "CREATE OR REPLACE TABLE pts_off AS " + select + ";");
+  auto const after_off = sirius::test::get_vector_join_pair_stats(con);
+  CHECK(after_off.blocks_built == before_off.blocks_built);
+  CHECK(after_off.pair_attempts == before_off.pair_attempts);
+
+  ok_rows(con, "SET vector_join_pair_tasks = true;");
+  ok_rows(con, "CREATE OR REPLACE TABLE pts_on AS " + select + ";");
+  auto const after_on = sirius::test::get_vector_join_pair_stats(con);
+  CHECK(after_on.blocks_built > after_off.blocks_built);
+  CHECK(after_on.pairs_finished > after_off.pairs_finished);
+  auto const reads_off = after_off.corpus_stages - before_off.corpus_stages;
+  auto const reads_on  = after_on.corpus_stages - after_off.corpus_stages;
+  if (c.probe_chunks) {
+    CHECK(reads_on < reads_off);
+  } else {
+    CHECK(reads_on == reads_off);
+  }
+
+  auto const pairs = scalar_i64(con, "SELECT count(*) FROM pts_off;");
+  REQUIRE(pairs > 0);
+  CHECK(scalar_i64(con, "SELECT count(*) FROM pts_on;") >= pairs - pairs / 1000);
+  CHECK(pairs_differing(con, "pts_off", "pts_on", c.eps) == 0);
+  CHECK(pairs_twice(con, "pts_on") == 0);
+}
+
+TEST_CASE("a threshold join's count in pair tasks is the pairs one task per probe chunk finds",
+          "[vss][kmeans][approx][pair_tasks][isolated_context]")
+{
+  sirius::test::scratch_dir scratch{"pair_tasks_count"};
+  sirius::test::shared_test_env env(write_block_rows_yaml(scratch, 2000000000, 2000000000, ""));
+  auto con = env.make_connection();
+  attach_with_small_chunks(con, scratch, "pair_tasks_count.db", "ptc");
+  ok_rows(con, "USE ptc;");
+  create_wide_clustered_join(con, "ptc", false, false, 16, 40000, 10000);
+  ok_rows(con, "SELECT * FROM unpin_table('ptc_probe');");
+  auto const count = "SELECT count(*) FROM " +
+                     threshold_scan_join("ptc_probe", "ptc_corpus", 1.5, ", metric => 'l2'") + ";";
+  auto const stats = sirius::test::get_vector_join_pair_stats(con);
+  ok_rows(con, "SET vector_join_pair_tasks = false;");
+  auto const off = scalar_i64(con, count);
+  CHECK(sirius::test::get_vector_join_pair_stats(con).pair_attempts == stats.pair_attempts);
+  ok_rows(con, "SET vector_join_pair_tasks = true;");
+  CHECK(off > 0);
+  CHECK(scalar_i64(con, count) == off);
+  CHECK(sirius::test::get_vector_join_pair_stats(con).pair_attempts > stats.pair_attempts);
+}
+
+TEST_CASE(
+  "a threshold join over host lists in pair tasks finds what one task per probe chunk finds",
+  "[vss][kmeans][approx][pair_tasks][lists][isolated_context]")
+{
+  sirius::test::scratch_dir scratch{"pair_tasks_lists"};
+  sirius::test::shared_test_env env(write_block_rows_yaml(scratch, 2000000000, 2000000000, ""));
+  auto con = env.make_connection();
+  attach_with_small_chunks(con, scratch, "pair_tasks_lists.db", "ptl");
+  ok_rows(con, "USE ptl;");
+  create_wide_clustered_join(con, "ptl", false, false, 16, 40000, 10000);
+  ok_rows(con, "SELECT * FROM unpin_table('ptl_probe');");
+  ok_rows(con,
+          "SELECT * FROM pin_table(name => 'ptl_corpus', tier => 'host', format => 'duckdb');");
+  auto const storage = GENERATE(as<std::string>{}, "float32", "float16");
+  INFO(storage);
+  ok_rows(con,
+          "SELECT * FROM sirius_kmeans_build_lists('ptl_corpus','vec','ptl_c', storage => '" +
+            storage + "', tier => 'host');");
+  auto const eps = 1.5;
+  std::string const select =
+    "SELECT left_id, right_id, distance FROM sirius_knn_join('ptl_probe','vec','ptl_corpus','vec', "
+    "probe_source => 'scan', metric => 'l2', join_mode => 'threshold', k => 1, eps => 1.5, "
+    "search_mode => 'approx', "
+    "clustering => 'ptl_c', n_probes => 4, left_output_columns => ['id'], right_output_columns => "
+    "['id'])";
+  ok_rows(con, "SET vector_join_pair_tasks = false;");
+  auto const before = sirius::test::get_vector_join_pair_stats(con);
+  ok_rows(con, "CREATE OR REPLACE TABLE ptl_off AS " + select + ";");
+  CHECK(sirius::test::get_vector_join_pair_stats(con).blocks_built == before.blocks_built);
+  ok_rows(con, "SET vector_join_pair_tasks = true;");
+  ok_rows(con, "CREATE OR REPLACE TABLE ptl_on AS " + select + ";");
+  auto const after = sirius::test::get_vector_join_pair_stats(con);
+  CHECK(after.blocks_built > before.blocks_built);
+  REQUIRE(scalar_i64(con, "SELECT count(*) FROM ptl_off;") > 0);
+  CHECK(pairs_differing(con, "ptl_off", "ptl_on", eps) == 0);
+  CHECK(pairs_twice(con, "ptl_on") == 0);
+  ok_rows(con, "SELECT * FROM unpin_table('ptl_corpus');");
+}
+
+TEST_CASE("a pair task retried after finding pairs loses none, doubles none and re-reads one chunk",
+          "[vss][kmeans][approx][pair_tasks][isolated_context]")
+{
+  sirius::test::scratch_dir scratch{"pair_tasks_retry"};
+  sirius::test::shared_test_env env(write_block_rows_yaml(scratch, 2000000000, 2000000000, ""));
+  auto con = env.make_connection();
+  attach_with_small_chunks(con, scratch, "pair_tasks_retry.db", "ptr");
+  ok_rows(con, "USE ptr;");
+  create_wide_clustered_join(con, "ptr", false, false, 16, 40000, 10000);
+  ok_rows(con, "SELECT * FROM unpin_table('ptr_probe');");
+  auto const clustered = GENERATE(false, true);
+  auto const extra =
+    std::string(", metric => 'l2'") +
+    (clustered ? ", search_mode => 'approx', clustering => 'ptr_c', cluster_column => "
+                 "'cluster_id', n_probes => 4"
+               : "");
+  auto const eps    = 1.6;
+  auto const select = "SELECT left_id, right_id, distance FROM " +
+                      threshold_scan_join("ptr_probe", "ptr_corpus", eps, extra);
+  ok_rows(con, "CREATE OR REPLACE TABLE ptr_plain AS " + select + ";");
+  auto const plain = sirius::test::get_vector_join_pair_stats(con);
+  REQUIRE(plain.pairs_finished > 0);
+  auto const pairs = scalar_i64(con, "SELECT count(*) FROM ptr_plain;");
+  REQUIRE(pairs > 0);
+
+  auto const same_pairs = [&](std::string const& table) {
+    CHECK(scalar_i64(con, "SELECT count(*) FROM " + table + ";") == pairs);
+    CHECK(pairs_differing(con, "ptr_plain", table, eps) == 0);
+    CHECK(pairs_twice(con, table) == 0);
+  };
+
+  SECTION("a shortage inside the task, after its pairs are found")
+  {
+    scoped_env vars;
+    vars.set("SIRIUS_VSS_PAIR_OOM_ONE_IN", "3");
+    auto const before = sirius::test::get_vector_join_pair_stats(con);
+    ok_rows(con, "CREATE OR REPLACE TABLE ptr_retried AS " + select + ";");
+    auto const after = sirius::test::get_vector_join_pair_stats(con);
+    same_pairs("ptr_retried");
+    auto const attempts = after.pair_attempts - before.pair_attempts;
+    auto const finished = after.pairs_finished - before.pairs_finished;
+    auto const cut      = after.pairs_cut_short - before.pairs_cut_short;
+    CHECK(attempts > finished + cut);
+    // One chunk an attempt, so a retry costs what its own chunk costs and no more.
+    CHECK(after.corpus_stages - before.corpus_stages == attempts);
+  }
+
+  SECTION("pairs moved to the host, and tasks stopping early with them")
+  {
+    scoped_env vars;
+    vars.set("SIRIUS_VSS_RADIUS_FLUSH_PAIRS", "200");
+    vars.set("SIRIUS_VSS_PAIR_CALL_ROWS", "512");
+    vars.set("SIRIUS_VSS_PAIR_OOM_ONE_IN", "3");
+    auto const before = sirius::test::get_vector_join_pair_stats(con);
+    ok_rows(con, "CREATE OR REPLACE TABLE ptr_cut AS " + select + ";");
+    auto const after = sirius::test::get_vector_join_pair_stats(con);
+    same_pairs("ptr_cut");
+    CHECK(after.pairs_cut_short > before.pairs_cut_short);
+    CHECK(after.pair_attempts - before.pair_attempts >
+          after.pairs_finished - before.pairs_finished +
+            (after.pairs_cut_short - before.pairs_cut_short));
+  }
+
+  SECTION("the engine's injected shortages")
+  {
+    // At each operator's start, so across builds and pairs and the materialize after them.
+    ok_rows(con, "SET sirius_test_gpu_task_retry_backoff_ms = 0;");
+    ok_rows(con, "SET sirius_test_inject_gpu_task_oom = 40;");
+    auto const before = sirius::test::get_vector_join_pair_stats(con);
+    ok_rows(con, "CREATE OR REPLACE TABLE ptr_engine AS " + select + ";");
+    auto const after = sirius::test::get_vector_join_pair_stats(con);
+    ok_rows(con, "SET sirius_test_inject_gpu_task_oom = 0;");
+    ok_rows(con, "SET sirius_test_gpu_task_retry_backoff_ms = 50;");
+    same_pairs("ptr_engine");
+    CHECK(after.corpus_stages - before.corpus_stages == plain.corpus_stages);
+  }
+}
+
+TEST_CASE("a threshold answer past the host and half the device finishes over a disk tier",
+          "[vss][kmeans][approx][pair_tasks][isolated_context]")
+{
+  sirius::test::scratch_dir scratch{"pair_tasks_large"};
+  auto const disk = scratch.path() / "disk";
+  std::filesystem::create_directories(disk);
+  // 300 MB of host and half of 1.5 GB of device: about 65M pairs at 16 B. These are 100M.
+  sirius::test::shared_test_env env(
+    write_block_rows_yaml(scratch, 1500000000, 300000000, disk.string()));
+  auto con = env.make_connection();
+  ok_rows(con, "ATTACH " + scratch.file_literal("pair_tasks_large.db") + " AS ptb;");
+  ok_rows(con, "USE ptb;");
+  ok_rows(con, "SET scan_task_batch_size = 67108864;");
+  ok_rows(
+    con,
+    "CREATE TABLE ptb_rows AS SELECT i::BIGINT AS id, "
+    "list_transform(range(32), lambda d: 0.5::FLOAT)::FLOAT[32] AS vec FROM range(10000) t(i);");
+  ok_rows(con, "CHECKPOINT;");
+  auto const query = "SELECT count(*), sum(left_id), sum(right_id) FROM " +
+                     threshold_scan_join("ptb_rows", "ptb_rows", 0.001, ", metric => 'l2'") + ";";
+
+  ok_rows(con, "SET vector_join_pair_tasks = false;");
+  auto refused = con.Query(query);
+  REQUIRE(refused);
+  CHECK(refused->HasError());
+
+  ok_rows(con, "SET vector_join_pair_tasks = true;");
+  auto const before = sirius::test::get_vector_join_pair_stats(con);
+  auto const rows   = ok_rows(con, query);
+  auto const after  = sirius::test::get_vector_join_pair_stats(con);
+  REQUIRE(rows.size() == 1);
+  CHECK(rows[0][0] == "100000000");
+  // 10,000 pairs for each id on either side, the ids summing to 49,995,000.
+  CHECK(rows[0][1] == "499950000000");
+  CHECK(rows[0][2] == "499950000000");
+  CHECK(after.pairs_cut_short > before.pairs_cut_short);
+}
+
+TEST_CASE("cancelling a threshold join in pair tasks returns within a pair task",
+          "[vss][kmeans][approx][pair_tasks][isolated_context]")
+{
+  sirius::test::scratch_dir scratch{"pair_tasks_cancel"};
+  sirius::test::shared_test_env env(write_block_rows_yaml(scratch, 2000000000, 2000000000, ""));
+  auto con = env.make_connection();
+  attach_with_small_chunks(con, scratch, "pair_tasks_cancel.db", "pty");
+  ok_rows(con, "USE pty;");
+  create_wide_clustered_join(con, "pty", false, false, 16, 40000, 10000);
+  ok_rows(con, "SELECT * FROM unpin_table('pty_probe');");
+  auto const query = "SELECT count(*), sum(distance) FROM " +
+                     threshold_scan_join("pty_probe", "pty_corpus", 1.5, ", metric => 'l2'") + ";";
+
+  // Slow pair tasks, one at a time, so that what finishes after the interrupt can be counted.
+  constexpr auto kPairMillis = 150;
+  scoped_env vars;
+  vars.set("SIRIUS_VSS_PAIR_TASKS", "1");
+  vars.set("SIRIUS_VSS_PAIR_SLOW_MS", std::to_string(kPairMillis));
+
+  auto const before = sirius::test::get_vector_join_pair_stats(con);
+  duckdb::unique_ptr<duckdb::QueryResult> result;
+  std::atomic<bool> returned{false};
+  std::thread runner([&] {
+    result = con.Query(query);
+    returned.store(true);
+  });
+  std::uint64_t at_interrupt = 0;
+  while (!returned.load()) {
+    at_interrupt = sirius::test::get_vector_join_pair_stats(con).pairs_finished;
+    if (at_interrupt >= before.pairs_finished + 2) { break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  auto const interrupted = std::chrono::steady_clock::now();
+  con.Interrupt();
+  runner.join();
+  auto const waited = std::chrono::steady_clock::now() - interrupted;
+  REQUIRE(result);
+  CHECK(result->HasError());
+  CHECK(sirius::test::get_vector_join_pair_stats(con).pairs_finished - at_interrupt <= 1);
+  // The pair under way and the engine's 25 ms between looks at the interrupt, with a margin.
+  CHECK(std::chrono::duration<double>(waited).count() < 3.0 * kPairMillis / 1000.0 + 1.0);
+
+  // The connection and the engine go on.
+  vars.set("SIRIUS_VSS_PAIR_SLOW_MS", "0");
+  CHECK(scalar_i64(con,
+                   "SELECT count(*) FROM " +
+                     threshold_scan_join("pty_probe", "pty_corpus", 1.5, ", metric => 'l2'") +
+                     ";") > 0);
 }

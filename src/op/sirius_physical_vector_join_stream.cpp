@@ -52,7 +52,9 @@
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/lists/lists_column_view.hpp>
+#include <cudf/partitioning.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/search.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
@@ -93,6 +95,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <typeinfo>
 #include <utility>
 #include <vector>
@@ -121,6 +124,42 @@ std::size_t scanned_block_tasks()
   auto const* v = std::getenv("SIRIUS_VSS_DEVICE_BLOCK_TASKS");
   return v != nullptr ? static_cast<std::size_t>(std::max(1.0, std::atof(v))) : 1;
 }
+
+/// Pair tasks at once over one block by default: while one reads its chunk the other's kernels run.
+constexpr std::size_t kPairTasksAtOnce = 2;
+
+/// Probe rows one threshold search of a pair task takes: its prepared copy of them stays within
+/// what a score tile holds, and its pairs leave between searches. SIRIUS_VSS_PAIR_CALL_ROWS sets
+/// it.
+std::int64_t pair_call_rows(std::int64_t dim)
+{
+  if (auto const* v = std::getenv("SIRIUS_VSS_PAIR_CALL_ROWS"); v != nullptr) {
+    return std::max<std::int64_t>(1, std::atoll(v));
+  }
+  return std::max<std::int64_t>(
+    1,
+    static_cast<std::int64_t>(vss::gemm_search_tile_bytes() /
+                              (static_cast<std::size_t>(dim + 4) * sizeof(float))));
+}
+
+/// Whether a threshold search that threw would fit over fewer probe rows.
+bool search_can_shrink(std::exception const& thrown)
+{
+  return dynamic_cast<rmm::out_of_memory const*>(&thrown) != nullptr ||
+         dynamic_cast<vss::threshold_pairs_exceed_device const*>(&thrown) != nullptr;
+}
+
+/// Waits for the stream as a scope ends, before the buffers and locks declared ahead of it go.
+class sync_stream_on_exit {
+ public:
+  explicit sync_stream_on_exit(rmm::cuda_stream_view stream) : _stream(stream) {}
+  sync_stream_on_exit(sync_stream_on_exit const&)            = delete;
+  sync_stream_on_exit& operator=(sync_stream_on_exit const&) = delete;
+  ~sync_stream_on_exit() { _stream.synchronize_no_throw(); }
+
+ private:
+  rmm::cuda_stream_view _stream;
+};
 
 /// A task's place under vector_join_admission: released, it makes room and asks the task creator
 /// for this join's next tasks, as a streaming source does when data arrives (schedule() only
@@ -472,8 +511,14 @@ class materialized_chunk_source : public vector_chunk_source {
   {
     return resident(i, space, stream, /*own_reservation=*/false);
   }
+  void count_reads() override { _count_reads = true; }
 
  private:
+  void note_read(std::size_t bytes_moved) const
+  {
+    if (_count_reads && _ctx != nullptr) { _ctx->record_vector_join_corpus_stage(bytes_moved); }
+  }
+
   staged_vector_chunk resident(std::size_t i,
                                cucascade::memory::memory_space& space,
                                rmm::cuda_stream_view stream,
@@ -482,6 +527,7 @@ class materialized_chunk_source : public vector_chunk_source {
     auto batch = fetch(_batch_ids.at(i));
     auto ro    = batch->to_read_only();
     if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
+      note_read(0);
       auto const table = sirius::get_cudf_table_view(ro);
       auto const view  = table.column(static_cast<cudf::size_type>(_column_index));
       // Borrowed, not owned: the reader holds the batch alive as well as locked, and `owner`
@@ -497,6 +543,7 @@ class materialized_chunk_source : public vector_chunk_source {
     // stays there; a shape that read does not take comes back to host through the engine.
     if (ro.get_current_tier() == cucascade::memory::Tier::DISK) {
       if (auto const layout = spilled_layout(ro, _column_index)) {
+        note_read(layout->bytes);
         std::shared_ptr<cucascade::memory::reservation> reservation;
         if (own_reservation) {
           reservation = vss::reserve_or_spill(_ctx, space, layout->bytes);
@@ -521,6 +568,7 @@ class materialized_chunk_source : public vector_chunk_source {
     std::array<std::size_t, 1> const cols{_column_index};
     auto data_rep    = host_repr(ro).slice(cols);
     auto const bytes = data_rep->get_size_in_bytes();
+    note_read(bytes);
 
     std::shared_ptr<cucascade::memory::reservation> reservation;
     if (own_reservation) {
@@ -619,6 +667,7 @@ class materialized_chunk_source : public vector_chunk_source {
   telemetry::batch_telemetry_info _telemetry_info;
   std::size_t _column_index{0};
   std::int64_t _dim{0};
+  bool _count_reads{false};
 };
 
 /// A pushed-down predicate's constant, as the cuDF scalar its column compares against.
@@ -972,10 +1021,13 @@ class cluster_lists_chunk_source : public vector_chunk_source {
  public:
   /// With @p exact_rows, a FLOAT16 chunk is staged from the FP32 rows the lists kept instead of
   /// widened from its half rows: for a search that must score the rows as they are.
-  explicit cluster_lists_chunk_source(const vss::cluster_lists& lists, bool exact_rows = false)
+  explicit cluster_lists_chunk_source(const vss::cluster_lists& lists,
+                                      bool exact_rows                = false,
+                                      duckdb::SiriusContext* context = nullptr)
     : _lists(lists),
       _exact_rows(exact_rows && lists.encoding == vss::list_encoding::float16 &&
-                  lists.has_exact_rows())
+                  lists.has_exact_rows()),
+      _context(context)
   {
   }
 
@@ -1007,6 +1059,18 @@ class cluster_lists_chunk_source : public vector_chunk_source {
   staged_vector_chunk stage(std::size_t i,
                             cucascade::memory::memory_space& space,
                             rmm::cuda_stream_view stream) override
+  { return staged_chunk(i, space, stream, /*own_reservation=*/true); }
+  staged_vector_chunk stage_for_pair(std::size_t i,
+                                     cucascade::memory::memory_space& space,
+                                     rmm::cuda_stream_view stream) override
+  { return staged_chunk(i, space, stream, /*own_reservation=*/false); }
+  void count_reads() override { _count_reads = true; }
+
+ private:
+  staged_vector_chunk staged_chunk(std::size_t i,
+                                   cucascade::memory::memory_space& space,
+                                   rmm::cuda_stream_view stream,
+                                   bool own_reservation)
   {
     auto const rows    = static_cast<std::int64_t>(chunk_rows(i));
     auto const first   = static_cast<std::int64_t>(i) * _lists.chunk_rows;
@@ -1019,13 +1083,17 @@ class cluster_lists_chunk_source : public vector_chunk_source {
     }
 
     auto const bytes = chunk_bytes(i);
-    std::shared_ptr<cucascade::memory::reservation> reservation{
-      space.make_reservation_or_null(bytes)};
-    if (!reservation) {
-      vss::throw_staging_shortfall(
-        space, bytes, "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(i));
+    if (_count_reads && _context != nullptr) { _context->record_vector_join_corpus_stage(bytes); }
+    std::shared_ptr<cucascade::memory::reservation> reservation;
+    if (own_reservation) {
+      reservation = space.make_reservation_or_null(bytes);
+      if (!reservation) {
+        vss::throw_staging_shortfall(
+          space, bytes, "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(i));
+      }
     }
-    auto const mr = reservation->get_memory_resource();
+    auto const mr =
+      reservation ? reservation->get_memory_resource() : space.get_default_allocator();
     auto buffer   = std::make_unique<rmm::device_buffer>(
       static_cast<std::size_t>(rows) * float_row_bytes(), stream, mr);
     if (_exact_rows) {
@@ -1110,6 +1178,8 @@ class cluster_lists_chunk_source : public vector_chunk_source {
 
   const vss::cluster_lists& _lists;
   bool _exact_rows{false};
+  duckdb::SiriusContext* _context{nullptr};
+  bool _count_reads{false};
 };
 
 /// A corpus chunk for the fold: staged on @p stage_on under a reservation of its own, so its copy
@@ -1154,10 +1224,8 @@ std::unique_ptr<vector_chunk_source> make_gpu_pinned_chunk_source(
 }
 
 std::unique_ptr<vector_chunk_source> make_cluster_lists_chunk_source(
-  const vss::cluster_lists& lists)
-{
-  return std::make_unique<cluster_lists_chunk_source>(lists);
-}
+  const vss::cluster_lists& lists, duckdb::SiriusContext* ctx)
+{ return std::make_unique<cluster_lists_chunk_source>(lists, /*exact_rows=*/false, ctx); }
 
 std::unique_ptr<vector_chunk_source> make_host_pinned_chunk_source(
   const sirius::scan_manager::pinned_entry& pin,
@@ -1323,7 +1391,7 @@ void sirius_physical_vector_join_stream::initialize_locked()
                                right.table + "." + right.column +
                                "'; run sirius_kmeans_build_lists after pinning");
     }
-    _corpus = make_cluster_lists_chunk_source(*_lists);
+    _corpus = make_cluster_lists_chunk_source(*_lists, _sirius_ctx);
     for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
       _max_chunk_bytes = std::max(_max_chunk_bytes, _corpus->chunk_bytes(i));
     }
@@ -1373,6 +1441,10 @@ void sirius_physical_vector_join_stream::initialize_locked()
     _right_total_rows = static_cast<std::int64_t>(right_pin->num_rows);
   }
 
+  _corpus->count_reads();
+  for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
+    _max_corpus_chunk_rows = std::max(_max_corpus_chunk_rows, _corpus->chunk_rows(i));
+  }
   _num_left = _probe->num_chunks();
   // A probe that stood in for a scalar subquery keeps the subquery's contract: one row. Counted
   // here, raised in execute(), where an exception becomes the query's error.
@@ -1388,6 +1460,16 @@ void sirius_physical_vector_join_stream::initialize_locked()
     }
   }
   plan_probe_blocks_locked();
+  if (pair_tasks_wanted() && !_blocks.empty()) {
+    _pair_schedule.emplace(_blocks.size(), scanned_block_tasks());
+    _pair_states.resize(_blocks.size());
+    _corpus_chunk_base.assign(_corpus->num_chunks(), 0);
+    std::int64_t base = 0;
+    for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
+      _corpus_chunk_base[i] = base;
+      base += static_cast<std::int64_t>(_corpus->chunk_rows(i));
+    }
+  }
   if (!_blocks.empty() && block_rows_on_host() && _host_rows_repo == nullptr &&
       _sirius_ctx != nullptr && get_pipeline() != nullptr) {
     auto manager = _sirius_ctx->get_data_repository_manager(get_pipeline()->get_query_id());
@@ -1402,7 +1484,9 @@ void sirius_physical_vector_join_stream::initialize_locked()
   // in the same task after the search has freed its scratch, so a task needs the search's estimate;
   // the quarter on top is for what that stage stages once for all tasks, outside any of them.
   _admission->pipeline = get_pipeline();
-  if (_lists == nullptr && _build_side != nullptr && !_blocks.empty()) {
+  if (_pair_schedule) {
+    _admission->limit = _pair_tasks_at_once;
+  } else if (_lists == nullptr && _build_side != nullptr && !_blocks.empty()) {
     _admission->limit = scanned_block_tasks();
   }
   if (_lists != nullptr && _lists->tier == cucascade::memory::Tier::GPU && _sirius_ctx != nullptr &&
@@ -1449,8 +1533,7 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
   // cut and join probe chunks to that size; only top-k answers are split back. A corpus the join
   // scans itself is read by every task too, from wherever the engine left it, the disk tier for
   // one larger than the host pool: SIFT100M from disk, 1M probes, ~5 passes as probe chunks.
-  bool const reread = (_lists != nullptr && _lists->tier == cucascade::memory::Tier::HOST) ||
-                      (_lists == nullptr && _build_side != nullptr);
+  bool const reread = corpus_reread();
   // Clustered lists on the device are read in place, so a task's size costs no re-read there; it
   // sets how many probe rows each (task, cluster) slice carries. Both sweeps pay a fixed cost per
   // slice (a GEMM and a selection, or a seed and its stretches), so pin-chunk tasks spread a large
@@ -1463,15 +1546,25 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
                               auto const* v = std::getenv("SIRIUS_VSS_DEVICE_BLOCKS");
                               return v == nullptr || std::string_view{v} != "0";
                             }();
-  bool const wanted = (reread || device_lists) &&
-                      _request.mode != vss::vector_join_mode::threshold &&
-                      _request.earlier_by.empty() && !_request.probe_scalar && _num_left > 0;
+  // A threshold join holds no [n x k] answer per block, so blocks go where pair tasks do: its pairs
+  // then leave chunk by chunk, split by probe chunk, instead of being kept to the block's end.
+  bool const pair_tasks = pair_tasks_wanted();
+  bool const wanted     = (reread || device_lists) &&
+                          (_request.mode != vss::vector_join_mode::threshold || pair_tasks) &&
+                          _request.earlier_by.empty() && !_request.probe_scalar && _num_left > 0;
   if (!wanted) { return; }
   auto const k_join = std::max<std::int64_t>(
     1, _right_total_rows > 0 ? std::min<std::int64_t>(_request.k, _right_total_rows) : _request.k);
   std::int64_t block_rows = 0;
+  if (pair_tasks) {
+    auto const* v = std::getenv("SIRIUS_VSS_PAIR_TASKS");
+    _pair_tasks_at_once =
+      v != nullptr ? static_cast<std::size_t>(std::max(1, std::atoi(v))) : kPairTasksAtOnce;
+  }
   if (auto const* env = std::getenv("SIRIUS_VSS_PROBE_BLOCK_ROWS")) {
     block_rows = std::max<std::int64_t>(0, std::atoll(env));
+  } else if (pair_tasks) {
+    block_rows = pair_block_rows();
   } else if (_sirius_ctx != nullptr) {
     auto const spaces =
       _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
@@ -1528,8 +1621,11 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
       return;
     }
   }
-  block_rows = std::min<std::int64_t>(
-    block_rows, static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) / k_join);
+  // A threshold block's limit is its routing edges, one column; a top-k block's its answer.
+  block_rows =
+    std::min<std::int64_t>(block_rows,
+                           static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) /
+                             (pair_tasks ? std::max<std::int64_t>(_request.n_probes, 1) : k_join));
   if (block_rows_on_host()) {
     // A block's routing edges are one column.
     block_rows = std::min<std::int64_t>(
@@ -1584,11 +1680,97 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
   if (current.rows > 0) { _blocks.push_back(std::move(current)); }
   if (std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
     std::fprintf(stderr,
-                 "[vecjoin-phase] probe blocks: %zu of up to %lld rows over %zu probe chunks\n",
+                 "[vecjoin-phase] probe blocks: %zu of up to %lld rows over %zu probe chunks%s\n",
                  _blocks.size(),
                  static_cast<long long>(block_rows),
-                 _num_left);
+                 _num_left,
+                 pair_tasks ? ", in pair tasks" : "");
   }
+}
+
+bool sirius_physical_vector_join_stream::corpus_reread() const
+{
+  return (_lists != nullptr && _lists->tier == cucascade::memory::Tier::HOST) ||
+         (_lists == nullptr && _build_side != nullptr);
+}
+
+bool sirius_physical_vector_join_stream::pair_tasks_wanted() const
+{
+  return _request.pair_tasks && _request.mode == vss::vector_join_mode::threshold &&
+         _request.earlier_by.empty() && !_request.best_only && !_request.probe_scalar &&
+         _right_total_rows > 0 && corpus_reread();
+}
+
+double sirius_physical_vector_join_stream::pair_block_row_bytes(bool building) const
+{
+  auto const row    = static_cast<double>(_request.dim) * sizeof(float);
+  bool const cosine = _request.metric == "cosine";
+  if (_centroids == nullptr) {
+    // A cosine block goes on holding only its unit rows.
+    return row * (cosine && building ? 2.0 : 1.0);
+  }
+  auto const probes = static_cast<double>(std::max<std::int64_t>(_request.n_probes, 1));
+  // A row's routing edges, sorted (~45 B an edge), then their rows alone; cosine's unit rows;
+  // coded lists' probe copy, norms, rounding error and limits.
+  auto const edges = probes * (building ? 45.0 : static_cast<double>(sizeof(std::int64_t)));
+  auto const coded = _lists != nullptr ? 0.5 * row + 4.0 * sizeof(float) : 0.0;
+  return row * (cosine ? 2.0 : 1.0) + edges + coded;
+}
+
+std::size_t sirius_physical_vector_join_stream::pair_task_bytes(std::int64_t gathered_rows) const
+{
+  auto const n        = _max_corpus_chunk_rows;
+  auto const row      = static_cast<std::size_t>(_request.dim) * sizeof(float);
+  auto const prepared = static_cast<std::size_t>(_request.dim + 4) * sizeof(float);
+  auto const gathered = static_cast<std::size_t>(std::max<std::int64_t>(gathered_rows, 0));
+  // Unexpanded distances go through cuVS's tiles, a block of distances and of kept indices; the
+  // rest through the GEMM's one score tile, with both sides prepared.
+  auto const cells = std::min(std::size_t{512} * n, std::size_t{1} << 27);
+  auto const cuvs  = cells * (sizeof(float) + sizeof(std::int64_t));
+  auto const gemm  = vss::gemm_search_tile_bytes() + n * prepared + gathered * prepared;
+  // The chunk, a chunk's unit rows under cosine, its gathered queries, the first edges, and on
+  // coded lists the buffer the filter's pairs wait in.
+  std::size_t const edges   = (std::size_t{1} << 20) * (2 * sizeof(std::int64_t) + sizeof(float));
+  std::size_t const waiting = _lists != nullptr ? (std::size_t{1} << 22) * 16 : 0;
+  return _max_chunk_bytes + (_request.metric == "cosine" ? n * row : 0) + gathered * row +
+         std::max(cuvs, gemm) + edges + waiting;
+}
+
+std::int64_t sirius_physical_vector_join_stream::pair_block_rows()
+{
+  if (_sirius_ctx == nullptr) { return 0; }
+  auto const spaces =
+    _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  if (spaces.empty()) { return 0; }
+  auto const device        = static_cast<double>(spaces.front()->get_max_memory());
+  std::size_t widest_chunk = 0;
+  for (std::size_t i = 0; i < _num_left; ++i) {
+    widest_chunk = std::max(widest_chunk, _probe->chunk_rows(i));
+  }
+  auto const widest = static_cast<double>(widest_chunk);
+  // A block over a re-read corpus takes most of the device, for the reason a top-k block does. Out
+  // of its share come its pair tasks' working memory and room for the pairs they hold: a task goes
+  // on past that only until its next search would not fit. What materialize concatenates once,
+  // the corpus's output columns, is about 8 B a row a column.
+  auto const share = kScannedBlockDeviceShare * device / static_cast<double>(scanned_block_tasks());
+  auto const scratch = static_cast<double>(pair_task_bytes(
+    std::min(static_cast<std::int64_t>(widest_chunk), pair_call_rows(_request.dim))));
+  if (2.0 * scratch > share && std::getenv("SIRIUS_VSS_PAIR_TASKS") == nullptr) {
+    _pair_tasks_at_once = 1;
+  }
+  auto const fixed    = static_cast<double>(_pair_tasks_at_once) * scratch + device / 8 +
+                        static_cast<double>(_right_total_rows) * sizeof(std::int64_t) *
+                          static_cast<double>(_request.right.output_columns.size());
+  auto const holding  = pair_block_row_bytes(false);
+  auto const building = pair_block_row_bytes(true);
+  auto rows           = share > fixed ? std::min((share - fixed) / holding, share / building) : 0.0;
+  // Never less than a whole probe chunk, unless one does not fit in the share at all.
+  if (rows < widest) {
+    rows = widest * building + scratch <= share
+             ? widest
+             : std::max(rows, static_cast<double>(std::int64_t{1} << 14));
+  }
+  return static_cast<std::int64_t>(rows);
 }
 
 void* host_pair_block_pool::take(std::size_t budget_bytes)
@@ -1659,6 +1841,22 @@ void sirius_physical_vector_join_stream::on_finalize_operator()
                  static_cast<unsigned long long>(stats.blocks_on_device));
   }
   _host_rows_repo = nullptr;
+  _pair_states.clear();
+  if (_sirius_ctx != nullptr && std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
+    auto const stats = _sirius_ctx->get_vector_join_pair_stats();
+    std::fprintf(
+      stderr,
+      "[vecjoin-phase] corpus reads this session: %llu chunks staged, %llu of them "
+      "moved to the device, %.3f GiB; pair tasks: %llu blocks built, %llu attempts, %llu "
+      "finished, %llu cut short\n",
+      static_cast<unsigned long long>(stats.corpus_stages),
+      static_cast<unsigned long long>(stats.corpus_moved),
+      static_cast<double>(stats.corpus_bytes_moved) / 1073741824.0,
+      static_cast<unsigned long long>(stats.blocks_built),
+      static_cast<unsigned long long>(stats.pair_attempts),
+      static_cast<unsigned long long>(stats.pairs_finished),
+      static_cast<unsigned long long>(stats.pairs_cut_short));
+  }
   _corpus_key.reset();
   _layout_key.reset();
   _layout_key_host    = {};
@@ -1685,6 +1883,15 @@ std::optional<task_creation_hint> sirius_physical_vector_join_stream::get_next_t
     if (_init_error_task_issued) { return std::nullopt; }
     return task_creation_hint{TaskCreationHint::READY, this};
   }
+  if (_pair_schedule) {
+    // A task's release re-arms this operator, so nothing waits here that a running task will not
+    // wake: a build about to publish, a block's last pair, or a free place under the cap.
+    std::lock_guard<std::mutex> admission_lock(_admission->mutex);
+    if (_admission->in_flight >= _admission->limit || !_pair_schedule->peek()) {
+      return std::nullopt;
+    }
+    return task_creation_hint{TaskCreationHint::READY, this};
+  }
   if (num_tasks() == 0 || _next_left >= num_tasks()) { return std::nullopt; }
   if (_admission->capped()) {
     // At the cap, a task's release re-arms this operator.
@@ -1705,6 +1912,7 @@ bool sirius_physical_vector_join_stream::all_ports_empty()
   ensure_initialized_locked();
   // Not empty until the task carrying the error has failed the query.
   if (_init_error) { return false; }
+  if (_pair_schedule) { return _pair_schedule->exhausted(); }
   return _next_left >= num_tasks();
 }
 
@@ -1718,6 +1926,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::get_next_task
     _init_error_task_issued = true;
     return std::make_unique<vector_join_stream_input>(0, 0);
   }
+  if (_pair_schedule) { return next_pair_step_locked(); }
   if (_next_left >= num_tasks()) { return nullptr; }
 
   // The probe batch is deliberately NOT carried in the task input as a pipelineable batch: a
@@ -2075,6 +2284,8 @@ void sirius_physical_vector_join_stream::ensure_earlier_keys(
 struct sirius_physical_vector_join_stream::found_pairs {
   std::vector<std::unique_ptr<cudf::column>> left, neighbors, distances;
   std::vector<std::shared_ptr<::cucascade::data_batch>> offloaded;
+  /// Under pair tasks, each offloaded piece's probe chunk.
+  std::vector<std::size_t> offloaded_chunks;
   std::int64_t held{0};
   std::int64_t total{0};
 };
@@ -2213,6 +2424,8 @@ struct sirius_physical_vector_join_stream::block_state {
   // The probe rows.
   staged_vector_chunk staged_probe;
   std::optional<rmm::device_uvector<float>> block_probe;
+  /// An exhaustive cosine block's rows as its pair tasks search them.
+  std::optional<rmm::device_uvector<float>> unit_rows;
   bool probe_rows_on_host{false};
   std::optional<vss::block_host_rows> host_rows;
   vss::dataset_matrix_view queries;
@@ -2279,8 +2492,11 @@ class sirius_physical_vector_join_stream::block_task {
       keyed(radius_join && !op._request.earlier_by.empty()),
       best_only(radius_join && op._request.best_only && !count_only),
       radius_eps(radius_for_kernel()),
-      next_search_room(space.get_max_memory() / 8)
+      next_search_room(space.get_max_memory() / 8),
+      pair_step(input.pair_step() ? &*input.pair_step() : nullptr)
   {
+    // A pair task finds its block's rows loaded.
+    n_left = state.n_left;
   }
 
   // Held for the whole task: every corpus chunk is searched against this probe chunk. A copy
@@ -2376,7 +2592,8 @@ class sirius_physical_vector_join_stream::block_task {
   /// Refuses, once, what no out-of-memory retry could help.
   void refuse_what_cannot_run()
   {
-    vss::column_size(n_left * k_join, "vector join output");
+    // Pair tasks hold no [n x k] answer.
+    if (pair_step == nullptr) { vss::column_size(n_left * k_join, "vector join output"); }
     // A top-k task whose estimate exceeds the whole device cannot fit however much memory is
     // released, so it is refused here, once, instead of through every out-of-memory retry of the
     // executor (k = 32,768 over 10,000 probes used to retry for ~5 s before failing). The routing
@@ -2904,7 +3121,300 @@ class sirius_physical_vector_join_stream::block_task {
     return output(std::move(batches));
   }
 
+  /// A block's rows as an exhaustive search's pair tasks read them.
+  void prepare_rows_for_pairs()
+  {
+    if (_request.metric != "cosine") { return; }
+    st.unit_rows.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
+    vss::normalize_rows(st.queries.data_handle(), n_left, dim, st.unit_rows->data(), stream);
+    stream.sync();
+    st.block_probe.reset();
+    st.queries =
+      raft::make_device_matrix_view<const float, std::int64_t>(st.unit_rows->data(), n_left, dim);
+    st.radius_scale = 0.5f;
+  }
+
+  /// One corpus chunk against the block's rows, in searches of at most pair_call_rows() rows,
+  /// from the step's row on. Pairs are the task's own until it returns, so a retry has nothing to
+  /// undo. When a search runs out of memory with pairs held, those go out first; with none held it
+  /// is run on fewer rows, down to one, past which the shortage is the engine's to retry.
+  /// @return where the next task starts, if this one stopped early.
+  [[nodiscard]] std::optional<vss::pair_schedule::step> search_pair()
+  {
+    auto const j = pair_step->chunk;
+    auto staged  = _op._corpus->stage_for_pair(j, *mem_space, stream);
+    sync_stream_on_exit const quiesce{stream};
+    auto const dataset    = vss::list_column_as_dataset_view(staged.view, dim);
+    auto const batch_rows = static_cast<std::int64_t>(dataset.extent(0));
+    if (static_cast<std::size_t>(batch_rows) != _op._corpus->chunk_rows(j)) {
+      throw std::runtime_error("[sirius_physical_vector_join_stream] corpus chunk " +
+                               std::to_string(j) + " holds " + std::to_string(batch_rows) +
+                               " rows, not the " + std::to_string(_op._corpus->chunk_rows(j)) +
+                               " its batch reports");
+    }
+    if (batch_rows == 0) { return std::nullopt; }
+    bool const cosine = _request.metric == "cosine";
+    auto const metric_searched =
+      cosine ? cuvs::distance::DistanceType::L2Unexpanded
+             : vss::join_selection_distance_type_from_metric(_request.metric,
+                                                             /*exact_unexpanded=*/true);
+    std::optional<rmm::device_uvector<float>> unit_chunk;
+    auto corpus = dataset;
+    if (cosine) {
+      unit_chunk.emplace(static_cast<std::size_t>(batch_rows * dim), stream, mr);
+      vss::normalize_rows(dataset.data_handle(), batch_rows, dim, unit_chunk->data(), stream);
+      corpus = raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+        unit_chunk->data(), batch_rows, dim);
+    }
+    auto const base = _op._corpus_chunk_base[j];
+    auto call_rows  = first_call_rows();
+    for (auto row = pair_step->row; row < n_left;) {
+      auto const rows = std::min(call_rows, n_left - row);
+      auto const queries =
+        raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+          st.queries.data_handle() + row * dim, rows, dim);
+      std::optional<vss::threshold_join_result> edges;
+      try {
+        edges.emplace(threshold_search(res,
+                                       corpus,
+                                       queries,
+                                       cosine ? 2.f * radius_eps : radius_eps,
+                                       metric_searched,
+                                       mr,
+                                       kGemmMinProbeRows,
+                                       count_only));
+      } catch (std::exception const& shortage) {
+        if (!search_can_shrink(shortage)) { throw; }
+        stream.sync();
+        if (found.held > 0) { return rest_of_chunk(0, row, call_rows); }
+        if (rows == 1) { throw; }
+        call_rows = rows / 2;
+        continue;
+      }
+      call_rows = rows_for_next_call(call_rows, rows, edges->n_edges);
+      if (count_only) {
+        note_radius_part(edges->n_edges);
+      } else if (edges->n_edges > 0) {
+        if (base != 0) {
+          cudf::numeric_scalar<std::int64_t> const shift(base, true, stream);
+          edges->neighbors = cudf::binary_operation(edges->neighbors->view(),
+                                                    shift,
+                                                    cudf::binary_operator::ADD,
+                                                    cudf::data_type{cudf::type_id::INT64},
+                                                    stream,
+                                                    mr);
+        }
+        auto left =
+          cudf::cast(edges->query_rows->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr);
+        if (row != 0) {
+          cudf::numeric_scalar<std::int32_t> const shift(
+            static_cast<std::int32_t>(row), true, stream);
+          left = cudf::binary_operation(left->view(),
+                                        shift,
+                                        cudf::binary_operator::ADD,
+                                        cudf::data_type{cudf::type_id::INT32},
+                                        stream,
+                                        mr);
+        }
+        auto const pairs = edges->n_edges;
+        found.left.push_back(std::move(left));
+        found.neighbors.push_back(std::move(edges->neighbors));
+        found.distances.push_back(std::move(edges->distances));
+        note_radius_part(pairs, /*may_stop=*/true);
+      }
+      row += rows;
+      if (row < n_left && holds_enough_to_stop()) { return rest_of_chunk(0, row, call_rows); }
+    }
+    return std::nullopt;
+  }
+
+  /// What a pair task found, as its output: one batch per probe chunk with pairs in it.
+  [[nodiscard]] std::unique_ptr<operator_data> pair_answer()
+  {
+    if (count_only) {
+      cudf::numeric_scalar<std::int64_t> const count(found.total, true, stream);
+      std::vector<std::unique_ptr<cudf::column>> cols;
+      cols.push_back(cudf::make_column_from_scalar(count, 1, stream, mr));
+      auto batch = sirius::make_data_batch(
+        std::make_unique<cudf::table>(std::move(cols)), *mem_space, stream, _op.batch_telemetry());
+      std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
+      batches.push_back(std::move(batch));
+      return output(std::move(batches));
+    }
+    auto batches   = std::move(found.offloaded);
+    auto chunks    = std::move(found.offloaded_chunks);
+    bool on_device = false;
+    if (!found.left.empty()) {
+      for (auto& [chunk, table] : pairs_by_probe_chunk()) {
+        batches.push_back(
+          sirius::make_data_batch(std::move(table), *mem_space, stream, _op.batch_telemetry()));
+        chunks.push_back(chunk);
+        on_device = true;
+      }
+    }
+    if (batches.empty()) { return output({}); }
+    // Materialize takes its device from a piece on it.
+    if (!on_device) {
+      std::vector<std::unique_ptr<cudf::column>> empty_cols;
+      empty_cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT32}));
+      empty_cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::INT64}));
+      empty_cols.push_back(cudf::make_empty_column(cudf::data_type{cudf::type_id::FLOAT32}));
+      batches.push_back(
+        sirius::make_data_batch(std::make_unique<cudf::table>(std::move(empty_cols)),
+                                *mem_space,
+                                stream,
+                                _op.batch_telemetry()));
+      chunks.push_back(chunks.front());
+    }
+    return std::make_unique<vector_join_stream_block_output>(
+      std::move(batches), std::move(chunks), join_in->ticket());
+  }
+
+  /// A build task's output: nothing goes on to materialize.
+  [[nodiscard]] std::unique_ptr<operator_data> no_answer() { return output({}); }
+
  protected:
+  [[nodiscard]] vss::pair_schedule::step rest_of_chunk(std::size_t run,
+                                                       std::int64_t row,
+                                                       std::int64_t call_rows) const
+  {
+    auto rest      = *pair_step;
+    rest.run       = run;
+    rest.row       = row;
+    rest.call_rows = call_rows;
+    return rest;
+  }
+
+  [[nodiscard]] std::int64_t first_call_rows() const
+  { return pair_step->call_rows > 0 ? pair_step->call_rows : pair_call_rows(dim); }
+
+  /// Probe rows for the search after one that found @p pairs over @p rows: a search should leave
+  /// about what a task may hold, or the pairs need cutting after the work is done. For this chunk
+  /// only: how many pairs a row finds differs from chunk to chunk.
+  [[nodiscard]] std::int64_t rows_for_next_call(std::int64_t call_rows,
+                                                std::int64_t rows,
+                                                std::int64_t pairs) const
+  {
+    auto const most = static_cast<std::int64_t>(mem_space->get_max_memory() / 8 / 16);
+    if (count_only || pairs <= most) { return call_rows; }
+    return std::clamp<std::int64_t>(
+      static_cast<std::int64_t>(static_cast<double>(rows) * static_cast<double>(most) /
+                                static_cast<double>(pairs)),
+      1,
+      call_rows);
+  }
+
+  /// Whether a pair task should end here and let its pairs out: the split by probe chunk and
+  /// materialize take as much again as the pairs while the next search needs its room, or a piece
+  /// has already gone to the host.
+  [[nodiscard]] bool holds_enough_to_stop()
+  {
+    if (count_only) { return false; }
+    if (!found.offloaded.empty()) { return true; }
+    if (flush_pairs) { return found.held > *flush_pairs; }
+    if (found.held < (std::int64_t{1} << 20)) { return false; }
+    auto const held_bytes = static_cast<std::size_t>(found.held) * 16;
+    return held_bytes > mem_space->get_max_memory() / 8 ||
+           2 * held_bytes + next_search_room > mem_space->get_available_memory(stream);
+  }
+
+  /// The pairs held on the device, closed: their parts joined, and scaled to what the join reports.
+  [[nodiscard]] std::vector<std::unique_ptr<cudf::column>> closed_pairs()
+  {
+    auto concat = [&](std::vector<std::unique_ptr<cudf::column>>& parts) {
+      std::unique_ptr<cudf::column> out;
+      if (parts.size() == 1) {
+        out = std::move(parts.front());
+      } else {
+        std::vector<cudf::column_view> views;
+        for (auto const& c : parts) {
+          views.push_back(c->view());
+        }
+        out = cudf::concatenate(views, stream, mr);
+      }
+      parts.clear();
+      return out;
+    };
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(concat(found.left));
+    cols.push_back(concat(found.neighbors));
+    cols.push_back(concat(found.distances));
+    if (st.radius_scale != 1.0f) {
+      vss::scale_in_place(
+        cols[2]->mutable_view().data<float>(), cols[2]->size(), st.radius_scale, stream);
+    }
+    return cols;
+  }
+
+  /// A pair task's left rows are rows of its block; materialize gathers a probe chunk at a time, so
+  /// its pairs split by chunk here, left rows counted from the start of each. Skips chunks with
+  /// none.
+  [[nodiscard]] std::vector<std::pair<std::size_t, std::unique_ptr<cudf::table>>>
+  pairs_by_probe_chunk()
+  {
+    auto table = std::make_unique<cudf::table>(closed_pairs());
+    std::vector<std::pair<std::size_t, std::unique_ptr<cudf::table>>> out;
+    auto const shifted = [&](std::unique_ptr<cudf::table> part, std::int64_t by) {
+      if (by == 0) { return part; }
+      cudf::numeric_scalar<std::int32_t> const shift(static_cast<std::int32_t>(by), true, stream);
+      auto cols = part->release();
+      cols[0]   = cudf::binary_operation(cols[0]->view(),
+                                         shift,
+                                         cudf::binary_operator::ADD,
+                                         cudf::data_type{cudf::type_id::INT32},
+                                         stream,
+                                         mr);
+      return std::make_unique<cudf::table>(std::move(cols));
+    };
+    auto const& pieces = block->pieces;
+    if (pieces.size() == 1) {
+      out.emplace_back(pieces.front().chunk, shifted(std::move(table), pieces.front().begin));
+      return out;
+    }
+    std::vector<std::int32_t> first_rows;
+    first_rows.reserve(pieces.size());
+    std::int64_t first = 0;
+    for (auto const& piece : pieces) {
+      first_rows.push_back(static_cast<std::int32_t>(first));
+      first += piece.end - piece.begin;
+    }
+    auto firsts = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                            static_cast<cudf::size_type>(first_rows.size()),
+                                            cudf::mask_state::UNALLOCATED,
+                                            stream,
+                                            mr);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(firsts->mutable_view().data<std::int32_t>(),
+                                  first_rows.data(),
+                                  first_rows.size() * sizeof(std::int32_t),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
+    stream.sync();
+    auto const above = cudf::upper_bound(cudf::table_view{{firsts->view()}},
+                                         cudf::table_view{{table->view().column(0)}},
+                                         {cudf::order::ASCENDING},
+                                         {cudf::null_order::BEFORE},
+                                         stream,
+                                         mr);
+    cudf::numeric_scalar<std::int32_t> const one(1, true, stream);
+    auto const chunk_of    = cudf::binary_operation(above->view(),
+                                                    one,
+                                                    cudf::binary_operator::SUB,
+                                                    cudf::data_type{cudf::type_id::INT32},
+                                                    stream,
+                                                    mr);
+    auto [parted, offsets] = cudf::partition(
+      table->view(), chunk_of->view(), static_cast<cudf::size_type>(pieces.size()), stream, mr);
+    table.reset();
+    for (std::size_t i = 0; i < pieces.size(); ++i) {
+      if (offsets[i + 1] == offsets[i]) { continue; }
+      auto const part = cudf::slice(parted->view(), {offsets[i], offsets[i + 1]}, stream).front();
+      out.emplace_back(
+        pieces[i].chunk,
+        shifted(std::make_unique<cudf::table>(part, stream, mr), pieces[i].begin - first_rows[i]));
+    }
+    return out;
+  }
+
   // A capped task keeps its admission ticket until the materialize stage is done with the output.
   [[nodiscard]] std::unique_ptr<operator_data> output(
     std::vector<std::shared_ptr<cucascade::data_batch>> batches)
@@ -2952,30 +3462,20 @@ class sirius_physical_vector_join_stream::block_task {
   void flush_radius()
   {
     if (found.left.empty()) { return; }
-    auto concat = [&](std::vector<std::unique_ptr<cudf::column>>& parts) {
-      std::unique_ptr<cudf::column> out;
-      if (parts.size() == 1) {
-        out = std::move(parts.front());
-      } else {
-        std::vector<cudf::column_view> views;
-        for (auto const& c : parts) {
-          views.push_back(c->view());
-        }
-        out = cudf::concatenate(views, stream, mr);
+    if (pair_step != nullptr) {
+      for (auto& [chunk, table] : pairs_by_probe_chunk()) {
+        auto piece =
+          sirius::make_data_batch(std::move(table), *mem_space, stream, _op.batch_telemetry());
+        piece->to_mutable().convert_to<cucascade::host_data_representation>(
+          sirius::converter_registry::get(), host_space, stream);
+        found.offloaded.push_back(std::move(piece));
+        found.offloaded_chunks.push_back(chunk);
       }
-      parts.clear();
-      return out;
-    };
-    std::vector<std::unique_ptr<cudf::column>> cols;
-    cols.push_back(concat(found.left));
-    cols.push_back(concat(found.neighbors));
-    cols.push_back(concat(found.distances));
-    if (st.radius_scale != 1.0f) {
-      vss::scale_in_place(
-        cols[2]->mutable_view().data<float>(), cols[2]->size(), st.radius_scale, stream);
+      found.held = 0;
+      return;
     }
     auto piece = sirius::make_data_batch(
-      std::make_unique<cudf::table>(std::move(cols)), *mem_space, stream, _op.batch_telemetry());
+      std::make_unique<cudf::table>(closed_pairs()), *mem_space, stream, _op.batch_telemetry());
     piece->to_mutable().convert_to<cucascade::host_data_representation>(
       sirius::converter_registry::get(), host_space, stream);
     found.offloaded.push_back(std::move(piece));
@@ -2988,18 +3488,22 @@ class sirius_physical_vector_join_stream::block_task {
     found.held = 0;
   }
 
-  void note_radius_part(std::int64_t pairs)
+  /// @param may_stop The caller can end the task right after this: its pairs then leave as its
+  /// output instead of going to the host, where nothing can move them. A forced flush still goes.
+  void note_radius_part(std::int64_t pairs, bool may_stop = false)
   {
     found.held += pairs;
     found.total += pairs;
-    if (!count_only && found.total > max_pairs) {
+    if (!count_only && pair_step == nullptr && found.total > max_pairs) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_stream] the pairs within the threshold reach " +
         std::to_string(found.total) + " for one probe batch, more than host and device memory " +
         "can hold as output (~" + std::to_string(max_pairs) + "); tighten the threshold or join " +
         "fewer probe rows at a time");
     }
-    if (host_space != nullptr && !count_only && must_flush()) { flush_radius(); }
+    if (host_space != nullptr && !count_only && (!may_stop || flush_pairs) && must_flush()) {
+      flush_radius();
+    }
   }
 
   void fold_best(std::int32_t const* rows,
@@ -3126,6 +3630,8 @@ class sirius_physical_vector_join_stream::block_task {
   std::optional<std::int64_t> flush_pairs;
   std::size_t next_search_room;
   std::int64_t max_pairs{0};
+  // Under pair tasks, this task's place in the schedule.
+  vss::pair_schedule::step const* pair_step;
 };
 
 //===----------------------------------------------------------------------===//
@@ -3142,6 +3648,19 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     : block_task(task),
       s(st.search.emplace(_op._host_pair_blocks)),
       w(s.run),
+      dbg(std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr),
+      phase_t0(std::chrono::steady_clock::now()),
+      stage_on(stream),
+      borrowed{stream},
+      building_for_pairs(pair_step != nullptr)
+  {
+  }
+
+  /// A pair task over a block already prepared, its walk its own.
+  clustered_search(block_task const& task, block_state::search_run& own)
+    : block_task(task),
+      s(*st.search),
+      w(own),
       dbg(std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr),
       phase_t0(std::chrono::steady_clock::now()),
       stage_on(stream),
@@ -3164,6 +3683,56 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     // What the answer does not read goes before it is shaped, which can take a good part of the
     // device.
     st.search.reset();
+  }
+
+  /// A build task's part: everything a pair task reads, written here and never after.
+  void prepare_for_pairs()
+  {
+    prepare();
+    begin_sweep(s.any_bounded ? 1 : 0);
+    phase("block set up");
+    if (_op._sirius_ctx != nullptr) {
+      _op._sirius_ctx->record_vector_join_prune(
+        0,
+        static_cast<std::uint64_t>(n_left) * static_cast<std::uint64_t>(_op._right_total_rows),
+        s.needed_chunks.size(),
+        _op._chunk_cluster_runs.size());
+    }
+  }
+
+  /// One chunk of the sweep against the block, from the step's run and row on. As in the exhaustive
+  /// search, what it holds is its own until it returns.
+  /// @return where the next task starts, if this one stopped early.
+  [[nodiscard]] std::optional<vss::pair_schedule::step> run_pair()
+  {
+    set_sweep(s.any_bounded ? 1 : 0);
+    keep_from_plan();
+    w.running_piece = s.running_bound_rows;
+    if (s.any_bounded) { w.candidates.emplace(std::int64_t{1} << 22, stream, mr); }
+    auto const j = (*chunks)[pair_step->chunk];
+    // Only a search that gathers its probe rows needs room for them, and only for this chunk's.
+    std::int64_t gathered = 0;
+    if (!s.any_bounded) {
+      auto const& edge_begin = s.routed->edge_begin;
+      for (auto const& slice : _op._chunk_cluster_runs[j]) {
+        auto const c = static_cast<std::size_t>(slice.cluster);
+        gathered     = std::max(gathered, edge_begin[c + 1] - edge_begin[c]);
+      }
+      gathered = std::min(gathered, pair_call_rows(dim));
+    }
+    routed_queries.emplace(static_cast<std::size_t>(gathered * dim), stream, mr);
+    prefetched = stage_next(j);
+    search_chunk(pair_step->chunk);
+    if (s.any_bounded) {
+      check_group();
+      flush();
+    }
+    stream.sync();
+    if (_op._sirius_ctx != nullptr) {
+      _op._sirius_ctx->record_vector_join_prune(
+        static_cast<std::uint64_t>(w.scanned_pairs), 0, 0, 0);
+    }
+    return stopped_at;
   }
 
  private:
@@ -3225,10 +3794,10 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   void prepare()
   {
     route_block();
-    seed_accumulator();
+    if (!building_for_pairs) { seed_accumulator(); }
     // Staging runs on its own stream so the next needed chunk's H2D overlaps this one's
     // compute, exactly as in the exhaustive fold.
-    if (_op._corpus->is_streaming()) { staging_stream.emplace(); }
+    if (_op._corpus->is_streaming() && !building_for_pairs) { staging_stream.emplace(); }
     stage_on = staging_stream ? staging_stream->view() : stream;
     plan_search();
   }
@@ -3381,10 +3950,12 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     s.max_nearest = nearest_edges.empty()
                       ? std::int64_t{0}
                       : *std::max_element(nearest_edges.begin(), nearest_edges.end());
-    routed_queries.emplace(
-      static_cast<std::size_t>((st.probe_rows_on_host ? s.max_nearest : s.max_routed) * dim),
-      stream,
-      mr);
+    if (!building_for_pairs) {
+      routed_queries.emplace(
+        static_cast<std::size_t>((st.probe_rows_on_host ? s.max_nearest : s.max_routed) * dim),
+        stream,
+        mr);
+    }
     s.routed_rows = reinterpret_cast<std::int64_t const*>(s.routed->rows.data());
   }
 
@@ -3406,6 +3977,18 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       st.acc_neighbors = cudf::make_column_from_scalar(miss_id, total, stream, mr);
       st.acc_distances = cudf::make_column_from_scalar(miss_distance, total, stream, mr);
     }
+  }
+
+  /// What each task over a block keeps at hand from its plan.
+  void keep_from_plan()
+  {
+    // The FLOAT16 rows' largest rounding error and norm, which the filter limit allows for: the
+    // lists' own, or for a scanned corpus the staged chunk's, set as each chunk is coded.
+    row_half_error = _lists != nullptr ? _lists->half_error : 0.f;
+    row_norm_max   = _lists != nullptr ? _lists->max_row_norm : 0.f;
+    // Where the FP32 re-score reads a layout row: the lists' kept rows, or for a scanned corpus the
+    // staged chunk, pointed at as each chunk is coded (its candidates are flushed before it goes).
+    exact_source = s.rescore && _lists != nullptr ? _lists->exact_source() : vss::exact_rows{};
   }
 
   /// Settles the search's form, from the join, the lists and the probe's rows, coding the probe on
@@ -3592,10 +4175,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     // A radius join whose score is never read keeps the filter's verdict where it already proves
     // the pair is inside the radius, and re-scores only the rest.
     s.skip_certain = radius_join && s.rescore && !_request.score_read && !best_only;
-    // The FLOAT16 rows' largest rounding error and norm, which the filter limit allows for: the
-    // lists' own, or for a scanned corpus the staged chunk's, set as each chunk is coded.
-    row_half_error = _lists != nullptr ? _lists->half_error : 0.f;
-    row_norm_max   = _lists != nullptr ? _lists->max_row_norm : 0.f;
+    keep_from_plan();
     s.sqrt_at_end =
       s.any_bounded && s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded;
     // Lists on the device run sweep 0 -- each row's nearest cluster, which only sets the bounded
@@ -3686,7 +4266,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       auto const* v = std::getenv("SIRIUS_VSS_SWEEP0_CODE_BOUND");
       return v == nullptr || std::string_view{v} != "0";
     }();
-    if (s.f16_sweep0) {
+    if (s.f16_sweep0 && !building_for_pairs) {
       routed_f16.emplace(static_cast<std::size_t>(s.max_routed * dim), stream, mr);
       routed_sqf.emplace(static_cast<std::size_t>(s.max_routed), stream, mr);
     }
@@ -3708,9 +4288,6 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         }
       }
     }
-    // Where the FP32 re-score reads a layout row: the lists' kept rows, or for a scanned corpus the
-    // staged chunk, pointed at as each chunk is coded (its candidates are flushed before it goes).
-    exact_source = s.rescore && _lists != nullptr ? _lists->exact_source() : vss::exact_rows{};
     // The kernels compare squared distances.
     s.radius_bound = s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded
                        ? s.search_radius * s.search_radius
@@ -3896,8 +4473,10 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     if (s.int8_search) {
       s.probe_i8.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
       s.probe_sq.emplace(static_cast<std::size_t>(n_left), stream, mr);
-      routed_i8.emplace(static_cast<std::size_t>(s.max_routed * dim), stream, mr);
-      routed_sq.emplace(static_cast<std::size_t>(s.max_routed), stream, mr);
+      if (!building_for_pairs) {
+        routed_i8.emplace(static_cast<std::size_t>(s.max_routed * dim), stream, mr);
+        routed_sq.emplace(static_cast<std::size_t>(s.max_routed), stream, mr);
+      }
       if (s.codes_int8) {
         // The probe gets the lists' codes too, and its own exact coding error per row -- rotated
         // first, like the rows, when the lists were (the FP32 re-score keeps the unrotated probe).
@@ -4734,14 +5313,19 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     auto const rows = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
     auto const bytes =
       staged_rows_bytes(rows) + (s.list_norms != nullptr ? static_cast<std::size_t>(rows) * 4 : 0);
-    std::shared_ptr<cucascade::memory::reservation> reservation{
-      mem_space->make_reservation_or_null(bytes)};
-    if (!reservation) {
-      vss::throw_staging_shortfall(
-        *mem_space, bytes, "[sirius_physical_vector_join_stream] lists chunk " + std::to_string(j));
+    if (_op._sirius_ctx != nullptr) { _op._sirius_ctx->record_vector_join_corpus_stage(bytes); }
+    std::shared_ptr<cucascade::memory::reservation> reservation;
+    if (pair_step == nullptr) {
+      reservation = mem_space->make_reservation_or_null(bytes);
+      if (!reservation) {
+        vss::throw_staging_shortfall(
+          *mem_space,
+          bytes,
+          "[sirius_physical_vector_join_stream] lists chunk " + std::to_string(j));
+      }
     }
-    auto buffer =
-      std::make_unique<rmm::device_buffer>(bytes, stage_on, reservation->get_memory_resource());
+    auto buffer = std::make_unique<rmm::device_buffer>(
+      bytes, stage_on, reservation ? reservation->get_memory_resource() : mr);
     auto* out       = static_cast<std::byte*>(buffer->data());
     auto const lock = vss::lock_host_list_chunk(*_lists, j, stage_on);
     vss::copy_host_list_rows(*_lists, lock, 0, rows, out, stage_on);
@@ -4786,12 +5370,10 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       }
       return stage_compact(j);
     }
-    return direct ? staged_vector_chunk{}
-                  : stage_for_fold(s.exact_lists_corpus ? *s.exact_lists_corpus : *_op._corpus,
-                                   j,
-                                   *mem_space,
-                                   stage_on,
-                                   stream);
+    auto& source = s.exact_lists_corpus ? *s.exact_lists_corpus : *_op._corpus;
+    if (direct) { return staged_vector_chunk{}; }
+    return pair_step != nullptr ? source.stage_for_pair(j, *mem_space, stream)
+                                : stage_for_fold(source, j, *mem_space, stage_on, stream);
   }
 
   // A sample is a quarter of its cluster, at least eight times k rows (and 64) and at most the
@@ -4918,12 +5500,10 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     }
   }
 
-  /// Sets up a pass over the corpus: which chunks it reads and how, and the bounds it starts from.
-  void begin_sweep(int which)
+  /// Which chunks a pass reads and how: what a task needs at hand of a sweep the block is set for.
+  void set_sweep(int which)
   {
-    sweep                     = which;
-    auto const& edge_begin    = s.routed->edge_begin;
-    auto const& nearest_edges = s.routed->nearest_edges;
+    sweep = which;
     if (sweep == 1 && !kept.empty()) {
       for (auto const& entry : kept) {
         kept_first.push_back(entry.first);
@@ -4952,8 +5532,18 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                        auto const* v = std::getenv("SIRIUS_VSS_GROUPED_SWEEP0");
                        return v == nullptr || std::string_view{v} != "0";
                      }();
+  }
+
+  /// Sets up a pass over the corpus: which chunks it reads and how, and the bounds it starts from.
+  void begin_sweep(int which)
+  {
+    set_sweep(which);
+    auto const& edge_begin    = s.routed->edge_begin;
+    auto const& nearest_edges = s.routed->nearest_edges;
     stretches.clear();
-    prefetched = chunks->empty() ? staged_vector_chunk{} : stage_next((*chunks)[0]);
+    if (!building_for_pairs) {
+      prefetched = chunks->empty() ? staged_vector_chunk{} : stage_next((*chunks)[0]);
+    }
     if (sweep == 0 && s.seed) {
       s.bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
       if (s.lists_on_host || s.f16_list_no_seed) {
@@ -5040,11 +5630,13 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         code_limits(s.bound->data(), s.certain_limit->data(), true);
       }
       // A radius join's buffer only has to amortize the flush that appends it to the result.
-      w.candidates.emplace(radius_join
-                             ? std::int64_t{1} << 22
-                             : std::max<std::int64_t>(std::int64_t{1} << 22, 4 * n_left * k_join),
-                           stream,
-                           mr);
+      if (!building_for_pairs) {
+        w.candidates.emplace(radius_join
+                               ? std::int64_t{1} << 22
+                               : std::max<std::int64_t>(std::int64_t{1} << 22, 4 * n_left * k_join),
+                             stream,
+                             mr);
+      }
     }
     if (grouped_sweep0) {
       // Each cluster is contiguous in the device lists, so one task group covers it whole.
@@ -5097,6 +5689,10 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     auto const& nearest_edges = s.routed->nearest_edges;
     auto const j              = (*chunks)[ci];
     auto staged               = std::move(prefetched);
+    // A pair task's kernels may still be reading the chunk if it fails, and the reader goes with
+    // it.
+    std::optional<sync_stream_on_exit> quiesce;
+    if (pair_step != nullptr) { quiesce.emplace(stream); }
     auto const chunk_base     = _op._chunk_row_base[j];
     float const* chunk_data   = nullptr;
     std::int64_t chunk_n      = 0;
@@ -5210,7 +5806,14 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       }
     }
 
-    for (auto const& slice : grouped_sweep0 ? no_runs : _op._chunk_cluster_runs[j]) {
+    auto const& runs     = grouped_sweep0 ? no_runs : _op._chunk_cluster_runs[j];
+    auto const first_run = pair_step != nullptr ? pair_step->run : std::size_t{0};
+    for (auto run = first_run; run < runs.size(); ++run) {
+      auto const& slice = runs[run];
+      if (pair_step != nullptr && holds_enough_to_stop()) {
+        stopped_at = rest_of_chunk(run, 0, pair_step->call_rows);
+        break;
+      }
       auto eb          = edge_begin[static_cast<std::size_t>(slice.cluster)];
       auto ee          = edge_begin[static_cast<std::size_t>(slice.cluster) + 1];
       auto const split = eb + nearest_edges[static_cast<std::size_t>(slice.cluster)];
@@ -5265,7 +5868,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                                         cudaMemcpyHostToDevice,
                                         stream.get()));
         }
-      } else if (!direct) {
+      } else if (!direct && pair_step == nullptr) {
         vss::gather_rows(
           s.search_queries.data_handle(), dim, rows_c, m, routed_queries->data(), stream);
       }
@@ -5361,6 +5964,14 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         w.bounded_padded += ((slice_rows + 127) / 128) * ((m + 127) / 128);
         group.push_back(sl);
         if (group.size() >= s.bounded_group) { check_group(); }
+        continue;
+      }
+
+      if (radius_join && pair_step != nullptr) {
+        if (!search_slice_of_pair(
+              run, slice_view, rows_c, m, id_base, id_map, run == first_run ? pair_step->row : 0)) {
+          break;
+        }
         continue;
       }
 
@@ -5504,7 +6115,8 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     // The searches above are issued, not finished. Staging the next needed chunk now runs its
     // H2D while the GPU works on this one.
     if (s.lists_on_host) { launch_deferred(); }
-    prefetched = ci + 1 < chunks->size() ? stage_next((*chunks)[ci + 1]) : staged_vector_chunk{};
+    prefetched = pair_step == nullptr && ci + 1 < chunks->size() ? stage_next((*chunks)[ci + 1])
+                                                                 : staged_vector_chunk{};
     if (s.keep_chunks && sweep == 0 && can_keep()) {
       kept.emplace(j, std::move(staged));
     } else {
@@ -5520,6 +6132,74 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       }
       release_staged(staged);
     }
+  }
+
+  /// One cluster's rows of this chunk against the block rows routed to it, a part of them at a
+  /// time, from @p first_row on. False when the task should stop here, with @ref stopped_at saying
+  /// where.
+  [[nodiscard]] bool search_slice_of_pair(std::size_t run,
+                                          vss::dataset_matrix_view slice_view,
+                                          std::int64_t const* rows_c,
+                                          std::int64_t m,
+                                          std::int64_t id_base,
+                                          std::int64_t const* id_map,
+                                          std::int64_t first_row)
+  {
+    auto call_rows = first_call_rows();
+    for (auto at = first_row; at < m;) {
+      auto const rows =
+        std::min({call_rows, m - at, static_cast<std::int64_t>(routed_queries->size()) / dim});
+      vss::gather_rows(
+        s.search_queries.data_handle(), dim, rows_c + at, rows, routed_queries->data(), stream);
+      auto const queries =
+        raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+          routed_queries->data(), rows, dim);
+      std::optional<vss::threshold_join_result> edges;
+      try {
+        edges.emplace(threshold_search(
+          res, slice_view, queries, s.search_radius, s.ranked_metric, mr, 0, count_only));
+      } catch (std::exception const& shortage) {
+        if (!search_can_shrink(shortage)) { throw; }
+        stream.sync();
+        if (found.held > 0) {
+          stopped_at = rest_of_chunk(run, at, call_rows);
+          return false;
+        }
+        if (rows == 1) { throw; }
+        call_rows = rows / 2;
+        continue;
+      }
+      call_rows = rows_for_next_call(call_rows, rows, edges->n_edges);
+      if (count_only) {
+        note_radius_part(edges->n_edges);
+      } else if (edges->n_edges > 0) {
+        auto left =
+          cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                    vss::column_size(edges->n_edges, "vector join threshold"),
+                                    cudf::mask_state::UNALLOCATED,
+                                    stream,
+                                    mr);
+        vss::remap_radius_edges(edges->query_rows->view().data<std::int64_t>(),
+                                rows_c + at,
+                                left->mutable_view().data<std::int32_t>(),
+                                edges->neighbors->mutable_view().data<std::int64_t>(),
+                                edges->n_edges,
+                                id_base,
+                                stream,
+                                id_map);
+        auto const pairs = edges->n_edges;
+        found.left.push_back(std::move(left));
+        found.neighbors.push_back(std::move(edges->neighbors));
+        found.distances.push_back(std::move(edges->distances));
+        note_radius_part(pairs, /*may_stop=*/true);
+      }
+      at += rows;
+      if (at < m && holds_enough_to_stop()) {
+        stopped_at = rest_of_chunk(run, at, call_rows);
+        return false;
+      }
+    }
+    return true;
   }
 
   void run_stretches()
@@ -5708,7 +6388,127 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   std::vector<chunk_cluster_run> const no_runs;
   // The stretched sweep 0's pieces, by stretch (see stretch_sweep0).
   std::vector<std::vector<bounded_slice>> stretches;
+  // A build task leaves out what only a walk over chunks reads.
+  bool building_for_pairs{false};
+  std::optional<vss::pair_schedule::step> stopped_at;
 };
+
+std::unique_ptr<operator_data> sirius_physical_vector_join_stream::next_pair_step_locked()
+{
+  if (!_pair_schedule->peek()) { return nullptr; }
+  {
+    std::lock_guard<std::mutex> admission_lock(_admission->mutex);
+    if (_admission->in_flight >= _admission->limit) { return nullptr; }
+    ++_admission->in_flight;
+  }
+  auto ticket       = std::make_shared<admission_ticket>(_admission);
+  auto const step   = _pair_schedule->take();
+  auto const& block = _blocks[step.block];
+  std::size_t bytes = 0;
+  if (step.kind == vss::pair_schedule::step_kind::build) {
+    bytes = static_cast<std::size_t>(static_cast<double>(block.rows) * pair_block_row_bytes(true)) +
+            _max_probe_chunk_bytes + vss::gemm_search_tile_bytes();
+  } else {
+    auto const& state = *_pair_states[step.block];
+    bytes             = pair_task_bytes(
+      std::min(state.search ? state.search->max_routed : block.rows, pair_call_rows(_request.dim)));
+  }
+  auto input =
+    std::make_unique<vector_join_stream_input>(block.pieces.front().chunk, bytes, step.block);
+  input->set_pair_step(step);
+  input->set_ticket(std::move(ticket));
+  if (_pair_device) { input->set_preferred_device_id(*_pair_device); }
+  return input;
+}
+
+std::unique_ptr<operator_data> sirius_physical_vector_join_stream::run_build_step(
+  vector_join_stream_input const& input,
+  ::cucascade::memory::memory_space& space,
+  rmm::cuda_stream_view stream)
+{
+  auto const b = input.pair_step()->block;
+  auto st      = std::make_shared<block_state>();
+  found_pairs none;
+  block_task task{*this, *st, none, input, space, stream};
+  task.load_rows();
+  task.refuse_what_cannot_run();
+  auto chunks = _corpus->num_chunks();
+  if (_centroids != nullptr) {
+    clustered_search search{task};
+    search.prepare_for_pairs();
+    chunks = st->search->needed_chunks.size();
+  } else {
+    task.prepare_rows_for_pairs();
+  }
+  // Other tasks read all this on their own streams.
+  stream.sync();
+  inject_pair_oom();
+  auto answer = task.no_answer();
+  std::lock_guard<std::mutex> lg(_op_mutex);
+  if (!_pair_device) { _pair_device = space.get_device_id(); }
+  if (!_pair_schedule->built(b, chunks)) { _pair_states[b] = std::move(st); }
+  if (_sirius_ctx != nullptr) { _sirius_ctx->record_vector_join_block_built(); }
+  return answer;
+}
+
+std::unique_ptr<operator_data> sirius_physical_vector_join_stream::run_pair_step(
+  vector_join_stream_input const& input,
+  ::cucascade::memory::memory_space& space,
+  rmm::cuda_stream_view stream)
+{
+  auto const& step = *input.pair_step();
+  std::shared_ptr<block_state> state;
+  {
+    std::lock_guard<std::mutex> lg(_op_mutex);
+    state = _pair_states[step.block];
+  }
+  if (_sirius_ctx != nullptr) { _sirius_ctx->record_vector_join_pair_attempt(); }
+  std::optional<vss::pair_schedule::step> rest;
+  std::unique_ptr<operator_data> answer;
+  {
+    found_pairs found;
+    block_task task{*this, *state, found, input, space, stream};
+    task.prepare_answer();
+    if (_centroids != nullptr) {
+      block_state::search_run run{_host_pair_blocks};
+      clustered_search search{task, run};
+      rest = search.run_pair();
+    } else {
+      rest = task.search_pair();
+    }
+    inject_pair_oom();
+    answer = task.pair_answer();
+    stream.sync();
+  }
+  // From here on the pairs are this task's output: a retry resumes after this operator, so the
+  // schedule moves on exactly once for them. Nothing below can run out of memory.
+  std::lock_guard<std::mutex> lg(_op_mutex);
+  if (rest) {
+    _pair_schedule->cut_short(*rest);
+    if (_sirius_ctx != nullptr) { _sirius_ctx->record_vector_join_pair_cut_short(); }
+  } else {
+    if (_pair_schedule->pair_done(step.block)) { _pair_states[step.block].reset(); }
+    if (_sirius_ctx != nullptr) { _sirius_ctx->record_vector_join_pair_finished(); }
+  }
+  return answer;
+}
+
+void sirius_physical_vector_join_stream::inject_pair_oom()
+{
+  if (auto const* slow = std::getenv("SIRIUS_VSS_PAIR_SLOW_MS"); slow != nullptr) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(slow)));
+  }
+  auto const* v = std::getenv("SIRIUS_VSS_PAIR_OOM_ONE_IN");
+  if (v == nullptr) { return; }
+  auto const one_in = std::strtoull(v, nullptr, 10);
+  if (one_in == 0) { return; }
+  // Splitmix64 of a counter: scattered over tasks, and the same run to run for one schedule.
+  auto x = (_pair_oom_draws.fetch_add(1) + 1) * 0x9E3779B97F4A7C15ull;
+  x      = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+  x      = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+  x ^= x >> 31;
+  if (x % one_in == 0) { throw rmm::out_of_memory("injected vector join pair task shortage"); }
+}
 
 std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   const operator_data& input_data, ::cuda::stream_ref stream_ref)
@@ -5741,6 +6541,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         ? "More than one row returned by a subquery used as an expression - scalar subqueries can "
           "only return a single row."
         : "sirius vector join: the scalar subquery giving the query vector returned no rows");
+  }
+
+  if (auto const& step = join_in->pair_step()) {
+    return step->kind == vss::pair_schedule::step_kind::build
+             ? run_build_step(*join_in, *mem_space, stream)
+             : run_pair_step(*join_in, *mem_space, stream);
   }
 
   block_state st;

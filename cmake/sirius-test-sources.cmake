@@ -392,6 +392,7 @@ set(TEST_SOURCES
     test/cpp/vss/test_distance_metric.cpp
     test/cpp/vss/test_enn_top_k.cpp
     test/cpp/vss/test_ivf_flat_index.cpp
+    test/cpp/vss/test_pair_schedule.cpp
     test/cpp/vss/test_pinned_column.cpp
     test/cpp/vss/test_spilled_read.cpp
     test/cpp/vss/test_vector_search.cpp
