@@ -341,11 +341,7 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
       batch, target, stream, false, nullptr, options.expression_policy);
     return materialized.table.release(stream, target.get_default_allocator());
   };
-  auto decode_batch = [&](std::unique_ptr<op::scan::scan_info> batch) {
-    int const gpu_id =
-      select_device
-        ? select_device()
-        : placement.get_next_gpu(/*pipeline_id=*/0, /*data=*/nullptr, /*hint=*/{}).value();
+  auto decode_batch = [&](std::unique_ptr<op::scan::scan_info> batch, int const gpu_id) {
     auto* target = space_by_device.at(gpu_id);
     rmm::cuda_set_device_raii device_guard{rmm::cuda_device_id{gpu_id}};
     // Borrow a real (non-default) stream from the target's runtime stream pool: the
@@ -547,9 +543,9 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
   auto const since = [](auto t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   };
-  auto const timed_decode = [&](std::unique_ptr<op::scan::scan_info> b) {
+  auto const timed_decode = [&](std::unique_ptr<op::scan::scan_info> b, int const gpu_id) {
     auto const t0 = std::chrono::steady_clock::now();
-    auto decoded  = decode_batch(std::move(b));
+    auto decoded  = decode_batch(std::move(b), gpu_id);
     decode_ns +=
       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
         .count();
@@ -576,15 +572,22 @@ std::vector<late_mat::unique_verdict> materialize_pin_batches(
       auto const per_batch = std::max<std::size_t>(1, 2 * batch->estimated_bytes());
       depth = std::clamp<std::size_t>(options.in_flight_budget_bytes / per_batch, 2, 16);
     }
+    // Placement follows emission order, not the order the workers happen to run in.
+    int const gpu_id =
+      select_device
+        ? select_device()
+        : placement.get_next_gpu(/*pipeline_id=*/0, /*data=*/nullptr, /*hint=*/{}).value();
     if (depth == 0) {
-      timed_finish(timed_decode(std::move(batch)));
+      timed_finish(timed_decode(std::move(batch), gpu_id));
       return;
     }
     std::optional<decoded_batch> ready;
     if (in_flight.size() == depth) { ready = take_oldest(); }
     in_flight.push_back(std::async(
       std::launch::async,
-      [&timed_decode, b = std::move(batch)]() mutable { return timed_decode(std::move(b)); }));
+      [&timed_decode, gpu_id, b = std::move(batch)]() mutable {
+        return timed_decode(std::move(b), gpu_id);
+      }));
     if (ready) { timed_finish(std::move(*ready)); }
   };
   auto drain = [&] {
