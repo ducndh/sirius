@@ -75,6 +75,7 @@
 #include <cucascade/data/disk_data_representation.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -2814,15 +2815,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     bool const codes_int8 = _lists != nullptr && _lists->encoding == vss::list_encoding::int8;
     if (codes_int8 &&
         !(gemm_search_enabled() && bound_gemm_enabled && l2 && _lists->has_exact_rows() &&
-          _lists->row_sq != nullptr && vss::bound_filter_int8_supports(dim))) {
+          _lists->row_sq != nullptr && vss::bound_filter_int8_supports(dim, /*rescored=*/true))) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_stream] int8 cluster lists answer only l2 joins through the "
-        "bounded search (vector width a multiple of 16, at most 256, and the FP32 rows kept); "
+        "bounded search (vector width a multiple of 16, at most 15360, and the FP32 rows kept); "
         "rebuild the lists with storage => 'float16' or 'float32'");
     }
     bool int8_search =
       gemm_search_enabled() && _lists != nullptr &&
-      (!radius_join || (bound_gemm_enabled && vss::bound_filter_int8_supports(dim))) &&
+      (!radius_join || (bound_gemm_enabled && vss::bound_filter_int8_supports(dim, codes_int8))) &&
       (_lists->encoding == vss::list_encoding::uint8 || codes_int8) && _lists->row_sq != nullptr &&
       l2 && dim % 4 == 0;
     std::optional<rmm::device_uvector<std::int8_t>> probe_i8, routed_i8;
@@ -2854,12 +2855,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         probe_code_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
         if (_lists->code_rotation) {
           rotated_probe.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
-          vss::rotate_rows(search_queries.data_handle(),
-                           n_left,
-                           dim,
-                           static_cast<float const*>(_lists->code_rotation->data()),
-                           rotated_probe->data(),
-                           stream);
+          vss::apply_code_rotation(
+            vss::code_rotation_ref{_lists->code_rotation->data(), _lists->code_rotation_structured},
+            search_queries.data_handle(),
+            n_left,
+            dim,
+            rotated_probe->data(),
+            stream);
         }
         vss::quantize_rows_int8(
           rotated_probe ? rotated_probe->data() : search_queries.data_handle(),
@@ -2871,7 +2873,10 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           probe_code_error->data(),
           nullptr,
           stream,
-          _lists->code_rotation ? vss::rotation_slack(dim) : 0.f);
+          vss::code_rotation_slack(
+            vss::code_rotation_ref{_lists->code_rotation ? _lists->code_rotation->data() : nullptr,
+                                   _lists->code_rotation_structured},
+            dim));
       } else {
         vss::narrow_to_shifted_int8(
           search_queries.data_handle(), n_left * dim, probe_i8->data(), stream);
@@ -2966,7 +2971,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       (_lists->tier == cucascade::memory::Tier::GPU || running_bound_rows > 0) && seed_enabled &&
       (!codes_int8 || large_partitions || running_bound_rows > 0 || seed_forced);
     bool const bounded = int8_search && (n_probes > 1 || radius_join || codes_int8 || seedable) &&
-                         vss::bound_filter_int8_supports(dim) && bound_gemm_enabled;
+                         vss::bound_filter_int8_supports(dim, codes_int8) && bound_gemm_enabled;
     // FLOAT16 lists that kept their FP32 rows get the same two sweeps with the half-precision
     // GEMM, and an exact answer: sweep 0's nearest-cluster answers are re-scored in FP32 only to
     // give each row a bound (their largest distance) and then dropped, and sweep 1 searches every
@@ -4961,6 +4966,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                      static_cast<long long>(bounded_padded),
                      rescore_seconds,
                      take_seconds);
+        if (auto const* gpu =
+              mem_space
+                ->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+            gpu != nullptr) {
+          std::fprintf(stderr,
+                       "[vecjoin-phase] device bytes peak so far: %zu\n",
+                       gpu->get_peak_total_allocated_bytes());
+        }
         if (pair_moves > 0 || slice_cuts > 0 || budget_flushes > 0) {
           std::fprintf(stderr,
                        "[vecjoin-phase] pairs to host: %lld moves, %lld pairs, %lld slice cuts, "

@@ -23,6 +23,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cucascade/data/data_batch.hpp>
@@ -166,11 +167,14 @@ struct cluster_lists {
   std::unique_ptr<rmm::device_buffer> code_offset;
   float code_scale{0};
   float code_error{0};
-  /// INT8 lists only, when set: the FP32 [dim x dim] orthogonal matrix every row (and every probe)
-  /// is rotated by before it is coded. One scale serves all components, so a component far wider
-  /// than the rest would leave the others a code or two each; a random rotation spreads the width
-  /// over all of them. Distances are unchanged, so the bounds and the FP32 re-score are too.
+  /// INT8 lists only, when set: the orthogonal map every row (and every probe) goes through before
+  /// it is coded, an FP32 [dim x dim] matrix or the signs of a structured one. One scale serves all
+  /// components, so a component far wider than the rest would leave the others a code or two each;
+  /// a rotation spreads the width over all of them. Distances are unchanged, so the bounds and the
+  /// FP32 re-score are too.
   std::unique_ptr<rmm::device_buffer> code_rotation;
+  /// code_rotation holds structured_rotation_signs, not a d x d matrix.
+  bool code_rotation_structured{false};
   /// INT32 [chunk_rows + 1] offsets 0, dim, 2 dim, ... A LIST view of any chunk borrows a
   /// prefix of these, since every list in the column has the same width.
   std::unique_ptr<rmm::device_buffer> list_offsets;
@@ -370,6 +374,34 @@ float decode_ordered_float(unsigned int bits);
 /// A random orthogonal @p d x @p d matrix, row-major, the same for the same @p d and @p seed:
 /// Gram-Schmidt over Gaussian rows, in double precision.
 [[nodiscard]] std::vector<float> random_rotation(std::int64_t d, std::uint64_t seed);
+[[nodiscard]] std::vector<double> random_rotation_f64(std::int64_t d, std::uint64_t seed);
+
+/// A random orthogonal @p d x @p d matrix on the device, row-major, the same for the same @p d and
+/// @p seed: block Gram-Schmidt run twice over Gaussian rows, with Cholesky panels, in double
+/// precision. Not the matrix random_rotation gives for that seed.
+[[nodiscard]] rmm::device_uvector<double> random_rotation_f64_device(
+  std::int64_t d,
+  std::uint64_t seed,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/// out = @p q rounded to FP32, what rotate_rows reads.
+void narrow_rotation(double const* q, std::int64_t d, float* out, rmm::cuda_stream_view stream);
+
+/// || Q Q^T - I ||: its largest entry and its Frobenius norm, which bounds its spectral norm.
+struct orthogonality_defect {
+  double max_abs{0};
+  double frobenius{0};
+};
+
+[[nodiscard]] orthogonality_defect rotation_defect(double const* q,
+                                                   std::int64_t d,
+                                                   rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref mr);
+[[nodiscard]] orthogonality_defect rotation_defect(float const* q,
+                                                   std::int64_t d,
+                                                   rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref mr);
 
 /// out[i] = rotation x[i] for @p rows rows of @p d floats (@p rotation row-major, d x d, on the
 /// device). @p out must not alias @p x.
@@ -392,14 +424,75 @@ void rotate_rows(float const* x,
                                        rmm::cuda_stream_view stream,
                                        float* out = nullptr);
 
-/// How far rotate_rows' result for a row x may sit from the exact rotation, as a multiple of |x|:
-/// each component is a d-term FP32 dot product with an orthonormal row (error at most about
-/// d u |x|, u = 2^-24), with the rotation itself rounded to FP32, over sqrt(d) components.
+/// The rotation a list build or a join's probe side applies: a dense matrix or structured signs.
+struct code_rotation_ref {
+  void const* data{nullptr};
+  bool structured{false};
+};
+
+/// out[i] = rotation x[i], by rotate_rows or structured_rotate_rows.
+void apply_code_rotation(code_rotation_ref rotation,
+                         float const* x,
+                         std::int64_t rows,
+                         std::int64_t d,
+                         float* out,
+                         rmm::cuda_stream_view stream);
+
+/// How far rotate_rows' result for a row x may sit from an isometry of x, as a multiple of |x|:
+/// each component is a d-term FP32 dot product with a unit row (error at most about d u |x|, u =
+/// 2^-24), over sqrt(d) components. The bounds in code space take |Q q - Q x| for |q - x|, which a
+/// matrix with defect ||Q Q^T - I|| = D misstates by up to D/2 (|q| + |x|), so D/2 is charged to
+/// each row here too: the (d + 2) allows D <= 4 sqrt(d) u, against about sqrt(d) u for a
+/// double-precision basis rounded to FP32 (rotation_defect; test_code_rotation.cpp holds both
+/// constructions to it).
 [[nodiscard]] inline float rotation_slack(std::int64_t d)
 {
   double const u = 1.0 / 16777216.0;
   return static_cast<float>(std::sqrt(static_cast<double>(d)) * (static_cast<double>(d) + 2.0) * u *
                             1.01);
+}
+
+/// In multiples of u = 2^-24 of |x|, what any coded row's error carries for rounding outside the
+/// rotation, with no rotation too. The bounds in code space compare true distances, but what must
+/// not be missed is a pair whose FP32 re-score is within the bound: a re-score (d / 32 + 5
+/// additions, 2 u per square) sits within (d / 64 + 4) u of the true |q - x|, charged to |q| + |x|.
+/// The rest is the row's measured coding error, whose components carry u |x| of their own.
+[[nodiscard]] inline double int8_rounding_terms(std::int64_t d)
+{ return static_cast<double>(d) / 64.0 + 6.0; }
+
+[[nodiscard]] inline float int8_rounding_slack(std::int64_t d)
+{ return static_cast<float>(int8_rounding_terms(d) * 5.9604644775390625e-8 * 1.01); }
+
+/// Whether @p d can use the structured rotation: a multiple of 16 of the form 2^a m with m <= 15.
+[[nodiscard]] bool structured_rotation_supports(std::int64_t d);
+
+/// The diagonal of the structured rotation, the same for the same @p d and @p seed: one bit a
+/// component, in 32-bit words.
+[[nodiscard]] std::vector<std::uint32_t> structured_rotation_signs(std::int64_t d,
+                                                                   std::uint64_t seed);
+
+/// out[i] = O x[i] with O = (W_(2^a) / 2^(a/2) kron S_m) D for d = 2^a m: D the signs (on the
+/// device), S_m a fixed orthogonal m x m, W the natural-order Walsh-Hadamard matrix. O spreads
+/// any row's energy across components as a random rotation does (D makes each output a sum of
+/// random signs over the row), costs d log d a row, and needs no matrix. @p out must not alias @p
+/// x.
+void structured_rotate_rows(float const* x,
+                            std::int64_t rows,
+                            std::int64_t d,
+                            std::uint32_t const* signs,
+                            float* out,
+                            rmm::cuda_stream_view stream);
+
+/// As rotation_slack for structured_rotate_rows, whose O is orthogonal by construction: S_m's
+/// chains m sqrt(m) u and its FP32 entries sqrt(m) u, u per Walsh stage (each is an isometry and
+/// rounds each output by u), 2 u for the final scale, plus int8_rounding_terms.
+[[nodiscard]] float structured_rotation_slack(std::int64_t d);
+
+/// The norm_slack for rows coded through @p rotation (no rotation: its data is null).
+[[nodiscard]] inline float code_rotation_slack(code_rotation_ref rotation, std::int64_t d)
+{
+  if (rotation.data == nullptr) { return int8_rounding_slack(d); }
+  return rotation.structured ? structured_rotation_slack(d) : rotation_slack(d);
 }
 
 /// out = clamp(round((x - offset) / scale), -127, 127) per component. Each row's error

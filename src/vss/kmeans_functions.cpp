@@ -58,6 +58,7 @@
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <algorithm>
 #include <array>
@@ -611,17 +612,19 @@ void check_lists_storage(const std::string& fn,
                          list_storage storage,
                          bool unit_rows)
 {
-  if (unit_rows && (storage == list_storage::uint8 || storage == list_storage::int8)) {
+  if (unit_rows && storage == list_storage::uint8) {
     throw duckdb::InvalidInputException(
-      fn + ": metric => 'cosine' stores unit rows, which need storage => 'float16' or 'float32'");
+      fn +
+      ": metric => 'cosine' stores unit rows, which need storage => 'int8', 'float16' or "
+      "'float32'");
   }
   // INT8 and FLOAT16 lists only filter; exact answers come from the bounded search's FP32
   // re-check, which needs these widths. Without it every join would refuse the lists (INT8) or
   // answer from rounded rows (FLOAT16), so refuse here, before the old lists are dropped.
-  if (storage == list_storage::int8 && !bound_filter_int8_supports(req.dim)) {
+  if (storage == list_storage::int8 && !bound_filter_int8_supports(req.dim, /*rescored=*/true)) {
     throw duckdb::InvalidInputException(fn +
                                         ": storage => 'int8' needs a vector width that is a "
-                                        "multiple of 16 and at most 256, not " +
+                                        "multiple of 16 and at most 15360, not " +
                                         std::to_string(req.dim) + "; use 'float16' or 'float32'");
   }
   if ((storage == list_storage::float16 || storage == list_storage::exact) &&
@@ -685,6 +688,20 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
                  std::chrono::duration<double>(now - phase_t0).count());
     phase_t0 = now;
   };
+  // An INT8 build's pieces, summed over chunks; each is bracketed by a synchronize under the
+  // switch.
+  double t_rotation = 0, t_rotate = 0, t_range = 0, t_code = 0;
+  auto timed = [&](double& total, auto&& work) {
+    if (!dbg) {
+      work();
+      return;
+    }
+    stream.sync();
+    auto const t0 = std::chrono::steady_clock::now();
+    work();
+    stream.sync();
+    total += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  };
 
   // Pass 1: every row's nearest centroid, to the host. 4 bytes a row, so even 100M rows is
   // 400 MB, and the host is where the counting sort below is cheapest to run deterministically.
@@ -716,9 +733,15 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
   // INT8 codes need each component's range over every row, taken while the chunks are resident.
   bool const want_int8 = storage == list_storage::int8;
   std::optional<rmm::device_uvector<unsigned int>> col_min, col_max;
-  // INT8 rows are rotated before they are coded (cluster_lists::code_rotation), unless
-  // SIRIUS_VSS_INT8_ROTATE=0. The range pass and the coding pass both see the rotated rows.
+  // INT8 rows are rotated before they are coded (cluster_lists::code_rotation): by the structured
+  // rotation, or a dense matrix built on the device for a width it does not cover.
+  // SIRIUS_VSS_INT8_ROTATE=0 skips it, =dense and =host pick a dense matrix built on the device or
+  // the host. The range pass and the coding pass both see the rotated rows.
   std::unique_ptr<rmm::device_buffer> rotation;
+  bool rotation_structured = false;
+  auto const rotation_ref  = [&] {
+    return code_rotation_ref{rotation ? rotation->data() : nullptr, rotation_structured};
+  };
   std::optional<rmm::device_uvector<float>> rotated;
   auto const rotated_rows = [&](float const* x, std::int64_t rows) -> float const* {
     if (!rotation) { return x; }
@@ -726,7 +749,7 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
       if (rotated) { stream.sync(); }  // the old buffer may still be read by queued work
       rotated.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
     }
-    rotate_rows(x, rows, dim, static_cast<float const*>(rotation->data()), rotated->data(), stream);
+    apply_code_rotation(rotation_ref(), x, rows, dim, rotated->data(), stream);
     return rotated->data();
   };
   if (want_int8) {
@@ -736,24 +759,46 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
       col_min->data(), 0xff, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.get()));
     CUDF_CUDA_TRY(cudaMemsetAsync(
       col_max->data(), 0, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.get()));
-    auto const* env = std::getenv("SIRIUS_VSS_INT8_ROTATE");
-    if (env == nullptr || std::string_view{env} != "0") {
-      auto const host =
-        random_rotation(dim, 0x5151'7a7e'0000'0000ull + static_cast<std::uint64_t>(dim));
-      rotation = std::make_unique<rmm::device_buffer>(host.size() * sizeof(float), stream, mr);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(rotation->data(),
-                                    host.data(),
-                                    host.size() * sizeof(float),
-                                    cudaMemcpyHostToDevice,
-                                    stream.get()));
-      stream.sync();  // `host` goes out of scope
+    auto const* env             = std::getenv("SIRIUS_VSS_INT8_ROTATE");
+    std::string_view const kind = env != nullptr ? env : "";
+    if (kind != "0") {
+      auto const seed = 0x5151'7a7e'0000'0000ull + static_cast<std::uint64_t>(dim);
+      timed(t_rotation, [&] {
+        if (kind == "host") {
+          auto const host = random_rotation(dim, seed);
+          rotation = std::make_unique<rmm::device_buffer>(host.size() * sizeof(float), stream, mr);
+          CUDF_CUDA_TRY(cudaMemcpyAsync(rotation->data(),
+                                        host.data(),
+                                        host.size() * sizeof(float),
+                                        cudaMemcpyHostToDevice,
+                                        stream.get()));
+          stream.sync();  // `host` goes out of scope
+        } else if (kind == "dense" || !structured_rotation_supports(dim)) {
+          auto const q = random_rotation_f64_device(dim, seed, stream, mr);
+          rotation     = std::make_unique<rmm::device_buffer>(
+            static_cast<std::size_t>(dim * dim) * sizeof(float), stream, mr);
+          narrow_rotation(q.data(), dim, static_cast<float*>(rotation->data()), stream);
+          stream.sync();  // `q` goes out of scope
+        } else {
+          auto const signs    = structured_rotation_signs(dim, seed);
+          rotation_structured = true;
+          rotation =
+            std::make_unique<rmm::device_buffer>(signs.size() * sizeof(std::uint32_t), stream, mr);
+          CUDF_CUDA_TRY(cudaMemcpyAsync(rotation->data(),
+                                        signs.data(),
+                                        signs.size() * sizeof(std::uint32_t),
+                                        cudaMemcpyHostToDevice,
+                                        stream.get()));
+          stream.sync();  // `signs` goes out of scope
+        }
+      });
     }
   }
   // One list rotated before coding keeps the rows pass 1 rotates and codes them from there, rather
   // than rotate every row again, when the device holds them besides what the lists will take and
   // the room the lists leave (below), so that where the lists go does not change.
   std::optional<rmm::device_uvector<float>> kept_rotated;
-  if (one_list && rotation && !host_tier) {
+  if (one_list && rotation && !rotation_structured && !host_tier) {
     auto const rows_bytes = static_cast<std::size_t>(n_rows * dim) * sizeof(float);
     auto const lists_bytes =
       static_cast<std::size_t>(n_rows) * (static_cast<std::size_t>(dim) + 12) +
@@ -793,29 +838,43 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
                         non_uint8.data(),
                         stream);
       }
+      // Outlives the chunk's kernels: released only after the synchronize below.
+      std::optional<rmm::device_uvector<float>> unit_chunk;
       if (want_int8) {
         auto const* chunk_rows = list_column_as_dataset_view(staged.view, dim).data_handle();
-        auto* const keep       = kept_rotated ? kept_rotated->data() + base * dim : nullptr;
+        // The range is of the rows the codes will stand for.
+        if (unit_rows) {
+          unit_chunk.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
+          normalize_rows(chunk_rows, rows, dim, unit_chunk->data(), stream);
+          chunk_rows = unit_chunk->data();
+        }
+        auto* const keep = kept_rotated ? kept_rotated->data() + base * dim : nullptr;
         // A rotation's range is taken as the rows are rotated, without writing them out unless
         // they are kept.
-        if (!rotation || !rotate_rows_min_max(chunk_rows,
-                                              rows,
-                                              dim,
-                                              static_cast<float const*>(rotation->data()),
-                                              col_min->data(),
-                                              col_max->data(),
-                                              stream,
-                                              keep)) {
-          if (keep != nullptr) {
-            rotate_rows(
-              chunk_rows, rows, dim, static_cast<float const*>(rotation->data()), keep, stream);
-          }
-          column_min_max(keep != nullptr ? keep : rotated_rows(chunk_rows, rows),
-                         rows,
-                         dim,
-                         col_min->data(),
-                         col_max->data(),
-                         stream);
+        bool fused = false;
+        timed(t_rotate, [&] {
+          fused = rotation && !rotation_structured &&
+                  rotate_rows_min_max(chunk_rows,
+                                      rows,
+                                      dim,
+                                      static_cast<float const*>(rotation->data()),
+                                      col_min->data(),
+                                      col_max->data(),
+                                      stream,
+                                      keep);
+        });
+        if (!fused) {
+          float const* to_scan = nullptr;
+          timed(t_rotate, [&] {
+            if (keep != nullptr) {
+              rotate_rows(
+                chunk_rows, rows, dim, static_cast<float const*>(rotation->data()), keep, stream);
+            }
+            to_scan = keep != nullptr ? keep : rotated_rows(chunk_rows, rows);
+          });
+          timed(t_range, [&] {
+            column_min_max(to_scan, rows, dim, col_min->data(), col_max->data(), stream);
+          });
         }
       }
       // Before the copy below, which waits for the labels: into pageable memory it is synchronous.
@@ -1184,6 +1243,7 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
     if (rotation) {
       lists.code_rotation = std::make_unique<rmm::device_buffer>(
         rotation->data(), rotation->size(), persistent, persistent_mr);
+      lists.code_rotation_structured = rotation_structured;
     }
     code_error_bits.emplace(1, stream, mr);
     CUDF_CUDA_TRY(cudaMemsetAsync(code_error_bits->data(), 0, sizeof(unsigned int), stream.get()));
@@ -1293,16 +1353,22 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
         }
       }
       if (encoding == list_encoding::int8) {
-        quantize_rows_int8(kept_rotated ? kept_rotated->data() + base * dim : rotated_rows(x, rows),
-                           rows,
-                           dim,
-                           static_cast<float const*>(lists.code_offset->data()),
-                           lists.code_scale,
-                           reinterpret_cast<std::int8_t*>(coded),
-                           nullptr,
-                           code_error_bits->data(),
-                           stream,
-                           rotation ? rotation_slack(dim) : 0.f);
+        float const* to_code = kept_rotated ? kept_rotated->data() + base * dim : nullptr;
+        if (to_code == nullptr) {
+          timed(t_rotate, [&] { to_code = rotated_rows(x, rows); });
+        }
+        timed(t_code, [&] {
+          quantize_rows_int8(to_code,
+                             rows,
+                             dim,
+                             static_cast<float const*>(lists.code_offset->data()),
+                             lists.code_scale,
+                             reinterpret_cast<std::int8_t*>(coded),
+                             nullptr,
+                             code_error_bits->data(),
+                             stream,
+                             code_rotation_slack(rotation_ref(), dim));
+        });
       }
       if (encoding == list_encoding::uint8) {
         if (check_in_pass_2) { count_non_uint8(x, rows * dim, non_uint8.data(), stream); }
@@ -1550,16 +1616,20 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
       if (encoding == list_encoding::int8) {
         coded_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
         coded_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
-        quantize_rows_int8(rotated_rows(in_rows, rows),
-                           rows,
-                           dim,
-                           static_cast<float const*>(lists.code_offset->data()),
-                           lists.code_scale,
-                           coded_i8->data(),
-                           nullptr,
-                           code_error_bits->data(),
-                           stream,
-                           rotation ? rotation_slack(dim) : 0.f);
+        float const* to_code = nullptr;
+        timed(t_rotate, [&] { to_code = rotated_rows(in_rows, rows); });
+        timed(t_code, [&] {
+          quantize_rows_int8(to_code,
+                             rows,
+                             dim,
+                             static_cast<float const*>(lists.code_offset->data()),
+                             lists.code_scale,
+                             coded_i8->data(),
+                             nullptr,
+                             code_error_bits->data(),
+                             stream,
+                             code_rotation_slack(rotation_ref(), dim));
+        });
         int8_row_sq_norms(coded_i8->data(), rows, dim, coded_sq->data(), stream);
         coded_bytes = reinterpret_cast<std::byte const*>(coded_i8->data());
         scatter(coded_sq->data(), sizeof(std::int32_t), lists.row_sq->data());
@@ -1644,9 +1714,37 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
     unsigned int bits = 0;
     CUDF_CUDA_TRY(cudaMemcpy(&bits, code_error_bits->data(), sizeof(bits), cudaMemcpyDeviceToHost));
     std::memcpy(&lists.code_error, &bits, sizeof(bits));
+    // A row whose squares leave FP32's range has a coding error nobody can bound, and the join's
+    // routing over its centroids is no better.
+    if (!std::isfinite(lists.code_error)) {
+      throw duckdb::InvalidInputException(
+        fn + ": storage => 'int8' needs rows whose squared norms fit FP32 (under about 1.8e19 a " +
+        "row); use 'float32'");
+    }
   }
 
   phase("pass 2 scatter");
+  if (auto const* gpu =
+        c.space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+      dbg && gpu != nullptr) {
+    std::fprintf(stderr,
+                 "[vecjoin-lists] device bytes peak so far: %zu\n",
+                 gpu->get_peak_total_allocated_bytes());
+  }
+  if (dbg && want_int8) {
+    std::fprintf(
+      stderr,
+      "[vecjoin-lists] int8 pieces: rotation %.4f rotate %.4f range %.4f code %.4f chunks %zu "
+      "code_scale %.6g code_error %.6g slack %.6g\n",
+      t_rotation,
+      t_rotate,
+      t_range,
+      t_code,
+      n_chunks,
+      lists.code_scale,
+      lists.code_error,
+      code_rotation_slack(rotation_ref(), dim));
+  }
 
   cluster_lists_result result;
   result.n_rows     = n_rows;
@@ -1680,7 +1778,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
 {
   static const std::string fn = "sirius_kmeans_build_lists";
   // Unit rows refused before the pin is looked for, the width once the clustering is known.
-  if (unit_rows && (storage == list_storage::uint8 || storage == list_storage::int8)) {
+  if (unit_rows && storage == list_storage::uint8) {
     check_lists_storage(fn, req, storage, unit_rows);
   }
   auto const c = resolve_context(ctx, fn, req.catalog, req.schema, req.table, req.table_identity);

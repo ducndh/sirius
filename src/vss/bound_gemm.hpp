@@ -47,8 +47,10 @@ struct bound_candidates {
   int64_t capacity() const { return static_cast<int64_t>(rows.size()); }
 };
 
-/// True when bound_filter_int8 can search vectors of this width.
-bool bound_filter_int8_supports(int64_t dim);
+/// True when bound_filter_int8 can search vectors of this width: a multiple of 16, at most 15,360
+/// when an FP32 re-score answers (@p rescored, INT8 codes), at most 256 when the filter's own
+/// distances are the answer (lossless byte rows: they must be exact floats).
+bool bound_filter_int8_supports(int64_t dim, bool rescored);
 
 /**
  * @brief Append every pair (rows[i], j) whose squared L2 distance is <= bound[rows[i]].
