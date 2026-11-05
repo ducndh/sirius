@@ -17,6 +17,7 @@
 #pragma once
 
 #include "cuda/vss/cudf_raft_interop.hpp"
+#include "vss/fit_defaults.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
@@ -50,7 +51,7 @@ struct clustering_spec {
   /// faster fit against looser centroids; the whole dataset is the other extreme.
   std::int64_t train_rows{0};
   /// Balanced k-means iterations.
-  std::int32_t n_iters{20};
+  std::int32_t n_iters{default_fit_iterations};
   /// Offsets the training sample so a re-fit under the same spec is reproducible while
   /// different seeds draw different rows.
   std::uint64_t seed{0};
@@ -103,8 +104,9 @@ struct cluster_assignment {
 /// Requested count, or sqrt(n_rows) when @p requested is 0. Clamped to [1, n_rows].
 [[nodiscard]] std::int64_t resolve_n_clusters(std::int64_t requested, std::int64_t n_rows);
 
-/// Requested count, or 256 rows per cluster when @p requested is 0. Clamped to [n_clusters,
-/// n_rows], since balanced k-means cannot place more centroids than it has training rows.
+/// Requested count, or @ref default_train_rows_per_cluster a cluster when @p requested is 0.
+/// Clamped to [n_clusters, n_rows], since balanced k-means cannot place more centroids than it has
+/// training rows.
 [[nodiscard]] std::int64_t resolve_train_rows(std::int64_t requested,
                                               std::int64_t n_rows,
                                               std::int64_t n_clusters);

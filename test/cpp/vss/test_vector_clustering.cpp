@@ -131,7 +131,7 @@ TEST_CASE("resolve_n_clusters defaults to sqrt(n_rows) and clamps", "[vss]")
 
 TEST_CASE("resolve_train_rows never trains on fewer rows than centroids", "[vss]")
 {
-  CHECK(resolve_train_rows(0, 1000000, 100) == 25600);
+  CHECK(resolve_train_rows(0, 1000000, 100) == 12800);
   CHECK(resolve_train_rows(5000, 1000000, 100) == 5000);
   // Defaults that overshoot the table fall back to the whole table, not to an error.
   CHECK(resolve_train_rows(0, 1000, 100) == 1000);

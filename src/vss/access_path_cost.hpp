@@ -17,6 +17,7 @@
 #pragma once
 
 #include "vss/device_rates.hpp"
+#include "vss/fit_defaults.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -57,7 +58,7 @@ struct access_path_cost {
       hbm{500e9 * d.hbm},
       sweep0{0.25 / d.f16},
       assign_gemm{25e12 * d.f16},
-      fit_per_value{3.7e-9 / d.fp32},
+      fit_per_value{1.4e-9 / d.fp32},
       write_per_value_u8{0.55e-9 / d.hbm},
       write_per_value_f16{1.55e-9 / d.hbm},
       codes_per_value_device{0.05e-9 / d.hbm},
@@ -116,15 +117,15 @@ struct access_path_cost {
            (s.probe_rows * probes / s.n_clusters > 128 ? s.n_clusters * slice : 0.0);
   }
 
-  /// Fitting the clustering (k-means on 256 sampled rows a cluster), assigning every row to its
-  /// nearest centroid, and writing the lists. Fitted 2026-10-13 on 100M-row builds of 1,024 to
-  /// 32,768 clusters (within 10% for 96-d rows, 25% for the 128-d fit). The fit's fixed part varies
-  /// with the data (0.65-3.3 s over the grid), so it is rounded up rather than modelled.
+  /// Fitting the clustering at the default sample and iterations, assigning every row to its
+  /// nearest centroid, and writing the lists. The fit is fitted on first fits of 256 to 16,384
+  /// clusters, 96 to 1,536 wide, over 1M to 10M rows (14% off on average, 34% at most).
   [[nodiscard]] double build(access_path_shape const& s) const
   {
     double const values = s.corpus_rows * s.dim;
-    double const train  = std::min(s.corpus_rows, 256.0 * s.n_clusters);
-    double const fit = 1.5 + fit_per_value * train * s.dim * std::pow(s.n_clusters / 1024.0, 0.6);
+    double const train =
+      std::min(s.corpus_rows, static_cast<double>(default_train_rows_per_cluster) * s.n_clusters);
+    double const fit = 0.065 + fit_per_value * train * s.dim * std::pow(s.n_clusters / 1024.0, 0.75);
     double const assign = 2.0 * values * s.n_clusters / assign_gemm;
     return fit + assign +
            (s.list_bytes_per_value == 1 ? write_per_value_u8 : write_per_value_f16) * values;

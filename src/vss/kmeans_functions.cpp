@@ -204,8 +204,8 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
   index_cache.erase(req.name);
   index_cache.erase(lists_key(req.name));
   auto reservation = index_cache.reserve_index_memory(footprint_of(train_rows), c.target_gpu);
-  // The default sample (256 rows a centroid) shrinks to what the device can train on, down to 32 a
-  // centroid; the rows it took are what the function reports. A sample asked for is not shrunk.
+  // The default sample shrinks to what the device can train on, down to 32 a centroid; the rows it
+  // took are what the function reports. A sample asked for is not shrunk.
   constexpr std::int64_t kMinRowsPerCentroid = 32;
   if (!reservation && req.spec.train_rows <= 0) {
     auto const room =

@@ -130,7 +130,7 @@ std::int64_t resolve_train_rows(std::int64_t requested,
                                 std::int64_t n_clusters)
 {
   if (n_rows <= 0 || n_clusters <= 0) { return 0; }
-  auto const resolved = requested > 0 ? requested : n_clusters * 256;
+  auto const resolved = requested > 0 ? requested : n_clusters * default_train_rows_per_cluster;
   return std::clamp<std::int64_t>(resolved, n_clusters, n_rows);
 }
 

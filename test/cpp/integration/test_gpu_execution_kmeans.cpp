@@ -184,8 +184,14 @@ TEST_CASE_METHOD(KMeansFixture,
   CHECK(r->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 2);
   CHECK(r->Collection().GetValue(1, 0).GetValue<std::int64_t>() == 3);
   CHECK(r->Collection().GetValue(3, 0).GetValue<std::int64_t>() == 400);
-  // The default sample is 256 rows per cluster, which the 400-row table cannot supply.
-  CHECK(r->Collection().GetValue(2, 0).GetValue<std::int64_t>() == 400);
+  CHECK(r->Collection().GetValue(2, 0).GetValue<std::int64_t>() ==
+        2 * sirius::vss::default_train_rows_per_cluster);
+
+  auto const asked =
+    query_ok(*con,
+             "SELECT train_rows FROM sirius_kmeans_fit('kmr_corpus','vec', "
+             "name => 'kmr_c', n_clusters => 2, train_rows => 300, n_iters => 20);");
+  CHECK(asked->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 300);
 }
 
 TEST_CASE_METHOD(KMeansFixture,
