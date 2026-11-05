@@ -396,6 +396,39 @@ TEST_CASE("monitor resumes after a downgrade target frees up (no disk)", "[downg
   REQUIRE(after > before);  // resumed firing once a target became viable
 }
 
+// A drain drops a monitor request it finds queued, or refuses one pushed while it runs. Neither is
+// answered, so neither may leave the monitor waiting.
+TEST_CASE("monitor keeps firing after drains drop its requests", "[downgrade_disk]")
+{
+  auto mem_mgr    = make_no_disk_pressure_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  auto gpu_hold = gpu_space->make_reservation_or_null(128ull << 20);
+  REQUIRE(gpu_hold);
+  REQUIRE(gpu_space->should_downgrade_memory());
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  repo_registry.create_for_query(kTestQueryId);
+  auto executor = make_monitoring_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  using namespace std::chrono_literals;
+  auto const until = std::chrono::steady_clock::now() + 500ms;
+  while (std::chrono::steady_clock::now() < until) {
+    executor.drain();
+  }
+  size_t const before = executor.monitor_requests_issued_for_testing();
+  std::this_thread::sleep_for(300ms);
+  size_t const after = executor.monitor_requests_issued_for_testing();
+
+  executor.stop();
+
+  REQUIRE(after > before);
+}
+
 // The viability gate must reflect HOST being full of *real stored downgraded data*, not just held
 // reservations: a downgrade conversion makes a reservation on HOST, so the gate probes with that
 // exact operation. This fills HOST by converting real batches (the production path) and verifies
