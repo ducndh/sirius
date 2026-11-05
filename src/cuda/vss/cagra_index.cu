@@ -80,6 +80,34 @@ __global__ void convert_rows_kernel(float const* __restrict__ in,
   }
 }
 
+__global__ void partition_distances_kernel(float const* __restrict__ rows,
+                                           std::int64_t n,
+                                           int d,
+                                           float const* __restrict__ centers,
+                                           float const* __restrict__ offsets,
+                                           int P,
+                                           float* __restrict__ out)
+{
+  int const lane = threadIdx.x % 32;
+  for (std::int64_t r = (blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x) / 32;
+       r < n;
+       r += static_cast<std::int64_t>(gridDim.x) * blockDim.x / 32) {
+    float const* row = rows + r * d;
+    for (int p = 0; p < P; ++p) {
+      float const* center = centers + static_cast<std::int64_t>(p) * d;
+      float s             = 0.f;
+      for (int c = lane; c < d; c += 32) {
+        float const t = row[c] - center[c];
+        s             = fmaf(t, t, s);
+      }
+      for (int step = 16; step > 0; step /= 2) {
+        s += __shfl_xor_sync(0xffffffffu, s, step);
+      }
+      if (lane == 0) { out[r * P + p] = s + offsets[p]; }
+    }
+  }
+}
+
 __global__ void widen_ids_kernel(std::uint32_t const* __restrict__ neighbors,
                                  std::int64_t n,
                                  std::int64_t n_rows,
@@ -188,11 +216,13 @@ class cagra_index_impl final : public cagra_index {
   template <typename T>
   cagra_index_impl(padded_index<T>&& index,
                    std::unique_ptr<rmm::device_buffer> rows,
+                   std::unique_ptr<rmm::device_buffer> graph,
                    std::int64_t n_rows,
                    std::int64_t dim,
                    cagra_build_settings const& settings,
                    bool rows_unit)
     : _rows(std::move(rows)),
+      _graph(std::move(graph)),
       _index(std::move(index)),
       _n_rows(n_rows),
       _dim(dim),
@@ -205,6 +235,22 @@ class cagra_index_impl final : public cagra_index {
   [[nodiscard]] std::int64_t n_rows() const noexcept override { return _n_rows; }
   [[nodiscard]] std::int64_t dim() const noexcept override { return _dim; }
   [[nodiscard]] bool rows_unit() const noexcept override { return _rows_unit; }
+
+  void copy_graph_to_host(std::uint32_t* out, rmm::cuda_stream_view stream) const override
+  {
+    std::visit(
+      [&](auto const& index) {
+        auto const graph = index.graph();
+        CUDF_CUDA_TRY(
+          cudaMemcpyAsync(out,
+                          graph.data_handle(),
+                          static_cast<std::size_t>(graph.size()) * sizeof(std::uint32_t),
+                          cudaMemcpyDeviceToHost,
+                          stream.get()));
+      },
+      _index);
+    stream.sync();
+  }
 
   void search(void const* queries,
               std::int64_t m,
@@ -235,8 +281,9 @@ class cagra_index_impl final : public cagra_index {
   }
 
  private:
-  // Declared first: the index views these rows, and is destroyed before them.
+  // Declared first: the index views these, and is destroyed before them.
   std::unique_ptr<rmm::device_buffer> _rows;
+  std::unique_ptr<rmm::device_buffer> _graph;
   std::variant<padded_index<half>, padded_index<float>> _index;
   std::int64_t _n_rows;
   std::int64_t _dim;
@@ -303,13 +350,80 @@ std::unique_ptr<cagra_index> build_cagra_index(std::unique_ptr<rmm::device_buffe
       metric, settings, static_cast<half const*>(rows->data()), n_rows, dim, stride_bytes, res);
     raft::resource::sync_stream(res);
     return std::make_unique<cagra_index_impl>(
-      std::move(index), std::move(rows), n_rows, dim, settings, rows_unit);
+      std::move(index), std::move(rows), nullptr, n_rows, dim, settings, rows_unit);
   }
   auto index = build_index<float>(
     metric, settings, static_cast<float const*>(rows->data()), n_rows, dim, stride_bytes, res);
   raft::resource::sync_stream(res);
   return std::make_unique<cagra_index_impl>(
-    std::move(index), std::move(rows), n_rows, dim, settings, rows_unit);
+    std::move(index), std::move(rows), nullptr, n_rows, dim, settings, rows_unit);
+}
+
+namespace {
+
+template <typename T>
+std::unique_ptr<cagra_index> index_over(std::unique_ptr<rmm::device_buffer> rows,
+                                        std::unique_ptr<rmm::device_buffer> graph,
+                                        std::int64_t n_rows,
+                                        std::int64_t dim,
+                                        std::size_t stride_bytes,
+                                        cagra_build_settings const& settings,
+                                        bool rows_unit,
+                                        rmm::cuda_stream_view stream)
+{
+  raft::device_resources res{stream};
+  auto view = raft::make_device_strided_matrix_view<T const, std::int64_t>(
+    static_cast<T const*>(rows->data()),
+    n_rows,
+    dim,
+    static_cast<std::int64_t>(stride_bytes / sizeof(T)));
+  auto const graph_view = raft::make_device_matrix_view<std::uint32_t const, std::int64_t>(
+    static_cast<std::uint32_t const*>(graph->data()), n_rows, settings.graph_degree);
+  padded_index<T> index(res,
+                        cuvs::distance::DistanceType::L2Expanded,
+                        cuvs::neighbors::make_device_padded_dataset_view(res, view),
+                        graph_view);
+  raft::resource::sync_stream(res);
+  return std::make_unique<cagra_index_impl>(
+    std::move(index), std::move(rows), std::move(graph), n_rows, dim, settings, rows_unit);
+}
+
+}  // namespace
+
+std::unique_ptr<cagra_index> make_cagra_index_over(std::unique_ptr<rmm::device_buffer> rows,
+                                                   std::unique_ptr<rmm::device_buffer> graph,
+                                                   std::int64_t n_rows,
+                                                   std::int64_t dim,
+                                                   std::size_t stride_bytes,
+                                                   cagra_build_settings const& settings,
+                                                   bool rows_unit,
+                                                   rmm::cuda_stream_view stream)
+{
+  if (settings.row_type == cagra_row_type::float16) {
+    return index_over<half>(
+      std::move(rows), std::move(graph), n_rows, dim, stride_bytes, settings, rows_unit, stream);
+  }
+  return index_over<float>(
+    std::move(rows), std::move(graph), n_rows, dim, stride_bytes, settings, rows_unit, stream);
+}
+
+void cagra_partition_distances(float const* rows,
+                               std::int64_t n,
+                               std::int64_t dim,
+                               float const* centers,
+                               float const* offsets,
+                               std::int64_t P,
+                               float* out,
+                               rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  int constexpr block_threads = 256;
+  int const warps_per_block   = block_threads / 32;
+  auto const grid             = static_cast<int>(
+    std::clamp<std::int64_t>((n + warps_per_block - 1) / warps_per_block, 1, 65535));
+  partition_distances_kernel<<<grid, block_threads, 0, stream.get()>>>(
+    rows, n, static_cast<int>(dim), centers, offsets, static_cast<int>(P), out);
+  CUDF_CUDA_TRY(cudaGetLastError());
 }
 
 void cagra_widen_ids(std::uint32_t const* neighbors,

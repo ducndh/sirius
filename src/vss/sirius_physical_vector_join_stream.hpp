@@ -471,6 +471,7 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   [[nodiscard]] std::size_t index_join_estimate(std::size_t n_left) const;
   /// One task's probe rows through the index, re-scored: per-row top-k, shaped.
   vss::shaped_join_result index_join_task(vss::dataset_matrix_view queries,
+                                          std::size_t left_idx,
                                           std::int64_t k_join,
                                           ::cucascade::memory::memory_space& space,
                                           rmm::cuda_stream_view stream,

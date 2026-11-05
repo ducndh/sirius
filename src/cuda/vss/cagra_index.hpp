@@ -60,6 +60,9 @@ class cagra_index : public any_cuvs_index {
   /// Whether every row was within unit_norm_tolerance of length 1 when the index was built.
   [[nodiscard]] virtual bool rows_unit() const noexcept = 0;
 
+  /// The graph, [n_rows, graph_degree], copied to @p out. Synchronous.
+  virtual void copy_graph_to_host(std::uint32_t* out, rmm::cuda_stream_view stream) const = 0;
+
   /// [m, k] neighbours of the @p m queries at @p queries, in the index's row type, @p dim tight.
   /// Ids are rows of the index, or at least n_rows() where a row found fewer than k. Synchronous.
   virtual void search(void const* queries,
@@ -93,6 +96,27 @@ inline constexpr float unit_norm_tolerance = 1e-5f;
   cagra_build_settings const& settings,
   bool rows_unit,
   rmm::cuda_stream_view stream);
+
+/// An index over rows and a graph already built and already on the device, which it takes over.
+[[nodiscard]] std::unique_ptr<cagra_index> make_cagra_index_over(
+  std::unique_ptr<rmm::device_buffer> rows,
+  std::unique_ptr<rmm::device_buffer> graph,
+  std::int64_t n_rows,
+  std::int64_t dim,
+  std::size_t stride_bytes,
+  cagra_build_settings const& settings,
+  bool rows_unit,
+  rmm::cuda_stream_view stream);
+
+/// out[r * P + p] = |rows[r] - centers[p]|^2 + offsets[p], for @p P partitions.
+void cagra_partition_distances(float const* rows,
+                               std::int64_t n,
+                               std::int64_t dim,
+                               float const* centers,
+                               float const* offsets,
+                               std::int64_t P,
+                               float* out,
+                               rmm::cuda_stream_view stream);
 
 /// ids[i] = neighbors[i], or -1 where it is at least @p n_rows.
 void cagra_widen_ids(std::uint32_t const* neighbors,

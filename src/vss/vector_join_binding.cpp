@@ -538,6 +538,8 @@ void serialize_vector_join_bind_data(duckdb::Serializer& serializer,
   serializer.WriteProperty(153, "cagra_itopk", req.cagra.search.itopk);
   serializer.WriteProperty(154, "cagra_search_width", req.cagra.search.search_width);
   serializer.WriteProperty(155, "cagra_build_settings_given", req.cagra.build_settings_given);
+  serializer.WriteProperty(156, "cagra_partitions", req.cagra.build.partitions);
+  serializer.WriteProperty(157, "cagra_partition_probes", req.cagra.search.partition_probes);
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
@@ -599,6 +601,9 @@ duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
   req.cagra.search.search_width = deserializer.ReadProperty<std::int64_t>(154, "cagra_search_width");
   req.cagra.build_settings_given =
     deserializer.ReadProperty<bool>(155, "cagra_build_settings_given");
+  req.cagra.build.partitions = deserializer.ReadProperty<std::int64_t>(156, "cagra_partitions");
+  req.cagra.search.partition_probes =
+    deserializer.ReadProperty<std::int64_t>(157, "cagra_partition_probes");
   return std::move(result);
 }
 

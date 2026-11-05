@@ -88,6 +88,10 @@ std::size_t cagra_build_peak_bytes(std::int64_t n_rows,
                                    cagra_build_settings const& settings,
                                    std::size_t staged_chunk_bytes)
 {
+  // A partitioned build holds one partition at a time, its largest taken 10 % over an even share.
+  if (settings.partitions > 1) {
+    n_rows = n_rows / settings.partitions + n_rows / settings.partitions / 10 + 1;
+  }
   // Host chunks are staged while the rows are converted, before the graph build's scratch exists.
   auto const rows =
     static_cast<std::size_t>(n_rows) * cagra_row_stride_bytes(dim, settings.row_type);
@@ -108,18 +112,23 @@ void check_cagra_build_fits(std::string const& fn,
     cagra_build_peak_bytes(n_rows, target.dim, settings, largest_staged_chunk(pin, target));
   auto const available = space.get_available_memory();
   if (peak <= available) { return; }
+  auto const largest = settings.partitions > 1
+                         ? n_rows / settings.partitions + n_rows / settings.partitions / 10 + 1
+                         : n_rows;
   auto const rows =
-    static_cast<std::size_t>(n_rows) * cagra_row_stride_bytes(target.dim, settings.row_type);
-  auto const resident = cagra_resident_bytes(n_rows, target.dim, settings);
+    static_cast<std::size_t>(largest) * cagra_row_stride_bytes(target.dim, settings.row_type);
+  auto const resident = cagra_resident_bytes(largest, target.dim, settings);
   throw duckdb::InvalidInputException(std::format(
-    "{}: a CAGRA index over '{}.{}' does not fit: {} rows x {}-d as {} are {:.2f} GiB, the graph "
+    "{}: a CAGRA index over '{}.{}' does not fit: {} rows x {}-d{} as {} are {:.2f} GiB, the graph "
     "at degree {} is {:.2f} GiB and the build's scratch {:.2f} GiB, {:.2f} GiB at its peak, and "
     "the device has {:.2f} GiB free of {:.2f} GiB{}",
     fn,
     target.table,
     target.column,
-    n_rows,
+    largest,
     target.dim,
+    settings.partitions > 1 ? std::format(" in the largest of {} partitions", settings.partitions)
+                            : std::string{},
     cagra_row_type_name(settings.row_type),
     gib(rows),
     settings.graph_degree,
@@ -129,8 +138,9 @@ void check_cagra_build_fits(std::string const& fn,
     gib(available),
     gib(space.get_max_memory()),
     pin.tier == cucascade::memory::Tier::GPU
-      ? "; pinning the table to the host tier frees what its FP32 rows hold on the device"
-      : ""));
+      ? "; pinning the table to the host tier frees what its FP32 rows hold on the device, and "
+        "partitions => 2, 4 or 8 holds one partition at a time"
+      : "; partitions => 2, 4 or 8 holds one partition at a time"));
 }
 
 std::shared_ptr<const pinned_index_entry> build_cagra_index_for_pin(

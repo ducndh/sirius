@@ -26,6 +26,7 @@
 #include "sirius_context.hpp"
 #include "vss/bound_gemm.hpp"
 #include "vss/cagra_join_index.hpp"
+#include "vss/cagra_partitions.hpp"
 #include "vss/join_result_shaping.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/sirius_physical_vector_join_stream.hpp"
@@ -69,11 +70,13 @@ struct vector_join_index_state {
   std::mutex build_mutex;
   std::shared_ptr<const vss::pinned_index_entry> entry;
   /// One search and its re-score at a time. Both are limited by device memory bandwidth, so a
-  /// second task in parallel adds nothing to them, and this bounds the device scratch to one batch's
-  /// and keeps each phase's time its own.
+  /// second task in parallel adds nothing to them, and this bounds the device scratch to one
+  /// batch's and keeps each phase's time its own.
   std::mutex search_mutex;
   /// Probe rows a search takes at once, from the room beside the index.
   std::atomic<std::int64_t> batch_rows{0};
+  /// A partitioned index: every probe row's candidates, found once by the first task.
+  std::optional<vss::cagra_partition_answers> partition_answers;
 };
 
 void sirius_physical_vector_join_stream::prepare_index_join_locked()
@@ -94,7 +97,16 @@ void sirius_physical_vector_join_stream::prepare_index_join_locked()
   auto const spaces =
     _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   auto const& space = *spaces.front();
-  if (state.entry != nullptr) {
+  bool const partitioned =
+    state.entry != nullptr
+      ? dynamic_cast<vss::cagra_partitioned_index const*>(state.entry->index.get()) != nullptr
+      : _request.cagra.build.partitions > 1;
+  if (partitioned) {
+    // The first task visits every partition; the others then only merge and re-score.
+    set_index_join_limits_locked(space.get_available_memory());
+    std::lock_guard<std::mutex> admission_lock(_admission->mutex);
+    _admission->limit = 1;
+  } else if (state.entry != nullptr) {
     set_index_join_limits_locked(space.get_available_memory());
   } else {
     // The first task builds the index, on a reservation of its own, so the others should neither
@@ -163,6 +175,7 @@ std::size_t sirius_physical_vector_join_stream::index_join_estimate(std::size_t 
 
 vss::shaped_join_result sirius_physical_vector_join_stream::index_join_task(
   vss::dataset_matrix_view queries,
+  std::size_t left_idx,
   std::int64_t k_join,
   ::cucascade::memory::memory_space& space,
   rmm::cuda_stream_view stream,
@@ -179,31 +192,91 @@ vss::shaped_join_result sirius_physical_vector_join_stream::index_join_task(
   std::shared_ptr<const vss::pinned_index_entry> entry;
   {
     std::lock_guard<std::mutex> build_lock(state.build_mutex);
-    if (state.entry == nullptr) {
+    auto const entry_is_partitioned = [&] {
+      return state.entry != nullptr &&
+             dynamic_cast<vss::cagra_partitioned_index const*>(state.entry->index.get()) != nullptr;
+    };
+    if (state.entry == nullptr || (entry_is_partitioned() && !state.partition_answers)) {
       telemetry::batch_telemetry_info const telemetry_info{};
       vss::cagra_build_report report;
       // Reservations are tracked per thread and this one's holds the task's, so the build, which is
       // charged to its own, runs on a thread of its own while the task waits for it.
       std::exception_ptr build_error;
+      bool built_here = false;
       std::thread builder([&] {
         try {
           rmm::cuda_set_device_raii const device{rmm::cuda_device_id{space.get_device_id()}};
-          state.entry = vss::build_cagra_index_for_pin("sirius_knn_join",
-                                                       _sirius_ctx->get_cuvs_index_cache(),
-                                                       state.target,
-                                                       _right_pin,
-                                                       _request.cagra.build,
-                                                       space,
-                                                       telemetry_info,
-                                                       report);
+          auto const hosts = _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(
+            cucascade::memory::Tier::HOST);
+          auto& cache = _sirius_ctx->get_cuvs_index_cache();
+          if (state.entry == nullptr) {
+            state.entry = _request.cagra.build.partitions > 1
+                            ? vss::build_partitioned_cagra_index_for_pin("sirius_knn_join",
+                                                                         cache,
+                                                                         state.target,
+                                                                         _right_pin,
+                                                                         _request.cagra.build,
+                                                                         space,
+                                                                         *hosts.front(),
+                                                                         telemetry_info,
+                                                                         report)
+                            : vss::build_cagra_index_for_pin("sirius_knn_join",
+                                                             cache,
+                                                             state.target,
+                                                             _right_pin,
+                                                             _request.cagra.build,
+                                                             space,
+                                                             telemetry_info,
+                                                             report);
+            built_here  = true;
+          }
+          if (auto const* parts =
+                dynamic_cast<vss::cagra_partitioned_index const*>(state.entry->index.get())) {
+            rmm::cuda_stream probe_stream;
+            rmm::cuda_stream_view const probe_view = probe_stream;
+            std::int64_t probe_rows                = 0;
+            for (std::size_t i = 0; i < _num_left; ++i) {
+              probe_rows += static_cast<std::int64_t>(_probe->chunk_rows(i));
+            }
+            auto const wanted_probes =
+              _request.cagra.search.partition_probes > 0
+                ? _request.cagra.search.partition_probes
+                : std::max<std::int64_t>(2, parts->settings().partitions / 2);
+            state.partition_answers = vss::cagra_search_partitions(
+              *parts,
+              [&](std::size_t i, std::function<void(float const*, std::int64_t)> const& with_rows) {
+                auto const chunk = _probe->stage(i, space, probe_view);
+                probe_view.sync();
+                auto const rows = vss::list_column_as_dataset_view(chunk.view, dim);
+                with_rows(rows.data_handle(), rows.extent(0));
+                probe_view.sync();
+              },
+              _num_left,
+              probe_rows,
+              k_join,
+              _request.cagra.search,
+              std::min(wanted_probes, parts->settings().partitions),
+              cosine,
+              cache,
+              space);
+          }
         } catch (...) {
           build_error = std::current_exception();
         }
       });
       builder.join();
       if (build_error) { std::rethrow_exception(build_error); }
-      _sirius_ctx->record_vector_join_index_build(
-        report.convert_seconds, report.build_seconds, report.peak_bytes, report.resident_bytes);
+      if (built_here) {
+        _sirius_ctx->record_vector_join_index_build(
+          report.convert_seconds, report.build_seconds, report.peak_bytes, report.resident_bytes);
+        _sirius_ctx->record_vector_join_index_moves(0, report.move_seconds);
+      }
+      if (state.partition_answers) {
+        auto const& answers = *state.partition_answers;
+        _sirius_ctx->record_vector_join_index_moves(answers.route_seconds, answers.move_seconds);
+        _sirius_ctx->record_vector_join_index_task(
+          0, answers.search_seconds, 0, answers.batches, 0, 0);
+      }
       if (phase_debug()) {
         std::fprintf(stderr,
                      "[vecjoin-phase] cagra build: convert %.3f s, graph %.3f s, peak %.2f GiB, "
@@ -230,6 +303,7 @@ vss::shaped_join_result sirius_physical_vector_join_stream::index_join_task(
                   vss::unit_norm_tolerance));
   }
 
+  auto const* partitioned = dynamic_cast<vss::cagra_partitioned_index const*>(entry->index.get());
   // The rows the re-score reads, wherever the pin keeps them.
   auto rows_map = vss::map_pinned_rows(*_right_pin, _request.right.column, dim, space, stream, mr);
   if (!rows_map) {
@@ -260,6 +334,33 @@ vss::shaped_join_result sirius_physical_vector_join_stream::index_join_task(
   std::int64_t batch_rows = std::max<std::int64_t>(state.batch_rows.load(), 1);
   std::int64_t batches    = 0;
   std::int64_t at         = 0;
+  if (partitioned != nullptr) {
+    // The partitions were searched by the first task: what is left is each row's candidates,
+    // nearest by the walk's own distances, and their FP32 distances.
+    auto mark = std::chrono::steady_clock::now();
+    std::vector<std::int64_t> merged;
+    vss::cagra_merge_partition_answers(
+      *state.partition_answers, state.partition_answers->chunk_first[left_idx], n_left, merged);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(ids,
+                                  merged.data(),
+                                  merged.size() * sizeof(std::int64_t),
+                                  cudaMemcpyHostToDevice,
+                                  stream.value()));
+    vss::exact_distances(queries.data_handle(),
+                         nullptr,
+                         k_join,
+                         ids,
+                         distances,
+                         n_left * k_join,
+                         exact_source,
+                         dim,
+                         stream,
+                         mr);
+    vss::cagra_sort_rows(distances, ids, n_left, k_join, stream);
+    stream.sync();
+    rescore_seconds += seconds_since(mark);
+    at = n_left;
+  }
   while (at < n_left) {
     auto const m = std::min(batch_rows, n_left - at);
     try {

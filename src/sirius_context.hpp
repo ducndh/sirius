@@ -458,6 +458,8 @@ class SiriusContext : public ClientContextState {
     double probe_convert_seconds = 0;
     double search_seconds        = 0;
     double rescore_seconds       = 0;
+    double route_seconds         = 0;
+    double move_seconds          = 0;
     uint64_t build_peak_bytes    = 0;
     uint64_t index_bytes         = 0;
     uint64_t batches             = 0;
@@ -906,6 +908,8 @@ class SiriusContext : public ClientContextState {
                                       double build_seconds,
                                       uint64_t peak_bytes,
                                       uint64_t resident_bytes);
+  /// \brief A partitioned index join's routing of its probe rows and its moves across the link.
+  void record_vector_join_index_moves(double route_seconds, double move_seconds);
   /// \brief One task of the index join.
   void record_vector_join_index_task(double convert_seconds,
                                      double search_seconds,

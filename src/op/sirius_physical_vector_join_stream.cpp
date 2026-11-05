@@ -2299,7 +2299,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   }
 
   if (_request.search_mode == vss::vector_join_search_mode::index) {
-    auto shaped = index_join_task(queries, k_join, *mem_space, stream, mr);
+    auto shaped = index_join_task(queries, left_idx, k_join, *mem_space, stream, mr);
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.push_back(std::move(shaped.left_rows));
     cols.push_back(std::move(shaped.neighbors));

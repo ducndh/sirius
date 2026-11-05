@@ -113,6 +113,7 @@ extern "C" int cudaProfilerStop();
 #include "vss/cluster_lists.hpp"
 #include "telemetry/data_batch_probe.hpp"
 #include "vss/cagra_join_index.hpp"
+#include "vss/cagra_partitions.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/kmeans_functions.hpp"
@@ -1669,7 +1670,8 @@ static unique_ptr<FunctionData> VectorJoinIndexStatsBind(ClientContext&,
     return_types.push_back(std::move(type));
   };
   column("index_event", LogicalType::VARCHAR);
-  for (auto const* name : {"build_convert_s", "build_s", "probe_convert_s", "search_s", "rescore_s"}) {
+  for (auto const* name :
+       {"build_convert_s", "build_s", "probe_convert_s", "search_s", "rescore_s", "route_s", "move_s"}) {
     column(name, LogicalType::DOUBLE);
   }
   for (auto const* name :
@@ -1702,7 +1704,9 @@ static void VectorJoinIndexStatsFunction(ClientContext& context,
                          s.build_seconds,
                          s.probe_convert_seconds,
                          s.search_seconds,
-                         s.rescore_seconds}) {
+                         s.rescore_seconds,
+                         s.route_seconds,
+                         s.move_seconds}) {
     output.data[col++].Append(Value::DOUBLE(v));
   }
   for (uint64_t const v : {s.build_peak_bytes, s.index_bytes, s.batches, s.probe_rows, s.misses}) {
@@ -1723,6 +1727,8 @@ static void add_cagra_options(TypedKwargs& options)
   options.Add("row_type", LogicalType::VARCHAR);
   options.Add("itopk", LogicalType::BIGINT);
   options.Add("search_width", LogicalType::BIGINT);
+  options.Add("partitions", LogicalType::BIGINT);
+  options.Add("partition_probes", LogicalType::BIGINT);
 }
 
 //! Takes one CAGRA option into @p settings, noting its name in @p given. False if @p key is not one.
@@ -1743,6 +1749,8 @@ static bool parse_cagra_option(std::string const& fn,
     settings.build.ivf_pq_n_lists = value.GetValue<int64_t>();
   } else if (key == "ivf_pq_n_probes") {
     settings.build.ivf_pq_n_probes = value.GetValue<int64_t>();
+  } else if (key == "partitions") {
+    settings.build.partitions = value.GetValue<int64_t>();
   } else if (key == "build_algo") {
     auto const algo = StringUtil::Lower(value.ToString());
     if (algo == "nn_descent") {
@@ -1770,6 +1778,8 @@ static bool parse_cagra_option(std::string const& fn,
       settings.search.itopk = value.GetValue<int64_t>();
     } else if (key == "search_width") {
       settings.search.search_width = value.GetValue<int64_t>();
+    } else if (key == "partition_probes") {
+      settings.search.partition_probes = value.GetValue<int64_t>();
     } else if (key == "index_type") {
       auto const type = StringUtil::Lower(value.ToString());
       if (type != "cagra") {
@@ -1800,6 +1810,15 @@ static void check_cagra_settings(std::string const& fn,
   }
   if (s.build.intermediate_graph_degree < s.build.graph_degree) {
     throw BinderException(fn + ": intermediate_graph_degree must be >= graph_degree");
+  }
+  auto const p = s.build.partitions;
+  if (p != 1 && p != 2 && p != 4 && p != 8) {
+    throw BinderException(fn + ": partitions must be 1, 2, 4 or 8");
+  }
+  // Without partitions in the statement, the index the column has decides how many there are.
+  if (s.search.partition_probes < 0 || s.search.partition_probes > 8 ||
+      (p > 1 && s.search.partition_probes > p)) {
+    throw BinderException(fn + ": partition_probes must be at most partitions");
   }
 }
 
@@ -1981,23 +2000,40 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
     }
     sirius::telemetry::batch_telemetry_info const telemetry_info{};
     sirius::vss::cagra_build_report report;
-    static_cast<void>(sirius::vss::build_cagra_index_for_pin(
-      "sirius_create_ann_index",
-      sirius_ctx->get_cuvs_index_cache(),
-      {entry_catalog,
-       entry_schema,
-       table_name,
-       data.column_name,
-       {entry.oid, entry.GetStorage().GetRowGroupCollection()},
-       dim},
-      pin_owner,
-      data.cagra.build,
-      *target_space,
-      telemetry_info,
-      report));
+    sirius::vss::cagra_index_target const target{
+      entry_catalog,
+      entry_schema,
+      table_name,
+      data.column_name,
+      {entry.oid, entry.GetStorage().GetRowGroupCollection()},
+      dim};
+    if (data.cagra.build.partitions > 1) {
+      auto const host_spaces =
+        memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      static_cast<void>(sirius::vss::build_partitioned_cagra_index_for_pin(
+        "sirius_create_ann_index",
+        sirius_ctx->get_cuvs_index_cache(),
+        target,
+        pin_owner,
+        data.cagra.build,
+        *target_space,
+        *host_spaces.front(),
+        telemetry_info,
+        report));
+    } else {
+      static_cast<void>(sirius::vss::build_cagra_index_for_pin("sirius_create_ann_index",
+                                                               sirius_ctx->get_cuvs_index_cache(),
+                                                               target,
+                                                               pin_owner,
+                                                               data.cagra.build,
+                                                               *target_space,
+                                                               telemetry_info,
+                                                               report));
+    }
     sirius_ctx->begin_vector_join_index_stats("built");
     sirius_ctx->record_vector_join_index_build(
       report.convert_seconds, report.build_seconds, report.peak_bytes, report.resident_bytes);
+    sirius_ctx->record_vector_join_index_moves(0, report.move_seconds);
     output.data[0].Append(Value::BOOLEAN(true));
     output.CheckCardinality(1);
     gstate.finished = true;

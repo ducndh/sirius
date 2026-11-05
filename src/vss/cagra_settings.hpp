@@ -42,6 +42,10 @@ struct cagra_build_settings {
   std::int64_t ivf_pq_n_lists{0};   ///< 0: cuVS's default for the table's size
   std::int64_t ivf_pq_n_probes{0};  ///< 0: cuVS's default
   cagra_row_type row_type{cagra_row_type::float16};
+  /// One global graph, or 2, 4 or 8 big partitions with a graph each, for a table whose one graph
+  /// would not fit the device. A walk costs about the same at any size, so more partitions cost
+  /// more search; one is the default, and several are for what else gets no answer.
+  std::int64_t partitions{1};
 
   [[nodiscard]] bool operator==(cagra_build_settings const&) const = default;
 };
@@ -51,6 +55,11 @@ struct cagra_build_settings {
 struct cagra_search_settings {
   std::int64_t itopk{64};
   std::int64_t search_width{1};
+  /// Over a partitioned index, the nearest partitions a probe row searches. 0: half of them, and at
+  /// least 2. With the partitions even in size the nearest one alone holds 0.77-0.91 of a row's
+  /// true neighbours at 2 to 8 partitions, the nearest half 0.97-1.0 (OpenAI 3-large, 1,024 and
+  /// 3,072-d).
+  std::int64_t partition_probes{0};
 };
 
 /// A join's CAGRA settings. With no build setting given in SQL, any index already on the column

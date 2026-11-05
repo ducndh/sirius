@@ -1700,6 +1700,13 @@ void SiriusContext::record_vector_join_index_build(double convert_seconds,
   s.index_bytes           = resident_bytes;
 }
 
+void SiriusContext::record_vector_join_index_moves(double route_seconds, double move_seconds)
+{
+  std::lock_guard lock{vector_join_index_stats_mutex_};
+  vector_join_index_stats_.route_seconds += route_seconds;
+  vector_join_index_stats_.move_seconds += move_seconds;
+}
+
 void SiriusContext::record_vector_join_index_task(double convert_seconds,
                                                   double search_seconds,
                                                   double rescore_seconds,

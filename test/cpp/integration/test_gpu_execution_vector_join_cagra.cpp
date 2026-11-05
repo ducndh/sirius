@@ -459,6 +459,65 @@ TEST_CASE_METHOD(CagraJoinFixture,
   CHECK(check_answer(pairs, probe_rows_, corpus_rows_, 10, l2, 2e-6) >= 0.85);
 }
 
+TEST_CASE_METHOD(CagraJoinFixture,
+                 "sirius_knn_join index: partitions, against float64",
+                 "[integration][gpu_execution][array][vss][vector_join][cagra]")
+{
+  make_tables(false);
+  for (auto const parts : {2, 4, 8}) {
+    UNSCOPED_INFO("partitions " << parts);
+    auto const options = "k => 10, partitions => " + std::to_string(parts);
+    auto const pairs   = join_rows(*con, join_sql(options));
+    CHECK(index_event(*con) == "built");
+    CHECK(check_answer(pairs, probe_rows_, corpus_rows_, 10, l2, 2e-6, /*allow_short=*/true) >=
+          0.5);
+    // Search again over the index in host memory, every partition this time.
+    auto const all =
+      join_rows(*con, join_sql(options + ", partition_probes => " + std::to_string(parts)));
+    CHECK(index_event(*con) == "reused");
+    auto const recall_all =
+      check_answer(all, probe_rows_, corpus_rows_, 10, l2, 2e-6, /*allow_short=*/true);
+    CHECK(recall_all >= 0.8);
+  }
+  // The phases of moving a partition are reported apart.
+  auto r =
+    con->Query("SELECT route_s, move_s, search_s, rescore_s FROM sirius_vector_join_index_stats()");
+  REQUIRE_FALSE(r->HasError());
+  CHECK(r->Collection().GetValue(0, 0).GetValue<double>() > 0.0);
+  CHECK(r->Collection().GetValue(1, 0).GetValue<double>() > 0.0);
+  CHECK(r->Collection().GetValue(2, 0).GetValue<double>() > 0.0);
+  CHECK(r->Collection().GetValue(3, 0).GetValue<double>() > 0.0);
+
+  // A self-join, and the rows it gives back cover every row of the corpus.
+  auto const self = join_rows(*con, join_sql("k => 5, partitions => 2", "corpus"));
+  CHECK(self.size() <= corpus_rows_.size() * 5);
+  CHECK(self.size() >= corpus_rows_.size() * 5 * 99 / 100);
+
+  expect_error(*con, join_sql("partitions => 3"), "partitions must be 1, 2, 4 or 8");
+  expect_error(*con, join_sql("partitions => 2, partition_probes => 3"), "at most partitions");
+  run_ok(
+    "SELECT * FROM sirius_create_ann_index('corpus', 'vec', index_type => 'cagra', partitions => "
+    "4);");
+  auto const prebuilt = join_rows(*con, join_sql("k => 10, partition_probes => 4"));
+  CHECK(index_event(*con) == "reused");
+  CHECK(check_answer(prebuilt, probe_rows_, corpus_rows_, 10, l2, 2e-6, /*allow_short=*/true) >=
+        0.8);
+}
+
+TEST_CASE_METHOD(CagraJoinFixture,
+                 "sirius_knn_join index: partitions over a host pin, and cosine",
+                 "[integration][gpu_execution][array][vss][vector_join][cagra]")
+{
+  make_tables(true);
+  run_ok("SELECT * FROM unpin_table('corpus');");
+  run_ok("SELECT * FROM pin_table(name => 'corpus', tier => 'host', format => 'duckdb');");
+  auto const pairs = join_rows(
+    *con, join_sql("k => 10, metric => 'cosine', output_type => 'distance', partitions => 2"));
+  CHECK(check_answer(
+          pairs, probe_rows_, corpus_rows_, 10, cosine_distance, 3e-5, /*allow_short=*/true) >=
+        0.8);
+}
+
 TEST_CASE("cagra search scratch follows itopk and width", "[integration][vss][vector_join][cagra]")
 {
   using sirius::vss::cagra_search_scratch_per_row;

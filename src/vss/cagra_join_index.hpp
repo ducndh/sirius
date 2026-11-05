@@ -78,6 +78,7 @@ void check_cagra_build_fits(std::string const& fn,
 struct cagra_build_report {
   double convert_seconds{0};
   double build_seconds{0};
+  double move_seconds{0};  ///< a partitioned build moving partitions across the link
   std::size_t peak_bytes{0};
   std::size_t resident_bytes{0};
 };
