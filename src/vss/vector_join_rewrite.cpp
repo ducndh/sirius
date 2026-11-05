@@ -585,6 +585,23 @@ bool rewrite_enabled(duckdb::ClientContext& context)
   return true;
 }
 
+bool expression_has_vector_distance(Expression const& e)
+{
+  if (e.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION) {
+    auto const& name = e.Cast<duckdb::BoundFunctionExpression>().Function().GetName().GetIdentifierName();
+    if (name == "array_distance" || name == "array_cosine_similarity" ||
+        name == "array_cosine_distance" || name == "array_inner_product" ||
+        name == "array_dot_product" || name == "array_negative_inner_product" ||
+        name == "array_negative_dot_product") {
+      return true;
+    }
+  }
+  bool found = false;
+  duckdb::ExpressionIterator::EnumerateChildren(
+    e, [&](Expression const& child) { found = found || expression_has_vector_distance(child); });
+  return found;
+}
+
 class rewriter {
  public:
   rewriter(duckdb::ClientContext& context,
@@ -603,6 +620,7 @@ class rewriter {
       SIRIUS_LOG_INFO("[vector_join_rewrite] plan before:\n{}", _root->ToString());
     }
     inline_vector_ctes(_root);
+    lift_distance_residuals(_root);
     // One pattern per pass: a rewrite moves subtrees, so the search restarts from the root.
     while (rewrites < 16 && try_one(_root)) {
       ++rewrites;
@@ -615,6 +633,53 @@ class rewriter {
   }
 
  private:
+  /// DuckDB keeps a predicate over both sides of an inner join among the join's own conditions. One
+  /// that computes a distance goes back to a filter above the join, where the matchers read it. As
+  /// with an inlined CTE, the caller keeps DuckDB's plan when nothing is rewritten after all.
+  void lift_distance_residuals(unique_ptr<LogicalOperator>& op)
+  {
+    for (auto& child : op->children) {
+      if (child) { lift_distance_residuals(child); }
+    }
+    if (op->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) { return; }
+    auto& join = op->Cast<duckdb::LogicalComparisonJoin>();
+    if (join.join_type != duckdb::JoinType::INNER) { return; }
+    auto const lifted = [](duckdb::JoinCondition const& c) {
+      return !c.IsComparison() && expression_has_vector_distance(c.GetJoinExpression());
+    };
+    auto const n_lifted = std::count_if(join.conditions.begin(), join.conditions.end(), lifted);
+    if (n_lifted == 0 || static_cast<std::size_t>(n_lifted) == join.conditions.size()) { return; }
+
+    auto filter = duckdb::make_uniq<duckdb::LogicalFilter>();
+    duckdb::vector<duckdb::JoinCondition> kept;
+    for (auto& c : join.conditions) {
+      if (lifted(c)) {
+        filter->expressions.push_back(std::move(c.JoinExpressionReference()));
+      } else {
+        kept.push_back(std::move(c));
+      }
+    }
+    join.conditions = std::move(kept);
+    // The filter reads columns the join's maps may have pruned, and passes up the columns the join
+    // used to, in the same positions.
+    auto const before = op->GetColumnBindings();
+    join.left_projection_map.clear();
+    join.right_projection_map.clear();
+    auto const after = op->GetColumnBindings();
+    if (before != after) {
+      for (auto const& b : before) {
+        auto const at = std::find(after.begin(), after.end(), b);
+        filter->projection_map.emplace_back(static_cast<duckdb::idx_t>(at - after.begin()));
+      }
+    }
+    filter->SetEstimatedCardinality(op->estimated_cardinality);
+    filter->children.push_back(std::move(op));
+    filter->children[0]->ResolveOperatorTypes();
+    filter->ResolveOperatorTypes();
+    op       = std::move(filter);
+    _inlined = true;
+  }
+
   /// DuckDB turns a subplan that appears twice into a materialized CTE (COMMON_SUBPLAN), so a
   /// self-join written as `images JOIN part ... JOIN images JOIN part` reaches the matcher with
   /// both sides as CTE scans, and a scan of a materialized CTE has no vectors to search. A CTE that
@@ -1459,6 +1524,7 @@ class rewriter {
       cross.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
       cross.Cast<duckdb::LogicalComparisonJoin>().join_type == duckdb::JoinType::INNER &&
       cross.Cast<duckdb::LogicalComparisonJoin>().conditions.size() == 1 &&
+      cross.Cast<duckdb::LogicalComparisonJoin>().conditions[0].IsComparison() &&
       cross.Cast<duckdb::LogicalComparisonJoin>().left_projection_map.empty() &&
       cross.Cast<duckdb::LogicalComparisonJoin>().right_projection_map.empty() &&
       cross.children.size() == 2;
@@ -3059,22 +3125,6 @@ class rewriter {
 
 namespace {
 
-bool expression_has_vector_distance(Expression& e)
-{
-  if (e.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION) {
-    auto const& name = e.Cast<duckdb::BoundFunctionExpression>().Function().GetName().GetIdentifierName();
-    if (name == "array_distance" || name == "array_cosine_similarity" ||
-        name == "array_cosine_distance" || name == "array_inner_product" ||
-        name == "array_dot_product" || name == "array_negative_inner_product" ||
-        name == "array_negative_dot_product") {
-      return true;
-    }
-  }
-  bool found = false;
-  duckdb::ExpressionIterator::EnumerateChildren(
-    e, [&](Expression& child) { found = found || expression_has_vector_distance(child); });
-  return found;
-}
 
 }  // namespace
 

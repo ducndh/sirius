@@ -169,12 +169,12 @@ TEST_CASE_METHOD(SqlRewriteFixture,
   std::string const counted =
     "SELECT count(*) FROM sr_probe p, sr_corpus c WHERE array_distance(p.vec, c.vec) <= 0.9;";
   require_gpu_matches_duckdb(*con, counted);
-  REQUIRE(con->ExtractPlan(counted)->ToString().find("sum_no_overflow") != std::string::npos);
+  REQUIRE(con->ExtractPlan(counted)->ToString().find("sirius_knn_count_sum") != std::string::npos);
   // The explicit call, a cosine threshold, against the same count on DuckDB.
   std::string const called =
     "SELECT count(*) FROM sirius_knn_join('sr_probe','vec','sr_corpus','vec', metric => "
     "'cosine', join_mode => 'threshold', eps => 0.8);";
-  REQUIRE(con->ExtractPlan(called)->ToString().find("sum_no_overflow") != std::string::npos);
+  REQUIRE(con->ExtractPlan(called)->ToString().find("sirius_knn_count_sum") != std::string::npos);
   run_ok("SET gpu_execution = false;");
   auto const expected = sorted_rows(*con,
                                     "SELECT count(*) FROM sr_probe p, sr_corpus c "
@@ -194,7 +194,7 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "SELECT count(*) FROM sr_probe p, sr_corpus c WHERE array_distance(p.vec, c.vec) <= 0.9 "
     "AND p.id <> c.id;";
   require_gpu_matches_duckdb(*con, filtered);
-  REQUIRE(con->ExtractPlan(filtered)->ToString().find("sum_no_overflow") == std::string::npos);
+  REQUIRE(con->ExtractPlan(filtered)->ToString().find("sirius_knn_count_sum") == std::string::npos);
   // Over the lists: the count equals the number of pairs the same approximate join returns.
   run_ok("SET vector_join_probes = 2;");
   auto const approx_rows = sorted_rows(
