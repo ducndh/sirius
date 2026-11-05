@@ -2844,24 +2844,19 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // first piece, and what passes is merged before the next, so after the first pieces the filter
     // runs under a bound near the final one (Deep10M INT8, 10k probes: 0.33 s, against 0.37 s
     // through its best partitioning). On the device the seed's sample bounds the first piece; host
-    // lists, with no device rows to sample, start from an unbounded first piece instead. Either way
-    // the first piece is cut to the batch, so that what it lets through -- every row of an
-    // unbounded piece, about k per sample's worth under the seed -- stays near 2^24 pairs: a 1M-row
-    // probe batch over host lists would otherwise buffer a billion. Later pieces pass about k a
-    // row. SIRIUS_VSS_RUNNING_BOUND=<rows> sets the first piece for any lists, 0 turns it off.
+    // lists, with no device rows to sample, start from an unbounded first piece instead. A seeded
+    // first piece is cut to the batch, so that what it lets through, about k per sample's worth,
+    // stays near 2^24 pairs. All of an unbounded piece's pairs pass, so it is only as long as a
+    // first k-th needs: 4k rows, at least 64. A longer one only holds more: the time does not move
+    // from 1k to 1M probes. Later pieces pass about k a row.
+    // SIRIUS_VSS_RUNNING_BOUND=<rows> sets the first piece for any lists, 0 turns it off.
     // A single list of FLOAT16 rows takes no sample on the device either: its codes give each row's
     // bound after the first piece (see hold_codes_pairs, below). Exact, with no FP32 read for the
     // bound. INT8 and byte codes keep the seed: measured slower without it, at every probe count.
     // The first piece's pairs all pass, so a device too full for their buffer keeps the seed too.
     // SIRIUS_VSS_F16_NO_SEED=0 keeps the seed here too, and setting SIRIUS_VSS_SEED or
     // SIRIUS_VSS_RUNNING_BOUND asks for the schedule they name.
-    auto const unbounded_piece_rows = [&] {
-      constexpr std::int64_t kFirstPiecePairs = std::int64_t{1} << 24;
-      auto const at_least                     = std::max<std::int64_t>(4 * k_join, 64);
-      return std::clamp<std::int64_t>(kFirstPiecePairs / std::max<std::int64_t>(n_left, 1),
-                                      at_least,
-                                      std::max<std::int64_t>(at_least, vss::kSeedSample));
-    };
+    auto const unbounded_piece_rows = [&] { return std::max<std::int64_t>(4 * k_join, 64); };
     bool const f16_list_no_seed =
       _lists != nullptr && _lists->offsets.size() == 2 && !int8_search &&
       _lists->encoding == vss::list_encoding::float16 && !radius_join && !ip &&
