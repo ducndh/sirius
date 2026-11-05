@@ -124,6 +124,7 @@ sirius:
     enable_pinned_zone_map_pruning: true  # capture and use per-chunk stats for pinned tables
     enable_runtime_size_estimation: false  # project total port input from upstream ratios
     enable_decimal_sum_stats_bound: true  # decide decimal and BIGINT SUM width from statistics at plan time
+    vector_join_pair_tasks: true  # run a threshold vector join over a re-read corpus as build and pair tasks
   telemetry:
     enable_quent: true
     output_directory: telemetry_data
@@ -623,6 +624,7 @@ does not re-derive either budget; `RESET` restores each registered startup defau
 | `avg_variable_column_bytes` | 32 | Per-row width assumed for variable-width columns (VARCHAR, LIST, STRUCT, ARRAY) when estimating scan output. Fixed-width columns use their real carrier width. Only consulted when `admission_bytes_per_gpu` is non-zero. |
 | `enable_runtime_size_estimation` | false | Size grouped-aggregation partitions from projected input, allowing a partial ingress barrier. |
 | `enable_decimal_sum_stats_bound` | true | Decide at plan time, from base-table statistics, whether a DECIMAL32/DECIMAL64 SUM or AVG input, or the BIGINT input of a SUM or AVG that DuckDB accumulates in HUGEINT, must be widened before aggregation, or whether a DECIMAL128 SUM input can be summed as DECIMAL64. An input whose magnitude bound the planner can prove skips the per-batch min/max scan and its stream synchronization; unproven inputs are still measured per batch. |
+| `vector_join_pair_tasks` | true | Run a threshold vector join whose corpus is re-read from outside the device (a scanned corpus, or cluster lists in host memory) as one build task per probe block and one task per (block, corpus chunk). A retry then redoes one chunk, a cancel waits for one chunk, and pairs leave as the task's output, where the engine can spill them. Read when the join is planned. Off: one task per probe chunk reads the whole corpus. Also `SET vector_join_pair_tasks`. |
 
 **Note:** `admission_bytes_per_gpu` is a parallelism dial, not a memory budget. Peak GPU residency is bounded by partition sizing (`hash_partition_bytes` and the batch settings), not by the admitted GPU count — a query on fewer GPUs processes more partitions sequentially at roughly unchanged peak memory, trading wall-clock for freed devices. Tune it against how much of the fleet a query should occupy, not against VRAM.
 

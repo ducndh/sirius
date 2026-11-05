@@ -19,6 +19,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "telemetry/data_batch_probe.hpp"
+#include "vss/pair_schedule.hpp"
 #include "vss/vector_join.hpp"
 #include "vss/vector_join_materialized_side.hpp"
 
@@ -32,6 +33,7 @@
 #include <cucascade/data/data_repository.hpp>
 #include <cuvs/distance/distance.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -170,6 +172,16 @@ class vector_chunk_source {
     return stage(i, space, stream);
   }
 
+  /// As stage_for_task(), for a pair task: its chunk is the only one it holds, so nothing but the
+  /// task's own reservation stands behind it.
+  virtual staged_vector_chunk stage_for_pair(std::size_t i,
+                                             ::cucascade::memory::memory_space& space,
+                                             rmm::cuda_stream_view stream)
+  { return stage_for_task(i, space, stream); }
+
+  /// This source is the join's corpus, whose reads the session counts.
+  virtual void count_reads() {}
+
   /// True when staging performs a host-to-device copy, i.e. the data is not resident.
   [[nodiscard]] virtual bool is_streaming() const = 0;
 
@@ -195,7 +207,7 @@ std::unique_ptr<vector_chunk_source> make_host_pinned_chunk_source(
 /// Cluster lists: chunks are fixed-size spans of the cluster-ordered copy, viewed in place on the
 /// GPU tier and copied block by block from pinned host memory on the HOST tier.
 std::unique_ptr<vector_chunk_source> make_cluster_lists_chunk_source(
-  const sirius::vss::cluster_lists& lists);
+  const sirius::vss::cluster_lists& lists, duckdb::SiriusContext* ctx = nullptr);
 
 /// Build phase: chunks are the batches a child scan deposited in the join's build port, taken
 /// in the buffer's snapshot order. A batch the downgrade executor has spilled is brought back
@@ -231,7 +243,8 @@ struct vector_join_admission {
  *
  * One task per left (query) batch, not per (left, right) pair: the task streams every
  * right batch through a running top-k fold, so the pair grid is walked inside execute()
- * instead of being handed out as separate tasks.
+ * instead of being handed out as separate tasks. A threshold join over a re-read corpus is the
+ * exception: its pairs depend on no other chunk's, so each is a task (see set_pair_step()).
  */
 /// Task input: which left (probe) batch this task searches. The probe batch itself stays idle in
 /// the "default" port until execute() stages it, so the engine can spill it meanwhile.
@@ -257,6 +270,14 @@ class vector_join_stream_input : public operator_data {
     return _estimated_bytes;
   }
 
+  /// Pair counts differ by block, so a light task's peak must not size a heavy one below what its
+  /// own rows are known to hold.
+  [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes() const override
+  {
+    return _estimated_bytes;
+  }
+  [[nodiscard]] bool working_set_floors_reservation() const override { return true; }
+
   [[nodiscard]] ::cucascade::memory::memory_space* get_gpu_memory_space() const
   {
     return _gpu_memory_space;
@@ -274,7 +295,14 @@ class vector_join_stream_input : public operator_data {
   void set_ticket(std::shared_ptr<void> ticket) { _ticket = std::move(ticket); }
   [[nodiscard]] std::shared_ptr<void> const& ticket() const { return _ticket; }
 
+  /// Set when the join runs in pair tasks: which step of its schedule this task is. It stays as it
+  /// is across retries, so a retry starts where the task did.
+  void set_pair_step(vss::pair_schedule::step step) { _pair_step = step; }
+  [[nodiscard]] std::optional<vss::pair_schedule::step> const& pair_step() const
+  { return _pair_step; }
+
  private:
+  std::optional<vss::pair_schedule::step> _pair_step;
   std::size_t _left_idx;
   ::cucascade::memory::memory_space* _gpu_memory_space = nullptr;
   std::size_t _estimated_bytes;
@@ -406,6 +434,14 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   std::string params_to_string() const override;
 
  private:
+  /// A threshold task's pairs, a task's probe rows and what its search holds across corpus chunks,
+  /// the task's steps over them, and the clustered search among those steps. Defined beside
+  /// execute().
+  struct found_pairs;
+  struct block_state;
+  class block_task;
+  class clustered_search;
+
   /// Resolve both pinned tables and snapshot per-batch views plus right-batch row
   /// offsets. Idempotent; caller holds _op_mutex. On the build path this is a no-op until
   /// @ref build_side_ready_locked, so callers must check that first.
@@ -438,6 +474,36 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   [[nodiscard]] std::size_t estimate_for_rows(std::size_t n_left,
                                               bool with_routing      = true,
                                               bool planning_a_block = false) const;
+  /// Whether each task reads the corpus again from outside the device, so a block's size sets how
+  /// often it is read.
+  [[nodiscard]] bool corpus_reread() const;
+  /// Whether this join runs as a build task per probe block and a task per (block, corpus chunk).
+  /// Decided once the corpus is known, from the query's setting and the join's form. Threshold
+  /// joins that keep every pair: nothing in a pair task then depends on another's result.
+  [[nodiscard]] bool pair_tasks_wanted() const;
+  /// Rows of a probe block in pair tasks, from what one holds: 0 when no device is known.
+  [[nodiscard]] std::int64_t pair_block_rows();
+  /// Device bytes a block holds per row: while its build task runs, or while its pair tasks do.
+  [[nodiscard]] double pair_block_row_bytes(bool building) const;
+  /// Peak bytes of a pair task, apart from its pairs, gathering @p gathered_rows probe rows at
+  /// most.
+  [[nodiscard]] std::size_t pair_task_bytes(std::int64_t gathered_rows) const;
+  /// The next build or pair task's input, or null if none can start now.
+  [[nodiscard]] std::unique_ptr<operator_data> next_pair_step_locked();
+  /// A block's build task: its rows, routing and whatever else its pair tasks read.
+  [[nodiscard]] std::unique_ptr<operator_data> run_build_step(
+    vector_join_stream_input const& input,
+    ::cucascade::memory::memory_space& space,
+    rmm::cuda_stream_view stream);
+  /// One (block, corpus chunk): its pairs are the task's output, published only by its sink.
+  [[nodiscard]] std::unique_ptr<operator_data> run_pair_step(
+    vector_join_stream_input const& input,
+    ::cucascade::memory::memory_space& space,
+    rmm::cuda_stream_view stream);
+  /// For tests: under SIRIUS_VSS_PAIR_OOM_ONE_IN=n, one call in about n fails as a shortage would,
+  /// after the task's work is done, and SIRIUS_VSS_PAIR_SLOW_MS holds each call back that long.
+  void inject_pair_oom();
+
   /// Whether a probe block over this join keeps its FP32 rows on the host (see the block's load).
   [[nodiscard]] bool block_rows_on_host() const;
   /// What a join's waiting pairs may pin on the host.
@@ -551,6 +617,22 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   };
   std::vector<probe_block> _blocks;
   host_pair_block_pool _host_pair_blocks;
+  /// Set when the join runs in pair tasks; _blocks are then what it walks, and the other members
+  /// here say how far. All read and written under _op_mutex.
+  std::optional<vss::pair_schedule> _pair_schedule;
+  /// Each block's state from its build task until its last pair task ends. What a pair task reads
+  /// is never written after the build publishes it. Device memory in it stays charged after the
+  /// build's task, as a hash table's does, and goes back when the last holder drops it.
+  std::vector<std::shared_ptr<block_state>> _pair_states;
+  std::size_t _pair_tasks_at_once{1};
+  /// The device every task of the join runs on, once the first build has picked it: a block's state
+  /// lives on one.
+  std::optional<int> _pair_device;
+  /// Per corpus chunk, its first row, for an exhaustive search (a clustered one has
+  /// _chunk_row_base).
+  std::vector<std::int64_t> _corpus_chunk_base;
+  std::size_t _max_corpus_chunk_rows{0};
+  std::atomic<std::uint64_t> _pair_oom_draws{0};
   /// Probe rows in total, counted only when the probe stands in for a scalar subquery.
   std::size_t _scalar_probe_rows{0};
   std::size_t _next_left{0};

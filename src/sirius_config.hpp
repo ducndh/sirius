@@ -244,6 +244,11 @@ struct operator_params {
   /// Let grouped-aggregation partitions size from projected input.
   bool enable_runtime_size_estimation = false;
 
+  /// Run a threshold vector join whose corpus is re-read from outside the device as one build task
+  /// per probe block and one task per (block, corpus chunk). Off: one task per probe chunk reads
+  /// the whole corpus.
+  bool vector_join_pair_tasks = true;
+
   /// Decide decimal and wide integer SUM widening from base-table statistics at plan time: an
   /// aggregate input with a proven magnitude bound skips the per-batch min/max scan and its stream
   /// synchronization (planner::resolve_sum_input_bounds). Off: every batch is measured.

@@ -925,6 +925,8 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
     scan_input != nullptr && scan_input->needs_carrier_conversion;
   const std::size_t input_scan_conversion_destination_bytes =
     scan_input != nullptr ? scan_input->conversion_destination_bytes : 0;
+  const bool input_floors_reservation =
+    ls._input_data && ls._input_data->working_set_floors_reservation();
   auto working_set_bytes = input_basis;
   // Resident (cached) scan inputs report mask/filter copy peaks through their
   // working-set estimate too — it seeds the cold-start guess below via
@@ -934,6 +936,8 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
       scan_input && target_space
         ? scan_input->get_estimated_working_set_size_in_bytes(target_space->get_device_id())
         : ls._input_data->get_estimated_working_set_size_in_bytes();
+  } else if (input_floors_reservation) {
+    working_set_bytes = ls._input_data->get_estimated_working_set_size_in_bytes();
   }
 
   std::size_t num_batches = 0;
@@ -958,8 +962,9 @@ pipeline::reservation_size_info gpu_pipeline_task::get_estimated_reservation_siz
   if (peak_opt.has_value()) {
     info.peak_memory_estimate = *peak_opt;
     // pipeline_memory_history may estimate below the current fresh batch's known decode working
-    // set.
-    if (input_type == op::operator_data_type::GPU_SCAN && !input_resident) {
+    // set, or below what an input says this task holds whatever smaller tasks peaked at.
+    if ((input_type == op::operator_data_type::GPU_SCAN && !input_resident) ||
+        input_floors_reservation) {
       info.peak_memory_estimate = std::max(info.peak_memory_estimate, working_set_bytes);
     }
     // pipeline_memory_history keys estimates by input bytes, not carrier layout, so batches with

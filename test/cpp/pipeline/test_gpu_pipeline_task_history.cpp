@@ -34,6 +34,7 @@
 #include "sirius/exception.hpp"
 #include "utils/telemetry_utils.hpp"
 #include "utils/utils.hpp"
+#include "vss/sirius_physical_vector_join_stream.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
@@ -206,6 +207,24 @@ class scan_sizing_input : public sirius::op::operator_data {
   }
   [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override { return 100; }
   [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes() const override { return 500; }
+};
+
+class working_set_input : public sirius::op::operator_data {
+ public:
+  working_set_input(bool floors, std::size_t working_set)
+    : floors_(floors), working_set_(working_set)
+  {
+  }
+  [[nodiscard]] std::size_t get_estimated_size_in_bytes() const override { return 100; }
+  [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes() const override
+  {
+    return working_set_;
+  }
+  [[nodiscard]] bool working_set_floors_reservation() const override { return floors_; }
+
+ private:
+  bool floors_;
+  std::size_t working_set_;
 };
 
 //------------------------------------------------------------------------------
@@ -986,6 +1005,52 @@ TEST_CASE("scan working set is a lower bound for history-based reservations",
   CHECK(estimate.had_history);
   CHECK(estimate.peak_memory_estimate == 500);
   CHECK(estimate.reservation_size == 500);
+}
+
+TEST_CASE("an input's working set floors history-based reservations only when it opts in",
+          "[gpu_pipeline_task][history]")
+{
+  auto const estimate_after_history = [](std::unique_ptr<sirius::op::operator_data> input) {
+    auto ctx          = create_pipeline_context();
+    auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+      ctx.pipeline, sirius::test::make_test_telemetry_context());
+    global_state->get_memory_history().record({100, 200, 100});
+    auto task = std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+      1,
+      std::vector<cucascade::shared_data_repository*>{},
+      std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(input)),
+      std::move(global_state));
+    return task->get_estimated_reservation_size_info(nullptr);
+  };
+
+  SECTION("the virtual unset leaves the reservation to history, whatever the working set")
+  {
+    auto const estimate = estimate_after_history(std::make_unique<working_set_input>(false, 500));
+    CHECK(estimate.had_history);
+    CHECK(estimate.peak_memory_estimate == 200);
+    CHECK(estimate.reservation_size == 200);
+  }
+  SECTION("set, history may not go under the working set")
+  {
+    auto const estimate = estimate_after_history(std::make_unique<working_set_input>(true, 500));
+    CHECK(estimate.had_history);
+    CHECK(estimate.peak_memory_estimate == 500);
+    CHECK(estimate.reservation_size == 500);
+  }
+  SECTION("set, history above the working set still stands")
+  {
+    auto const estimate = estimate_after_history(std::make_unique<working_set_input>(true, 50));
+    CHECK(estimate.had_history);
+    CHECK(estimate.peak_memory_estimate == 200);
+    CHECK(estimate.reservation_size == 200);
+  }
+  SECTION("a vector join task's input opts in with its own estimate")
+  {
+    sirius::op::vector_join_stream_input input(0, 500);
+    CHECK(input.working_set_floors_reservation());
+    CHECK(input.get_estimated_working_set_size_in_bytes() == 500);
+    CHECK_FALSE(sirius::op::operator_data{}.working_set_floors_reservation());
+  }
 }
 
 // ---------------------------------------------------------------------------

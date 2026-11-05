@@ -1264,6 +1264,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   // The count comes from the bind, which reads it from the pin or from the table itself
   // depending on where this join's corpus is coming from.
   auto req              = bind_data.req;
+  req.pair_tasks        = duckdb::session_operator_params(context).vector_join_pair_tasks;
   auto const right_rows = static_cast<std::int64_t>(bind_data.right_rows);
 
   // A side read from its pin is served only by the table incarnation it is planned against.

@@ -149,6 +149,9 @@ struct vector_join_request {
   /// The probe relation replaces a scalar subquery (the plain-SQL rewrite unwrapped it), so it
   /// must hold exactly one row, as the subquery had to.
   bool probe_scalar{false};
+  /// Whether a threshold join that re-reads its corpus may run in build and pair tasks, from the
+  /// operator parameter of that name. The planner sets it.
+  bool pair_tasks{false};
 };
 
 struct SiriusVectorJoinBindData : public duckdb::TableFunctionData {

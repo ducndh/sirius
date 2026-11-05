@@ -41,6 +41,13 @@ inline cudf::size_type column_size(std::int64_t rows, char const* what)
   return static_cast<cudf::size_type>(rows);
 }
 
+/// One threshold search's pairs would pass what the device can ever hold: a task can run it over
+/// fewer rows, but a retry as it is would only reach the same point.
+class threshold_pairs_exceed_device : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 /// A threshold search's pairs held on the device at @p bytes_per_pair each: past what Sirius's
 /// pool can ever hold (it takes at most ~0.94 of the device, so 0.85 leaves room for the search's
 /// own buffers) they cannot fit however much else is released, so this throws a plain error, not
@@ -59,7 +66,7 @@ inline void require_pairs_fit(std::uint64_t pairs, std::uint64_t bytes_per_pair,
   CUDF_CUDA_TRY(cudaMemGetInfo(&free_bytes, &total_bytes));
   if (static_cast<double>(pairs) * static_cast<double>(bytes_per_pair) >
       0.85 * static_cast<double>(total_bytes)) {
-    throw std::runtime_error(
+    throw threshold_pairs_exceed_device(
       std::string{what} + ": " + std::to_string(pairs) +
       " pairs within the threshold need more than the device can hold (" +
       std::to_string(total_bytes >> 30) +

@@ -4197,6 +4197,13 @@ static void SetDynamicFilterKeepThreshold(ClientContext& context, SetScope scope
                    params->dynamic_filter_keep_threshold);
 }
 
+static void SetVectorJoinPairTasks(ClientContext& context, SetScope scope, Value& parameter)
+{
+  auto* params                   = get_operator_params(context, scope);
+  params->vector_join_pair_tasks = BooleanValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config VECTOR_JOIN_PAIR_TASKS to {}", params->vector_join_pair_tasks);
+}
+
 static void SetEnablePinnedZoneMapPruning(ClientContext& context, SetScope scope, Value& parameter)
 {
   auto* params                           = get_operator_params(context, scope);
@@ -4849,6 +4856,15 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
     LogicalType::DOUBLE,
     Value::DOUBLE(operator_defaults.dynamic_filter_keep_threshold),
     SetDynamicFilterKeepThreshold);
+
+  config.AddExtensionOption(
+    "vector_join_pair_tasks",
+    "Run a threshold vector join whose corpus is re-read from outside the device as one build task "
+    "per probe block and one task per (block, corpus chunk), read when the join is planned; off, "
+    "one task per probe chunk reads the whole corpus",
+    LogicalType::BOOLEAN,
+    Value::BOOLEAN(operator_defaults.vector_join_pair_tasks),
+    SetVectorJoinPairTasks);
 
   // Default from the YAML-loaded params, so a sirius.yaml value is what connections inherit.
   config.AddExtensionOption(

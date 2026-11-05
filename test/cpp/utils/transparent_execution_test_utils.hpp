@@ -65,6 +65,10 @@ inline duckdb::SiriusContext::vector_join_prune_stats get_vector_join_prune_stat
   return get_registered_sirius_context(con)->get_vector_join_prune_stats();
 }
 
+inline duckdb::SiriusContext::vector_join_pair_stats get_vector_join_pair_stats(
+  duckdb::Connection& con)
+{ return get_registered_sirius_context(con)->get_vector_join_pair_stats(); }
+
 inline duckdb::SiriusContext::vector_join_host_rows_stats get_vector_join_host_rows_stats(
   duckdb::Connection& con)
 {

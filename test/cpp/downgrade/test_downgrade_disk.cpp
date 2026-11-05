@@ -213,6 +213,45 @@ TEST_CASE("Downgrade task falls back to DISK when HOST is full", "[downgrade_dis
   REQUIRE(get_batch_tier(*batch) == cucascade::memory::Tier::DISK);
 }
 
+TEST_CASE("Downgrade task sends a batch past the whole HOST tier to DISK", "[downgrade_disk]")
+{
+  // A reservation past a space's whole size throws rather than returning null, so a batch larger
+  // than the HOST tier used to fail every attempt and stay on the device, with room on disk.
+  sirius::converter_registry::reset_for_testing();
+
+  cucascade::memory::reservation_manager_configurator builder;
+  auto tmp_dir = std::filesystem::temp_directory_path() / "sirius_test_disk_large_batch";
+  std::filesystem::create_directories(tmp_dir);
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(2ull << 30)
+    .set_reservation_fraction_per_gpu(0.75)
+    .set_per_numa_region_capacity(2ull << 20)
+    .use_gpu_id_as_host_id()
+    .set_reservation_fraction_per_numa_region(0.75)
+    .set_disk_mounting_point(0, 4ull << 30, tmp_dir.string());
+  auto mem_mgr =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(builder.build());
+  sirius::converter_registry::initialize();
+
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+  // 4 MB of INT32 against a 1.5 MB limit.
+  auto batch = make_gpu_batch(*gpu_space, 1000000);
+
+  rmm::cuda_stream stream;
+  std::vector<const cucascade::memory::memory_space*> target_spaces;
+  for (auto const* space : mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+    target_spaces.push_back(space);
+  }
+  for (auto const* space : mem_mgr->get_memory_spaces_for_tier(cucascade::memory::Tier::DISK)) {
+    target_spaces.push_back(space);
+  }
+  sirius::convertible_data_batch batch_converter(batch);
+  auto converted = batch_converter.convert(target_spaces, stream, *mem_mgr, false);
+  REQUIRE(converted.has_value());
+  CHECK(get_batch_tier(*batch) == cucascade::memory::Tier::DISK);
+}
+
 TEST_CASE("Downgrade task uses HOST when HOST has capacity", "[downgrade_disk]")
 {
   // HOST (4GB) and DISK (4GB) both available — HOST is listed first in tier preference,
@@ -394,6 +433,39 @@ TEST_CASE("monitor resumes after a downgrade target frees up (no disk)", "[downg
   executor.stop();
 
   REQUIRE(after > before);  // resumed firing once a target became viable
+}
+
+// A drain drops a monitor request it finds queued, or refuses one pushed while it runs. Neither is
+// answered, so neither may leave the monitor waiting.
+TEST_CASE("monitor keeps firing after drains drop its requests", "[downgrade_disk]")
+{
+  auto mem_mgr    = make_no_disk_pressure_manager();
+  auto* gpu_space = get_gpu_space(*mem_mgr);
+  REQUIRE(gpu_space != nullptr);
+
+  auto gpu_hold = gpu_space->make_reservation_or_null(128ull << 20);
+  REQUIRE(gpu_hold);
+  REQUIRE(gpu_space->should_downgrade_memory());
+
+  sirius::exec::query_lifecycle_registry lifecycle;
+  lifecycle.open_query(kTestQueryId);
+  sirius::data::data_repository_manager_registry repo_registry;
+  repo_registry.create_for_query(kTestQueryId);
+  auto executor = make_monitoring_executor(lifecycle, repo_registry, gpu_space, *mem_mgr);
+  executor.start();
+
+  using namespace std::chrono_literals;
+  auto const until = std::chrono::steady_clock::now() + 500ms;
+  while (std::chrono::steady_clock::now() < until) {
+    executor.drain();
+  }
+  size_t const before = executor.monitor_requests_issued_for_testing();
+  std::this_thread::sleep_for(300ms);
+  size_t const after = executor.monitor_requests_issued_for_testing();
+
+  executor.stop();
+
+  REQUIRE(after > before);
 }
 
 // The viability gate must reflect HOST being full of *real stored downgraded data*, not just held

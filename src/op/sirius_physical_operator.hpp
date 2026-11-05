@@ -215,6 +215,15 @@ class operator_data {
   }
 
   /**
+   * @brief Whether history may not size this task's reservation below its working set.
+   *
+   * The engine does this for fresh scan splits itself. Any other input opts in here when its
+   * working set is known from the task and differs from task to task, so that the peak of a
+   * smaller task cannot stand in for it. By default a reservation comes from history alone.
+   */
+  [[nodiscard]] virtual bool working_set_floors_reservation() const { return false; }
+
+  /**
    * @brief Record the GPU this data should be processed on.
    *
    * Set upstream of task creation when the producer of this data has already
