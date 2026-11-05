@@ -436,14 +436,15 @@ std::vector<std::int32_t> nearest_by_hand(std::vector<float> const& rows,
 
 std::vector<std::int32_t> labels_of(std::vector<float> const& rows,
                                     std::vector<float> const& centers,
-                                    cudf::size_type dim)
+                                    cudf::size_type dim,
+                                    Metric metric = Metric::L2Expanded)
 {
   auto const stream = cudf::get_default_stream();
   auto const mr     = cudf::get_current_device_resource_ref();
   raft::device_resources res{stream};
   auto const vectors   = make_vectors(rows, dim);
   auto const centroids = make_vectors(centers, dim);
-  sirius::vss::centroid_labeler labeler{res, centroids->view(), dim, Metric::L2Expanded, mr};
+  sirius::vss::centroid_labeler labeler{res, centroids->view(), dim, metric, mr};
   rmm::device_uvector<std::int32_t> labels(static_cast<std::size_t>(vectors->size()), stream);
   labeler.label(vectors->view(), labels.data());
   std::vector<std::int32_t> host(labels.size());
@@ -515,6 +516,61 @@ TEST_CASE("centroid_labeler ranks a batch with a value outside half's range", "[
   rows[static_cast<std::size_t>(500 * dim)] = 1e6f;
   expected[500]                             = n_cents - 1;
   CHECK(labels_of(rows, centers, dim) == expected);
+}
+
+// Enough centroids for the filtered path. The norms of rows and centroids vary over four orders
+// of magnitude, which cosine must not see. A zero row has no direction and takes the first list.
+TEST_CASE("centroid_labeler under cosine picks the centroid of largest cosine", "[vss][kmeans]")
+{
+  constexpr cudf::size_type dim  = 16;
+  constexpr std::int64_t n_rows  = 20'000;
+  constexpr std::int64_t n_cents = 1024;
+  std::mt19937 gen(11);
+  std::uniform_real_distribution<float> uniform(-1.f, 1.f);
+  std::uniform_real_distribution<float> log_norm(-2.f, 2.f);
+  std::normal_distribution<float> noise(0.f, 0.02f);
+  std::vector<float> centers(static_cast<std::size_t>(n_cents * dim));
+  for (std::int64_t c = 0; c < n_cents; ++c) {
+    auto const scale = std::pow(10.f, log_norm(gen));
+    for (std::int64_t j = 0; j < dim; ++j) {
+      centers[static_cast<std::size_t>(c * dim + j)] = uniform(gen) * scale;
+    }
+  }
+  std::vector<float> rows(static_cast<std::size_t>(n_rows * dim));
+  for (std::int64_t r = 10; r < n_rows; ++r) {
+    auto const c     = static_cast<std::int64_t>(gen() % n_cents);
+    auto const scale = std::pow(10.f, log_norm(gen));
+    for (std::int64_t j = 0; j < dim; ++j) {
+      auto const near_center = centers[static_cast<std::size_t>(c * dim + j)] *
+                               (1.f + noise(gen));
+      rows[static_cast<std::size_t>(r * dim + j)] =
+        r % 3 == 0 ? near_center * scale : uniform(gen) * scale;
+    }
+  }
+  auto const labels = labels_of(rows, centers, dim, Metric::CosineExpanded);
+  auto const cosine = [&](std::int64_t r, std::int64_t c) {
+    double dot = 0, a = 0, b = 0;
+    for (std::int64_t j = 0; j < dim; ++j) {
+      double const x = rows[static_cast<std::size_t>(r * dim + j)];
+      double const y = centers[static_cast<std::size_t>(c * dim + j)];
+      dot += x * y;
+      a += x * x;
+      b += y * y;
+    }
+    return a > 0 && b > 0 ? dot / std::sqrt(a * b) : 0.0;
+  };
+  std::int64_t wrong = 0;
+  for (std::int64_t r = 0; r < n_rows; ++r) {
+    auto const label = labels[static_cast<std::size_t>(r)];
+    REQUIRE((label >= 0 && label < n_cents));
+    if (r < 10) { CHECK(label == 0); }
+    double best = -2;
+    for (std::int64_t c = 0; c < n_cents; ++c) {
+      best = std::max(best, cosine(r, c));
+    }
+    wrong += best - cosine(r, label) > 1e-5;
+  }
+  CHECK(wrong == 0);
 }
 
 TEST_CASE("scatter_rows moves whole rows of any width", "[vss][kmeans]")

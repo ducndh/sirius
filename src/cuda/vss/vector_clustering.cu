@@ -557,6 +557,12 @@ __global__ void take_labels_kernel(unsigned long long const* best,
   }
 }
 
+__global__ void zero_rows_to_first_kernel(float const* row_sq, std::int64_t n, std::int32_t* labels)
+{
+  auto const r = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+  if (r < n && row_sq[r] == 0.f) { labels[r] = 0; }
+}
+
 bool is_l2(cuvs::distance::DistanceType metric)
 {
   return metric == cuvs::distance::DistanceType::L2Expanded ||
@@ -583,6 +589,8 @@ struct centroid_labeler::impl {
 
   std::int64_t n_centers{0};
   float const* centers{nullptr};
+  // Under cosine the filtered path ranks these by L2 from unit rows, which orders them alike.
+  std::optional<rmm::device_uvector<float>> unit_centers;
   // The filtered path's view of the centroids; empty when every batch goes to cuVS.
   std::optional<rmm::device_uvector<float>> seeds;
   std::optional<rmm::device_uvector<std::uint16_t>> half;
@@ -619,12 +627,18 @@ centroid_labeler::centroid_labeler(raft::device_resources const& res,
   s.centers          = centers.data_handle();
   if (s.n_centers == 0) { throw std::invalid_argument("centroid_labeler: no centroids"); }
   auto const* off = std::getenv("SIRIUS_VSS_BOUND_GEMM");
-  if ((off != nullptr && std::strcmp(off, "0") == 0) || !is_l2(metric) ||
+  bool const cosine = metric == cuvs::distance::DistanceType::CosineExpanded;
+  if ((off != nullptr && std::strcmp(off, "0") == 0) || !(is_l2(metric) || cosine) ||
       !bound_filter_f16_supports(dim) || s.n_centers < kMinFilteredCentroids) {
     return;
   }
   auto const stream = raft::resource::get_cuda_stream(res);
   auto const n      = s.n_centers;
+  if (cosine) {
+    s.unit_centers.emplace(static_cast<std::size_t>(n * dim), stream, mr);
+    normalize_rows(s.centers, n, dim, s.unit_centers->data(), stream);
+    s.centers = s.unit_centers->data();
+  }
   rmm::device_uvector<std::uint16_t> half(static_cast<std::size_t>(n * dim), stream, mr);
   rmm::device_uvector<float> half_sq(static_cast<std::size_t>(n), stream, mr);
   rmm::device_uvector<unsigned int> extremes(2, stream, mr);
@@ -709,10 +723,16 @@ void centroid_labeler::label(cudf::column_view const& vectors, std::int32_t* lab
   auto const capacity = static_cast<unsigned long long>(candidates.capacity());
   // The FP32 sum of d squared differences is within this of the true distance, relatively.
   float const gamma = 2.f * static_cast<float>(dim) * 5.9604645e-8f;
+  std::optional<rmm::device_uvector<float>> unit_rows;
+  if (s.unit_centers) { unit_rows.emplace(static_cast<std::size_t>(batch * dim), stream, mr); }
 
   for (std::int64_t at = 0; at < total; at += batch) {
     auto const m  = std::min(batch, total - at);
     auto const* x = queries.data_handle() + at * dim;
+    if (unit_rows) {
+      normalize_rows(x, m, dim, unit_rows->data(), stream);
+      x = unit_rows->data();
+    }
     s.predict(x, m, s.seeds->data(), s.n_seeds, seed.data());
     seed_bound_kernel<<<label_grid(m), kLabelBlock, 0, stream.get()>>>(
       x, m, dim, s.seeds->data(), seed.data(), 1.f + 2.f * gamma, bound.data());
@@ -769,6 +789,12 @@ void centroid_labeler::label(cudf::column_view const& vectors, std::int32_t* lab
                                                            best.data());
     take_labels_kernel<<<label_grid(m), kLabelBlock, 0, stream.get()>>>(
       best.data(), m, labels + at, unusable.data());
+    // A zero row has no direction, and every centroid is equally far from it but for rounding. It
+    // takes the first list, as cuVS's nearest does, which is the one a zero probe row reaches.
+    if (unit_rows) {
+      zero_rows_to_first_kernel<<<label_grid(m), kLabelBlock, 0, stream.get()>>>(
+        x_sq.data(), m, labels + at);
+    }
     CUDF_CHECK_CUDA(stream.get());
     unsigned long long passed = 0, bad = 0;
     CUDF_CUDA_TRY(cudaMemcpyAsync(

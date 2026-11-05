@@ -239,6 +239,7 @@ struct strided_rows {
  * centroids keeps those that may be within it, and the FP32 distance picks among what passed.
  * The label is the centroid at the smallest FP32 squared distance, the lowest-numbered of equals:
  * the rounding only decides which pairs are scored, as in the bounded search over FLOAT16 lists.
+ * Cosine takes the same path on unit rows and unit centroids, where L2 orders centroids alike.
  * Everything else, and a batch whose candidates do not fit, goes to cuVS's k-means predict, which
  * fuses an FP32 distance and the argmin into one pass. SIRIUS_VSS_BOUND_GEMM=0 sends every batch
  * there.
