@@ -1784,15 +1784,23 @@ std::int64_t sirius_physical_vector_join_stream::pair_block_rows()
   auto const share = kScannedBlockDeviceShare * device / static_cast<double>(scanned_block_tasks());
   auto const scratch = static_cast<double>(pair_task_bytes(
     std::min(static_cast<std::int64_t>(widest_chunk), pair_call_rows(_request.dim))));
-  if (2.0 * scratch > share && std::getenv("SIRIUS_VSS_PAIR_TASKS") == nullptr) {
+  auto const holding    = pair_block_row_bytes(false);
+  auto const building   = pair_block_row_bytes(true);
+  auto const rows_after = [&](std::size_t tasks_at_once) {
+    auto const fixed = static_cast<double>(tasks_at_once) * scratch + device / 8 +
+                       static_cast<double>(_right_total_rows) * sizeof(std::int64_t) *
+                         static_cast<double>(_request.right.output_columns.size());
+    return share > fixed ? std::min((share - fixed) / holding, share / building) : 0.0;
+  };
+  // A second task at once overlaps one's reads with the other's kernels, but its room comes out of
+  // the block's rows, and each block reads the whole corpus again. So it stays only while it costs
+  // the block at most a quarter of its rows. On 6.7 GiB of a 24 GB card at 1,024-d, two tasks of
+  // 2.6 GB each left a block one probe chunk, so 121 reads of the corpus; one leaves about 31.
+  if (_pair_tasks_at_once > 1 && std::getenv("SIRIUS_VSS_PAIR_TASKS") == nullptr &&
+      rows_after(_pair_tasks_at_once) < 0.75 * rows_after(1)) {
     _pair_tasks_at_once = 1;
   }
-  auto const fixed    = static_cast<double>(_pair_tasks_at_once) * scratch + device / 8 +
-                        static_cast<double>(_right_total_rows) * sizeof(std::int64_t) *
-                          static_cast<double>(_request.right.output_columns.size());
-  auto const holding  = pair_block_row_bytes(false);
-  auto const building = pair_block_row_bytes(true);
-  auto rows           = share > fixed ? std::min((share - fixed) / holding, share / building) : 0.0;
+  auto rows = rows_after(_pair_tasks_at_once);
   // Never less than a whole probe chunk, unless one does not fit in the share at all.
   if (rows < widest) {
     rows = widest * building + scratch <= share
