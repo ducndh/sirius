@@ -19,6 +19,7 @@
 
 // sirius
 #include <vss/cluster_lists.hpp>
+#include <vss/routed_edges.hpp>
 #include <vss/vector_clustering.hpp>
 
 // raft
@@ -45,8 +46,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <numeric>
 #include <random>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -555,4 +558,122 @@ TEST_CASE("scatter_rows moves whole rows of any width", "[vss][kmeans]")
     CAPTURE(width);
     CHECK(wrong == 0);
   }
+}
+
+namespace {
+
+rmm::device_uvector<std::int32_t> routing_on_device(std::vector<std::int32_t> const& routing,
+                                                    rmm::cuda_stream_view stream,
+                                                    rmm::device_async_resource_ref mr)
+{
+  rmm::device_uvector<std::int32_t> out(routing.size(), stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(out.data(),
+                                routing.data(),
+                                routing.size() * sizeof(std::int32_t),
+                                cudaMemcpyHostToDevice,
+                                stream.get()));
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("sort_routed_edges sorts on (cluster, not nearest, row)", "[vss]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  struct shape {
+    std::int64_t rows, probes;
+    std::int32_t clusters;
+  };
+  // One radix pass and two, a single sort tile and several, one probe, every cluster probed.
+  for (auto const [n_rows, n_probes, n_clusters] : {shape{1, 1, 1},
+                                                    shape{3, 2, 2},
+                                                    shape{1000, 1, 16},
+                                                    shape{1000, 4, 16},
+                                                    shape{5000, 8, 200},
+                                                    shape{300, 40, 40},
+                                                    shape{200000, 8, 4096}}) {
+    CAPTURE(n_rows, n_probes, n_clusters);
+    std::mt19937 rng(static_cast<unsigned>(n_rows * 31 + n_clusters));
+    std::vector<std::int32_t> routing(static_cast<std::size_t>(n_rows * n_probes));
+    std::vector<std::int32_t> all(static_cast<std::size_t>(n_clusters));
+    std::iota(all.begin(), all.end(), 0);
+    for (std::int64_t r = 0; r < n_rows; ++r) {
+      // A partial shuffle: a row's clusters are distinct.
+      for (std::int64_t t = 0; t < n_probes; ++t) {
+        auto const pick =
+          t + static_cast<std::int64_t>(rng() % static_cast<unsigned>(n_clusters - t));
+        std::swap(all[static_cast<std::size_t>(t)], all[static_cast<std::size_t>(pick)]);
+        routing[static_cast<std::size_t>(r * n_probes + t)] = all[static_cast<std::size_t>(t)];
+      }
+    }
+    std::vector<std::tuple<std::int32_t, bool, std::int64_t>> oracle;
+    oracle.reserve(routing.size());
+    std::vector<std::int64_t> want_begin(static_cast<std::size_t>(n_clusters) + 1, 0);
+    std::vector<std::int64_t> want_nearest(static_cast<std::size_t>(n_clusters), 0);
+    for (std::int64_t r = 0; r < n_rows; ++r) {
+      for (std::int64_t t = 0; t < n_probes; ++t) {
+        auto const c = routing[static_cast<std::size_t>(r * n_probes + t)];
+        oracle.emplace_back(c, t > 0, r);
+        ++want_begin[static_cast<std::size_t>(c) + 1];
+        if (t == 0) { ++want_nearest[static_cast<std::size_t>(c)]; }
+      }
+    }
+    std::sort(oracle.begin(), oracle.end());
+    std::partial_sum(want_begin.begin(), want_begin.end(), want_begin.begin());
+
+    std::vector<std::int64_t> const cluster_rows(static_cast<std::size_t>(n_clusters), 10);
+    auto keyed = sirius::vss::key_routed_edges(
+      routing_on_device(routing, stream, mr), n_rows, n_probes, cluster_rows, 10, stream, mr);
+    REQUIRE(keyed.refused_row == -1);
+    for (std::int64_t r = 0; r < n_rows; ++r) {
+      REQUIRE(keyed.nearest_cluster[static_cast<std::size_t>(r)] ==
+              routing[static_cast<std::size_t>(r * n_probes)]);
+    }
+    auto const sorted = sirius::vss::sort_routed_edges(std::move(keyed), stream, mr);
+    CHECK(sorted.edge_begin == want_begin);
+    CHECK(sorted.nearest_edges == want_nearest);
+    REQUIRE(sorted.rows.size() == oracle.size());
+    std::vector<std::int64_t> rows(oracle.size());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(rows.data(),
+                                  sorted.rows.data(),
+                                  rows.size() * sizeof(std::int64_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    stream.sync();
+    std::int64_t wrong = 0;
+    for (std::size_t e = 0; e < rows.size(); ++e) {
+      wrong += rows[e] != std::get<2>(oracle[e]);
+    }
+    CHECK(wrong == 0);
+  }
+}
+
+TEST_CASE("key_routed_edges reports the first row it refuses", "[vss]")
+{
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  // Two probes over clusters of 5, 0 and 3 rows: { 0, 1 } holds 5, { 1, 2 } holds 3, { 2, 0 } 8.
+  std::vector<std::int64_t> const cluster_rows{5, 0, 3};
+  auto const refused = [&](std::vector<std::int32_t> const& routing, std::int64_t k) {
+    auto keyed = sirius::vss::key_routed_edges(routing_on_device(routing, stream, mr),
+                                               static_cast<std::int64_t>(routing.size()) / 2,
+                                               2,
+                                               cluster_rows,
+                                               k,
+                                               stream,
+                                               mr);
+    return std::make_pair(keyed.refused_row, keyed.refused_clusters);
+  };
+  using row = std::vector<std::int32_t>;
+  CHECK(refused({0, 1, 2, 0, 1, 0}, 5).first == -1);
+  CHECK(refused({0, 1, 2, 0, 1, 2}, 5) == std::make_pair(std::int64_t{2}, row{1, 2}));
+  CHECK(refused({0, 1, 2, 0, 1, 2, 0, 2}, 8) == std::make_pair(std::int64_t{0}, row{0, 1}));
+  CHECK(refused({0, 1, 0, 3, 2, 0}, 1) == std::make_pair(std::int64_t{1}, row{0, 3}));
+  CHECK(refused({0, 1, 2, 0, -1, 0}, 1) == std::make_pair(std::int64_t{2}, row{-1, 0}));
+  // A row of empty clusters holds fewer than the one row every join needs, whatever k is.
+  std::vector<std::int64_t> const all_empty{0, 0, 0};
+  auto keyed = sirius::vss::key_routed_edges(
+    routing_on_device({1, 2}, stream, mr), 1, 2, all_empty, 0, stream, mr);
+  CHECK(keyed.refused_row == 0);
 }

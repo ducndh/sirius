@@ -30,6 +30,7 @@ target_sources(
           vss/device_rates.cu
           vss/gemm_topk.cu
           vss/knn_merge.cu
+          vss/routed_edges.cu
           vss/vector_clustering.cu
           vss/ivf_flat_index.cu)
 

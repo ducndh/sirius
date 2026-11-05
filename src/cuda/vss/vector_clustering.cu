@@ -20,6 +20,7 @@
 #include "vss/cluster_fold.hpp"
 #include "vss/cluster_lists.hpp"
 #include "vss/scoped_device_resource.hpp"
+#include "vss/size_limits.hpp"
 #include "vss/vector_clustering.hpp"
 
 #include <cudf/binaryop.hpp>
@@ -257,6 +258,57 @@ std::unique_ptr<cudf::column> mean_centroid(std::vector<cudf::column_view> const
   return out;
 }
 
+namespace {
+
+// One GEMM and one selection, like the join's own searches: cuVS brute force at so small a
+// depth runs a fused SIMT kernel instead, which took ~0.26 s to route 180k rows to 2 of 1024
+// centroids (SIRIUS_VSS_GEMM_TOPK=0 keeps cuVS, as for the join).
+knn_result nearest_centroids(raft::device_resources const& res,
+                             dataset_matrix_view centers,
+                             dataset_matrix_view queries,
+                             std::int64_t depth,
+                             cuvs::distance::DistanceType metric,
+                             rmm::device_async_resource_ref mr)
+{
+  auto const use_gemm = [&] {
+    auto const* v = std::getenv("SIRIUS_VSS_GEMM_TOPK");
+    return (v == nullptr || std::string_view{v} != "0") && gemm_search_supports(metric);
+  }();
+  return use_gemm ? gemm_topk(res, centers, queries, depth, metric, mr)
+                  : brute_force_knn(res, centers, queries, depth, metric, mr);
+}
+
+__global__ void narrow_ids_kernel(std::int64_t const* in, std::int64_t n, std::int32_t* out)
+{
+  auto const i = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+  if (i < n) { out[i] = static_cast<std::int32_t>(in[i]); }
+}
+
+}  // namespace
+
+rmm::device_uvector<std::int32_t> nearest_centroid_ids(raft::device_resources const& res,
+                                                       dataset_matrix_view queries,
+                                                       cudf::column_view const& centroids,
+                                                       std::int64_t dim,
+                                                       std::int64_t n_probes,
+                                                       cuvs::distance::DistanceType metric,
+                                                       rmm::cuda_stream_view stream,
+                                                       rmm::device_async_resource_ref mr)
+{
+  auto const centers = list_column_as_dataset_view(centroids, dim);
+  auto const edges   = static_cast<std::int64_t>(queries.extent(0)) * n_probes;
+  column_size(edges, "vector join routing");
+  auto const knn = nearest_centroids(res, centers, queries, n_probes, metric, mr);
+  rmm::device_uvector<std::int32_t> out(static_cast<std::size_t>(edges), stream, mr);
+  constexpr std::int64_t block = 256;
+  auto const grid = static_cast<int>(std::max<std::int64_t>((edges + block - 1) / block, 1));
+  narrow_ids_kernel<<<grid, block, 0, stream.get()>>>(
+    knn.neighbors->view().data<std::int64_t>(), edges, out.data());
+  CUDF_CHECK_CUDA(stream.get());
+  stream.sync();
+  return out;
+}
+
 cluster_assignment assign_to_centroids(raft::device_resources const& res,
                                        cudf::column_view const& vectors,
                                        cudf::column_view const& centroids,
@@ -311,15 +363,7 @@ cluster_assignment assign_to_centroids(raft::device_resources const& res,
       "n_probes/max_probes");
   }
 
-  // One GEMM and one selection, like the join's own searches: cuVS brute force at so small a
-  // depth runs a fused SIMT kernel instead, which took ~0.26 s to route 180k rows to 2 of 1024
-  // centroids (SIRIUS_VSS_GEMM_TOPK=0 keeps cuVS, as for the join).
-  auto const use_gemm = [&] {
-    auto const* v = std::getenv("SIRIUS_VSS_GEMM_TOPK");
-    return (v == nullptr || std::string_view{v} != "0") && gemm_search_supports(metric);
-  }();
-  auto knn = use_gemm ? gemm_topk(res, centers, queries, depth, metric, mr)
-                      : brute_force_knn(res, centers, queries, depth, metric, mr);
+  auto knn = nearest_centroids(res, centers, queries, depth, metric, mr);
 
   auto const total = static_cast<cudf::size_type>(edges);
   cudf::numeric_scalar<std::int32_t> const zero(0, true, stream);
