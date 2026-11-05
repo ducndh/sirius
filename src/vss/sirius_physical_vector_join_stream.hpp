@@ -414,8 +414,10 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   std::string params_to_string() const override;
 
  private:
-  /// A task's probe rows and what its search holds across corpus chunks, the task's steps over
-  /// them, and the clustered search among those steps. Defined beside execute().
+  /// A threshold task's pairs, a task's probe rows and what its search holds across corpus chunks,
+  /// the task's steps over them, and the clustered search among those steps. Defined beside
+  /// execute().
+  struct found_pairs;
   struct block_state;
   class block_task;
   class clustered_search;

@@ -2068,6 +2068,18 @@ void sirius_physical_vector_join_stream::ensure_earlier_keys(
 }
 
 //===----------------------------------------------------------------------===//
+// A threshold join's pairs
+//===----------------------------------------------------------------------===//
+/// What one task has found of a threshold join's answer: pairs on the device, and pieces moved to
+/// host memory. Nothing here outlives the task that found them unless the task's output carries it.
+struct sirius_physical_vector_join_stream::found_pairs {
+  std::vector<std::unique_ptr<cudf::column>> left, neighbors, distances;
+  std::vector<std::shared_ptr<::cucascade::data_batch>> offloaded;
+  std::int64_t held{0};
+  std::int64_t total{0};
+};
+
+//===----------------------------------------------------------------------===//
 // A probe block's state
 //===----------------------------------------------------------------------===//
 /// What a task keeps of its probe rows from their load to the answer: the rows themselves, what
@@ -2204,11 +2216,6 @@ struct sirius_physical_vector_join_stream::block_state {
   std::unique_ptr<cudf::column> acc_neighbors;
   std::unique_ptr<cudf::column> acc_distances;
 
-  // The answer of a threshold join: pairs on the device, and pieces moved to host memory.
-  std::vector<std::unique_ptr<cudf::column>> radius_left, radius_neighbors, radius_distances;
-  std::vector<std::shared_ptr<::cucascade::data_batch>> offloaded;
-  std::int64_t held_pairs{0};
-  std::int64_t total_pairs{0};
   float radius_scale{1.0f};  ///< unit-row cosine search reports twice the cosine distance
 
   // A keyed or best-match threshold join's keys, and each probe row's best match so far.
@@ -2239,6 +2246,7 @@ class sirius_physical_vector_join_stream::block_task {
  public:
   block_task(sirius_physical_vector_join_stream& op,
              block_state& state,
+             found_pairs& pairs,
              vector_join_stream_input const& input,
              ::cucascade::memory::memory_space& space,
              rmm::cuda_stream_view task_stream)
@@ -2246,6 +2254,7 @@ class sirius_physical_vector_join_stream::block_task {
       _request(op._request),
       _lists(op._lists),
       st(state),
+      found(pairs),
       join_in(&input),
       mem_space(&space),
       stream(task_stream),
@@ -2669,10 +2678,10 @@ class sirius_physical_vector_join_stream::block_task {
                        pairs);
             continue;
           }
-          st.radius_left.push_back(cudf::cast(
+          found.left.push_back(cudf::cast(
             edges.query_rows->view(), cudf::data_type{cudf::type_id::INT32}, stream, mr));
-          st.radius_neighbors.push_back(std::move(edges.neighbors));
-          st.radius_distances.push_back(std::move(edges.distances));
+          found.neighbors.push_back(std::move(edges.neighbors));
+          found.distances.push_back(std::move(edges.distances));
           note_radius_part(pairs);
         }
         continue;
@@ -2722,7 +2731,7 @@ class sirius_physical_vector_join_stream::block_task {
     emit_best();
     if (exhaustive_cosine) {
       if (radius_join) {
-        for (auto& part : st.radius_distances) {
+        for (auto& part : found.distances) {
           vss::scale_in_place(part->mutable_view().data<float>(), part->size(), 0.5f, stream);
         }
       } else {
@@ -2746,7 +2755,7 @@ class sirius_physical_vector_join_stream::block_task {
 
     if (count_only) {
       // One row, the pairs this probe batch found; the aggregate above sums the batches.
-      cudf::numeric_scalar<std::int64_t> const count(st.total_pairs, true, stream);
+      cudf::numeric_scalar<std::int64_t> const count(found.total, true, stream);
       std::vector<std::unique_ptr<cudf::column>> cols;
       cols.push_back(cudf::make_column_from_scalar(count, 1, stream, mr));
       auto batch = sirius::make_data_batch(
@@ -2820,9 +2829,9 @@ class sirius_physical_vector_join_stream::block_task {
         }
         return cudf::concatenate(views, stream, mr);
       };
-      shaped.left_rows = join_cols(st.radius_left, cudf::type_id::INT32);
-      shaped.neighbors = join_cols(st.radius_neighbors, cudf::type_id::INT64);
-      shaped.distances = join_cols(st.radius_distances, cudf::type_id::FLOAT32);
+      shaped.left_rows = join_cols(found.left, cudf::type_id::INT32);
+      shaped.neighbors = join_cols(found.neighbors, cudf::type_id::INT64);
+      shaped.distances = join_cols(found.distances, cudf::type_id::FLOAT32);
     } else {
       // The fold is mode-independent; only which of its candidates survive is not.
       switch (_request.mode) {
@@ -2883,7 +2892,7 @@ class sirius_physical_vector_join_stream::block_task {
 
     auto batch =
       sirius::make_data_batch(std::move(out_table), *mem_space, stream, _op.batch_telemetry());
-    auto batches = std::move(st.offloaded);
+    auto batches = std::move(found.offloaded);
     batches.push_back(std::move(batch));
     return output(std::move(batches));
   }
@@ -2927,15 +2936,15 @@ class sirius_physical_vector_join_stream::block_task {
 
   [[nodiscard]] bool must_flush()
   {
-    if (flush_pairs) { return st.held_pairs > *flush_pairs; }
-    if (st.held_pairs < (std::int64_t{1} << 20)) { return false; }
-    auto const held_bytes = static_cast<std::size_t>(st.held_pairs) * 16;
+    if (flush_pairs) { return found.held > *flush_pairs; }
+    if (found.held < (std::int64_t{1} << 20)) { return false; }
+    auto const held_bytes = static_cast<std::size_t>(found.held) * 16;
     return held_bytes + next_search_room > mem_space->get_available_memory(stream);
   }
 
   void flush_radius()
   {
-    if (st.radius_left.empty()) { return; }
+    if (found.left.empty()) { return; }
     auto concat = [&](std::vector<std::unique_ptr<cudf::column>>& parts) {
       std::unique_ptr<cudf::column> out;
       if (parts.size() == 1) {
@@ -2951,9 +2960,9 @@ class sirius_physical_vector_join_stream::block_task {
       return out;
     };
     std::vector<std::unique_ptr<cudf::column>> cols;
-    cols.push_back(concat(st.radius_left));
-    cols.push_back(concat(st.radius_neighbors));
-    cols.push_back(concat(st.radius_distances));
+    cols.push_back(concat(found.left));
+    cols.push_back(concat(found.neighbors));
+    cols.push_back(concat(found.distances));
     if (st.radius_scale != 1.0f) {
       vss::scale_in_place(
         cols[2]->mutable_view().data<float>(), cols[2]->size(), st.radius_scale, stream);
@@ -2962,24 +2971,24 @@ class sirius_physical_vector_join_stream::block_task {
       std::make_unique<cudf::table>(std::move(cols)), *mem_space, stream, _op.batch_telemetry());
     piece->to_mutable().convert_to<cucascade::host_data_representation>(
       sirius::converter_registry::get(), host_space, stream);
-    st.offloaded.push_back(std::move(piece));
+    found.offloaded.push_back(std::move(piece));
     SIRIUS_LOG_DEBUG(
       "[sirius_physical_vector_join_stream] left batch {}: {} threshold pairs moved "
       "to host memory (piece {})",
       left_idx,
-      st.held_pairs,
-      st.offloaded.size());
-    st.held_pairs = 0;
+      found.held,
+      found.offloaded.size());
+    found.held = 0;
   }
 
   void note_radius_part(std::int64_t pairs)
   {
-    st.held_pairs += pairs;
-    st.total_pairs += pairs;
-    if (!count_only && st.total_pairs > max_pairs) {
+    found.held += pairs;
+    found.total += pairs;
+    if (!count_only && found.total > max_pairs) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_stream] the pairs within the threshold reach " +
-        std::to_string(st.total_pairs) + " for one probe batch, more than host and device memory " +
+        std::to_string(found.total) + " for one probe batch, more than host and device memory " +
         "can hold as output (~" + std::to_string(max_pairs) + "); tighten the threshold or join " +
         "fewer probe rows at a time");
     }
@@ -3028,11 +3037,11 @@ class sirius_physical_vector_join_stream::block_task {
     auto const pairs = static_cast<std::int64_t>(kept.rows.size());
     if (pairs == 0) { return; }
     if (!count_only) {
-      st.radius_left.push_back(
+      found.left.push_back(
         std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
-      st.radius_neighbors.push_back(
+      found.neighbors.push_back(
         std::make_unique<cudf::column>(std::move(kept.ids), rmm::device_buffer{}, 0));
-      st.radius_distances.push_back(
+      found.distances.push_back(
         std::make_unique<cudf::column>(std::move(kept.distances), rmm::device_buffer{}, 0));
     }
     note_radius_part(pairs);
@@ -3051,11 +3060,11 @@ class sirius_physical_vector_join_stream::block_task {
       mr);
     auto const pairs = static_cast<std::int64_t>(best.rows.size());
     if (pairs == 0) { return; }
-    st.radius_left.push_back(
+    found.left.push_back(
       std::make_unique<cudf::column>(std::move(best.rows), rmm::device_buffer{}, 0));
-    st.radius_neighbors.push_back(
+    found.neighbors.push_back(
       std::make_unique<cudf::column>(std::move(best.ids), rmm::device_buffer{}, 0));
-    st.radius_distances.push_back(
+    found.distances.push_back(
       std::make_unique<cudf::column>(std::move(best.distances), rmm::device_buffer{}, 0));
     note_radius_part(pairs);
   }
@@ -3065,6 +3074,7 @@ class sirius_physical_vector_join_stream::block_task {
   sirius::vss::vector_join_request const& _request;
   sirius::vss::cluster_lists const* _lists;
   block_state& st;
+  found_pairs& found;
   vector_join_stream_input const* join_in;
   ::cucascade::memory::memory_space* mem_space;
   rmm::cuda_stream_view stream;
@@ -4219,11 +4229,11 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       if (kept.rows.size() > 0) {
         auto const pairs = static_cast<std::int64_t>(kept.rows.size());
         if (!count_only) {
-          st.radius_left.push_back(
+          found.left.push_back(
             std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
-          st.radius_neighbors.push_back(
+          found.neighbors.push_back(
             std::make_unique<cudf::column>(std::move(kept.ids), rmm::device_buffer{}, 0));
-          st.radius_distances.push_back(
+          found.distances.push_back(
             std::make_unique<cudf::column>(std::move(kept.distances), rmm::device_buffer{}, 0));
         }
         note_radius_part(pairs);
@@ -4325,11 +4335,11 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       if (kept.rows.size() > 0) {
         auto const pairs = static_cast<std::int64_t>(kept.rows.size());
         if (!count_only) {
-          st.radius_left.push_back(
+          found.left.push_back(
             std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
-          st.radius_neighbors.push_back(
+          found.neighbors.push_back(
             std::make_unique<cudf::column>(std::move(kept.ids), rmm::device_buffer{}, 0));
-          st.radius_distances.push_back(
+          found.distances.push_back(
             std::make_unique<cudf::column>(std::move(kept.distances), rmm::device_buffer{}, 0));
         }
         note_radius_part(pairs);
@@ -5392,9 +5402,9 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                        edges.n_edges);
             continue;
           }
-          st.radius_left.push_back(std::move(left));
-          st.radius_neighbors.push_back(std::move(edges.neighbors));
-          st.radius_distances.push_back(std::move(edges.distances));
+          found.left.push_back(std::move(left));
+          found.neighbors.push_back(std::move(edges.neighbors));
+          found.distances.push_back(std::move(edges.distances));
           note_radius_part(edges.n_edges);
         }
         continue;
@@ -5621,7 +5631,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     }
     if (s.unit_cosine || s.direct_cosine) {
       if (radius_join) {
-        for (auto& part : st.radius_distances) {
+        for (auto& part : found.distances) {
           vss::scale_in_place(part->mutable_view().data<float>(), part->size(), 0.5f, stream);
         }
       } else {
@@ -5725,7 +5735,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   }
 
   block_state st;
-  block_task task{*this, st, *join_in, *mem_space, stream};
+  found_pairs found;
+  block_task task{*this, st, found, *join_in, *mem_space, stream};
   task.load_rows();
   // An empty probe batch joins to nothing; the search libraries refuse a zero-row query matrix.
   if (st.n_left == 0) { return task.empty_answer(); }
