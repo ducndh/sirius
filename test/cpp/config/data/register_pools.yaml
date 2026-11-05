@@ -23,6 +23,8 @@ sirius:
     downgrade:
       num_threads: 1
       monitor_period: 10ms
+    scan_manager:
+      uring_n_reactors: 1
   telemetry:
     enable_quent: false
     output_directory: "/tmp/sirius_telemetry_register_pools_test"
