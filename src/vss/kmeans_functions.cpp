@@ -677,6 +677,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     // labels are already zero.
     std::optional<centroid_labeler> labeler;
     if (n_clusters > 1) { labeler.emplace(res, centroids->view(), dim, entry->meta.metric, mr); }
+    bool check_pass_1 = check_uint8 && !check_in_pass_2;
     pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0; i < n_chunks; ++i) {
@@ -689,7 +690,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       rmm::device_uvector<std::int32_t> chunk_labels(
         labeler ? static_cast<std::size_t>(rows) : 0, stream, mr);
       if (labeler) { labeler->label(staged.view, chunk_labels.data()); }
-      if (check_uint8 && !check_in_pass_2) {
+      if (check_pass_1) {
         count_non_uint8(list_column_as_dataset_view(staged.view, dim).data_handle(),
                         rows * dim,
                         non_uint8.data(),
@@ -730,6 +731,14 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                       stream.get()));
       }
       stream.sync();
+      // One value that is not a byte settles it, unless 'uint8' has to report how many there are.
+      if (check_pass_1 && storage != list_storage::uint8) {
+        unsigned long long seen = 0;
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          &seen, non_uint8.data(), sizeof(seen), cudaMemcpyDeviceToHost, stream.get()));
+        stream.sync();
+        check_pass_1 = seen == 0;
+      }
       base += rows;
     }
     if (base != n_rows) {
