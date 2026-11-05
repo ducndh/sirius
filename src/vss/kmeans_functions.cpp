@@ -1244,15 +1244,15 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     }
   }
 
-  // Pass 2: stage each chunk again and move its rows into the lists. A list's rows keep pin
-  // order, so the rows one chunk contributes to a list are one contiguous run of that list, and
-  // the chunk is grouped by cluster on the device so that they are one run of the chunk too.
-  // What the lists keep on the device takes the grouped chunk in one scatter. What they keep on
-  // the host takes it in one transfer to pinned staging and a host copy per run, made while the
-  // device works on the next chunk. A device copy per run costs microseconds whatever its size,
-  // which grows with the cluster count and was most of the build at 16,384 clusters; writing
-  // rows through mapped host memory from a kernel ran at ~5 GB/s, one scattered PCIe write per
-  // row.
+  // Pass 2: stage each chunk again and move its rows into the lists. What the lists keep on the
+  // device takes the chunk's rows as they stand, in one scatter through `dest`. What they keep on
+  // the host needs more: a list's rows keep pin order, so the rows one chunk contributes to a list
+  // are one contiguous run of that list, and the chunk is grouped by cluster on the device so that
+  // they are one run of the chunk too. It then takes one transfer to pinned staging and a host copy
+  // per run, made while the device works on the next chunk. A device copy per run costs
+  // microseconds whatever its size, which grows with the cluster count and was most of the build
+  // at 16,384 clusters; writing rows through mapped host memory from a kernel ran at ~5 GB/s, one
+  // scattered PCIe write per row.
   if (!one_list) {
     struct run {
       std::int64_t first;  // position in the grouped chunk
@@ -1321,8 +1321,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     // Two of each, used in turn: the copies out of one overlap the transfer into the other.
     std::array<staging, 2> exact_stages, row_stages;
 
+    bool const grouped_copies = !on_device || lists.exact_vectors != nullptr;
     std::vector<std::int64_t> order, grouped_dest;
-    std::vector<std::int64_t> count(static_cast<std::size_t>(n_clusters));
+    std::vector<std::int64_t> count(grouped_copies ? static_cast<std::size_t>(n_clusters) : 0);
     pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0, turn = 0; i < n_chunks; ++i) {
@@ -1330,32 +1331,34 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       auto const rows = static_cast<std::int64_t>(staged.view.size());
       if (rows == 0) { continue; }
       auto const vectors       = list_column_as_dataset_view(staged.view, dim);
-      auto const* chunk_labels = labels.get() + base;
 
-      std::fill(count.begin(), count.end(), 0);
-      for (std::int64_t r = 0; r < rows; ++r) {
-        ++count[static_cast<std::size_t>(chunk_labels[r])];
-      }
       auto const runs_owner = std::make_shared<std::vector<run>>();
-      auto& runs            = *runs_owner;
-      std::int64_t pos      = 0;
-      for (std::int64_t k = 0; k < n_clusters; ++k) {
-        auto const n = count[static_cast<std::size_t>(k)];
-        if (n == 0) { continue; }
-        runs.push_back(run{pos, -1, n});
-        count[static_cast<std::size_t>(k)] = pos;  // now the next slot of cluster k
-        pos += n;
-      }
-      order.resize(static_cast<std::size_t>(rows));
-      grouped_dest.resize(static_cast<std::size_t>(rows));
-      for (std::int64_t r = 0; r < rows; ++r) {
-        auto const slot =
-          static_cast<std::size_t>(count[static_cast<std::size_t>(chunk_labels[r])]++);
-        order[slot]        = r;
-        grouped_dest[slot] = dest[static_cast<std::size_t>(base + r)];
-      }
-      for (auto& g : runs) {
-        g.dest = grouped_dest[static_cast<std::size_t>(g.first)];
+      if (grouped_copies) {
+        auto const* chunk_labels = labels.get() + base;
+        auto& runs               = *runs_owner;
+        std::fill(count.begin(), count.end(), 0);
+        for (std::int64_t r = 0; r < rows; ++r) {
+          ++count[static_cast<std::size_t>(chunk_labels[r])];
+        }
+        std::int64_t pos = 0;
+        for (std::int64_t k = 0; k < n_clusters; ++k) {
+          auto const n = count[static_cast<std::size_t>(k)];
+          if (n == 0) { continue; }
+          runs.push_back(run{pos, -1, n});
+          count[static_cast<std::size_t>(k)] = pos;  // now the next slot of cluster k
+          pos += n;
+        }
+        order.resize(static_cast<std::size_t>(rows));
+        grouped_dest.resize(static_cast<std::size_t>(rows));
+        for (std::int64_t r = 0; r < rows; ++r) {
+          auto const slot =
+            static_cast<std::size_t>(count[static_cast<std::size_t>(chunk_labels[r])]++);
+          order[slot]        = r;
+          grouped_dest[slot] = dest[static_cast<std::size_t>(base + r)];
+        }
+        for (auto& g : runs) {
+          g.dest = grouped_dest[static_cast<std::size_t>(g.first)];
+        }
       }
 
       auto& exact_stage = exact_stages[turn % 2];
@@ -1365,108 +1368,118 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       exact_stage.wait();
       row_stage.wait();
 
-      rmm::device_uvector<std::int64_t> order_d(static_cast<std::size_t>(rows), stream, mr);
       rmm::device_uvector<std::int64_t> chunk_dest(static_cast<std::size_t>(rows), stream, mr);
-      rmm::device_uvector<std::int64_t> grouped_dest_d(static_cast<std::size_t>(rows), stream, mr);
-      rmm::device_uvector<float> grouped(static_cast<std::size_t>(rows * dim), stream, mr);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(order_d.data(),
-                                    order.data(),
-                                    static_cast<std::size_t>(rows) * sizeof(std::int64_t),
-                                    cudaMemcpyHostToDevice,
-                                    stream.get()));
       CUDF_CUDA_TRY(cudaMemcpyAsync(chunk_dest.data(),
                                     dest.get() + base,
                                     static_cast<std::size_t>(rows) * sizeof(std::int64_t),
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
-      CUDF_CUDA_TRY(cudaMemcpyAsync(grouped_dest_d.data(),
-                                    grouped_dest.data(),
-                                    static_cast<std::size_t>(rows) * sizeof(std::int64_t),
-                                    cudaMemcpyHostToDevice,
-                                    stream.get()));
-      // Per-row values of the grouped chunk into a device-resident part of the layout.
-      auto const scatter = [&](void const* src, std::size_t width, void* out) {
+      std::optional<rmm::device_uvector<std::int64_t>> order_d, grouped_dest_d;
+      // The rows the steps below read: the chunk's own, unless grouped or made unit.
+      std::optional<rmm::device_uvector<float>> rewritten;
+      float const* in_rows = vectors.data_handle();
+      if (grouped_copies || unit_rows) {
+        rewritten.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
+      }
+      if (grouped_copies) {
+        order_d.emplace(static_cast<std::size_t>(rows), stream, mr);
+        grouped_dest_d.emplace(static_cast<std::size_t>(rows), stream, mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(order_d->data(),
+                                      order.data(),
+                                      static_cast<std::size_t>(rows) * sizeof(std::int64_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(grouped_dest_d->data(),
+                                      grouped_dest.data(),
+                                      static_cast<std::size_t>(rows) * sizeof(std::int64_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        gather_rows(in_rows, dim, order_d->data(), rows, rewritten->data(), stream);
+        in_rows = rewritten->data();
+      }
+      if (unit_rows) {
+        normalize_rows(in_rows, rows, dim, rewritten->data(), stream);
+        in_rows = rewritten->data();
+      }
+      // Per-row values of these rows into a device-resident part of the layout.
+      auto const* const scatter_dest = grouped_copies ? grouped_dest_d->data() : chunk_dest.data();
+      auto const scatter             = [&](void const* src, std::size_t width, void* out) {
         scatter_rows(static_cast<std::byte const*>(src),
                      static_cast<std::int64_t>(width),
-                     grouped_dest_d.data(),
+                     scatter_dest,
                      rows,
                      static_cast<std::byte*>(out),
                      stream);
       };
-      gather_rows(vectors.data_handle(), dim, order_d.data(), rows, grouped.data(), stream);
-      if (unit_rows) { normalize_rows(grouped.data(), rows, dim, grouped.data(), stream); }
-      // The copies below read the grouped rows in the list encoding.
-      std::optional<rmm::device_uvector<std::uint16_t>> grouped_f16;
-      std::optional<rmm::device_uvector<std::int8_t>> grouped_i8;
-      std::optional<rmm::device_uvector<std::int32_t>> grouped_sq;
-      auto const* grouped_bytes = reinterpret_cast<std::byte const*>(grouped.data());
+      // The copies below read the rows in the list encoding.
+      std::optional<rmm::device_uvector<std::uint16_t>> coded_f16;
+      std::optional<rmm::device_uvector<std::int8_t>> coded_i8;
+      std::optional<rmm::device_uvector<std::int32_t>> coded_sq;
+      auto const* coded_bytes = reinterpret_cast<std::byte const*>(in_rows);
       if (encoding == list_encoding::float16) {
-        grouped_f16.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
-        narrow_to_float16(grouped.data(), rows * dim, grouped_f16->data(), stream);
-        grouped_bytes = reinterpret_cast<std::byte const*>(grouped_f16->data());
+        coded_f16.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
+        narrow_to_float16(in_rows, rows * dim, coded_f16->data(), stream);
+        coded_bytes = reinterpret_cast<std::byte const*>(coded_f16->data());
       }
-      std::optional<rmm::device_uvector<float>> grouped_sqf;
+      std::optional<rmm::device_uvector<float>> row_sqf;
       if (lists.has_exact_rows()) {
-        grouped_sqf.emplace(static_cast<std::size_t>(rows), stream, mr);
-        if (grouped_f16) {
+        row_sqf.emplace(static_cast<std::size_t>(rows), stream, mr);
+        if (coded_f16) {
           // The FP16 search compares rounded rows, so it needs their norms and how far each is
           // from the row it stands for.
-          half_rows_norms(grouped.data(),
-                          grouped_f16->data(),
+          half_rows_norms(in_rows,
+                          coded_f16->data(),
                           rows,
                           dim,
-                          grouped_sqf->data(),
+                          row_sqf->data(),
                           nullptr,
                           half_error_bits->data(),
                           max_norm_bits->data(),
                           stream);
         } else {
-          float_row_sq_norms(
-            grouped.data(), rows, dim, grouped_sqf->data(), max_norm_bits->data(), stream);
+          float_row_sq_norms(in_rows, rows, dim, row_sqf->data(), max_norm_bits->data(), stream);
         }
-        if (lists.row_sq_f32) {
-          scatter(grouped_sqf->data(), sizeof(float), lists.row_sq_f32->data());
-        }
+        if (lists.row_sq_f32) { scatter(row_sqf->data(), sizeof(float), lists.row_sq_f32->data()); }
         if (lists.exact_vectors) {
           download(exact_stage,
-                   reinterpret_cast<std::byte const*>(grouped.data()),
+                   reinterpret_cast<std::byte const*>(in_rows),
                    static_cast<std::size_t>(rows) * exact_row_bytes);
         }
       }
       if (encoding == list_encoding::int8) {
-        grouped_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
-        grouped_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
-        quantize_rows_int8(rotated_rows(grouped.data(), rows),
+        coded_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
+        coded_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
+        quantize_rows_int8(rotated_rows(in_rows, rows),
                            rows,
                            dim,
                            static_cast<float const*>(lists.code_offset->data()),
                            lists.code_scale,
-                           grouped_i8->data(),
+                           coded_i8->data(),
                            nullptr,
                            code_error_bits->data(),
                            stream,
                            rotation ? rotation_slack(dim) : 0.f);
-        int8_row_sq_norms(grouped_i8->data(), rows, dim, grouped_sq->data(), stream);
-        grouped_bytes = reinterpret_cast<std::byte const*>(grouped_i8->data());
-        scatter(grouped_sq->data(), sizeof(std::int32_t), lists.row_sq->data());
+        int8_row_sq_norms(coded_i8->data(), rows, dim, coded_sq->data(), stream);
+        coded_bytes = reinterpret_cast<std::byte const*>(coded_i8->data());
+        scatter(coded_sq->data(), sizeof(std::int32_t), lists.row_sq->data());
       }
       if (encoding == list_encoding::uint8) {
-        grouped_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
-        grouped_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
-        narrow_to_shifted_int8(grouped.data(), rows * dim, grouped_i8->data(), stream);
-        int8_row_sq_norms(grouped_i8->data(), rows, dim, grouped_sq->data(), stream);
-        grouped_bytes = reinterpret_cast<std::byte const*>(grouped_i8->data());
-        scatter(grouped_sq->data(), sizeof(std::int32_t), lists.row_sq->data());
+        coded_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
+        coded_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
+        narrow_to_shifted_int8(in_rows, rows * dim, coded_i8->data(), stream);
+        int8_row_sq_norms(coded_i8->data(), rows, dim, coded_sq->data(), stream);
+        coded_bytes = reinterpret_cast<std::byte const*>(coded_i8->data());
+        scatter(coded_sq->data(), sizeof(std::int32_t), lists.row_sq->data());
       }
       if (on_device) {
         scatter_row_ids(
           chunk_dest.data(), rows, base, static_cast<std::int64_t*>(lists.row_ids->data()), stream);
-        scatter(grouped_bytes, row_bytes_v, lists.device_vectors->data());
+        scatter(coded_bytes, row_bytes_v, lists.device_vectors->data());
       } else {
-        download(row_stage, grouped_bytes, static_cast<std::size_t>(rows) * row_bytes_v);
+        download(row_stage, coded_bytes, static_cast<std::size_t>(rows) * row_bytes_v);
       }
       walk.prefetch_after(i);
-      // The staged chunk, the grouped rows and the pageable sources of the copies above are
+      // The staged chunk, the rows made here and the pageable sources of the copies above are
       // released or reused once this iteration ends.
       stream.sync();
       if (lists.exact_vectors) { copy_out(exact_stage, runs_owner, exact_row_bytes, exact_at); }
