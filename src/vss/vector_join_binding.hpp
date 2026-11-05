@@ -29,6 +29,7 @@
 namespace duckdb {
 class ClientContext;
 class DuckTableEntry;
+class LogicalOperator;
 class TableCatalogEntry;
 class TableFilter;
 class SiriusContext;
@@ -61,6 +62,10 @@ duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
 /// which already refuse an UPDATE on a pinned table). Recorded when the statement is prepared, so
 /// a write that rolls back still counts.
 void note_pinned_table_written(sirius::scan_manager::pinned_entry const& pin);
+
+/// Whether @p plan holds a vector join. Such a plan has no CPU form: the join's table function
+/// runs on the GPU only.
+[[nodiscard]] bool plan_has_vector_join(duckdb::LogicalOperator const& plan);
 
 /// The identity a pin of @p table is matched against.
 [[nodiscard]] sirius::duckdb_table_identity table_identity_of(duckdb::TableCatalogEntry& table);

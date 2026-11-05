@@ -120,7 +120,8 @@ class read_view_registry {
   void publish_correspondence(op::scan::certificate_evidence_scope scope,
                               std::string correspondence,
                               std::span<op::scan::bound_read_view const> physical_original);
-  void exempt_from_correspondence(op::scan::scan_contract_id id);
+  /// A plan with no CPU form has no CPU reads to agree with: nothing is compared or published.
+  void exempt_from_correspondence();
   void inject_mismatch_for_testing(bool swap);
   void record_delete_preparation(op::scan::scan_contract_id id, uint64_t elapsed_us);
 

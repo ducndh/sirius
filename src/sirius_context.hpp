@@ -502,7 +502,6 @@ class SiriusContext : public ClientContextState {
     PreparedStatementData& prepared,
     unique_ptr<LogicalOperator> logical_plan,
     sirius::transparent::candidate_origin candidate_source,
-    std::optional<sirius::op::scan::logical_bound_read_view_capture> logical_original_views,
     sirius::transparent::plan_source_policy const& source_policy);
 
   RebindQueryInfo OnFinalizePrepare(ClientContext& context,

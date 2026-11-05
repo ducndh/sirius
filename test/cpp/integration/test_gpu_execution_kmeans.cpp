@@ -3009,7 +3009,10 @@ std::filesystem::path write_block_rows_yaml(sirius::test::scratch_dir const& scr
          "      downgrade_root_dirs: \""
       << disk_dir << "\"\n";
   }
+  // One reactor's 64 MiB of pinned staging fits the smallest host pool these tests configure.
   f << "  executor:\n"
+       "    scan_manager:\n"
+       "      uring_n_reactors: 1\n"
        "    pipeline:\n"
        "      num_threads: 4\n"
        "    task_creator:\n"

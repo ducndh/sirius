@@ -1849,18 +1849,6 @@ void print_cpu_fallback_banner()
 
 namespace {
 
-bool subtree_has_vector_join(const LogicalOperator& op)
-{
-  if (op.type == LogicalOperatorType::LOGICAL_GET) {
-    auto const& name = op.Cast<LogicalGet>().function.GetName();
-    if (name == "sirius_knn_join" || name == "sirius_knn_join_rel") { return true; }
-  }
-  for (auto const& child : op.children) {
-    if (subtree_has_vector_join(*child)) { return true; }
-  }
-  return false;
-}
-
 bool is_sink_root(const LogicalOperator& op)
 {
   return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
@@ -1880,11 +1868,10 @@ RebindQueryInfo SiriusContext::splice_gpu_child_under_sink(
   PreparedStatementData& prepared,
   unique_ptr<LogicalOperator> logical_plan,
   sirius::transparent::candidate_origin candidate_source,
-  std::optional<sirius::op::scan::logical_bound_read_view_capture> logical_original_views,
   sirius::transparent::plan_source_policy const& source_policy)
 {
   if (!logical_plan || !is_sink_root(*logical_plan) || logical_plan->children.size() != 1 ||
-      !subtree_has_vector_join(*logical_plan->children[0])) {
+      !sirius::vss::plan_has_vector_join(*logical_plan->children[0])) {
     return RebindQueryInfo::DO_NOT_REBIND;
   }
   if (!prepared.physical_plan || prepared.physical_plan->Root().children.size() != 1) {
@@ -1898,8 +1885,6 @@ RebindQueryInfo SiriusContext::splice_gpu_child_under_sink(
     child_names.emplace_back("col" + std::to_string(i));
   }
   auto& root = prepared.physical_plan->Root();
-  auto physical_original_views =
-    sirius::op::scan::capture_bound_read_views(root.children[0].get(), context);
   try {
     unique_ptr<LogicalOperator> validation_plan;
     try {
@@ -1921,8 +1906,8 @@ RebindQueryInfo SiriusContext::splice_gpu_child_under_sink(
   auto& sirius_op = prepared.physical_plan->Make<sirius::transparent::PhysicalSiriusExecution>(
     std::move(child),
     candidate_source,
-    std::move(logical_original_views),
-    std::move(physical_original_views),
+    std::nullopt,
+    std::vector<sirius::op::scan::bound_read_view>{},
     std::string{},
     child_types,
     std::move(child_names),
@@ -2095,14 +2080,12 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
   }
 
   if (sink_statement) {
-    return splice_gpu_child_under_sink(context,
-                                       prepared,
-                                       std::move(logical_plan),
-                                       candidate_source,
-                                       std::move(logical_original_views),
-                                       source_policy);
+    return splice_gpu_child_under_sink(
+      context, prepared, std::move(logical_plan), candidate_source, source_policy);
   }
 
+  bool const no_cpu_form = sirius::vss::plan_has_vector_join(*logical_plan);
+  if (no_cpu_form) { logical_original_views.reset(); }
   try {
     // Copy can rebind table functions, whose bind callbacks may acquire maintenance access.
     // Finish it before taking a planning permit so maintenance cannot wait on our own permit.
@@ -2119,7 +2102,7 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // Keep acquisition inside this try so runtime-unavailable errors use the fallback below.
     SlotGuard plan_window(*this, context, sirius::exec::query_admission::access::planning);
     auto physical_original_views =
-      prepared.physical_plan
+      prepared.physical_plan && !no_cpu_form
         ? sirius::op::scan::capture_bound_read_views(prepared.physical_plan->Root(), context)
         : std::vector<sirius::op::scan::bound_read_view>{};
     // Validate that the captured logical plan is GPU-translatable before we
@@ -2150,6 +2133,8 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
       validated_sirius_plan = planner->create_plan(std::move(logical_plan));
       logical_plan.reset();  // signal PhysicalSiriusExecution to use the SQL replan path
     }
+
+    if (no_cpu_form) { planner->read_views->exempt_from_correspondence(); }
 
     duckdb::Value read_view_injection;
     if (context.TryGetCurrentSetting("sirius_test_inject_read_view_mismatch",

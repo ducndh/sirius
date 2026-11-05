@@ -1203,7 +1203,6 @@ void certify_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
         entry->capture(scan.function, scan.bind_data.get(), context));
     }
     scan.contract_id = scan.read_views->allocate_declined_scan(scan, *entry);
-    if (scan.correspondence_exempt) { scan.read_views->exempt_from_correspondence(scan.contract_id); }
     certification_result result;
     result.verdict     = scan.pre_declined->verdict;
     result.reason      = scan.pre_declined->reason;
@@ -1252,7 +1251,6 @@ void certify_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
                                              {materializer_kind, entry->registry_profile},
                                              scan.duckdb_types,
                                              scan.table_index);
-  if (scan.correspondence_exempt) { scan.read_views->exempt_from_correspondence(scan.contract_id); }
   auto started = std::chrono::steady_clock::now();
   certification_result result;
   try {

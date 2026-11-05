@@ -23,6 +23,7 @@
 #include "sirius_sql_rewrite.hpp"
 #include "transparent/read_view_registry.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
+#include "vss/vector_join_binding.hpp"
 
 #include <duckdb/common/enums/statement_type.hpp>
 #include <duckdb/execution/executor.hpp>
@@ -349,7 +350,9 @@ duckdb::SourceResultType PhysicalSiriusExecution::GetDataInternal(
         }
         sirius::planner::sirius_physical_plan_generator planner(
           context.client, {{sirius::value_of(window->query_id())}, 0});
-        sirius_plan = planner.create_plan(std::move(fresh_plan));
+        bool const no_cpu_form = sirius::vss::plan_has_vector_join(*fresh_plan);
+        sirius_plan            = planner.create_plan(std::move(fresh_plan));
+        if (no_cpu_form) { planner.read_views->exempt_from_correspondence(); }
         if (read_view_injection_stage == "execute") {
           planner.read_views->inject_mismatch_for_testing(false);
         }

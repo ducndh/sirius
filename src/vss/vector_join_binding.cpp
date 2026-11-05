@@ -31,6 +31,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
@@ -63,6 +64,17 @@ void note_pinned_table_written(sirius::scan_manager::pinned_entry const& pin)
   std::lock_guard lock{written_mutex};
   std::erase_if(written_pins, [](auto const& note) { return note.expired(); });
   written_pins.insert(pin.snapshot_identity);
+}
+
+bool plan_has_vector_join(duckdb::LogicalOperator const& plan)
+{
+  if (plan.type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+    auto const& name = plan.Cast<duckdb::LogicalGet>().function.GetName();
+    if (name == "sirius_knn_join" || name == "sirius_knn_join_rel") { return true; }
+  }
+  return std::any_of(plan.children.begin(), plan.children.end(), [](auto const& child) {
+    return plan_has_vector_join(*child);
+  });
 }
 
 sirius::duckdb_table_identity table_identity_of(duckdb::TableCatalogEntry& table)
