@@ -592,7 +592,14 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
 
   // Pass 1: every row's nearest centroid, to the host. 4 bytes a row, so even 100M rows is
   // 400 MB, and the host is where the counting sort below is cheapest to run deterministically.
-  std::vector<std::int32_t> labels(one_list ? 0 : static_cast<std::size_t>(n_rows));
+  // Every row's label is written below, except that a single list labels nothing and its labels
+  // are zero, so only then is zeroing them useful.
+  std::unique_ptr<std::int32_t[]> labels;
+  if (n_clusters == 1 && !one_list) {
+    labels = std::make_unique<std::int32_t[]>(static_cast<std::size_t>(n_rows));
+  } else if (!one_list) {
+    labels = std::make_unique_for_overwrite<std::int32_t[]>(static_cast<std::size_t>(n_rows));
+  }
   // Whether every component is a byte, counted while the chunks are resident anyway: that is
   // what decides if the lists may be stored as UINT8 without changing a single value.
   bool const check_uint8 =
@@ -716,7 +723,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       // Before the copy below, which waits for the labels: into pageable memory it is synchronous.
       walk.prefetch_after(i);
       if (labeler) {
-        CUDF_CUDA_TRY(cudaMemcpyAsync(labels.data() + base,
+        CUDF_CUDA_TRY(cudaMemcpyAsync(labels.get() + base,
                                       chunk_labels.data(),
                                       static_cast<std::size_t>(rows) * sizeof(std::int32_t),
                                       cudaMemcpyDeviceToHost,
@@ -856,11 +863,14 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     }
     lists.offsets.back() = run;
   }
-  std::vector<std::int64_t> dest(one_list ? 0 : static_cast<std::size_t>(n_rows));
+  std::unique_ptr<std::int64_t[]> dest;
+  if (!one_list) {
+    dest = std::make_unique_for_overwrite<std::int64_t[]>(static_cast<std::size_t>(n_rows));
+  }
   if (one_list) {
     // Layout row r is pin row r.
   } else if (n_clusters == 1) {
-    std::iota(dest.begin(), dest.end(), std::int64_t{0});
+    std::iota(dest.get(), dest.get() + n_rows, std::int64_t{0});
   } else {
     parallel([&](std::int64_t t, std::int64_t lo, std::int64_t hi) {
       auto& s = start[static_cast<std::size_t>(t)];
@@ -1311,7 +1321,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       auto const rows = static_cast<std::int64_t>(staged.view.size());
       if (rows == 0) { continue; }
       auto const vectors       = list_column_as_dataset_view(staged.view, dim);
-      auto const* chunk_labels = labels.data() + base;
+      auto const* chunk_labels = labels.get() + base;
 
       std::fill(count.begin(), count.end(), 0);
       for (std::int64_t r = 0; r < rows; ++r) {
@@ -1356,7 +1366,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
       CUDF_CUDA_TRY(cudaMemcpyAsync(chunk_dest.data(),
-                                    dest.data() + base,
+                                    dest.get() + base,
                                     static_cast<std::size_t>(rows) * sizeof(std::int64_t),
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
@@ -1460,8 +1470,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       }
     }
   }
-  labels.clear();
-  labels.shrink_to_fit();
+  labels.reset();
   if (!on_device) {
     // One flat column per chunk: the H2D converter reconstructs it from this metadata when the
     // engine stages the chunk, and the join reads the same bytes directly while a chunk is on
