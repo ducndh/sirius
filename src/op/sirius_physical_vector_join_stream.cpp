@@ -2086,10 +2086,49 @@ struct sirius_physical_vector_join_stream::found_pairs {
 /// the answer accumulates, and, while the corpus is searched, @ref search_state. Holds data only:
 /// nothing here names a stream, so what operates on it says which stream it runs on.
 struct sirius_physical_vector_join_stream::block_state {
+  /// What a walk over corpus chunks changes as it goes: the pairs it holds and what it did.
+  struct search_run {
+    explicit search_run(host_pair_block_pool& pool) : host_pairs(pool) {}
+
+    // The candidate buffer, and the pairs waiting beyond it.
+    std::optional<vss::bound_candidates> candidates;
+    std::int64_t pending{0};
+    std::optional<rmm::device_uvector<float>> gap_limit;
+    /// Moved pairs back in the buffer: already counted as passed.
+    std::int64_t pairs_back{0};
+    std::vector<std::int32_t> host_row_slot;
+    host_pair_queue host_pairs;
+    std::optional<rmm::device_uvector<float>> moved_codes;
+
+    // The running bound's schedule.
+    std::int64_t running_piece{0};
+    std::int64_t since_merge{0};
+
+    // What the search did.
+    std::int64_t scanned_pairs{0};
+    std::int64_t bounded_emitted{0};
+    std::int64_t bounded_merges{0};
+    std::int64_t bounded_launches{0};
+    std::int64_t bounded_padded{0};
+    /// Debug only (they synchronize): time spent re-scoring candidates and taking/merging them.
+    double rescore_seconds{0};
+    double take_seconds{0};
+    double trim_seconds{0};
+    vss::gap_rescore_stats gap_stats{};
+    std::int64_t gap_rescored{0};
+    std::int64_t pair_moves{0};
+    std::int64_t slice_cuts{0};
+    std::int64_t pairs_moved{0};
+    std::int64_t budget_flushes{0};
+    double host_seconds{0};
+    /// Debug only: pairs each stretch passed.
+    std::vector<std::int64_t> stretch_pairs;
+  };
+
   /// What a clustered search reads and writes from one corpus chunk to the next, gone before the
   /// answer is shaped. The search's form is decided once for its rows and held here with them.
   struct search_state {
-    explicit search_state(host_pair_block_pool& pool) : host_pairs(pool) {}
+    explicit search_state(host_pair_block_pool& pool) : run(pool) {}
 
     // Routing: each probe row's clusters, and the corpus chunks they need.
     std::int64_t n_probes{0};
@@ -2166,39 +2205,7 @@ struct sirius_physical_vector_join_stream::block_state {
     std::optional<rmm::device_uvector<float>> certain_limit;
     std::optional<rmm::device_uvector<float>> bound;
 
-    // The candidate buffer, and the pairs waiting beyond it.
-    std::optional<vss::bound_candidates> candidates;
-    std::int64_t pending{0};
-    std::optional<rmm::device_uvector<float>> gap_limit;
-    /// Moved pairs back in the buffer: already counted as passed.
-    std::int64_t pairs_back{0};
-    std::vector<std::int32_t> host_row_slot;
-    host_pair_queue host_pairs;
-    std::optional<rmm::device_uvector<float>> moved_codes;
-
-    // The running bound's schedule.
-    std::int64_t running_piece{0};
-    std::int64_t since_merge{0};
-
-    // What the search did.
-    std::int64_t scanned_pairs{0};
-    std::int64_t bounded_emitted{0};
-    std::int64_t bounded_merges{0};
-    std::int64_t bounded_launches{0};
-    std::int64_t bounded_padded{0};
-    /// Debug only (they synchronize): time spent re-scoring candidates and taking/merging them.
-    double rescore_seconds{0};
-    double take_seconds{0};
-    double trim_seconds{0};
-    vss::gap_rescore_stats gap_stats{};
-    std::int64_t gap_rescored{0};
-    std::int64_t pair_moves{0};
-    std::int64_t slice_cuts{0};
-    std::int64_t pairs_moved{0};
-    std::int64_t budget_flushes{0};
-    double host_seconds{0};
-    /// Debug only: pairs each stretch passed.
-    std::vector<std::int64_t> stretch_pairs;
+    search_run run;
   };
 
   std::int64_t n_left{0};
@@ -3134,6 +3141,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   explicit clustered_search(block_task const& task)
     : block_task(task),
       s(st.search.emplace(_op._host_pair_blocks)),
+      w(s.run),
       dbg(std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr),
       phase_t0(std::chrono::steady_clock::now()),
       stage_on(stream),
@@ -3813,7 +3821,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                    static_cast<int>(s.hold_codes_pairs));
     }
 
-    s.running_piece = s.running_bound_rows;
+    w.running_piece = s.running_bound_rows;
 
     // Lists that did not fit the device are read by the same searches: a sweep that reads the
     // lists in place copies each needed chunk's stored rows in as they are, still compact, and
@@ -4063,33 +4071,33 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   // seeds alike.)
   void gap_trim()
   {
-    if (!s.gap_rescore || s.pending == 0) { return; }
+    if (!s.gap_rescore || w.pending == 0) { return; }
     auto const t0 = debug_mark();
-    if (!s.gap_limit) { s.gap_limit.emplace(static_cast<std::size_t>(n_left), stream, mr); }
-    vss::gap_rescore_bound(s.candidates->rows.data(),
-                           s.candidates->distances.data(),
-                           s.pending,
+    if (!w.gap_limit) { w.gap_limit.emplace(static_cast<std::size_t>(n_left), stream, mr); }
+    vss::gap_rescore_bound(w.candidates->rows.data(),
+                           w.candidates->distances.data(),
+                           w.pending,
                            st.acc_distances->view().data<float>(),
                            n_left,
                            k_join,
                            s.bound->data(),
                            code_terms(),
-                           s.gap_limit->data(),
+                           w.gap_limit->data(),
                            stream,
                            mr);
     // In place: each row's limit is computed from its own bound alone.
-    code_limits(s.gap_limit->data(), s.gap_limit->data(), false);
-    s.pending = vss::keep_within_row_limit(s.candidates->rows.data(),
-                                           s.candidates->ids.data(),
-                                           s.candidates->distances.data(),
-                                           s.pending,
-                                           s.gap_limit->data(),
+    code_limits(w.gap_limit->data(), w.gap_limit->data(), false);
+    w.pending = vss::keep_within_row_limit(w.candidates->rows.data(),
+                                           w.candidates->ids.data(),
+                                           w.candidates->distances.data(),
+                                           w.pending,
+                                           w.gap_limit->data(),
                                            n_left,
                                            k_join,
-                                           s.gap_stats_on ? &s.gap_stats : nullptr,
+                                           s.gap_stats_on ? &w.gap_stats : nullptr,
                                            stream,
                                            mr);
-    if (dbg) { s.trim_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
+    if (dbg) { w.trim_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
   }
 
   // The candidates' FP32 distances, over host probe rows: their rows are brought over a slice of
@@ -4100,10 +4108,10 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     constexpr std::size_t kRescoreBytes = std::size_t{256} << 20;
     auto const row_bytes                = static_cast<std::size_t>(dim) * sizeof(float);
     auto const kRows                    = std::max<std::size_t>(1, kRescoreBytes / row_bytes);
-    if (s.host_row_slot.empty()) { s.host_row_slot.assign(static_cast<std::size_t>(n_left), -1); }
-    std::vector<std::int32_t> rows(static_cast<std::size_t>(s.pending));
+    if (w.host_row_slot.empty()) { w.host_row_slot.assign(static_cast<std::size_t>(n_left), -1); }
+    std::vector<std::int32_t> rows(static_cast<std::size_t>(w.pending));
     CUDF_CUDA_TRY(cudaMemcpyAsync(rows.data(),
-                                  s.candidates->rows.data(),
+                                  w.candidates->rows.data(),
                                   rows.size() * sizeof(std::int32_t),
                                   cudaMemcpyDeviceToHost,
                                   stream.get()));
@@ -4114,7 +4122,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       distinct.clear();
       auto to = from;
       for (; to < rows.size(); ++to) {
-        auto& slot = s.host_row_slot[static_cast<std::size_t>(rows[to])];
+        auto& slot = w.host_row_slot[static_cast<std::size_t>(rows[to])];
         if (slot < 0) {
           if (distinct.size() == kRows) { break; }
           slot = static_cast<std::int32_t>(distinct.size());
@@ -4125,7 +4133,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       staged.resize(distinct.size() * static_cast<std::size_t>(dim));
       st.host_rows->gather(distinct.data(), distinct.size(), staged.data());
       for (auto const row : distinct) {
-        s.host_row_slot[static_cast<std::size_t>(row)] = -1;
+        w.host_row_slot[static_cast<std::size_t>(row)] = -1;
       }
       rmm::device_uvector<float> device_rows(staged.size(), stream, mr);
       rmm::device_uvector<std::int32_t> slots(to - from, stream, mr);
@@ -4143,8 +4151,8 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       vss::exact_distances(device_rows.data(),
                            slots.data(),
                            0,
-                           s.candidates->ids.data() + from,
-                           s.candidates->distances.data() + from,
+                           w.candidates->ids.data() + from,
+                           w.candidates->distances.data() + from,
                            static_cast<std::int64_t>(to - from),
                            exact_source,
                            dim,
@@ -4160,19 +4168,19 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
 
   void flush()
   {
-    if (s.pending == 0) { return; }
-    ++s.bounded_merges;
-    s.bounded_emitted += s.pending - s.pairs_back;
-    s.pairs_back       = 0;
+    if (w.pending == 0) { return; }
+    ++w.bounded_merges;
+    w.bounded_emitted += w.pending - w.pairs_back;
+    w.pairs_back       = 0;
     auto const t0      = debug_mark();
-    auto const* c_rows = s.candidates->rows.data();
-    auto const* c_ids  = s.candidates->ids.data();
-    auto const* c_dist = s.candidates->distances.data();
+    auto const* c_rows = w.candidates->rows.data();
+    auto const* c_ids  = w.candidates->ids.data();
+    auto const* c_dist = w.candidates->distances.data();
     auto const done    = [&] {
       CUDF_CUDA_TRY(
-        cudaMemsetAsync(s.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
-      s.pending = 0;
-      if (dbg) { s.rescore_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
+        cudaMemsetAsync(w.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
+      w.pending = 0;
+      if (dbg) { w.rescore_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
     };
     if (keyed && !best_only) {
       // The pairs the keys drop are dropped before anything is re-scored; the rest are held to
@@ -4183,7 +4191,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       auto kept = s.rescore ? vss::take_pairs(c_rows,
                                               c_ids,
                                               c_dist,
-                                              s.pending,
+                                              w.pending,
                                               st.layout_keys,
                                               no_limit,
                                               nullptr,
@@ -4193,7 +4201,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                             : vss::take_pairs(c_rows,
                                               c_ids,
                                               c_dist,
-                                              s.pending,
+                                              w.pending,
                                               st.pin_keys,
                                               s.radius_bound,
                                               nullptr,
@@ -4250,7 +4258,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         vss::best_match_winners(c_rows,
                                 c_ids,
                                 c_dist,
-                                s.pending,
+                                w.pending,
                                 st.layout_keys,
                                 s.code_limit->data(),
                                 st.best_scratch->data(),
@@ -4261,7 +4269,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
           auto taken   = vss::best_match_take(c_rows,
                                               c_ids,
                                               c_dist,
-                                              s.pending,
+                                              w.pending,
                                               st.layout_keys,
                                               s.code_limit->data(),
                                               winner.data(),
@@ -4294,23 +4302,23 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
           st.best_rescored += n;
         }
       } else {
-        fold_best(c_rows, c_ids, c_dist, s.pending, s.radius_bound, st.pin_keys, s.bound->data());
+        fold_best(c_rows, c_ids, c_dist, w.pending, s.radius_bound, st.pin_keys, s.bound->data());
       }
       done();
       return;
     }
     if (!radius_join) { gap_trim(); }
-    s.gap_rescored += s.rescore ? s.pending : 0;
+    w.gap_rescored += s.rescore ? w.pending : 0;
     auto const t_rescore = debug_mark();
     if (s.rescore && st.probe_rows_on_host) {
       rescore_from_host_rows();
     } else if (s.rescore) {
       vss::exact_distances(s.search_queries.data_handle(),
-                           s.candidates->rows.data(),
+                           w.candidates->rows.data(),
                            0,
-                           s.candidates->ids.data(),
-                           s.candidates->distances.data(),
-                           s.pending,
+                           w.candidates->ids.data(),
+                           w.candidates->distances.data(),
+                           w.pending,
                            exact_source,
                            dim,
                            stream,
@@ -4320,13 +4328,13 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                            ip);
     }
     auto const t1 = debug_mark();
-    if (dbg) { s.rescore_seconds += std::chrono::duration<double>(t1 - t_rescore).count(); }
+    if (dbg) { w.rescore_seconds += std::chrono::duration<double>(t1 - t_rescore).count(); }
     if (radius_join) {
       // FP16 survivors were re-scored above and are held to the radius again in FP32; int8
       // distances are already exact. Their ids stay layout rows until here.
       auto kept = vss::take_within(
-        *s.candidates,
-        s.pending,
+        *w.candidates,
+        w.pending,
         s.radius_bound,
         s.rescore ? static_cast<std::int64_t const*>(_lists->row_ids->data()) : nullptr,
         s.sqrt_at_end,
@@ -4345,25 +4353,25 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         note_radius_part(pairs);
       }
       CUDF_CUDA_TRY(
-        cudaMemsetAsync(s.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
-      s.pending = 0;
-      if (dbg) { s.take_seconds += std::chrono::duration<double>(debug_mark() - t1).count(); }
+        cudaMemsetAsync(w.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
+      w.pending = 0;
+      if (dbg) { w.take_seconds += std::chrono::duration<double>(debug_mark() - t1).count(); }
       return;
     }
     vss::merge_bound_candidates(st.acc_distances->mutable_view().data<float>(),
                                 st.acc_neighbors->mutable_view().data<std::int64_t>(),
                                 n_left,
                                 k_join,
-                                *s.candidates,
-                                s.pending,
+                                *w.candidates,
+                                w.pending,
                                 s.bound->data(),
                                 stream,
                                 mr);
     refresh_code_limit(s.bound->data());
     CUDF_CUDA_TRY(
-      cudaMemsetAsync(s.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
-    s.pending = 0;
-    if (dbg) { s.take_seconds += std::chrono::duration<double>(debug_mark() - t1).count(); }
+      cudaMemsetAsync(w.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
+    w.pending = 0;
+    if (dbg) { w.take_seconds += std::chrono::duration<double>(debug_mark() - t1).count(); }
   }
 
   [[nodiscard]] bool joins_group(std::int64_t m, std::int64_t n)
@@ -4386,7 +4394,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                             dim,
                             s.code_limit->data(),
                             vss::float16_slack{},
-                            *s.candidates,
+                            *w.candidates,
                             stream);
       return;
     }
@@ -4401,7 +4409,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                            sl.m,
                            dim,
                            s.codes_int8 ? s.code_limit->data() : s.bound->data(),
-                           *s.candidates,
+                           *w.candidates,
                            stream);
   }
 
@@ -4409,16 +4417,16 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   {
     unsigned long long total = 0;
     CUDF_CUDA_TRY(cudaMemcpyAsync(
-      &total, s.candidates->count.data(), sizeof(total), cudaMemcpyDeviceToHost, stream.get()));
+      &total, w.candidates->count.data(), sizeof(total), cudaMemcpyDeviceToHost, stream.get()));
     stream.sync();
     return static_cast<std::int64_t>(total);
   }
 
   void rollback()
   {
-    auto const keep = static_cast<unsigned long long>(s.pending);
+    auto const keep = static_cast<unsigned long long>(w.pending);
     CUDF_CUDA_TRY(cudaMemcpyAsync(
-      s.candidates->count.data(), &keep, sizeof(keep), cudaMemcpyHostToDevice, stream.get()));
+      w.candidates->count.data(), &keep, sizeof(keep), cudaMemcpyHostToDevice, stream.get()));
   }
 
   void launch_deferred()
@@ -4433,7 +4441,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                       : static_cast<void const*>(s.probe_sq->data()),
         dim,
         s.f16_bounded || s.codes_int8 ? s.code_limit->data() : s.bound->data(),
-        *s.candidates,
+        *w.candidates,
         stream,
         mr);
       deferred.clear();
@@ -4451,40 +4459,40 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   // pairs pass, and the buffer has room for them. The same codes and U_r as the seed's bound.
   void hold_trim()
   {
-    if (s.pending == 0) { return; }
+    if (w.pending == 0) { return; }
     auto const t0 = debug_mark();
-    s.bounded_emitted += s.pending - s.pairs_back;
-    if (!s.gap_limit) { s.gap_limit.emplace(static_cast<std::size_t>(n_left), stream, mr); }
-    vss::gap_rescore_bound(s.candidates->rows.data(),
-                           s.candidates->distances.data(),
-                           s.pending,
+    w.bounded_emitted += w.pending - w.pairs_back;
+    if (!w.gap_limit) { w.gap_limit.emplace(static_cast<std::size_t>(n_left), stream, mr); }
+    vss::gap_rescore_bound(w.candidates->rows.data(),
+                           w.candidates->distances.data(),
+                           w.pending,
                            st.acc_distances->view().data<float>(),
                            n_left,
                            k_join,
                            s.bound->data(),
                            code_terms(),
-                           s.gap_limit->data(),
+                           w.gap_limit->data(),
                            stream,
                            mr);
     CUDF_CUDA_TRY(cudaMemcpyAsync(s.bound->data(),
-                                  s.gap_limit->data(),
+                                  w.gap_limit->data(),
                                   static_cast<std::size_t>(n_left) * sizeof(float),
                                   cudaMemcpyDeviceToDevice,
                                   stream.get()));
     refresh_code_limit(s.bound->data());
-    s.pending    = vss::keep_within_row_limit(s.candidates->rows.data(),
-                                              s.candidates->ids.data(),
-                                              s.candidates->distances.data(),
-                                              s.pending,
+    w.pending    = vss::keep_within_row_limit(w.candidates->rows.data(),
+                                              w.candidates->ids.data(),
+                                              w.candidates->distances.data(),
+                                              w.pending,
                                               s.code_limit->data(),
                                               n_left,
                                               k_join,
                                               nullptr,
                                               stream,
                                               mr);
-    s.pairs_back = s.pending;
+    w.pairs_back = w.pending;
     rollback();
-    if (dbg) { s.trim_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
+    if (dbg) { w.trim_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
   }
 
   [[nodiscard]] std::size_t device_room()
@@ -4495,19 +4503,19 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
 
   void move_pairs_to_host()
   {
-    if (s.pending == 0) { return; }
+    if (w.pending == 0) { return; }
     auto const t0 = debug_mark();
-    s.bounded_emitted += s.pending - s.pairs_back;
-    s.pairs_back = 0;
-    if (!s.moved_codes) {
-      s.moved_codes.emplace(static_cast<std::size_t>(n_left * k_join), stream, mr);
+    w.bounded_emitted += w.pending - w.pairs_back;
+    w.pairs_back = 0;
+    if (!w.moved_codes) {
+      w.moved_codes.emplace(static_cast<std::size_t>(n_left * k_join), stream, mr);
       vss::fill_bound(
-        s.moved_codes->data(), n_left * k_join, std::numeric_limits<float>::infinity(), stream);
+        w.moved_codes->data(), n_left * k_join, std::numeric_limits<float>::infinity(), stream);
     }
-    vss::code_topk_merge(s.candidates->rows.data(),
-                         s.candidates->distances.data(),
-                         s.pending,
-                         s.moved_codes->data(),
+    vss::code_topk_merge(w.candidates->rows.data(),
+                         w.candidates->distances.data(),
+                         w.pending,
+                         w.moved_codes->data(),
                          n_left,
                          k_join,
                          s.bound->data(),
@@ -4515,19 +4523,19 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                          stream,
                          mr);
     refresh_code_limit(s.bound->data());
-    s.pending = vss::keep_within_row_limit(s.candidates->rows.data(),
-                                           s.candidates->ids.data(),
-                                           s.candidates->distances.data(),
-                                           s.pending,
+    w.pending = vss::keep_within_row_limit(w.candidates->rows.data(),
+                                           w.candidates->ids.data(),
+                                           w.candidates->distances.data(),
+                                           w.pending,
                                            s.code_limit->data(),
                                            n_left,
                                            k_join,
                                            nullptr,
                                            stream,
                                            mr);
-    if (!s.host_pairs.reserve(s.pending, s.pair_budget)) {
-      s.pairs_back    = s.pending;
-      auto const need = static_cast<std::size_t>(s.pending) * kFlushBytesPerPair;
+    if (!w.host_pairs.reserve(w.pending, s.pair_budget)) {
+      w.pairs_back    = w.pending;
+      auto const need = static_cast<std::size_t>(w.pending) * kFlushBytesPerPair;
       auto const room = device_room();
       if (s.budget_flush_refused || need > room) {
         throw std::runtime_error(
@@ -4541,33 +4549,33 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                       _request.right.table,
                       k_join,
                       _request.n_probes,
-                      s.pairs_moved,
-                      s.pending,
+                      w.pairs_moved,
+                      w.pending,
                       s.pair_budget >> 20,
                       need >> 20,
                       room >> 20));
       }
-      ++s.budget_flushes;
+      ++w.budget_flushes;
       rollback();
       flush();
       return;
     }
-    for (std::int64_t at = 0; at < s.pending;) {
-      auto& block      = s.host_pairs.tail();
-      auto const take  = std::min(s.pending - at, kHostBlockPairs - block.n);
+    for (std::int64_t at = 0; at < w.pending;) {
+      auto& block      = w.host_pairs.tail();
+      auto const take  = std::min(w.pending - at, kHostBlockPairs - block.n);
       auto const count = static_cast<std::size_t>(take);
       CUDF_CUDA_TRY(cudaMemcpyAsync(block.rows() + block.n,
-                                    s.candidates->rows.data() + at,
+                                    w.candidates->rows.data() + at,
                                     count * sizeof(std::int32_t),
                                     cudaMemcpyDeviceToHost,
                                     stream.get()));
       CUDF_CUDA_TRY(cudaMemcpyAsync(block.ids() + block.n,
-                                    s.candidates->ids.data() + at,
+                                    w.candidates->ids.data() + at,
                                     count * sizeof(std::int64_t),
                                     cudaMemcpyDeviceToHost,
                                     stream.get()));
       CUDF_CUDA_TRY(cudaMemcpyAsync(block.codes() + block.n,
-                                    s.candidates->distances.data() + at,
+                                    w.candidates->distances.data() + at,
                                     count * sizeof(float),
                                     cudaMemcpyDeviceToHost,
                                     stream.get()));
@@ -4575,11 +4583,11 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       at += take;
     }
     stream.sync();
-    s.pairs_moved += s.pending;
-    ++s.pair_moves;
-    s.pending = 0;
+    w.pairs_moved += w.pending;
+    ++w.pair_moves;
+    w.pending = 0;
     rollback();
-    if (dbg) { s.host_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
+    if (dbg) { w.host_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
   }
 
   // The task's end: every row's bound is final once the last pairs have moved, and each piece's
@@ -4589,33 +4597,33 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     move_pairs_to_host();
     auto const piece = std::clamp<std::int64_t>(
       static_cast<std::int64_t>(device_room() / kFlushBytesPerPair),
-      std::min<std::int64_t>(std::int64_t{1} << 16, s.candidates->capacity()),
-      std::min(kBackPiecePairs, s.candidates->capacity()));
+      std::min<std::int64_t>(std::int64_t{1} << 16, w.candidates->capacity()),
+      std::min(kBackPiecePairs, w.candidates->capacity()));
     std::int64_t filled = 0;
     auto flush_piece    = [&] {
       if (filled == 0) { return; }
-      s.pending    = filled;
-      s.pairs_back = filled;
+      w.pending    = filled;
+      w.pairs_back = filled;
       rollback();
       flush();
       filled = 0;
     };
-    while (!s.host_pairs.empty()) {
-      auto const& block = s.host_pairs.front();
+    while (!w.host_pairs.empty()) {
+      auto const& block = w.host_pairs.front();
       for (std::int64_t at = 0; at < block.n;) {
         auto const take  = std::min(block.n - at, piece - filled);
         auto const count = static_cast<std::size_t>(take);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(s.candidates->rows.data() + filled,
+        CUDF_CUDA_TRY(cudaMemcpyAsync(w.candidates->rows.data() + filled,
                                       block.rows() + at,
                                       count * sizeof(std::int32_t),
                                       cudaMemcpyHostToDevice,
                                       stream.get()));
-        CUDF_CUDA_TRY(cudaMemcpyAsync(s.candidates->ids.data() + filled,
+        CUDF_CUDA_TRY(cudaMemcpyAsync(w.candidates->ids.data() + filled,
                                       block.ids() + at,
                                       count * sizeof(std::int64_t),
                                       cudaMemcpyHostToDevice,
                                       stream.get()));
-        CUDF_CUDA_TRY(cudaMemcpyAsync(s.candidates->distances.data() + filled,
+        CUDF_CUDA_TRY(cudaMemcpyAsync(w.candidates->distances.data() + filled,
                                       block.codes() + at,
                                       count * sizeof(float),
                                       cudaMemcpyHostToDevice,
@@ -4625,7 +4633,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         filled += take;
         if (filled == piece) { flush_piece(); }
       }
-      s.host_pairs.drop_front();
+      w.host_pairs.drop_front();
     }
     flush_piece();
   }
@@ -4633,12 +4641,12 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   void make_room()
   {
     if (s.hold_codes_pairs) {
-      auto const before = s.pending;
+      auto const before = w.pending;
       hold_trim();
-      if (s.pending == before || s.pending > s.candidates->capacity() / 2) { flush(); }
+      if (w.pending == before || w.pending > w.candidates->capacity() / 2) { flush(); }
     } else if (s.pairs_to_host &&
                (s.pairs_to_host_forced ||
-                static_cast<std::size_t>(s.pending) * kFlushBytesPerPair > device_room())) {
+                static_cast<std::size_t>(w.pending) * kFlushBytesPerPair > device_room())) {
       move_pairs_to_host();
     } else {
       flush();
@@ -4651,13 +4659,13 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     while (true) {
       launch_bounded(sl);
       auto const total = read_count();
-      if (total <= s.candidates->capacity()) {
-        s.pending = total;
+      if (total <= w.candidates->capacity()) {
+        w.pending = total;
         return;
       }
-      auto const slice_pairs = total - s.pending;
+      auto const slice_pairs = total - w.pending;
       rollback();
-      if (s.pending > 0) {
+      if (w.pending > 0) {
         make_room();
         continue;
       }
@@ -4665,8 +4673,8 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       if (s.cut_large_slices && sl.n > 1 &&
           (s.slice_cuts_forced ||
            static_cast<std::size_t>(want) * kFlushBytesPerPair >
-             device_room() + static_cast<std::size_t>(s.candidates->capacity()) * 16)) {
-        ++s.slice_cuts;
+             device_room() + static_cast<std::size_t>(w.candidates->capacity()) * 16)) {
+        ++w.slice_cuts;
         auto lo = sl;
         lo.n    = sl.n / 2;
         auto hi = sl;
@@ -4682,8 +4690,8 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         replay_slice(hi);
         return;
       }
-      s.candidates.reset();
-      s.candidates.emplace(want, stream, mr);
+      w.candidates.reset();
+      w.candidates.emplace(want, stream, mr);
     }
   }
 
@@ -4695,16 +4703,16 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     if (group.empty()) { return; }
     launch_deferred();
     auto total = read_count();
-    if (total > s.candidates->capacity()) {
+    if (total > w.candidates->capacity()) {
       rollback();
       for (auto const& sl : group) {
         replay_slice(sl);
       }
-      total = s.pending;
+      total = w.pending;
     }
-    s.pending = total;
+    w.pending = total;
     group.clear();
-    if (s.pairs_to_host_forced || s.pending > s.candidates->capacity() / 2) { make_room(); }
+    if (s.pairs_to_host_forced || w.pending > w.candidates->capacity() / 2) { make_room(); }
   }
 
   void release_staged(staged_vector_chunk& chunk)
@@ -4957,7 +4965,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       } else {
         seed_bound();
       }
-      s.candidates.emplace(
+      w.candidates.emplace(
         std::max<std::int64_t>({std::int64_t{1} << 22,
                                 4 * n_left * k_join,
                                 s.f16_list_no_seed ? n_left * s.running_bound_rows * 5 / 4 : 0}),
@@ -4971,14 +4979,14 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       }
       if (dbg && s.seed) {
         std::string per_stretch;
-        for (auto const p : s.stretch_pairs) {
+        for (auto const p : w.stretch_pairs) {
           per_stretch += " " + std::to_string(p);
         }
         std::fprintf(stderr,
                      "[vecjoin-phase] sweep 0: %lld pairs passed, %lld merges, %zu stretches:%s\n",
-                     static_cast<long long>(s.bounded_emitted),
-                     static_cast<long long>(s.bounded_merges),
-                     s.stretch_pairs.size(),
+                     static_cast<long long>(w.bounded_emitted),
+                     static_cast<long long>(w.bounded_merges),
+                     w.stretch_pairs.size(),
                      per_stretch.c_str());
       }
       phase("nearest-cluster sweep");
@@ -5032,7 +5040,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         code_limits(s.bound->data(), s.certain_limit->data(), true);
       }
       // A radius join's buffer only has to amortize the flush that appends it to the result.
-      s.candidates.emplace(radius_join
+      w.candidates.emplace(radius_join
                              ? std::int64_t{1} << 22
                              : std::max<std::int64_t>(std::int64_t{1} << 22, 4 * n_left * k_join),
                            stream,
@@ -5054,7 +5062,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                              std::min<std::int64_t>(vss::kNearestTaskProbes, nearest - e)),
                            offsets[c]});
         }
-        s.scanned_pairs += n_rows * nearest;
+        w.scanned_pairs += n_rows * nearest;
       }
       rmm::device_uvector<vss::nearest_task> device_tasks(tasks.size(), stream, mr);
       // From a pageable vector, so the copy has completed when the call returns.
@@ -5264,7 +5272,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       auto const queries_view =
         raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
           routed_queries->data(), m, dim);
-      s.scanned_pairs += slice_rows * m;
+      w.scanned_pairs += slice_rows * m;
       // Neighbour ids come back local to the slice; the slice's own start in corpus row
       // space is the base that makes them corpus row ids, exactly as the chunk offset does
       // in the exhaustive fold.
@@ -5316,7 +5324,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         }
         if (s.running_bound_rows > 0) {
           for (std::int64_t o = 0; o < slice_rows;) {
-            auto const n = std::min(slice_rows - o, s.running_piece - s.since_merge);
+            auto const n = std::min(slice_rows - o, w.running_piece - w.since_merge);
             auto piece   = sl;
             piece.x      = static_cast<std::byte const*>(sl.x) + o * dim * (s.f16_bounded ? 2 : 1);
             piece.x_sq   = static_cast<std::byte const*>(sl.x_sq) + o * 4;
@@ -5324,20 +5332,20 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
             piece.id_base += o;
             if (piece.id_map != nullptr) { piece.id_map += o; }
             launch_bounded(piece);
-            ++s.bounded_launches;
-            s.bounded_padded += ((n + 127) / 128) * ((m + 127) / 128);
+            ++w.bounded_launches;
+            w.bounded_padded += ((n + 127) / 128) * ((m + 127) / 128);
             group.push_back(piece);
             o += n;
-            s.since_merge += n;
-            if (s.since_merge >= s.running_piece) {
+            w.since_merge += n;
+            if (w.since_merge >= w.running_piece) {
               check_group();
               if (s.hold_codes_pairs) {
                 hold_trim();
               } else {
                 flush();
               }
-              s.since_merge   = 0;
-              s.running_piece = std::min<std::int64_t>(2 * s.running_piece, std::int64_t{1} << 22);
+              w.since_merge   = 0;
+              w.running_piece = std::min<std::int64_t>(2 * w.running_piece, std::int64_t{1} << 22);
             } else if (group.size() >= s.bounded_group) {
               check_group();
             }
@@ -5349,8 +5357,8 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         } else {
           launch_bounded(sl);
         }
-        ++s.bounded_launches;
-        s.bounded_padded += ((slice_rows + 127) / 128) * ((m + 127) / 128);
+        ++w.bounded_launches;
+        w.bounded_padded += ((slice_rows + 127) / 128) * ((m + 127) / 128);
         group.push_back(sl);
         if (group.size() >= s.bounded_group) { check_group(); }
         continue;
@@ -5523,7 +5531,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     // round is a few launches, not one per bounded_group clusters (10k probes, 4,096 clusters:
     // 16 checks a round, each reading the buffer's fill back).
     for (auto const& round : stretches) {
-      auto const emitted_before = s.bounded_emitted;
+      auto const emitted_before = w.bounded_emitted;
       std::int64_t group_pairs  = 0;  // the group's pairs, were every one to pass
       for (auto const& piece : round) {
         if (joins_group(piece.m, piece.n)) {
@@ -5531,18 +5539,18 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         } else {
           launch_bounded(piece);
         }
-        ++s.bounded_launches;
-        s.bounded_padded += ((piece.n + 127) / 128) * ((piece.m + 127) / 128);
+        ++w.bounded_launches;
+        w.bounded_padded += ((piece.n + 127) / 128) * ((piece.m + 127) / 128);
         group.push_back(piece);
         group_pairs += piece.m * piece.n;
-        if (group.size() >= s.bounded_group && group_pairs > s.candidates->capacity() - s.pending) {
+        if (group.size() >= s.bounded_group && group_pairs > w.candidates->capacity() - w.pending) {
           check_group();
           group_pairs = 0;
         }
       }
       check_group();
       flush();
-      if (dbg) { s.stretch_pairs.push_back(s.bounded_emitted - emitted_before); }
+      if (dbg) { w.stretch_pairs.push_back(w.bounded_emitted - emitted_before); }
     }
   }
 
@@ -5556,7 +5564,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     kept.clear();
     if (s.any_bounded) {
       check_group();
-      if (s.host_pairs.empty()) {
+      if (w.host_pairs.empty()) {
         flush();
       } else {
         bring_pairs_back();
@@ -5572,21 +5580,21 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         std::fprintf(stderr,
                      "[vecjoin-phase] bounded: %lld pairs passed, %lld merges, %lld launches, "
                      "%lld 128x128 tiles; re-score %.3f s, take/merge %.3f s\n",
-                     static_cast<long long>(s.bounded_emitted),
-                     static_cast<long long>(s.bounded_merges),
-                     static_cast<long long>(s.bounded_launches),
-                     static_cast<long long>(s.bounded_padded),
-                     s.rescore_seconds,
-                     s.take_seconds);
-        if (s.pair_moves > 0 || s.slice_cuts > 0 || s.budget_flushes > 0) {
+                     static_cast<long long>(w.bounded_emitted),
+                     static_cast<long long>(w.bounded_merges),
+                     static_cast<long long>(w.bounded_launches),
+                     static_cast<long long>(w.bounded_padded),
+                     w.rescore_seconds,
+                     w.take_seconds);
+        if (w.pair_moves > 0 || w.slice_cuts > 0 || w.budget_flushes > 0) {
           std::fprintf(stderr,
                        "[vecjoin-phase] pairs to host: %lld moves, %lld pairs, %lld slice cuts, "
                        "%lld flushes past the budget, %.3f s\n",
-                       static_cast<long long>(s.pair_moves),
-                       static_cast<long long>(s.pairs_moved),
-                       static_cast<long long>(s.slice_cuts),
-                       static_cast<long long>(s.budget_flushes),
-                       s.host_seconds);
+                       static_cast<long long>(w.pair_moves),
+                       static_cast<long long>(w.pairs_moved),
+                       static_cast<long long>(w.slice_cuts),
+                       static_cast<long long>(w.budget_flushes),
+                       w.host_seconds);
         }
         if (s.f16_bounded) {
           auto const l = vss::f16_filter_launch_counts();
@@ -5608,18 +5616,18 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
             "[vecjoin-phase] gap re-score: %lld of %lld candidates re-scored (trim %.3f s); "
             "row-stretches %llu: %llu under 2k, %llu trimmed at m=2, %llu at m=4, %llu "
             "fall back; the m-rule would re-score %llu\n",
-            static_cast<long long>(s.gap_rescored),
-            static_cast<long long>(s.bounded_emitted),
-            s.trim_seconds,
-            s.gap_stats.rows,
-            s.gap_stats.short_rows,
-            s.gap_stats.m2_rows,
-            s.gap_stats.m4_rows,
-            s.gap_stats.fallback_rows,
-            s.gap_stats.literal_rescored);
+            static_cast<long long>(w.gap_rescored),
+            static_cast<long long>(w.bounded_emitted),
+            w.trim_seconds,
+            w.gap_stats.rows,
+            w.gap_stats.short_rows,
+            w.gap_stats.m2_rows,
+            w.gap_stats.m4_rows,
+            w.gap_stats.fallback_rows,
+            w.gap_stats.literal_rescored);
         }
       }
-      if (s.gap_stats_on) { vss::add_gap_rescore_totals(s.gap_stats); }
+      if (s.gap_stats_on) { vss::add_gap_rescore_totals(w.gap_stats); }
       if (s.sqrt_at_end && !radius_join) {
         vss::sqrt_in_place(st.acc_distances->mutable_view().data<float>(), n_left * k_join, stream);
       }
@@ -5645,7 +5653,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     // it from one that pruned hard. This is what a test can assert on.
     auto const exhaustive_pairs = n_left * _op._right_total_rows;
     if (_op._sirius_ctx != nullptr) {
-      _op._sirius_ctx->record_vector_join_prune(static_cast<std::uint64_t>(s.scanned_pairs),
+      _op._sirius_ctx->record_vector_join_prune(static_cast<std::uint64_t>(w.scanned_pairs),
                                                 static_cast<std::uint64_t>(exhaustive_pairs),
                                                 s.needed_chunks.size(),
                                                 _op._chunk_cluster_runs.size());
@@ -5659,15 +5667,16 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                    static_cast<long>(s.n_probes),
                    s.needed_chunks.size(),
                    _op._chunk_cluster_runs.size(),
-                   static_cast<long long>(s.scanned_pairs),
+                   static_cast<long long>(w.scanned_pairs),
                    static_cast<long long>(exhaustive_pairs),
                    exhaustive_pairs == 0 ? 0.0
-                                         : 100.0 * static_cast<double>(s.scanned_pairs) /
+                                         : 100.0 * static_cast<double>(w.scanned_pairs) /
                                              static_cast<double>(exhaustive_pairs));
     }
   }
 
   block_state::search_state& s;
+  block_state::search_run& w;
   bool dbg;
   std::chrono::steady_clock::time_point phase_t0;
   // The gather buffers: a slice's probe rows as its search reads them.
