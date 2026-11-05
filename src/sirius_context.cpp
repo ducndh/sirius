@@ -2174,11 +2174,16 @@ RebindQueryInfo SiriusContext::OnFinalizePrepare(ClientContext& context,
     // PreparedStatementData. On a runtime GPU failure PhysicalSiriusExecution runs
     // it on a private Executor in the same transaction. It's collector-free here —
     // exactly what GetResultCollector expects at execute time.
-    auto cpu_fallback   = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
-    cpu_fallback->types = prepared.types;
-    cpu_fallback->names = prepared.names;
-    cpu_fallback->properties    = prepared.properties;
-    cpu_fallback->physical_plan = std::move(prepared.physical_plan);
+    // A plan with no CPU form stashes nothing, so a runtime failure surfaces as the GPU's error
+    // rather than as the join's CPU stub refusing to run.
+    shared_ptr<PreparedStatementData> cpu_fallback;
+    if (!no_cpu_form) {
+      cpu_fallback        = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
+      cpu_fallback->types = prepared.types;
+      cpu_fallback->names = prepared.names;
+      cpu_fallback->properties    = prepared.properties;
+      cpu_fallback->physical_plan = std::move(prepared.physical_plan);
+    }
 
     // Create a new DuckDB PhysicalPlan containing our custom operator.
     auto new_physical_plan = make_uniq<PhysicalPlan>(Allocator::Get(context));
