@@ -55,10 +55,13 @@
 #include <cucascade/cudf/host_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/disk_data_representation.hpp>
+#include <cucascade/error.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 #include <fcntl.h>
 #include <unistd.h>
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -77,7 +80,8 @@ namespace sirius::op {
 namespace {
 /// A side batch or answer piece the downgrade executor took to disk has to be moved before it can
 /// be read: release the caller's read lock, bring the batch back to the host tier through the
-/// engine (in place) and return a fresh read lock on it. Batches on GPU or HOST pass through.
+/// engine (in place), or to the device if it is larger than the whole host pool, and return a
+/// fresh read lock on it. Batches on GPU or HOST pass through.
 cucascade::read_only_data_batch host_or_device_resident(
   const std::shared_ptr<cucascade::data_batch>& batch,
   cucascade::read_only_data_batch ro,
@@ -96,8 +100,18 @@ cucascade::read_only_data_batch host_or_device_resident(
     throw std::runtime_error(std::string("[sirius_physical_vector_join_materialize] ") + what +
                              " is on disk and no HOST memory space is available to restore it");
   }
+  const cucascade::memory::memory_space* target = host_space;
+  if (ctx != nullptr && sirius::pipeline::larger_than_whole_space(ro, *host_space)) {
+    int device = 0;
+    CUCASCADE_CUDA_TRY(cudaGetDevice(&device));
+    auto const gpus =
+      ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+    auto const on_device = std::find_if(
+      gpus.begin(), gpus.end(), [&](auto const* gpu) { return gpu->get_id().device_id == device; });
+    if (on_device != gpus.end()) { target = *on_device; }
+  }
   std::ignore   = cucascade::data_batch::to_idle(std::move(ro));
-  auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, host_space, stream);
+  auto prepared = sirius::pipeline::lock_and_prepare_batch(batch, target, stream);
   if (!prepared) {
     throw std::runtime_error(
       std::string("[sirius_physical_vector_join_materialize] could not restore ") + what +

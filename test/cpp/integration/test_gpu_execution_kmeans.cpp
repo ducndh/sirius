@@ -4685,6 +4685,46 @@ TEST_CASE("a threshold join in pair tasks finds what one task per probe chunk fi
   CHECK(pairs_twice(con, "pts_on") == 0);
 }
 
+TEST_CASE("a batch past the whole host pool comes back to the device when a read needs all of it",
+          "[vss][kmeans][approx][pair_tasks][isolated_context]")
+{
+  sirius::test::scratch_dir scratch{"batch_past_host"};
+  auto const disk = scratch.path() / "disk";
+  std::filesystem::create_directories(disk);
+  // Batches of about 330 MB over a 300 MB host pool, so one leaving the device goes straight to
+  // disk and cannot come back through the host. A VARCHAR output column has no read straight from
+  // the batch's file, so the whole batch has to come back. Every row is alone within the radius.
+  sirius::test::shared_test_env env(write_block_rows_yaml(scratch,
+                                                          2000000000,
+                                                          300000000,
+                                                          disk.string(),
+                                                          "      downgrade_trigger_fraction: 0.02\n"
+                                                          "      downgrade_stop_fraction: 0.01\n"));
+  auto con = env.make_connection();
+  ok_rows(
+    con,
+    "ATTACH " + scratch.file_literal("batch_past_host.db") + " AS bph (STORAGE_VERSION 'v1.4.0');");
+  ok_rows(con, "USE bph;");
+  ok_rows(con, "SET scan_task_batch_size = 335544320;");
+  std::int64_t const rows = 614400;
+  ok_rows(con,
+          "CREATE TABLE wide AS SELECT i::BIGINT AS id, 'row number ' || i AS name, "
+          "list_transform(range(128), lambda d: ((hash(i * 1000 + d) % 1000)::FLOAT / "
+          "1000.0))::FLOAT[128] AS vec FROM range(" +
+            std::to_string(rows) + ") t(i);");
+  ok_rows(con, "CHECKPOINT;");
+
+  auto result = con.Query(
+    "SELECT count(*), sum(left_id), min(left_name) FROM sirius_knn_join('wide','vec','wide','vec', "
+    "probe_source => 'scan', build_source => 'scan', join_mode => 'threshold', k => 1, eps => 0.5, "
+    "metric => 'l2', left_output_columns => ['id','name'], right_output_columns => ['id']);");
+  INFO((result->HasError() ? result->GetError() : std::string("ok")));
+  REQUIRE_FALSE(result->HasError());
+  CHECK(result->Collection().GetValue(0, 0).GetValue<std::int64_t>() == rows);
+  CHECK(result->Collection().GetValue(1, 0).GetValue<std::int64_t>() == rows * (rows - 1) / 2);
+  CHECK(result->Collection().GetValue(2, 0).ToString() == "row number 0");
+}
+
 TEST_CASE("a threshold join's count in pair tasks is the pairs one task per probe chunk finds",
           "[vss][kmeans][approx][pair_tasks][isolated_context]")
 {

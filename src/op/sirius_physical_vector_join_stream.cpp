@@ -528,11 +528,7 @@ class materialized_chunk_source : public vector_chunk_source {
     auto ro    = batch->to_read_only();
     if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
       note_read(0);
-      auto const table = sirius::get_cudf_table_view(ro);
-      auto const view  = table.column(static_cast<cudf::size_type>(_column_index));
-      // Borrowed, not owned: the reader holds the batch alive as well as locked, and `owner`
-      // stays null so the fold does not try to rebind a stream on memory it did not allocate.
-      return staged_vector_chunk{view, nullptr, nullptr, std::move(ro)};
+      return borrowed(std::move(ro));
     }
 
     // Spilled: copy just the vector column back, the rest of the batch is dead weight on the
@@ -562,6 +558,10 @@ class materialized_chunk_source : public vector_chunk_source {
         staged_vector_chunk out{view, nullptr, std::move(reservation)};
         out.buffer = std::move(buffer);
         return out;
+      }
+      if (_host_space != nullptr && pipeline::larger_than_whole_space(ro, *_host_space)) {
+        note_read(ro.get_data()->get_size_in_bytes());
+        return borrowed(device_resident(batch, std::move(ro), space, stream));
       }
       ro = host_resident(batch, std::move(ro));
     }
@@ -615,6 +615,34 @@ class materialized_chunk_source : public vector_chunk_source {
         " is no longer in the repository; the corpus must outlive every probe chunk");
     }
     return batch;
+  }
+
+  /// The vector column of a batch on the device. Borrowed, not owned: the reader holds the batch
+  /// alive as well as locked, and `owner` stays null so the fold does not try to rebind a stream on
+  /// memory it did not allocate.
+  staged_vector_chunk borrowed(cucascade::read_only_data_batch ro) const
+  {
+    auto const table = sirius::get_cudf_table_view(ro);
+    auto const view  = table.column(static_cast<cudf::size_type>(_column_index));
+    return staged_vector_chunk{view, nullptr, nullptr, std::move(ro)};
+  }
+
+  /// Brings a disk-resident build batch back to the device through the engine (in place) and
+  /// returns a fresh read lock on it; @p ro is the lock the caller held and is released first.
+  cucascade::read_only_data_batch device_resident(
+    const std::shared_ptr<cucascade::data_batch>& batch,
+    cucascade::read_only_data_batch ro,
+    const cucascade::memory::memory_space& space,
+    rmm::cuda_stream_view stream) const
+  {
+    std::ignore = cucascade::data_batch::to_idle(std::move(ro));
+    auto prepared =
+      pipeline::lock_and_prepare_batch(batch, &space, ::cuda::stream_ref{stream.get()});
+    if (!prepared) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] could not restore a disk-resident build batch");
+    }
+    return std::visit([](auto& r) { return std::move(r.ro_lock); }, *prepared);
   }
 
   /// Brings a disk-resident build batch back to the host tier through the engine (in place) and

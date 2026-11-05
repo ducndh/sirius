@@ -223,5 +223,14 @@ inline std::optional<lock_and_prepare_batch_result> lock_and_prepare_batch(
   }
 }
 
+/// Whether a batch cannot come back to @p space however long it waits: a reservation past a space's
+/// whole size is an error rather than a wait. The device takes such a batch instead.
+inline bool larger_than_whole_space(const cucascade::read_only_data_batch& ro,
+                                    const cucascade::memory::memory_space& space)
+{
+  const auto* data = ro.get_data();
+  return data != nullptr && data->get_size_in_bytes() > space.get_max_memory();
+}
+
 }  // namespace pipeline
 }  // namespace sirius
