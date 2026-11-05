@@ -443,8 +443,10 @@ constexpr std::int64_t kLabelBatch = std::int64_t{1} << 17;
 constexpr std::int64_t kSeedStride = 16;
 /// Candidates the buffer holds per row: four times what the seed leaves on average.
 constexpr std::int64_t kCandidatesPerRow = 4 * kSeedStride + 16;
-/// With fewer centroids than this there is no sample worth a second pass.
-constexpr std::int64_t kMinFilteredCentroids = 256;
+/// Below this cuVS's fused FP32 nearest is cheaper: its cost a row is nearly flat in centroids at
+/// first, and the filtered path pays it anyway to reach the seeds, then adds the bound, the FP16
+/// rows and the re-score. They cross at 700-900 centroids, from 96 to 1,536 dimensions on sm_86.
+constexpr std::int64_t kMinFilteredCentroids = 1000;
 
 int label_grid(std::int64_t n)
 {

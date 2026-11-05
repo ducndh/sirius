@@ -464,7 +464,7 @@ TEST_CASE("centroid_labeler returns the centroid at the smallest FP32 distance",
 {
   constexpr cudf::size_type dim  = 16;
   constexpr std::int64_t n_rows  = 140'000;
-  constexpr std::int64_t n_cents = 512;
+  constexpr std::int64_t n_cents = 1024;
   std::mt19937 gen(7);
   std::uniform_real_distribution<float> uniform(-1.f, 1.f);
   std::vector<float> centers(static_cast<std::size_t>(n_cents * dim));
@@ -499,17 +499,17 @@ TEST_CASE("centroid_labeler returns the centroid at the smallest FP32 distance",
 TEST_CASE("centroid_labeler ranks a batch with a value outside half's range", "[vss][kmeans]")
 {
   constexpr cudf::size_type dim  = 16;
-  constexpr std::int64_t n_cents = 256;
+  constexpr std::int64_t n_cents = 1024;
   constexpr std::int64_t n_rows  = 1'000;
   std::vector<float> centers(static_cast<std::size_t>(n_cents * dim), 0.f);
   for (std::int64_t c = 0; c < n_cents; ++c) {
-    centers[static_cast<std::size_t>(c * dim)] = 100.f * static_cast<float>(c);
+    centers[static_cast<std::size_t>(c * dim)] = 50.f * static_cast<float>(c);
   }
   std::vector<float> rows(static_cast<std::size_t>(n_rows * dim), 0.f);
   std::vector<std::int32_t> expected(static_cast<std::size_t>(n_rows));
   for (std::int64_t r = 0; r < n_rows; ++r) {
     auto const c                            = (r * 37) % n_cents;
-    rows[static_cast<std::size_t>(r * dim)] = 100.f * static_cast<float>(c) + 20.f;
+    rows[static_cast<std::size_t>(r * dim)] = 50.f * static_cast<float>(c) + 10.f;
     expected[static_cast<std::size_t>(r)]   = static_cast<std::int32_t>(c);
   }
   rows[static_cast<std::size_t>(500 * dim)] = 1e6f;
