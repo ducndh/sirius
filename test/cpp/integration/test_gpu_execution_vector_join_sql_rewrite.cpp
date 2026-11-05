@@ -1195,6 +1195,163 @@ TEST_CASE_METHOD(SqlRewriteFixture,
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
+                 "an exact radius over many probe rows answers from the differences",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // 600 probe rows, so the exhaustive search takes its GEMM screen (from 512). First rows far from
+  // the origin, as in the LATERAL case above, where the screen's own bound passes most of the table
+  // and the differences answer; then the same shape near the origin, where it screens, and the
+  // radius falls between two shells of pairs. DuckDB's array_distance is the reference for both.
+  auto const make = [&](
+                      std::string const& name, std::string const& first, std::string const& step) {
+    run_ok("CREATE TABLE " + name + " AS SELECT i::INTEGER AS id, [(" + first + " + i * " + step +
+           ")::FLOAT, (" + first + " + (i + 1) * " + step + ")::FLOAT, (" + first +
+           " + (i + 2) * " + step + ")::FLOAT]::FLOAT[3] AS vec FROM range(50000) t(i);");
+    run_ok("CREATE TABLE " + name + "_p AS SELECT id, vec FROM " + name +
+           " WHERE id >= 49000 AND id < 49600;");
+  };
+  make("sr_rfar", "0.0", "1.0");
+  make("sr_rnear", "0.0", "0.001");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_rfar', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'sr_rnear', tier => 'gpu', format => 'duckdb');");
+  require_gpu_matches_duckdb(*con,
+                             "SELECT p.id, c.id FROM sr_rfar_p p, sr_rfar c WHERE "
+                             "array_distance(p.vec, c.vec) <= 6.0;");
+  // Shells 0.001 * sqrt(3) apart: 0.0095 is between the fifth and the sixth.
+  require_gpu_matches_duckdb(*con,
+                             "SELECT p.id, c.id FROM sr_rnear_p p, sr_rnear c WHERE "
+                             "array_distance(p.vec, c.vec) <= 0.0095;");
+  run_ok("SELECT * FROM unpin_table('sr_rfar');");
+  run_ok("SELECT * FROM unpin_table('sr_rnear');");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "an exact cosine radius over many probe rows keeps near-duplicates",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite][cosine]")
+{
+  // 600 probe rows, each with four corpus rows: itself with its first component moved by k * 1e-4,
+  // k = 0..3, at cosine distances from 0 to about 1e-9, which 1 - q.x / (|q| |x|) rounds to 0 in
+  // FP32. Rows of different probes are far apart, and more such rows bring the search past the size
+  // the screen takes. The radius is read from FP64 over the rows as stored.
+  auto const row = [](std::string const& i, std::string const& k) {
+    return "list_transform(range(16), lambda d: (1.0 + (hash(" + i +
+           " * 100 + d) % 1000)::DOUBLE / 1000.0 + CASE WHEN d = 0 THEN " + k +
+           " * 0.0001 ELSE 0.0 END)::FLOAT)::FLOAT[16]";
+  };
+  run_ok("CREATE TABLE sr_rcos_p AS SELECT i::INTEGER AS id, " + row("i", "0") +
+         " AS vec FROM range(600) t(i);");
+  run_ok("CREATE TABLE sr_rcos AS SELECT (i * 4 + k)::INTEGER AS id, " + row("i", "k") +
+         " AS vec FROM range(600) t(i), range(4) u(k) UNION ALL SELECT (2400 + i)::INTEGER, " +
+         row("(i + 5000)", "0") + " FROM range(20000) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_rcos', tier => 'gpu', format => 'duckdb');");
+  struct rows_of_table {
+    std::map<int, std::array<double, 16>> by_id;
+  };
+  auto const read = [&](std::string const& table) {
+    rows_of_table out;
+    for (auto const& r : sorted_rows(*con, "SELECT id, vec FROM " + table + ";")) {
+      std::array<double, 16> v{};
+      auto const text = r.at(1);
+      std::size_t at  = text.find('[') + 1;
+      for (auto& c : v) {
+        std::size_t used = 0;
+        c                = std::stod(text.substr(at), &used);
+        at += used + 1;
+        while (at < text.size() && text[at] == ' ') {
+          ++at;
+        }
+      }
+      out.by_id[std::stoi(r.at(0))] = v;
+    }
+    return out;
+  };
+  auto const probes = read("sr_rcos_p");
+  auto const corpus = read("sr_rcos");
+  auto const cosine = [](std::array<double, 16> const& q, std::array<double, 16> const& x) {
+    double nq = 0, nx = 0;
+    for (std::size_t j = 0; j < 16; ++j) {
+      nq += q[j] * q[j];
+      nx += x[j] * x[j];
+    }
+    double s = 0;
+    for (std::size_t j = 0; j < 16; ++j) {
+      auto const e = q[j] / std::sqrt(nq) - x[j] / std::sqrt(nx);
+      s += e * e;
+    }
+    return s / 2;
+  };
+  // Between what k = 1 and k = 2 give, near each row's own value: 6e-10 for these rows.
+  double const radius = 6e-10;
+  std::set<std::pair<int, int>> must, must_not;
+  for (auto const& [p, q] : probes.by_id) {
+    for (int k = 0; k < 4; ++k) {
+      auto const id = p * 4 + k;
+      auto const d  = cosine(q, corpus.by_id.at(id));
+      if (d < radius * 0.7) { must.insert({p, id}); }
+      if (d > radius * 1.3) { must_not.insert({p, id}); }
+    }
+  }
+  REQUIRE(must.size() >= 600);
+  REQUIRE(must_not.size() >= 600);
+  std::set<std::pair<int, int>> got;
+  for (auto const& r :
+       sorted_rows(*con,
+                   "SELECT left_id, right_id FROM sirius_knn_join('sr_rcos_p','vec',"
+                   "'sr_rcos','vec', probe_source => 'scan', metric => 'cosine', "
+                   "output_type => 'distance', join_mode => 'threshold', "
+                   "eps => 6e-10);")) {
+    got.insert({std::stoi(r.at(0)), std::stoi(r.at(1))});
+  }
+  std::size_t missed = 0, extra = 0;
+  for (auto const& pair : must) {
+    missed += got.count(pair) == 0;
+  }
+  for (auto const& pair : must_not) {
+    extra += got.count(pair);
+  }
+  CHECK(missed == 0);
+  CHECK(extra == 0);
+  run_ok("SELECT * FROM unpin_table('sr_rcos');");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
+                 "an exact top-k over many probe rows answers from the differences",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // 600 probe rows, so the exhaustive search takes its GEMM screen (from 512). Rows far from the
+  // origin, where the screen's own bound passes most of each chunk and the differences answer, and
+  // the same shape near the origin, where it screens. DuckDB's array_distance is the reference.
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "brute", 1);
+  struct reset_on_exit {
+    ~reset_on_exit() { ::unsetenv("SIRIUS_VSS_ACCESS_PATH"); }
+  } reset;
+  auto const make = [&](std::string const& name, std::string const& step) {
+    run_ok("CREATE TABLE " + name + " AS SELECT i::INTEGER AS id, [(i * " + step +
+           ")::FLOAT, ((i + 1) * " + step + ")::FLOAT, ((i + 2) * " + step +
+           ")::FLOAT]::FLOAT[3] AS vec FROM range(50000) t(i);");
+    run_ok("CREATE TABLE " + name + "_p AS SELECT id, vec FROM " + name +
+           " WHERE id >= 49000 AND id < 49600;");
+  };
+  make("sr_tfar", "1.0");
+  make("sr_tnear", "0.001");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_tfar', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'sr_tnear', tier => 'gpu', format => 'duckdb');");
+  for (std::string const name : {"sr_tfar", "sr_tnear"}) {
+    // k 3: the row itself and its two neighbours, tied with each other, so the set is one answer.
+    require_gpu_matches_duckdb(*con,
+                               "SELECT p.id, n.id FROM " + name +
+                                 "_p p, LATERAL (SELECT c.id, "
+                                 "array_distance(p.vec, c.vec) AS d FROM " +
+                                 name + " c ORDER BY d LIMIT 3) n;");
+  }
+  run_ok("SELECT * FROM unpin_table('sr_tfar');");
+  run_ok("SELECT * FROM unpin_table('sr_tnear');");
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
                  "cosine ranks near-duplicates on rows normalized in FP32",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite][cosine]")
 {
