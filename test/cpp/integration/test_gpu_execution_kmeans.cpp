@@ -72,21 +72,20 @@ using KMeansFixture = sirius::test::GpuExecutionFixture;
 
 namespace {
 
-std::unique_ptr<duckdb::MaterializedQueryResult> query_ok(duckdb::Connection& con,
+std::unique_ptr<duckdb::QueryResult> query_ok(duckdb::Connection& con,
                                                           const std::string& sql)
 {
   auto r = con.Query(sql);
   REQUIRE(r);
   if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
   REQUIRE_FALSE(r->HasError());
-  return std::unique_ptr<duckdb::MaterializedQueryResult>(
-    static_cast<duckdb::MaterializedQueryResult*>(r.release()));
+  return std::unique_ptr<duckdb::QueryResult>(r.release());
 }
 
 std::int64_t scalar_i64(duckdb::Connection& con, const std::string& sql)
 {
   auto r = query_ok(con, sql);
-  return r->GetValue(0, 0).GetValue<std::int64_t>();
+  return r->Collection().GetValue(0, 0).GetValue<std::int64_t>();
 }
 
 // Sorted rows from a query that must succeed, so two result sets compare independent of the
@@ -151,11 +150,11 @@ TEST_CASE_METHOD(KMeansFixture,
                     "SELECT n_clusters, dim, train_rows, n_rows FROM sirius_kmeans_fit("
                     "'kmr_corpus','vec', name => 'kmr_c', n_clusters => 2);");
   REQUIRE(r->RowCount() == 1);
-  CHECK(r->GetValue(0, 0).GetValue<std::int64_t>() == 2);
-  CHECK(r->GetValue(1, 0).GetValue<std::int64_t>() == 3);
-  CHECK(r->GetValue(3, 0).GetValue<std::int64_t>() == 400);
+  CHECK(r->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 2);
+  CHECK(r->Collection().GetValue(1, 0).GetValue<std::int64_t>() == 3);
+  CHECK(r->Collection().GetValue(3, 0).GetValue<std::int64_t>() == 400);
   // The default sample is 256 rows per cluster, which the 400-row table cannot supply.
-  CHECK(r->GetValue(2, 0).GetValue<std::int64_t>() == 400);
+  CHECK(r->Collection().GetValue(2, 0).GetValue<std::int64_t>() == 400);
 }
 
 TEST_CASE_METHOD(KMeansFixture,
@@ -175,16 +174,16 @@ TEST_CASE_METHOD(KMeansFixture,
     query_ok(*con,
              "SELECT n_clusters, train_rows, n_rows FROM sirius_kmeans_fit('kmr_rows','vec', "
              "name => 'kmr_rows_c', rows_are_centroids => true);");
-  CHECK(fit->GetValue(0, 0).GetValue<std::int64_t>() == 150000);
-  CHECK(fit->GetValue(1, 0).GetValue<std::int64_t>() == 150000);
+  CHECK(fit->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 150000);
+  CHECK(fit->Collection().GetValue(1, 0).GetValue<std::int64_t>() == 150000);
   auto const mismatched = query_ok(
     *con,
     "SELECT count(*) FROM sirius_kmeans_centroids('kmr_rows_c') c JOIN (SELECT id, "
     "unnest(vec) AS v, generate_subscripts(vec, 1) - 1 AS d FROM kmr_rows) r ON c.cluster_id = "
     "r.id AND c.dim_index = r.d WHERE c.value <> r.v;");
-  CHECK(mismatched->GetValue(0, 0).GetValue<std::int64_t>() == 0);
+  CHECK(mismatched->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 0);
   auto const values = query_ok(*con, "SELECT count(*) FROM sirius_kmeans_centroids('kmr_rows_c');");
-  CHECK(values->GetValue(0, 0).GetValue<std::int64_t>() == 150000 * 3);
+  CHECK(values->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 150000 * 3);
 }
 
 TEST_CASE_METHOD(KMeansFixture,
@@ -1021,10 +1020,10 @@ TEST_CASE_METHOD(KMeansFixture,
     *con,
     "SELECT n_rows, n_clusters, tier, encoding FROM sirius_kmeans_build_lists('" + prefix +
       "_corpus','vec','" + prefix + "_c'" + (bytes ? "" : ", storage => 'float32'") + ");");
-  CHECK(built->GetValue(0, 0).GetValue<std::int64_t>() == 70000);
-  CHECK(built->GetValue(1, 0).GetValue<std::int64_t>() == 16);
-  CHECK(built->GetValue(2, 0).ToString() == (bytes ? std::string("gpu") : tier));
-  CHECK(built->GetValue(3, 0).ToString() == (bytes ? "uint8" : "float32"));
+  CHECK(built->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 70000);
+  CHECK(built->Collection().GetValue(1, 0).GetValue<std::int64_t>() == 16);
+  CHECK(built->Collection().GetValue(2, 0).ToString() == (bytes ? std::string("gpu") : tier));
+  CHECK(built->Collection().GetValue(3, 0).ToString() == (bytes ? "uint8" : "float32"));
 
   auto const join = [&](const std::string& extra) {
     return "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
@@ -1086,9 +1085,9 @@ TEST_CASE_METHOD(KMeansFixture,
                         "SELECT n_clusters, tier, encoding FROM sirius_kmeans_build_lists('" +
                           prefix + "_corpus','vec','" + prefix + "_c', storage => '" + storage +
                           "', tier => '" + (tier == "gpu" ? "auto" : "host") + "');");
-  CHECK(built->GetValue(0, 0).GetValue<std::int64_t>() == 1);
-  CHECK(built->GetValue(1, 0).ToString() == tier);
-  CHECK(built->GetValue(2, 0).ToString() == storage);
+  CHECK(built->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 1);
+  CHECK(built->Collection().GetValue(1, 0).ToString() == tier);
+  CHECK(built->Collection().GetValue(2, 0).ToString() == storage);
 
   auto const join = [&](const std::string& extra) {
     return "SELECT left_id, distance FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
@@ -1376,7 +1375,7 @@ lists_bytes read_lists(duckdb::Connection& con, const std::string& clustering)
         static_cast<std::byte*>(staged.data()) +
           static_cast<std::size_t>(ch * lists->chunk_rows) * row_bytes,
         stream);
-      stream.synchronize();
+      stream.sync();
     }
     out.rows = read_bytes(staged.data(), staged.size());
   }
@@ -1565,8 +1564,8 @@ TEST_CASE_METHOD(KMeansFixture,
   auto built = query_ok(
     *con,
     "SELECT encoding, exact_rows FROM sirius_kmeans_build_lists('kmu_corpus','vec','kmu_c');");
-  CHECK(built->GetValue(0, 0).ToString() == "float16");
-  CHECK(built->GetValue(1, 0).ToString() == "pin");
+  CHECK(built->Collection().GetValue(0, 0).ToString() == "float16");
+  CHECK(built->Collection().GetValue(1, 0).ToString() == "pin");
 }
 
 TEST_CASE_METHOD(KMeansFixture,
@@ -1579,8 +1578,8 @@ TEST_CASE_METHOD(KMeansFixture,
   auto bytes = query_ok(
     *con,
     "SELECT encoding, exact_rows FROM sirius_kmeans_build_lists('kma_corpus','vec','kma_c');");
-  CHECK(bytes->GetValue(0, 0).ToString() == "uint8");
-  CHECK(bytes->GetValue(1, 0).ToString() == "none");
+  CHECK(bytes->Collection().GetValue(0, 0).ToString() == "uint8");
+  CHECK(bytes->Collection().GetValue(1, 0).ToString() == "none");
   // A width the FLOAT16 filter cannot take (not a multiple of 16): FP32 rather than a refusal.
   run_ok(
     "CREATE TABLE kma_odd AS SELECT i::INTEGER AS id, list_transform(range(20), lambda d: "
@@ -1590,12 +1589,12 @@ TEST_CASE_METHOD(KMeansFixture,
   run_ok("SELECT * FROM sirius_kmeans_fit('kma_odd','vec', name => 'kma_o', n_clusters => 8);");
   auto odd =
     query_ok(*con, "SELECT encoding FROM sirius_kmeans_build_lists('kma_odd','vec','kma_o');");
-  CHECK(odd->GetValue(0, 0).ToString() == "float32");
+  CHECK(odd->Collection().GetValue(0, 0).ToString() == "float32");
   // An explicit format is still a hint the build follows.
   auto f32 = query_ok(*con,
                       "SELECT encoding FROM sirius_kmeans_build_lists('kma_corpus','vec','kma_c', "
                       "storage => 'float32');");
-  CHECK(f32->GetValue(0, 0).ToString() == "float32");
+  CHECK(f32->Collection().GetValue(0, 0).ToString() == "float32");
   run_ok("SELECT * FROM unpin_table('kma_odd');");
 }
 
@@ -1611,7 +1610,7 @@ TEST_CASE_METHOD(KMeansFixture,
     "SELECT * FROM sirius_kmeans_fit('kmrb_corpus','vec', name => 'kmrb_c', n_clusters => 2);");
   auto built =
     query_ok(*con, "SELECT encoding FROM sirius_kmeans_build_lists('kmrb_corpus','vec','kmrb_c');");
-  CHECK(built->GetValue(0, 0).ToString() == "uint8");
+  CHECK(built->Collection().GetValue(0, 0).ToString() == "uint8");
   expect_error(*con,
                "SELECT * FROM sirius_kmeans_build_lists('kmrb_corpus','vec','kmrb_c', "
                "storage => 'int8');",
@@ -1639,8 +1638,8 @@ TEST_CASE_METHOD(KMeansFixture,
   auto built = query_ok(*con,
                         "SELECT tier, encoding FROM sirius_kmeans_build_lists('kmh_corpus','vec',"
                         "'kmh_c', storage => 'float16');");
-  CHECK(built->GetValue(0, 0).ToString() == "gpu");
-  CHECK(built->GetValue(1, 0).ToString() == "float16");
+  CHECK(built->Collection().GetValue(0, 0).ToString() == "gpu");
+  CHECK(built->Collection().GetValue(1, 0).ToString() == "float16");
 
   for (auto const k : {5, 50}) {
     auto const join = [&](const std::string& extra) {
@@ -1695,7 +1694,7 @@ TEST_CASE_METHOD(
     query_ok(*con,
              "SELECT encoding FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" +
                prefix + "_c', storage => '" + (bytes ? "uint8" : "float16") + "');");
-  CHECK(built->GetValue(0, 0).ToString() == (bytes ? "uint8" : "float16"));
+  CHECK(built->Collection().GetValue(0, 0).ToString() == (bytes ? "uint8" : "float16"));
 
   // A radius around the median 10th-nearest distance: some rows have many pairs, some none.
   std::vector<double> tenth;
@@ -1807,8 +1806,8 @@ TEST_CASE_METHOD(
     query_ok(*con,
              "SELECT tier, encoding FROM sirius_kmeans_build_lists('" + prefix +
                "_corpus','vec','" + prefix + "_c', storage => '" + storage + "', tier => 'host');");
-  CHECK(built->GetValue(0, 0).ToString() == "host");
-  CHECK(built->GetValue(1, 0).ToString() == storage);
+  CHECK(built->Collection().GetValue(0, 0).ToString() == "host");
+  CHECK(built->Collection().GetValue(1, 0).ToString() == storage);
 
   auto const fetch = [&](const std::string& mode) {
     std::vector<std::pair<std::string, double>> out;
@@ -2079,7 +2078,7 @@ TEST_CASE_METHOD(KMeansFixture,
   auto built = query_ok(*con,
                         "SELECT encoding FROM sirius_kmeans_build_lists('" + prefix +
                           "_corpus','vec','" + prefix + "_c', storage => 'int8');");
-  CHECK(built->GetValue(0, 0).ToString() == "int8");
+  CHECK(built->Collection().GetValue(0, 0).ToString() == "int8");
 
   auto const fetch = [&](const std::string& mode) {
     std::vector<std::pair<std::string, double>> out;
@@ -2143,7 +2142,7 @@ TEST_CASE_METHOD(KMeansFixture,
     query_ok(*con,
              "SELECT encoding FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" +
                prefix + "_c', storage => 'float16', metric => 'cosine');");
-  CHECK(built->GetValue(0, 0).ToString() == "float16");
+  CHECK(built->Collection().GetValue(0, 0).ToString() == "float16");
 
   auto const fetch = [&](const std::string& mode) {
     std::vector<std::pair<std::string, double>> out;
@@ -2293,7 +2292,7 @@ TEST_CASE_METHOD(KMeansFixture,
   auto built = query_ok(*con,
                         "SELECT encoding FROM sirius_kmeans_build_lists('" + prefix +
                           "_corpus','vec','" + prefix + "_c', storage => '" + storage + "');");
-  CHECK(built->GetValue(0, 0).ToString() == storage);
+  CHECK(built->Collection().GetValue(0, 0).ToString() == storage);
   auto const fetch = [&](const std::string& args) {
     std::vector<std::pair<std::string, double>> out;
     for (auto const& r :
@@ -2632,7 +2631,7 @@ TEST_CASE_METHOD(KMeansFixture,
     return out;
   };
 
-  auto const* pin = ctx->get_scan_manager().find_pinned_entry("khs");
+  auto const pin = ctx->get_scan_manager().find_pinned_entry("khs");
   REQUIRE(pin != nullptr);
   auto const n_chunks = sirius::vss::pinned_column_chunk_count(*pin, "vec");
   REQUIRE(n_chunks == 3);
@@ -2659,7 +2658,7 @@ TEST_CASE_METHOD(KMeansFixture,
   }
 
   // A null row leaves the column to staging.
-  auto const* with_null = ctx->get_scan_manager().find_pinned_entry("khs_null");
+  auto const with_null = ctx->get_scan_manager().find_pinned_entry("khs_null");
   REQUIRE(with_null != nullptr);
   CHECK_FALSE(
     sirius::vss::map_pinned_rows(*with_null, "vec", 32, space, stream.view(), mr).has_value());
@@ -3360,7 +3359,7 @@ TEST_CASE_METHOD(KMeansFixture,
   REQUIRE_FALSE(gpu_spaces.empty());
   auto& space = *const_cast<cucascade::memory::memory_space*>(gpu_spaces.front());
 
-  auto const* pin = ctx->get_scan_manager().find_pinned_entry("mst");
+  auto const pin = ctx->get_scan_manager().find_pinned_entry("mst");
   REQUIRE(pin != nullptr);
   REQUIRE(pin->host_chunks.size() == 1);
   REQUIRE(pin->cache_info.column_names().at(1) == "payload");
@@ -3392,7 +3391,8 @@ TEST_CASE_METHOD(KMeansFixture,
   sirius::op::partitioned_operator_data const input(
     std::vector<std::shared_ptr<cucascade::data_batch>>{sirius::make_data_batch(
       cudf::table{std::move(pair)}, space, stream, sirius::telemetry::batch_telemetry_info{})},
-    0);
+    0,
+    sirius::op::partition_placement::unpinned(1));
 
   sirius::vss::vector_join_request request;
   request.mode                = sirius::vss::vector_join_mode::per_row_top_k;
@@ -3420,14 +3420,14 @@ TEST_CASE_METHOD(KMeansFixture,
   auto const free_blocked = space.get_available_memory();
   for (int attempt = 0; attempt < 3; ++attempt) {
     CHECK_THROWS_AS(materialize.execute(input, stream), rmm::out_of_memory);
-    stream.synchronize();
+    stream.sync();
     CHECK(space.get_available_memory() == free_blocked);
   }
 
   // With the room back the same operator finishes its init.
   blocker.reset();
   auto const output = materialize.execute(input, stream);
-  stream.synchronize();
+  stream.sync();
   auto const* out = dynamic_cast<sirius::op::pipelineable_operator_data const*>(output.get());
   REQUIRE(out != nullptr);
   auto const batches = out->get_data_batches();

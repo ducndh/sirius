@@ -517,7 +517,7 @@ void serialize_vector_join_bind_data(duckdb::Serializer& serializer,
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
-  duckdb::Deserializer& deserializer, duckdb::TableFunction& /*function*/)
+  duckdb::Deserializer& deserializer, duckdb::BoundTableFunction& /*function*/)
 {
   auto result = duckdb::make_uniq<SiriusVectorJoinBindData>();
   auto& req   = result->req;

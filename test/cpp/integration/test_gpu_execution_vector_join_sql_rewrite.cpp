@@ -51,7 +51,7 @@ std::vector<std::vector<std::string>> sorted_rows(duckdb::Connection& con, const
   if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
   REQUIRE_FALSE(r->HasError());
   auto rows = sirius::test::GpuExecutionFixture::collect_rows(
-    r->Cast<duckdb::MaterializedQueryResult>(), /*sort=*/true);
+    (*r), /*sort=*/true);
   return rows;
 }
 
@@ -619,7 +619,7 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "SELECT count(DISTINCT cluster_id) FROM "
     "sirius_kmeans_centroids('__sirius_auto_sr_fresh_vec');");
   REQUIRE_FALSE(centroids->HasError());
-  auto const n_clusters = centroids->GetValue(0, 0).GetValue<std::int64_t>();
+  auto const n_clusters = centroids->Collection().GetValue(0, 0).GetValue<std::int64_t>();
   REQUIRE(n_clusters == 63);
   auto const tvf = sorted_rows(
     *con,
@@ -676,7 +676,7 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "SELECT count(DISTINCT cluster_id) FROM "
       "sirius_kmeans_centroids('__sirius_auto_sr_count_vec');");
   REQUIRE_FALSE(centroids->HasError());
-  REQUIRE(centroids->GetValue(0, 0).GetValue<std::int64_t>() == 252);
+  REQUIRE(centroids->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 252);
   auto const two = tvf(2), three = tvf(3), four = tvf(4);
   REQUIRE_FALSE(rows_match(two, four));
   REQUIRE_FALSE(rows_match(two, three));
@@ -750,7 +750,7 @@ TEST_CASE_METHOD(SqlRewriteFixture,
   auto centroids = con->Query(
     "SELECT count(DISTINCT cluster_id) FROM sirius_kmeans_centroids('__sirius_auto_sr_c4k_vec');");
   REQUIRE_FALSE(centroids->HasError());
-  REQUIRE(centroids->GetValue(0, 0).GetValue<std::int64_t>() == 4096);
+  REQUIRE(centroids->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 4096);
   run_ok("RESET vector_join_clusters;");
 
   run_ok("SET vector_join_probes = 0.5;");
@@ -774,7 +774,7 @@ TEST_CASE_METHOD(SqlRewriteFixture,
   }
   auto const kept = con->Query("SELECT current_setting('vector_join_probes');");
   REQUIRE_FALSE(kept->HasError());
-  CHECK(kept->GetValue(0, 0).GetValue<double>() == 64.0);
+  CHECK(kept->Collection().GetValue(0, 0).GetValue<double>() == 64.0);
 
   run_ok("SET vector_join_probes = 0;");
   CHECK(probe_lines([&] { require_gpu_matches_duckdb(*con, sql); }).empty());
@@ -852,7 +852,7 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "SELECT count(DISTINCT cluster_id) FROM "
     "sirius_kmeans_centroids('__sirius_auto_codes_sr_bytes_vec');");
   REQUIRE_FALSE(centroids->HasError());
-  CHECK(centroids->GetValue(0, 0).GetValue<std::int64_t>() == 1);
+  CHECK(centroids->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 1);
 
   // An approximate join does not take the single list for its partitions: it builds its own.
   run_ok("SET vector_join_probes = 2;");
@@ -864,12 +864,12 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "SELECT count(*) FROM (SELECT p.id, n.id FROM sr_bytes_probe p, LATERAL (SELECT c.id, "
     "array_distance(p.vec, c.vec) AS d FROM sr_bytes c ORDER BY d LIMIT 5) n);");
   REQUIRE_FALSE(approx->HasError());
-  CHECK(approx->GetValue(0, 0).GetValue<std::int64_t>() == 30 * 5);
+  CHECK(approx->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 30 * 5);
   auto partitions = con->Query(
     "SELECT count(DISTINCT cluster_id) FROM "
     "sirius_kmeans_centroids('__sirius_auto_sr_bytes_vec');");
   REQUIRE_FALSE(partitions->HasError());
-  CHECK(partitions->GetValue(0, 0).GetValue<std::int64_t>() > 1);
+  CHECK(partitions->Collection().GetValue(0, 0).GetValue<std::int64_t>() > 1);
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
@@ -966,7 +966,7 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "SELECT count(DISTINCT cluster_id) FROM "
     "sirius_kmeans_centroids('__sirius_auto_codes_sr_wide16_vec');");
   REQUIRE_FALSE(codes->HasError());
-  CHECK(codes->GetValue(0, 0).GetValue<std::int64_t>() == 1);
+  CHECK(codes->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 1);
   CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, threshold); }));
   CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, lateral_ip); }));
   ::unsetenv("SIRIUS_VSS_ACCESS_PATH");
@@ -978,7 +978,7 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "SELECT count(DISTINCT cluster_id) FROM "
     "sirius_kmeans_centroids('__sirius_auto_sr_wide16_vec');");
   REQUIRE_FALSE(partitions->HasError());
-  CHECK(partitions->GetValue(0, 0).GetValue<std::int64_t>() > 1);
+  CHECK(partitions->Collection().GetValue(0, 0).GetValue<std::int64_t>() > 1);
   CHECK(fell_back([&] { require_gpu_matches_duckdb(*con, threshold); }));
 }
 

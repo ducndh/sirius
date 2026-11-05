@@ -47,7 +47,7 @@ std::vector<std::vector<std::string>> sorted_rows(duckdb::Connection& con, const
   REQUIRE(r);
   if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
   REQUIRE_FALSE(r->HasError());
-  return sirius::test::GpuExecutionFixture::collect_rows(r->Cast<duckdb::MaterializedQueryResult>(),
+  return sirius::test::GpuExecutionFixture::collect_rows((*r),
                                                          /*sort=*/true);
 }
 
@@ -234,7 +234,7 @@ TEST_CASE_METHOD(InnerProductFixture,
       "SELECT count(DISTINCT cluster_id) FROM "
       "sirius_kmeans_centroids('__sirius_auto_codes_ip_corpus_vec_ip');");
     REQUIRE_FALSE(centroids->HasError());
-    CHECK(centroids->GetValue(0, 0).GetValue<std::int64_t>() == 1);
+    CHECK(centroids->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 1);
   }
   // Under vector_join_probes the rewrite partitions the corpus inside the query (FLOAT16 lists of
   // its own, apart from an l2 join's) and routes each probe row by the inner product; with every
@@ -254,7 +254,7 @@ TEST_CASE_METHOD(InnerProductFixture,
     "SELECT count(DISTINCT cluster_id) FROM "
     "sirius_kmeans_centroids('__sirius_auto_ip_corpus_vec_ip');");
   REQUIRE_FALSE(partitions->HasError());
-  CHECK(partitions->GetValue(0, 0).GetValue<std::int64_t>() == 8);
+  CHECK(partitions->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 8);
 }
 
 TEST_CASE_METHOD(InnerProductFixture,
@@ -672,7 +672,7 @@ TEST_CASE_METHOD(InnerProductFixture,
     "SELECT count(DISTINCT cluster_id) FROM "
     "sirius_kmeans_centroids('__sirius_auto_ipa_corpus_vec_ip');");
   REQUIRE_FALSE(partitions->HasError());
-  CHECK(partitions->GetValue(0, 0).GetValue<std::int64_t>() == 16);
+  CHECK(partitions->Collection().GetValue(0, 0).GetValue<std::int64_t>() == 16);
 }
 
 TEST_CASE_METHOD(InnerProductFixture,

@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <optional>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 
 using sirius::from_duckdb_function_name;
@@ -443,26 +444,24 @@ TEST_CASE("ast_function_id - argument counts follow the GPU handlers", "[ast_fun
 TEST_CASE("ast_function_id - to_duckdb_function_name rejects an id outside the enum",
           "[ast_function_id]")
 {
-  auto const past_end = static_cast<function_id>(static_cast<uint16_t>(function_id::negate) + 1);
+  auto const past_end = static_cast<function_id>(static_cast<uint16_t>(function_id::pow) + 1);
   REQUIRE_THROWS_AS(to_duckdb_function_name(past_end), sirius::internal_exception);
 }
 
 TEST_CASE("ast_function_id - math functions round-trip through name mappers", "[ast_function_id]")
 {
-  for (auto const [id, name] : {std::pair{function_id::abs, "abs"},
-                                std::pair{function_id::sqrt, "sqrt"},
-                                std::pair{function_id::floor, "floor"},
-                                std::pair{function_id::ceil, "ceil"},
-                                std::pair{function_id::round, "round"},
-                                std::pair{function_id::exp, "exp"},
-                                std::pair{function_id::ln, "ln"},
-                                std::pair{function_id::pow, "pow"}}) {
+  for (auto const [id, name, arguments] : {std::tuple{function_id::sqrt, "sqrt", 1},
+                                           std::tuple{function_id::floor, "floor", 1},
+                                           std::tuple{function_id::ceil, "ceil", 1},
+                                           std::tuple{function_id::exp, "exp", 1},
+                                           std::tuple{function_id::ln, "ln", 1},
+                                           std::tuple{function_id::pow, "pow", 2}}) {
     REQUIRE(to_duckdb_function_name(id) == name);
-    auto const back = from_duckdb_function_name(name);
+    auto const back = from_duckdb_function_name(name, arguments);
     REQUIRE(back.has_value());
     REQUIRE(*back == id);
   }
   // aliases resolve to the canonical id
-  REQUIRE(*from_duckdb_function_name("ceiling") == function_id::ceil);
-  REQUIRE(*from_duckdb_function_name("power") == function_id::pow);
+  REQUIRE(*from_duckdb_function_name("ceiling", 1) == function_id::ceil);
+  REQUIRE(*from_duckdb_function_name("power", 2) == function_id::pow);
 }

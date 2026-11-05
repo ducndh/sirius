@@ -42,7 +42,7 @@ std::vector<std::vector<std::string>> ok_rows(duckdb::Connection& con, const std
   REQUIRE(r);
   if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
   REQUIRE_FALSE(r->HasError());
-  auto& mat = r->Cast<duckdb::MaterializedQueryResult>();
+  auto& mat = (*r);
   return sirius::test::GpuExecutionFixture::collect_rows(mat, /*sort=*/true);
 }
 
@@ -53,7 +53,7 @@ float single_float(duckdb::Connection& con, const std::string& sql)
   REQUIRE(r);
   if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
   REQUIRE_FALSE(r->HasError());
-  return r->GetValue(0, 0).GetValue<float>();
+  return r->Collection().GetValue(0, 0).GetValue<float>();
 }
 
 // Assert a query fails, and that its error mentions `needle`.
@@ -1483,9 +1483,9 @@ TEST_CASE_METHOD(VectorJoinFixture,
   REQUIRE(r);
   if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
   REQUIRE_FALSE(r->HasError());
-  auto& mat = r->Cast<duckdb::MaterializedQueryResult>();
-  REQUIRE(mat.names.size() == 1);
-  REQUIRE(mat.names[0] == "distance");
+  auto& mat = (*r);
+  REQUIRE(mat.GetNames().size() == 1);
+  REQUIRE(mat.GetNames()[0] == "distance");
   REQUIRE(sirius::test::GpuExecutionFixture::collect_rows(mat, true).size() == 200 * 3);
 
   // Each row is its own nearest neighbour, so a third of the pairs sit at distance 0.
