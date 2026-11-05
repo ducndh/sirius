@@ -21,24 +21,13 @@
 
 namespace sirius::transparent {
 
-/// \brief Pre-optimization hook that derives single-table restrictions out of OR-ed filters.
+/// \brief Pre-optimization hook that classifies the query before optimization can remove scans.
 ///
-/// For a filter `(a1 AND b1) OR (a2 AND b2) OR ...` where the branches span more than one table,
-/// every branch implies the AND of its own single-table conjuncts, so the disjunction implies the
-/// OR of those per-table restrictions. AND-ing that implied restriction onto the filter is
-/// row-preserving and lets DuckDB's own filter pushdown, join-order and build/probe-side passes
-/// push it into the base scans.
-///
-/// DuckDB has this rewrite (JoinDependentFilterRule) but only applies it when the OR is the *root*
-/// of a filter expression. Its DistributivityRule runs first and hoists the conjuncts common to
-/// every branch (for TPC-H q19: the join key, `l_shipmode IN ...`, `l_shipinstruct = ...`) into an
-/// enclosing AND; ExpressionRewriter::ApplyRules then re-runs on the rewritten node with
-/// `is_root = false`, so the surviving OR is never offered to the rule again and nothing is
-/// derived. Running the derivation here — before any built-in optimizer — sidesteps that ordering
-/// entirely; the derived conjuncts then travel through the normal pipeline.
-///
-/// Gated on the `gpu_execution` setting: it applies exactly when the user asked for GPU execution,
-/// leaving `SET gpu_execution = false` CPU baselines byte-for-byte unchanged.
+/// It decides, while every scan is still in the plan, whether the connection and statement may run
+/// on the GPU at all (see should_use_duckdb). It does not change the plan. It used to derive the
+/// single-table restrictions implied by an OR-ed multi-table filter, which DuckDB 1.5 missed for
+/// TPC-H q19; DuckDB v2's JoinDependentFilterRule derives them itself, and deriving them twice
+/// doubled the pushed filters.
 void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                                duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
 
@@ -53,11 +42,24 @@ void sirius_pre_optimizer_hook(duckdb::OptimizerExtensionInput& input,
 void sirius_optimizer_hook(duckdb::OptimizerExtensionInput& input,
                            duckdb::unique_ptr<duckdb::LogicalOperator>& plan);
 
+/// \brief Copy the cardinality estimates of every node in \p from onto the matching node in \p to.
+///
+/// Walks both trees in lockstep and copies \c estimated_cardinality and
+/// \c has_estimated_cardinality. A node whose type or child count differs from its counterpart is
+/// left untouched along with its subtree.
+///
+/// \param from  The tree to read estimates from.
+/// \param to    The tree to write estimates to.
+/// \return      True if the two trees have the same shape, false if any subtree was skipped.
+bool copy_cardinality_estimates(duckdb::LogicalOperator const& from, duckdb::LogicalOperator& to);
+
 /// \brief Copy a logical plan for Sirius's transparent execution path.
 ///
-/// Wraps \c duckdb::LogicalOperator::Copy. Serialization omits DuckDB join-filter metadata, but
-/// Sirius discovers targets from plan structure and does not consume that metadata. The original
-/// plan remains unchanged for CPU fallback.
+/// Wraps \c duckdb::LogicalOperator::Copy and then copies the cardinality estimates, which
+/// serialization omits, with \c copy_cardinality_estimates. Verified Parquet bind data is copied
+/// directly to preserve its pruned file inventory. Serialization also omits DuckDB
+/// join-filter metadata, but Sirius discovers targets from plan structure and does not consume
+/// that metadata. The original plan remains unchanged for CPU fallback.
 ///
 /// \param plan     The plan to copy. Not consumed.
 /// \param context  DuckDB client context for \c LogicalOperator::Copy.

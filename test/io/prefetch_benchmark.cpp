@@ -38,7 +38,6 @@
 #include <cudf/io/text/byte_range_info.hpp>
 #include <cudf/table/table.hpp>
 
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/stream_pool.hpp>
 #include <glob.h>
@@ -109,13 +108,13 @@ std::vector<std::string> glob_parquet_files(std::string const& dir, std::size_t 
 // shim or ownership transfer is needed.  Stream is synchronised before
 // returning so the caller may safely discard the table immediately.
 std::unique_ptr<cudf::table> parse_parquet(sirius::io::sirius_datasource& ds,
-                                           rmm::cuda_stream_view stream)
+                                           ::cuda::stream_ref stream)
 {
   auto opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds})
                 .column_names(COLUMNS)
                 .build();
   auto result = cudf::io::read_parquet(opts, stream);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   return std::move(result.tbl);
 }
 
@@ -186,7 +185,9 @@ void run_prefetch(std::vector<file_info>& files,
   auto t0 = clock_type::now();
   for (std::size_t k = 0; k < files.size(); ++k) {
     auto const refusal = files[k].ds->prefetch_async(
-      [k, &files, &streams, &total_rows, &done, &disp, &io_ok, &io_not_ok](bool ok) noexcept {
+      [k, &files, &streams, &total_rows, &done, &disp, &io_ok, &io_not_ok](
+        sirius::io::cache::prefetch_result result) noexcept {
+        bool const ok = result.ok;
         if (ok) {
           io_ok.fetch_add(1, std::memory_order_relaxed);
         } else {

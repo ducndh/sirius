@@ -26,12 +26,11 @@
 #include "log/logging.hpp"
 #include "scan_manager/config.hpp"
 
-#include <cudf/io/datasource.hpp>
-
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <exception>
 #include <memory>
@@ -41,6 +40,122 @@
 #include <utility>
 
 namespace sirius::io {
+
+namespace {
+
+bool same_object_store_config(object_store_config const& lhs, object_store_config const& rhs)
+{
+  return lhs.endpoint == rhs.endpoint && lhs.region == rhs.region &&
+         lhs.access_key == rhs.access_key && lhs.secret_key == rhs.secret_key &&
+         lhs.session_token == rhs.session_token && lhs.s3_transport == rhs.s3_transport &&
+         lhs.s3_signing_mode == rhs.s3_signing_mode && lhs.ca_bundle_path == rhs.ca_bundle_path &&
+         lhs.tls_verify == rhs.tls_verify;
+}
+
+std::size_t hash_object_store_config(object_store_config const& config)
+{
+  std::size_t hash = 0;
+  auto combine = [&](std::size_t value) { hash ^= value + 0x9e3779b9 + (hash << 6) + (hash >> 2); };
+  auto add_string = [&](std::string const& value) { combine(std::hash<std::string>{}(value)); };
+  add_string(config.endpoint);
+  add_string(config.region);
+  add_string(config.access_key);
+  add_string(config.secret_key);
+  add_string(config.session_token);
+  combine(std::hash<int>{}(static_cast<int>(config.s3_transport)));
+  combine(std::hash<int>{}(static_cast<int>(config.s3_signing_mode)));
+  add_string(config.ca_bundle_path);
+  combine(std::hash<bool>{}(config.tls_verify));
+  return hash;
+}
+
+std::string canonicalize_scheme(std::string_view path)
+{
+  std::string canonical{path};
+  auto const delimiter = canonical.find("://");
+  if (delimiter == std::string::npos) { return canonical; }
+  for (std::size_t i = 0; i < delimiter; ++i) {
+    canonical[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(canonical[i])));
+  }
+  return canonical;
+}
+
+}  // namespace
+
+std::optional<std::uint64_t> scoped_object_store_configs::install(std::string_view path,
+                                                                  object_store_config config)
+{
+  std::string scope   = canonicalize_scheme(path);
+  auto const wildcard = scope.find_first_of("*?[");
+  if (wildcard != std::string::npos) {
+    auto const slash = scope.rfind('/', wildcard);
+    scope = slash == std::string::npos ? scope.substr(0, wildcard) : scope.substr(0, slash + 1);
+  }
+  if (scope.empty()) return std::nullopt;
+  auto snapshot_config   = std::make_shared<const object_store_config>(std::move(config));
+  auto const config_hash = hash_object_store_config(*snapshot_config);
+  std::lock_guard lk{_mtx};
+  auto const scope_it = _scope_ids.find(scope);
+  auto const old_id =
+    scope_it == _scope_ids.end() ? std::nullopt : std::optional<std::uint64_t>{scope_it->second};
+  if (old_id && same_object_store_config(*_snapshots.at(*old_id).value.config, *snapshot_config)) {
+    return std::nullopt;
+  }
+
+  auto new_id        = std::uint64_t{0};
+  auto config_ids_it = _config_ids_by_hash.find(config_hash);
+  if (config_ids_it != _config_ids_by_hash.end()) {
+    for (auto candidate_id : config_ids_it->second) {
+      auto const& candidate = _snapshots.at(candidate_id).value;
+      if (same_object_store_config(*candidate.config, *snapshot_config)) {
+        new_id = candidate_id;
+        break;
+      }
+    }
+  }
+  if (new_id == 0) {
+    new_id = _next_id++;
+    _snapshots.emplace(
+      new_id, stored_snapshot{snapshot{new_id, std::move(snapshot_config)}, 0, config_hash});
+    _config_ids_by_hash[config_hash].push_back(new_id);
+  }
+  if (old_id && *old_id == new_id) return std::nullopt;
+  _scope_ids[std::move(scope)] = new_id;
+  ++_snapshots.at(new_id).scope_refs;
+
+  if (!old_id) return std::nullopt;
+  auto& old_snapshot = _snapshots.at(*old_id);
+  if (--old_snapshot.scope_refs != 0) return std::nullopt;
+  auto const old_hash = old_snapshot.config_hash;
+  _snapshots.erase(*old_id);
+  auto hash_it = _config_ids_by_hash.find(old_hash);
+  if (hash_it != _config_ids_by_hash.end()) {
+    auto& ids = hash_it->second;
+    ids.erase(std::remove(ids.begin(), ids.end(), *old_id), ids.end());
+    if (ids.empty()) _config_ids_by_hash.erase(hash_it);
+  }
+  return old_id;
+}
+
+std::optional<scoped_object_store_configs::snapshot> scoped_object_store_configs::resolve(
+  std::string_view path) const
+{
+  std::lock_guard lk{_mtx};
+  auto canonical = canonicalize_scheme(path);
+  auto candidate = std::string_view{canonical};
+  while (!candidate.empty()) {
+    auto it = _scope_ids.find(candidate);
+    if (it != _scope_ids.end()) return _snapshots.at(it->second).value;
+    if (candidate.back() == '/') {
+      candidate.remove_suffix(1);
+      continue;
+    }
+    auto const slash = candidate.rfind('/');
+    if (slash == std::string_view::npos) break;
+    candidate = candidate.substr(0, slash + 1);
+  }
+  return std::nullopt;
+}
 
 namespace {
 
@@ -67,23 +182,6 @@ cucascade::memory::fixed_size_host_memory_resource* first_host_resource(
   auto host_spaces = rm.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
   if (host_spaces.empty()) { return nullptr; }
   return host_spaces.front()->get_memory_resource_of<cucascade::memory::Tier::HOST>();
-}
-
-/// Reactors for the local-disk path: the configured count, or with none configured one per
-/// 16 GiB of the host memory space, between the built-in default and 4. A buffered read from the
-/// page cache is a copy on the reactor's thread, so one reactor caps a pin's reads at one core's
-/// copy rate; each reactor also holds a fixed 64 MiB of pinned staging, which a small host pool
-/// cannot spare. Deep10M pinned on the GPU (3.35 GB read, RTX A5000, 140 GB host pool): 1 reactor
-/// 0.47 s, 4 reactors 0.23 s, 8 reactors 0.22 s, with 16 batches in flight.
-std::size_t uring_reactor_count(const scan_manager::scan_manager_config& config,
-                                cucascade::memory::memory_reservation_manager& rm)
-{
-  if (config.uring_n_reactors_explicit) { return config.uring_n_reactors; }
-  auto host_spaces = rm.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-  if (host_spaces.empty()) { return config.uring_n_reactors; }
-  constexpr std::size_t bytes_per_reactor = std::size_t{16} << 30;
-  auto const by_memory = host_spaces.front()->get_max_memory() / bytes_per_reactor;
-  return std::clamp<std::size_t>(by_memory, config.uring_n_reactors, 4);
 }
 
 /// Build a SigV4 authorizer from the object-store credentials, or nullptr when
@@ -137,8 +235,7 @@ factory_type make_uring_ioctx_factory(
       }
       // One reactor_context shares config and the pinned staging resource.
       auto ctx = std::make_shared<uring::uring_reactor::reactor_context>(config.uring, host_mr);
-      return std::make_shared<uring::uring_ioctx>(uring_reactor_count(config, reservation_manager),
-                                                  std::move(ctx));
+      return std::make_shared<uring::uring_ioctx>(config.uring_n_reactors, std::move(ctx));
     } catch (const std::exception& e) {
       SIRIUS_LOG_ERROR("make_uring_ioctx_factory: construction failed: {}", e.what());
       return nullptr;
@@ -239,10 +336,16 @@ std::optional<io_context_type> io_context_registry::lookup_path(
 
 std::shared_ptr<ioctx> io_context_registry::make_ioctx(io_context_type type) const noexcept
 {
+  return make_ioctx(type, _config);
+}
+
+std::shared_ptr<ioctx> io_context_registry::make_ioctx(io_context_type type,
+                                                       const config_type& config) const noexcept
+{
   std::shared_lock lk{_mtx};
   auto it = _entries.find(type);
   if (it == _entries.end()) return nullptr;
-  return it->second.factory(_config);
+  return it->second.factory(config);
 }
 
 void io_context_registry::clear()

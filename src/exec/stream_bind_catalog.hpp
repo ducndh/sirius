@@ -21,9 +21,11 @@
 #include "exec/stream_session.hpp"
 #include "op/sirius_physical_streaming_source.hpp"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -39,11 +41,14 @@ struct stream_input_binding {
 
   /// Back-pointer into the engine-owned plan; filled during planning for session registration.
   op::sirius_physical_streaming_source* built = nullptr;
+
+  /// Reported to the optimizer as the scan's cardinality. nullopt keeps DuckDB's default of 1.
+  std::optional<std::uint64_t> estimated_rows;
 };
 
 /// Per-connection declared input streams. ClientContextState so DuckDB bind can resolve schema
-/// before physical planning. Multiple fragments may share one connection at once (e.g. chained
-/// via relay_from), each owning a disjoint set of ids — see clear() vs erase() below.
+/// before physical planning. A fragment declares its ids for the duration of its build() and
+/// erases only those, so fragments sharing a connection never wipe each other's ids.
 class stream_bind_catalog : public duckdb::ClientContextState {
  public:
   static constexpr const char* kStateKey = "sirius_stream_catalog";
@@ -52,10 +57,6 @@ class stream_bind_catalog : public duckdb::ClientContextState {
   /// @throws sirius::invalid_input_exception on null repository, names/types size mismatch, or
   ///         empty names.
   void declare(stream_id_t id, stream_input_binding binding);
-
-  /// Drop every declaration on this connection. Only safe when the caller owns the whole
-  /// catalog; a fragment sharing a connection must use erase() so it cannot wipe a peer's ids.
-  void clear();
 
   /// Drop one declaration. No-op when `id` was never declared, so teardown paths can call it
   /// unconditionally.

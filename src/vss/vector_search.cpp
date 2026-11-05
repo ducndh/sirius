@@ -59,7 +59,7 @@ void restore_native_carriers(std::vector<std::unique_ptr<cudf::column>>& cols,
   auto const n = std::min(cols.size(), native_types.size());
   for (std::size_t j = 0; j < n; ++j) {
     if (cols[j] == nullptr) { continue; }
-    auto const native = sirius::get_cudf_type(native_types[j]);
+    auto const native = sirius::require_cudf_type(native_types[j]);
     // Only widen a genuinely-narrowed carrier; leave native columns and any type we can't
     // safely widen back (e.g. non-numeric) untouched. cast_through_rep handles DATE, which a
     // plain cudf::cast cannot restore from its narrowed integer carrier.
@@ -114,7 +114,7 @@ std::unique_ptr<cucascade::host_data_representation> run_vector_search(
   // OWNING: pin_owner is kept alive for the whole search below (vector_search_context::pin
   // binds to it), so a concurrent unpin on another connection cannot invalidate it mid-search.
   auto pin_owner = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
-    req.catalog, req.schema, req.table_name);
+    req.catalog, req.schema, req.table_name, req.table_identity);
   const auto* pin = pin_owner.get();
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
     throw duckdb::InvalidInputException("sirius_knn_search: table '" + req.table_name +

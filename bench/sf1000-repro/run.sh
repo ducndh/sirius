@@ -20,6 +20,7 @@ NAME="${NAME:-sf1000_repro}"
 export SIRIUS_EXP_LATE_MAT="${SIRIUS_EXP_LATE_MAT:-1}"
 export SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS="${SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS:-c_custkey,n_name,n_nationkey}"
 export SIRIUS_EXP_FUSED_SCAN_FILTER="${SIRIUS_EXP_FUSED_SCAN_FILTER:-1}"
+export SIRIUS_EXP_LOWCARD_GROUPBY="${SIRIUS_EXP_LOWCARD_GROUPBY:-1}"
 
 [ -d "$DATA" ] || { echo "ERROR: no SF1000 parquet at $DATA (set DATA=)"; exit 1; }
 
@@ -55,10 +56,12 @@ echo "plans     : $PLANS"
 echo "config    : $CFG"
 echo "late-mat  : SIRIUS_EXP_LATE_MAT=$SIRIUS_EXP_LATE_MAT SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS=$SIRIUS_EXP_LATE_MAT_PIN_UNIQUE_COLS"
 echo "fused scan: SIRIUS_EXP_FUSED_SCAN_FILTER=$SIRIUS_EXP_FUSED_SCAN_FILTER"
+echo "lowcard gb: SIRIUS_EXP_LOWCARD_GROUPBY=$SIRIUS_EXP_LOWCARD_GROUPBY"
 echo
 
 cd "$REPO"
 python3 test/tpch_performance/performance_test.py \
   --input "$DATA" \
+  --scale-factor 1000 \
   --mode grouped --iterations 3 --engine gpu --pin host \
   --queries 1-22 --config "$CFG" --name "$NAME"

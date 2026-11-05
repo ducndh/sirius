@@ -69,7 +69,7 @@ std::unique_ptr<cudf::column> make_test_column(cudf::data_type type,
     column = cudf::make_fixed_width_column(type, size, cudf::mask_state::UNALLOCATED, stream, mr);
   } else {
     auto null_mask = cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr);
-    auto* mask     = static_cast<cudf::bitmask_type*>(null_mask.data());
+    auto* mask     = reinterpret_cast<cudf::bitmask_type*>(null_mask.data());
     cudf::size_type null_count = 0;
     for (cudf::size_type row = 0; row < size; ++row) {
       if (!valid[static_cast<std::size_t>(row)]) {
@@ -866,7 +866,7 @@ TEST_CASE("pin-time native type records the declared mapping, not the decoded ca
   auto const declared = duckdb::LogicalType::DECIMAL(15, 2);
   auto const decoded  = cudf::data_type{cudf::type_id::DECIMAL128, -2};
 
-  auto const plan_time_native = sirius::try_get_cudf_type(sirius::from_duckdb(declared));
+  auto const plan_time_native = sirius::get_cudf_type(sirius::from_duckdb(declared));
   require_decimal_type(plan_time_native, cudf::type_id::DECIMAL64, -2);
 
   REQUIRE(sirius::pin_native_type(decoded, &declared) == *plan_time_native);

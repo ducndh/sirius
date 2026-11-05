@@ -48,7 +48,6 @@
 
 #include "exec/scoped_dispatcher.hpp"
 #include "exec/thread_pool.hpp"
-#include "io/cache/config.hpp"
 #include "io/sirius_datasource.hpp"
 #include "io/uring/uring_ioctx.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -65,11 +64,9 @@
 
 #include <rmm/device_buffer.hpp>
 
-#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <cucascade/memory/stream_pool.hpp>
 #include <glob.h>
-#include <log/logging.hpp>
 #include <log/spdlog_owning_sink.hpp>
 
 #include <algorithm>
@@ -145,13 +142,13 @@ std::vector<std::string> glob_parquet_files(std::string const& dir, std::size_t 
 // shim or ownership transfer is needed.  Stream is synchronised before
 // returning so the caller may safely discard the table immediately.
 std::unique_ptr<cudf::table> parse_parquet(sirius::io::sirius_datasource& ds,
-                                           rmm::cuda_stream_view stream)
+                                           ::cuda::stream_ref stream)
 {
   auto opts = cudf::io::parquet_reader_options::builder(cudf::io::source_info{&ds})
                 .column_names(COLUMNS)
                 .build();
   auto result = cudf::io::read_parquet(opts, stream);
-  cudaStreamSynchronize(stream.value());
+  cudaStreamSynchronize(stream.get());
   return std::move(result.tbl);
 }
 

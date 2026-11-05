@@ -1,6 +1,6 @@
 # cuDF (libcudf) — Module Reference
 
-**Version**: 26.04+ (with 25.04 backward compatibility via `CUDF_VERSION_NUM` macro)
+**Version**: 26.10 (project pin)
 **Location**: `/home/felipe/miniconda3/envs/libcudf-env/include/cudf/`
 **Namespace**: `cudf`
 **Build Integration**: Linked via CMake as `cudf::cudf`
@@ -50,17 +50,8 @@ We use **19 of 25** modules. Primary integration points:
 
 ## Version Compatibility
 
-Sirius handles cuDF API differences between 25.04 and 26.04+ via a version macro:
-```cpp
-#include <cudf/version_config.hpp>
-#define CUDF_VERSION_NUM (CUDF_VERSION_MAJOR * 100 + CUDF_VERSION_MINOR)
-```
-
-Key version differences:
-- **Join headers**: Unified `cudf/join.hpp` in ≤25.04, split into `cudf/join/*.hpp` in 26.04+
-- **Aggregation headers**: `cudf/aggregation.hpp` in ≤25.04, split headers in 26.04+
-- **Stream compaction**: Detail API access patterns differ
-- **Reduction**: `distinct_count` moved to `cudf/reduction/distinct_count.hpp` in 26.04+
+The main Sirius build targets cuDF 26.10 and no longer carries 25.04 or 26.08 API fallbacks.
+Version checks are retained only where behavior or APIs differ in cuDF 26.12 and later.
 
 ## Files That Reference cuDF
 
@@ -71,9 +62,6 @@ Key version differences:
 | `src/cuda/cudf/cudf_groupby.cu` | aggregation, stream_compaction | `groupby`, aggregation factories |
 | `src/cuda/cudf/cudf_orderby.cu` | sorting, copying | `sorted_order`, `gather` |
 | `src/cuda/cudf/cudf_aggregate.cu` | aggregation | Reduction aggregation |
-| `src/expression_executor/specializations/gpu_execute_operator.cpp` | unary_binary, search | `binary_operation`, `cast` |
-| `src/expression_executor/specializations/gpu_execute_comparison.cpp` | unary_binary, scalar | `binary_operation`, scalar construction |
-| `src/expression_executor/specializations/gpu_execute_function.cpp` | strings, unary_binary, scalar, datetime | String functions, type casting |
 | `src/expression_executor/gpu_expression_translator.cpp` | ast, types | AST tree construction |
 | `src/op/sirius_physical_hash_join.cpp` | join, copying, unary_binary | `hash_join`, `gather`, `cast` |
 | `src/op/sirius_physical_nested_loop_join.cpp` | join, ast, copying | `conditional_join`, AST expressions |

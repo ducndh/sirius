@@ -125,6 +125,8 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type)
     case SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM: return "VECTOR_JOIN_STREAM";
     case SiriusPhysicalOperatorType::VECTOR_JOIN_REDUCE_LOCAL: return "VECTOR_JOIN_REDUCE_LOCAL";
     case SiriusPhysicalOperatorType::VECTOR_JOIN_MATERIALIZE: return "VECTOR_JOIN_MATERIALIZE";
+    case SiriusPhysicalOperatorType::BUILD_FILTER: return "BUILD_FILTER";
+    case SiriusPhysicalOperatorType::REPLICATE: return "REPLICATE";
     case SiriusPhysicalOperatorType::INVALID: break;
   }
   return "INVALID";

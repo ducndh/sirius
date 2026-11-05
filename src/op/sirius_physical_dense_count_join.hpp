@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
@@ -34,9 +35,9 @@ namespace sirius::op {
  * every position: batch `i` belongs to the preserved input exactly when `i < preserved_count()`.
  *
  * The batches are one partition of each side. A partition index is carried only when the operator
- * produced more than one partition: an indexed task is pinned to `_active_gpu_ids[idx % size]` so
- * every task of a partition shares a device, while a single-partition task has no such constraint
- * and is better placed by data affinity.
+ * produced more than one partition: an indexed task is pinned to the partition's device in the
+ * exchange's placement so every task of a partition shares a device, while a single-partition task
+ * has no such constraint and is better placed by data affinity.
  */
 class dense_count_join_input : public partitioned_operator_data {
  public:
@@ -56,17 +57,28 @@ class dense_count_join_input : public partitioned_operator_data {
    *
    * @param preserved_batches Batches from the outer-join-preserved input
    * @param counted_batches Batches from the input whose matches contribute to COUNT
-   * @param partition_idx Partition these batches came from; pins the task to one GPU
+   * @param partition_idx Partition these batches came from
+   * @param placement Placement of the exchange; pins the task to the partition's GPU
    */
   dense_count_join_input(std::vector<std::shared_ptr<::cucascade::data_batch>> preserved_batches,
                          std::vector<std::shared_ptr<::cucascade::data_batch>> counted_batches,
-                         std::size_t partition_idx);
+                         std::size_t partition_idx,
+                         partition_placement const& placement);
 
   /** @brief Number of leading batches that belong to the preserved input. */
   [[nodiscard]] std::size_t preserved_count() const noexcept { return _preserved_count; }
 
   /** @brief Number of trailing batches that belong to the counted input. */
   [[nodiscard]] std::size_t counted_count() const noexcept { return _counted_count; }
+
+  /**
+   * @brief Keeps both side counts and the partition identity; see
+   * `pipelineable_operator_data::with_batches_preserving_rows`
+   *
+   * @throws std::invalid_argument if @p batches does not hold exactly one replacement per batch
+   */
+  [[nodiscard]] std::unique_ptr<pipelineable_operator_data> with_batches_preserving_rows(
+    std::vector<std::shared_ptr<::cucascade::data_batch>> batches) const override;
 
  private:
   std::size_t _preserved_count;
@@ -218,8 +230,7 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
    * @param in What the sizing partition measured, including both siblings' byte totals
    * @return The partition count to apply to both input PARTITIONs
    */
-  [[nodiscard]] partition_strategy get_partition_strategy(
-    const partition_sizing_input& in) override;
+  [[nodiscard]] partition_strategy get_partition_strategy(const partition_sizing_input& in);
 
   /**
    * @brief Estimate a conservative first-run peak across all execution strategies
@@ -259,6 +270,9 @@ class sirius_physical_dense_count_join : public sirius_physical_partition_consum
   }
 
  private:
+  /// Consumer-owned sizing target; batch-only receivers have no sizing configuration.
+  uint64_t _hash_partition_bytes = config::DEFAULT_HASH_PARTITION_BYTES;
+
   /// Number of partitions decided by get_partition_strategy, mirrored from the input repositories.
   /// One until sizing runs.
   [[nodiscard]] std::size_t partition_count() const;

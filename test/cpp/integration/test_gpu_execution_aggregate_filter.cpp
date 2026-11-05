@@ -14,185 +14,320 @@
  * limitations under the License.
  */
 
-// Aggregates with a FILTER clause on the GPU path. Before the planner rewrite these ran with the
-// predicate hoisted into a projection and then ignored, so count(*) FILTER (WHERE c) returned the
-// unfiltered count with no error.
-
-#include "duckdb/main/config.hpp"
+// GPU-vs-CPU correctness for the aggregate FILTER (WHERE ...) clause. The planner rewrites each
+// filtered aggregate input to CASE WHEN filter THEN input ELSE NULL END below the aggregate and
+// lowers count(*) FILTER to count(mask), so these cases prove the mask-to-null lowering on the
+// real GPU path: every compare_gpu_vs_cpu query runs once on the GPU with a no-fallback
+// assertion and once on DuckDB CPU, then compares results. Rejected shapes (DISTINCT other than
+// COUNT(DISTINCT), and first, with FILTER) are asserted to take the plan-time transparent CPU
+// fallback instead.
 
 #include <catch.hpp>
-#include <duckdb.hpp>
-#include <utils/sirius_test_env.hpp>
+#include <utils/dynamic_filter_test_utils.hpp>
+#include <utils/gpu_execution_fixture.hpp>
+#include <utils/scoped_sirius_setting.hpp>
 #include <utils/transparent_execution_test_utils.hpp>
 
-#include <filesystem>
-#include <memory>
-#include <set>
 #include <string>
-#include <system_error>
 
 namespace {
 
-void require_ok(duckdb::Connection& con, const std::string& sql)
-{
-  auto result = con.Query(sql);
-  REQUIRE(result);
-  if (result->HasError()) { UNSCOPED_INFO(result->GetError()); }
-  REQUIRE_FALSE(result->HasError());
-}
-
-std::string sql_string_literal(const std::string& value)
-{
-  std::string escaped = "'";
-  for (char c : value) {
-    if (c == '\'') { escaped += '\''; }
-    escaped += c;
-  }
-  return escaped + "'";
-}
-
-class AggregateFilterFixture {
+// `x` is dense (each residue 0-99 appears 10 times), `xn` is NULL exactly where x = 50,
+// `g` is the group key and contains a NULL group, `d`/`s` cover the DECIMAL and VARCHAR
+// aggregate paths.
+class AggFilterFixture : public sirius::test::GpuExecutionFixture {
  public:
-  AggregateFilterFixture()
+  AggFilterFixture()
   {
-    REQUIRE(sirius::test::g_integration_env != nullptr);
-    if (!sirius::test::g_integration_env->is_active()) {
-      sirius::test::g_integration_env->resume();
-    }
-    con = std::make_unique<duckdb::Connection>(sirius::test::g_integration_env->make_connection());
-    require_ok(*con, "SET enable_duckdb_fallback = false");
-    // The shared database's optimizer mask is DB-global and an earlier test can leave it
-    // cleared; DuckDB's compressed materialization then rewrites these small-range columns into
-    // shapes the GPU plan does not translate. Pin the mask Sirius publishes at load for this
-    // fixture, the way the pipeline-conversion fixtures do, and restore it afterwards.
-    auto& disabled = duckdb::DBConfig::GetConfig(*con->context).options.disabled_optimizers;
-    original_disabled_optimizers = disabled;
-    disabled.insert(duckdb::OptimizerType::COMPRESSED_MATERIALIZATION);
-    // The shared environment's database is in-memory and the GPU scan reads a database
-    // file's block manager, so the table is written to a file by a plain DuckDB instance
-    // (Sirius is disabled for secondary instances) and attached read-only, as the TPC-H
-    // fixtures attach their prebuilt file.
-    db_path = std::filesystem::temp_directory_path() / "sirius_aggregate_filter_test.db";
-    std::error_code ec;
-    std::filesystem::remove(db_path, ec);
-    std::filesystem::remove(db_path.string() + ".wal", ec);
-    {
-      duckdb::DuckDB file_db(db_path.string());
-      duckdb::Connection writer(file_db);
-      require_ok(writer,
-                 "CREATE TABLE af AS "
-                 "SELECT CAST(i % 13 AS INTEGER) AS g, "
-                 "       CASE WHEN i % 11 = 0 THEN NULL ELSE CAST(i AS BIGINT) END AS v, "
-                 "       CAST(i % 5 AS DOUBLE) AS d "
-                 "FROM range(50000) AS t(i)");
-      require_ok(writer, "CHECKPOINT");
-    }
-    require_ok(*con, "ATTACH '" + db_path.string() + "' AS afdb (READ_ONLY)");
-    require_ok(*con, "USE afdb");
+    run_ok(
+      "CREATE TABLE agg_f AS SELECT"
+      "  CAST(range % 100 AS INTEGER)             AS x,"
+      "  CAST(NULLIF(range % 100, 50) AS INTEGER) AS xn,"
+      "  CAST(NULLIF(range % 4, 3) AS INTEGER)    AS g,"
+      "  CAST(range % 100 AS DECIMAL(10,2))       AS d,"
+      "  concat('s', range % 100)                 AS s "
+      "FROM range(1000);");
+    run_ok("CREATE TABLE marks(y INTEGER);");
+    run_ok("INSERT INTO marks VALUES (1),(2),(NULL);");
+    run_ok("CREATE TABLE agg_nulls(g INTEGER, v INTEGER, keep BOOLEAN);");
+    run_ok(
+      "INSERT INTO agg_nulls VALUES (1,1,true),(1,NULL,true),(1,2,true),"
+      "(1,100,false),(1,200,NULL),(2,NULL,true),(2,300,false),"
+      "(3,400,false),(3,500,NULL);");
+    run_ok("CREATE TABLE agg_empty(g INTEGER, v INTEGER, keep BOOLEAN);");
+    run_ok("CHECKPOINT;");
   }
 
-  ~AggregateFilterFixture()
+  /// Rejected FILTER shapes decline at plan time: assert exactly one transparent fallback
+  /// (no rebind, no GPU execution) and that the fallback result matches a plain CPU run.
+  void expect_plan_fallback_and_compare(const std::string& query)
   {
-    if (con) {
-      duckdb::DBConfig::GetConfig(*con->context).options.disabled_optimizers =
-        original_disabled_optimizers;
-      con->Query("USE memory");
-      con->Query("DETACH afdb");
-    }
-    std::error_code ec;
-    std::filesystem::remove(db_path, ec);
-    std::filesystem::remove(db_path.string() + ".wal", ec);
-  }
-
-  // The same statement through transparent GPU execution (asserted to have run on the GPU via
-  // the execution counters) and through DuckDB, compared value for value.
-  void compare(const std::string& query)
-  {
-    require_ok(*con, "SET gpu_execution = true");
+    con->Query("SET gpu_execution = true;");
     auto before = sirius::test::get_transparent_execution_stats(*con);
-    auto gpu    = con->Query(query);
-    REQUIRE(gpu);
-    if (gpu->HasError()) { UNSCOPED_INFO(gpu->GetError()); }
-    REQUIRE_FALSE(gpu->HasError());
-    auto after = sirius::test::get_transparent_execution_stats(*con);
-    sirius::test::require_transparent_execution_delta(before, after, 1, 0, 1);
+    auto result = con->Query(query);
+    auto after  = sirius::test::get_transparent_execution_stats(*con);
+    REQUIRE(result);
+    if (result->HasError()) { UNSCOPED_INFO("execution error: " << result->GetError()); }
+    REQUIRE_FALSE(result->HasError());
+    sirius::test::require_transparent_execution_delta(before, after, 0, 1, 0);
 
-    require_ok(*con, "SET gpu_execution = false");
-    auto cpu = con->Query(query);
-    require_ok(*con, "SET gpu_execution = true");
-    REQUIRE(cpu);
-    REQUIRE_FALSE(cpu->HasError());
-    REQUIRE(gpu->RowCount() == cpu->RowCount());
-    REQUIRE(gpu->ColumnCount() == cpu->ColumnCount());
-    for (duckdb::idx_t r = 0; r < cpu->RowCount(); ++r) {
-      for (duckdb::idx_t c = 0; c < cpu->ColumnCount(); ++c) {
-        UNSCOPED_INFO("row " << r << " col " << c);
-        REQUIRE(gpu->GetValue(c, r).ToString() == cpu->GetValue(c, r).ToString());
-      }
-    }
+    con->Query("SET gpu_execution = false;");
+    auto cpu_result = con->Query(query);
+    con->Query("SET gpu_execution = true;");
+    REQUIRE(cpu_result);
+    REQUIRE_FALSE(cpu_result->HasError());
+
+    auto rows     = collect_rows(*result);
+    auto cpu_rows = collect_rows(*cpu_result);
+    REQUIRE(rows == cpu_rows);
   }
-
-  std::unique_ptr<duckdb::Connection> con;
-  std::filesystem::path db_path;
-  std::set<duckdb::OptimizerType> original_disabled_optimizers;
 };
 
 }  // namespace
 
-TEST_CASE_METHOD(AggregateFilterFixture,
-                 "aggregate FILTER - ungrouped count(*)/count/sum/min/max/avg",
-                 "[integration][gpu_execution][aggregate][filter]")
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution ungrouped FILTER on all supported aggregates",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
 {
-  compare(
-    "SELECT count(*) FILTER (WHERE v > 25000) AS c_star, "
-    "       count(v) FILTER (WHERE g = 3) AS c_v, "
-    "       sum(v) FILTER (WHERE g IN (1, 2)) AS s, "
-    "       min(v) FILTER (WHERE g = 7) AS mn, "
-    "       max(v) FILTER (WHERE g = 7) AS mx, "
-    "       avg(d) FILTER (WHERE v IS NOT NULL) AS a "
-    "FROM af");
+  // The x=50 rows pass with NULL xn, so count(*) includes them and count(xn) skips them. Unfiltered
+  // aggregates prove the mask stays local to the filtered inputs.
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FILTER (WHERE x <= 50), count(xn) FILTER (WHERE x <= 50),"
+    "       sum(x) FILTER (WHERE x <= 50), min(x) FILTER (WHERE x <= 50),"
+    "       max(x) FILTER (WHERE x <= 50), avg(x) FILTER (WHERE x <= 50),"
+    "       count(*), sum(x) "
+    "FROM agg_f");
 }
 
-TEST_CASE_METHOD(AggregateFilterFixture,
-                 "aggregate FILTER - grouped, mixed with unfiltered aggregates",
-                 "[integration][gpu_execution][aggregate][filter]")
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution grouped FILTER on all supported aggregates with a NULL group key",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
 {
-  compare(
-    "SELECT g, count(*) AS n, count(*) FILTER (WHERE v > 25000) AS n_hi, "
-    "       sum(v) FILTER (WHERE d > 2) AS s_d, sum(v) AS s "
-    "FROM af GROUP BY g ORDER BY g");
+  compare_gpu_vs_cpu(
+    "SELECT g, count(*) FILTER (WHERE x <= 50), count(xn) FILTER (WHERE x <= 50),"
+    "       sum(x) FILTER (WHERE x <= 50), min(x) FILTER (WHERE x <= 50),"
+    "       max(x) FILTER (WHERE x <= 50), avg(x) FILTER (WHERE x <= 50),"
+    "       count(*) "
+    "FROM agg_f GROUP BY g");
 }
 
-TEST_CASE_METHOD(AggregateFilterFixture,
-                 "aggregate FILTER - predicate that matches no row and one that matches all",
-                 "[integration][gpu_execution][aggregate][filter]")
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution FILTER with a NULL-containing predicate masks NULL out",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
 {
-  // Predicates statistics cannot fold: a filter the optimizer proves constant becomes a
-  // constant CASE, and two of those in one projection hit a pre-existing translation gap
-  // that has nothing to do with FILTER (the same query with explicit CASE fails the same way).
-  compare(
-    "SELECT count(*) FILTER (WHERE v % 7 = 99) AS none, sum(v) FILTER (WHERE v % 7 = 99) AS "
-    "s_none, "
-    "       count(*) FILTER (WHERE g % 1 = 0) AS all_rows FROM af");
+  // xn is NULL where x = 50, so `xn % 2 = 0` is three-valued: TRUE passes, FALSE and NULL
+  // must both mask out.
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FILTER (WHERE xn % 2 = 0), sum(x) FILTER (WHERE xn % 2 = 0) FROM agg_f");
+  compare_gpu_vs_cpu(
+    "SELECT g, count(*) FILTER (WHERE xn % 2 = 0), sum(x) FILTER (WHERE xn % 2 = 0) "
+    "FROM agg_f GROUP BY g");
 }
 
-TEST_CASE_METHOD(AggregateFilterFixture,
-                 "avg over a nullable column divides by the non-NULL count",
-                 "[integration][gpu_execution][aggregate][filter]")
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution FILTER with a mark-join subquery predicate",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
 {
-  // v is NULL on every 11th row. Before the fix the ungrouped avg divided by the row count.
-  compare("SELECT avg(v) AS a, avg(v) FILTER (WHERE g < 6) AS af, avg(d) AS ad FROM af");
-  compare("SELECT g, avg(v) AS a, avg(v) FILTER (WHERE d > 1) AS af FROM af GROUP BY g ORDER BY g");
+  // The NULL in marks makes non-matching IN results NULL (mark-join three-valued output).
+  // Only the single-subquery shape is covered: two IN subqueries in one query plan two MARK
+  // joins, which aborts on a pre-existing hash-join scheduling bug ("MARK join must run in
+  // BUILD_PROBE mode" in refresh_cross_schedule) unrelated to the FILTER lowering.
+  compare_gpu_vs_cpu("SELECT count(*) FILTER (WHERE x IN (SELECT y FROM marks)) FROM agg_f");
 }
 
-TEST_CASE_METHOD(AggregateFilterFixture,
-                 "aggregate FILTER - unsupported aggregate is declined, not silently unfiltered",
-                 "[integration][gpu_execution][aggregate][filter]")
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution FILTER with an empty qualifying set",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
 {
-  // string_agg keeps every input; there is no NULL-skipping rewrite for it, so with fallback off
-  // the statement must fail rather than return the unfiltered aggregate.
-  require_ok(*con, "SET gpu_execution = true");
-  auto gpu = con->Query("SELECT string_agg(CAST(g AS VARCHAR), ',') FILTER (WHERE g < 2) FROM af");
-  REQUIRE(gpu);
-  REQUIRE(gpu->HasError());
+  // The predicates below are false on every row but not provably false from column statistics,
+  // so the mask column really evaluates on the GPU (a stats-foldable predicate like x < 0 takes
+  // scalar-mask path instead -- covered by the next case).
+  // Ungrouped: xn is NULL exactly where x = 50, so no row passes -> count 0, sum NULL.
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FILTER (WHERE xn IS NULL AND x < 50),"
+    "       sum(x) FILTER (WHERE xn IS NULL AND x < 50) FROM agg_f");
+  // Grouped: x < 1 passes only on multiples of 100, which all land in group 0, so groups
+  // 1, 2, and NULL have zero passing rows and must still emit 0 / NULL.
+  compare_gpu_vs_cpu(
+    "SELECT g, count(*) FILTER (WHERE x < 1), sum(x) FILTER (WHERE x < 1) "
+    "FROM agg_f GROUP BY g");
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution constant-folded FILTER runs on GPU",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  // Statistics propagation folds x < 0 to FALSE; CASE broadcasts scalar masks on GPU.
+  compare_gpu_vs_cpu(
+    "SELECT count(*) FILTER (WHERE x < 0), sum(x) FILTER (WHERE x < 0) FROM agg_f");
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution FILTER on VARCHAR and DECIMAL aggregate inputs",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  compare_gpu_vs_cpu(
+    "SELECT min(s) FILTER (WHERE x < 50), max(s) FILTER (WHERE x < 50) FROM agg_f");
+  compare_gpu_vs_cpu(
+    "SELECT sum(d) FILTER (WHERE x < 50), avg(d) FILTER (WHERE x < 50) FROM agg_f");
+  compare_gpu_vs_cpu(
+    "SELECT g, sum(d) FILTER (WHERE x < 50), avg(d) FILTER (WHERE x < 50) "
+    "FROM agg_f GROUP BY g");
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution rejected FILTER shapes take the plan-time CPU fallback",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  expect_plan_fallback_and_compare("SELECT sum(DISTINCT x) FILTER (WHERE x < 50) FROM agg_f");
+  expect_plan_fallback_and_compare("SELECT first(x) FILTER (WHERE x = 42) FROM agg_f");
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution COUNT(DISTINCT) FILTER on several columns and types",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  // Every value repeats, so DISTINCT changes each count. xn % 2 = 0 is NULL where x = 50, which
+  // must mask out. The unfiltered COUNT(DISTINCT x) proves the mask stays local.
+  for (bool grouped : {false, true}) {
+    compare_gpu_vs_cpu(std::string("SELECT ") + (grouped ? "g, " : "") +
+                       "count(DISTINCT x) FILTER (WHERE x < 50), "
+                       "count(DISTINCT xn) FILTER (WHERE x <= 50), "
+                       "count(DISTINCT s) FILTER (WHERE x % 3 = 0), "
+                       "count(DISTINCT d) FILTER (WHERE xn % 2 = 0), count(DISTINCT x) "
+                       "FROM agg_f" +
+                       (grouped ? " GROUP BY g" : ""));
+  }
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution COUNT(DISTINCT) FILTER is 0 when no non-NULL value passes",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  // In agg_nulls group 2 passes only a NULL value and group 3 passes no row. The distinct count
+  // shares its masked input with the other aggregates filtered on keep.
+  for (bool grouped : {false, true}) {
+    for (auto const* table : {"agg_nulls", "agg_empty"}) {
+      compare_gpu_vs_cpu(std::string("SELECT ") + (grouped ? "g, " : "") +
+                         "count(DISTINCT v) FILTER (WHERE keep), count(v) FILTER (WHERE keep), "
+                         "sum(v) FILTER (WHERE keep), count(DISTINCT v) FILTER (WHERE NOT keep) "
+                         "FROM " +
+                         table + (grouped ? " GROUP BY g" : ""));
+    }
+  }
+  for (auto group : {2, 3}) {
+    compare_gpu_vs_cpu("SELECT count(DISTINCT v) FILTER (WHERE keep) FROM agg_nulls WHERE g = " +
+                       std::to_string(group));
+  }
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution COUNT(DISTINCT) FILTER with a NOT IN subquery (TPC-Havoc Q16_V07)",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  // HAVING repeats the filtered aggregate, so the plan has two MARK joins.
+  compare_gpu_vs_cpu(
+    "SELECT g, count(DISTINCT x) FILTER (WHERE x NOT IN (SELECT y FROM marks WHERE y IS NOT NULL)) "
+    "FROM agg_f GROUP BY g "
+    "HAVING count(DISTINCT x) FILTER (WHERE x NOT IN (SELECT y FROM marks WHERE y IS NOT NULL)) "
+    "> 24");
+  // The NULL in marks makes NOT IN FALSE or NULL on every row, so every count is 0.
+  compare_gpu_vs_cpu(
+    "SELECT g, count(DISTINCT x) FILTER (WHERE x NOT IN (SELECT y FROM marks)) FROM agg_f "
+    "GROUP BY g");
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution COUNT(DISTINCT) FILTER merges sets across batches",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  // Each (g, v) pair repeats 150000 rows later, in another batch, so the merge must union the
+  // sets. Only the first rows pass i < 100000, so later batches contribute empty or NULL sets.
+  run_ok(
+    "CREATE TABLE agg_big AS SELECT i, (i % 150000)::INTEGER v, (i % 150000 % 7)::INTEGER g "
+    "FROM range(300000) r(i);");
+  run_ok("CHECKPOINT;");
+  sirius::test::scoped_setting const scan_batch{*con, "scan_task_batch_size", 65536};
+  for (bool grouped : {false, true}) {
+    compare_gpu_vs_cpu(std::string("SELECT ") + (grouped ? "g, " : "") +
+                       "count(DISTINCT v) FILTER (WHERE i < 100000), "
+                       "count(DISTINCT v) FILTER (WHERE v % 3 = 0), count(DISTINCT v) "
+                       "FROM agg_big" +
+                       (grouped ? " GROUP BY g" : ""));
+  }
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution shared FILTER inputs preserve passing NULLs and empty groups",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  for (bool grouped : {false, true}) {
+    compare_gpu_vs_cpu(std::string("SELECT ") + (grouped ? "g, " : "") +
+                       "sum(v) FILTER (WHERE keep), min(v) FILTER (WHERE keep), "
+                       "max(v) FILTER (WHERE keep), avg(v) FILTER (WHERE keep), "
+                       "count(v) FILTER (WHERE keep), count(*) FILTER (WHERE keep), "
+                       "count(v) FILTER (WHERE NOT keep), sum(v) FILTER (WHERE NOT keep) "
+                       "FROM agg_nulls" +
+                       (grouped ? " GROUP BY g" : ""));
+  }
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution shared FILTER predicates preserve NULL inputs and empty groups",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  auto current = con->Query("SELECT current_setting('disabled_optimizers')");
+  REQUIRE(current);
+  REQUIRE_FALSE(current->HasError());
+  auto disabled = current->Collection().GetValue(0, 0).ToString();
+  if (!disabled.empty()) { disabled += ","; }
+  disabled += "common_subexpressions";
+  // Exercise Sirius predicate sharing even when DuckDB has not already projected the predicate.
+  sirius::test::scoped_sirius_setting guard(
+    *con, "disabled_optimizers", std::string_view(disabled));
+
+  for (bool grouped : {false, true}) {
+    for (auto const* table : {"agg_nulls", "agg_empty"}) {
+      compare_gpu_vs_cpu(
+        std::string("SELECT ") + (grouped ? "g, " : "") +
+        "sum(v) FILTER (WHERE keep OR v < 0), min(g) FILTER (WHERE keep OR v < 0), "
+        "count(v) FILTER (WHERE keep OR v < 0), count(*) FILTER (WHERE keep OR v < 0), "
+        "sum(v) FILTER (WHERE NOT keep), count(*) FILTER (WHERE NOT keep), count(*), sum(v) "
+        "FROM " +
+        table + (grouped ? " GROUP BY g" : ""));
+    }
+    compare_gpu_vs_cpu(std::string("SELECT ") + (grouped ? "g, " : "") +
+                       "sum(d) FILTER (WHERE x <= 50), min(s) FILTER (WHERE x <= 50), "
+                       "max(xn) FILTER (WHERE x <= 50), count(xn) FILTER (WHERE x <= 50), "
+                       "count(*) FILTER (WHERE x <= 50), sum(x) FROM agg_f" +
+                       (grouped ? " GROUP BY g" : ""));
+  }
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution FILTER over a truly empty on-disk table",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  for (bool grouped : {false, true}) {
+    compare_gpu_vs_cpu(std::string("SELECT ") + (grouped ? "g, " : "") +
+                       "sum(v) FILTER (WHERE keep), min(v) FILTER (WHERE keep), "
+                       "max(v) FILTER (WHERE keep), avg(v) FILTER (WHERE keep), "
+                       "count(v) FILTER (WHERE keep), count(*) FILTER (WHERE keep) "
+                       "FROM agg_empty" +
+                       (grouped ? " GROUP BY g" : ""));
+  }
+}
+
+TEST_CASE_METHOD(AggFilterFixture,
+                 "gpu_execution shared FILTER reductions with all-NULL or all-failing inputs",
+                 "[integration][gpu_execution][aggregate][aggregate_filter]")
+{
+  for (auto group : {2, 3}) {
+    compare_gpu_vs_cpu(
+      "SELECT sum(v) FILTER (WHERE keep), min(v) FILTER (WHERE keep), "
+      "max(v) FILTER (WHERE keep), avg(v) FILTER (WHERE keep), "
+      "count(v) FILTER (WHERE keep), count(*) FILTER (WHERE keep) "
+      "FROM agg_nulls WHERE g = " +
+      std::to_string(group));
+  }
 }

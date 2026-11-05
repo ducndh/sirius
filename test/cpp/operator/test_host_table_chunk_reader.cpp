@@ -32,9 +32,6 @@
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-// duckdb
-#include <duckdb/common/types/timestamp.hpp>
-
 // rmm
 #include <rmm/cuda_stream.hpp>
 
@@ -172,7 +169,10 @@ void apply_null_mask(cudf::column& column,
     cudf::clear_bit_unsafe(host_mask.data(), idx);
   }
 
-  rmm::device_buffer mask_buffer(host_mask.data(), bytes, stream, mr);
+  auto mask_buffer =
+    cudf::create_null_mask(column.size(), cudf::mask_state::UNINITIALIZED, stream, mr);
+  cudaMemcpyAsync(
+    mask_buffer.data(), host_mask.data(), bytes, cudaMemcpyHostToDevice, stream.get());
   column.set_null_mask(std::move(mask_buffer), static_cast<cudf::size_type>(null_rows.size()));
 }
 
@@ -353,7 +353,7 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
     REQUIRE(reader.get_next_chunk(chunk));
 
     auto const count = static_cast<size_t>(chunk.size());
-    REQUIRE(chunk.GetCapacity() == static_cast<duckdb::idx_t>(count));
+    REQUIRE(count == std::min<size_t>(STANDARD_VECTOR_SIZE, num_rows - row_base));
     auto* int32_data = duckdb::FlatVector::GetData<int32_t>(chunk.data[0]);
     auto* int64_data = duckdb::FlatVector::GetData<int64_t>(chunk.data[1]);
     auto* str_data   = duckdb::FlatVector::GetData<duckdb::string_t>(chunk.data[2]);
@@ -609,7 +609,8 @@ TEST_CASE("host_table_chunk_reader converts TIMESTAMP_SECONDS and TIMESTAMP_NS t
       read_timestamp_chunks(con, sirius_ctx, batch, duckdb::LogicalType::TIMESTAMP, stream);
     REQUIRE(values.size() == nanos.size());
     REQUIRE(values[0].value == 873431589000000LL);
-    REQUIRE(values[1].value == 1);
+    // DuckDB v2 rounds nanoseconds to the nearest microsecond.
+    REQUIRE(values[1].value == 2);
     REQUIRE(values[2].value == -2);
   }
 }

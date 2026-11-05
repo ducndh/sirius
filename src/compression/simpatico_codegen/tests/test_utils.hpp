@@ -8,13 +8,17 @@
 #include <cudf/types.hpp>
 
 #include <rmm/device_buffer.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+#include <rmm/resource_ref.hpp>
 
+#include <cuda/memory_resource>
 #include <cuda/stream>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -61,6 +65,37 @@ inline std::unique_ptr<cudf::table> make_int64_table(int num_cols, int num_rows,
                    host.size() * sizeof(std::int64_t),
                    cudaMemcpyHostToDevice) != cudaSuccess)
       throw std::runtime_error("make_int64_table: cudaMemcpy failed");
+    cols.push_back(std::move(col));
+  }
+  return std::make_unique<cudf::table>(std::move(cols));
+}
+
+// DECIMAL128, the only 16-byte dtype the codegen path supports.
+//
+// The values are deliberately SMALL multiples of a common factor rather than
+// magnitudes that need the full 128 bits. A fixture whose values exceed 2^64
+// latches bitpack's `_gwide` flag on its first element, which forces the divisor
+// to 1 and skips the folded-in GCD reduction entirely -- so the wide fixtures
+// leave the 128-bit divisor path untested. Mantissas of a DECIMAL(38,2) holding
+// whole units (every value a multiple of 100, spanning a narrow range) are both
+// the realistic shape and the one that actually exercises it: the GCD reduces to
+// 100 and the residual packs into a handful of bits.
+inline std::unique_ptr<cudf::table> make_decimal128_table(int num_cols, int num_rows, int seed)
+{
+  std::vector<std::unique_ptr<cudf::column>> cols;
+  cols.reserve(static_cast<std::size_t>(num_cols));
+  for (int c = 0; c < num_cols; ++c) {
+    std::vector<__int128> host(static_cast<std::size_t>(num_rows));
+    for (int r = 0; r < num_rows; ++r)
+      host[static_cast<std::size_t>(r)] =
+        static_cast<__int128>(100) * static_cast<__int128>((r * 17 + c * 1013 + seed) % 1000);
+    auto col = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::DECIMAL128, 0}, num_rows, cudf::mask_state::UNALLOCATED);
+    if (cudaMemcpy(col->mutable_view().head<__int128>(),
+                   host.data(),
+                   host.size() * sizeof(__int128),
+                   cudaMemcpyHostToDevice) != cudaSuccess)
+      throw std::runtime_error("make_decimal128_table: cudaMemcpy failed");
     cols.push_back(std::move(col));
   }
   return std::make_unique<cudf::table>(std::move(cols));
@@ -239,6 +274,39 @@ inline void expect(bool cond, char const* msg)
   if (!cond) throw std::runtime_error(msg);
 }
 
+inline void cuda_check(cudaError_t status)
+{
+  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+}
+
+// Whether `action` throws an `Error`; any other exception propagates.
+template <typename Error = std::exception, typename Action>
+bool throws(Action&& action)
+{
+  try {
+    action();
+  } catch (Error const&) {
+    return true;
+  }
+  return false;
+}
+
+// Installs `resource` as the current device resource for the guard's lifetime.
+class current_resource_guard {
+ public:
+  explicit current_resource_guard(rmm::device_async_resource_ref resource)
+    : previous_(rmm::mr::set_current_device_resource(
+        cuda::mr::any_resource<cuda::mr::device_accessible>{resource}))
+  {
+  }
+  ~current_resource_guard() { rmm::mr::set_current_device_resource(std::move(previous_)); }
+  current_resource_guard(current_resource_guard const&)            = delete;
+  current_resource_guard& operator=(current_resource_guard const&) = delete;
+
+ private:
+  cuda::mr::any_resource<cuda::mr::device_accessible> previous_;
+};
+
 // ---------------------------------------------------------------------------
 // String helpers
 // ---------------------------------------------------------------------------
@@ -276,8 +344,11 @@ inline std::unique_ptr<cudf::column> make_string_column(int num_rows, ::cuda::st
     throw std::runtime_error("make_string_column: chars copy failed");
   stream.sync();
 
-  return cudf::make_strings_column(
-    num_rows, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
+  return cudf::make_strings_column(num_rows,
+                                   std::move(offsets_col),
+                                   std::move(chars_buf),
+                                   0,
+                                   cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 }
 
 // Single-column STRING table wrapping make_string_column.
@@ -389,8 +460,11 @@ inline std::unique_ptr<cudf::column> make_strings_column(std::vector<std::string
 
   if (!has_nulls) {
     stream.sync();
-    return cudf::make_strings_column(
-      n, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{});
+    return cudf::make_strings_column(n,
+                                     std::move(offsets_col),
+                                     std::move(chars_buf),
+                                     0,
+                                     cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
   }
   std::size_t const mask_bytes = cudf::bitmask_allocation_size_bytes(n);
   std::vector<std::uint32_t> words(static_cast<std::size_t>((n + 31) / 32), 0u);
@@ -401,7 +475,7 @@ inline std::unique_ptr<cudf::column> make_strings_column(std::vector<std::string
     else
       ++nulls;
   }
-  rmm::device_buffer mask_buf(mask_bytes, stream);
+  auto mask_buf = cudf::create_null_mask(n, cudf::mask_state::UNINITIALIZED, stream);
   cudaMemsetAsync(mask_buf.data(), 0, mask_bytes, stream.get());
   cudaMemcpyAsync(mask_buf.data(),
                   words.data(),

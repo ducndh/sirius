@@ -18,8 +18,10 @@
 
 #include "duckdb/catalog/dependency_list.hpp"
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "op/scan/table_scan/scan_contract.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 namespace sirius::vss {
@@ -27,13 +29,19 @@ struct vector_join_side;
 }  // namespace sirius::vss
 
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sirius::op {
 class sirius_physical_table_scan;
 }  // namespace sirius::op
+namespace sirius::transparent {
+class read_view_registry;
+}
 
 namespace duckdb {
 class ClientContext;
@@ -41,14 +49,15 @@ class Expression;
 class FunctionData;
 class LogicalType;
 class Value;
-class GPUContext;
 class ColumnDataCollection;
 class LogicalOperator;
 class LogicalAggregate;
 class LogicalAnyJoin;
 class LogicalColumnDataGet;
 class LogicalComparisonJoin;
+class LogicalCrossProduct;
 class LogicalDelimGet;
+class LogicalDistinct;
 class LogicalDummyScan;
 class LogicalEmptyResult;
 class LogicalExpressionGet;
@@ -57,13 +66,31 @@ class LogicalGet;
 class LogicalLimit;
 class LogicalOrder;
 class LogicalTopN;
+class LogicalWindow;
 class LogicalProjection;
 class LogicalSetOperation;
 class LogicalMaterializedCTE;
 class LogicalCTERef;
+class TableFilterSet;
 }  // namespace duckdb
 
 namespace sirius::planner {
+
+/// Attribution attached to every scan contract created by one plan build.
+/// Execution-time plans carry a window id; plans built before an execution
+/// window carry a non-zero planning/finalize generation instead.
+struct scan_contract_provenance {
+  std::optional<uint64_t> window_id;
+  uint64_t finalize_generation = 0;
+  op::scan::certification_budget budget;
+  op::scan::test_injections injections;
+  uint64_t setting_lookups          = 0;
+  uint64_t certification_scan_index = 0;
+  uint64_t lineage_time_us          = 0;
+  std::optional<std::pair<op::scan::verdict_reason, std::string>> first_pre_decline;
+  // A fragment publishes cuDF batches directly; it has no DuckDB host exporter.
+  bool host_export_available = true;
+};
 
 /// Resolved parquet file set identifying a parquet-family scan
 /// ("parquet_scan" / "read_parquet" / "sirius_read_parquet"), derived exactly
@@ -77,28 +104,32 @@ namespace sirius::planner {
   duckdb::FunctionData const* bind_data,
   duckdb::vector<duckdb::Value> const& parameters);
 
+//! Bind unpushed filters to output positions; the scan projection must include their columns.
+duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> extract_unpushed_scan_filters(
+  duckdb::LogicalGet const& op, duckdb::TableFilterSet& table_filters);
+
 //! The physical plan generator generates a physical execution plan from a
 //! logical query plan
 class sirius_physical_plan_generator {
  public:
   explicit sirius_physical_plan_generator(duckdb::ClientContext& context);
+  sirius_physical_plan_generator(duckdb::ClientContext& context,
+                                 scan_contract_provenance provenance);
   ~sirius_physical_plan_generator();
 
   duckdb::LogicalDependencyList dependencies;
   //! Recursive CTEs require at least one ChunkScan, referencing the working_table.
   //! This data structure is used to establish it.
-  duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
+  duckdb::unordered_map<duckdb::TableIndex, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
     recursive_cte_tables;
   //! Used to reference the recurring tables
-  duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
+  duckdb::unordered_map<duckdb::TableIndex, duckdb::shared_ptr<duckdb::ColumnDataCollection>>
     recurring_cte_tables;
   //! Materialized CTE ids must be collected.
   duckdb::unordered_map<
-    std::size_t,
+    duckdb::TableIndex,
     duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>>
     materialized_ctes;
-  // duckdb::unordered_map<std::size_t, duckdb::shared_ptr<duckdb::GPUIntermediateRelation>>
-  // gpu_recursive_cte_tables;
 
  public:
   //! Creates a plan from the logical operator. This involves resolving column bindings and
@@ -118,14 +149,19 @@ class sirius_physical_plan_generator {
   static sirius::OrderPreservationType order_preservation_recursive(
     sirius::op::sirius_physical_operator& op);
 
+  //! Throws NotImplementedException (CPU fallback) unless each @p planned column is its @p declared
+  //! type; @p subject names the input in the message.
+  static void require_planned_schema(std::span<sirius::logical_type const> planned,
+                                     duckdb::vector<duckdb::LogicalType> const& declared,
+                                     std::string_view subject);
+
  protected:
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOperator& op);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalAggregate& op);
+  //! Plan an INNER ANY join as a cross product filtered by its condition; other join types throw.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin& op);
-  // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalAnyJoin
-  // &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalColumnDataGet& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
@@ -138,13 +174,24 @@ class sirius_physical_plan_generator {
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalCreateIndex
   // &op); duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   // create_plan(duckdb::LogicalCreateSecret &op);
-  // duckdb::unique_ptr<sirius::op::sirius_physical_operator>
-  // create_plan(duckdb::LogicalCrossProduct &op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
+    duckdb::LogicalCrossProduct& op);
+  //! Lower a join with no conditions to the nested loop join's cross product. Shared by the
+  //! LogicalCrossProduct overload and by plan_comparison_join for a LogicalComparisonJoin whose
+  //! condition list is empty, so the two entry points cannot drift. Leaves
+  //! op.estimated_cardinality to the caller.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_cross_product_join(
+    duckdb::LogicalOperator& op,
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> left,
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> right,
+    duckdb::JoinType join_type,
+    std::size_t estimated_cardinality,
+    duckdb::vector<std::size_t> left_projection_map,
+    duckdb::vector<std::size_t> right_projection_map);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelete
   // &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDelimGet& op);
-  // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDistinct
-  // &op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalDistinct& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalDummyScan& expr);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
@@ -170,6 +217,7 @@ class sirius_physical_plan_generator {
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalLimit& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalOrder& op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalTopN& op);
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalWindow& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator>
   // create_plan(duckdb::LogicalPositionalJoin &op);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
@@ -179,8 +227,7 @@ class sirius_physical_plan_generator {
   // create_plan(duckdb::LogicalCopyToFile &op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalExplain
   // &op);
-  //! `UNION ALL` only; the builder rejects distinct UNION. EXCEPT / INTERSECT share the same
-  //! DuckDB node but keep their own throwing case in the dispatch switch, so they never arrive.
+  //! Dispatches a set operation on its type.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(
     duckdb::LogicalSetOperation& op);
   // duckdb::unique_ptr<sirius::op::sirius_physical_operator> create_plan(duckdb::LogicalUpdate
@@ -219,12 +266,26 @@ class sirius_physical_plan_generator {
   //! (the join plus its projection), or nullptr if the TOP_N is not that shape.
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_vector_global_topk_join(
     duckdb::LogicalTopN& op);
+  //! Lowers EXCEPT ALL / INTERSECT ALL to tag, UNION ALL, per-group tag sums, and
+  //! `sirius_physical_replicate`; refuses the distinct forms.
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_except_intersect(
+    duckdb::LogicalSetOperation& op);
+
+  duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_union(
+    duckdb::LogicalSetOperation& op);
+
+  //! A zero-aggregate grouped aggregate over @p child keyed on its @p key_columns, in that order;
+  //! its output is exactly those columns.
+  static duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan_dedup(
+    duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
+    std::span<duckdb::idx_t const> key_columns,
+    duckdb::idx_t estimated_cardinality);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> try_plan_dense_count_join(
     duckdb::LogicalAggregate& op);
 
   // Sirius reads and projects nested (STRUCT/LIST/MAP) columns but cannot operate
-  // on them yet: WHERE / GROUP BY / JOIN ON over a nested column must fail with a
+  // on them yet: WHERE / GROUP BY / DISTINCT / JOIN ON over a nested column must fail with a
   // clear error naming the column instead of crashing or returning wrong results.
   // @p operation names the context, e.g. "a filter predicate".
   static void reject_nested_column_operation(duckdb::Expression const& expr,
@@ -241,10 +302,12 @@ class sirius_physical_plan_generator {
   // bool use_batch_index(sirius::op::sirius_physical_operator &plan);
  public:
   std::size_t delim_index = 0;
+  std::shared_ptr<sirius::transparent::read_view_registry> read_views;
+  uint64_t next_scan_node_id = 0;
+  scan_contract_provenance contract_provenance;
 
  public:
   duckdb::ClientContext& context;
-  // duckdb::GPUContext& gpu_context;
 
  public:
   //! Recursive post-pass that derives each operator's `_parent_op` from the final tree after

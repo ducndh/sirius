@@ -25,6 +25,7 @@
 // cudf
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -32,7 +33,6 @@
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/device_resources.hpp>
 
-#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
 #include <cuda/stream>
@@ -75,8 +75,11 @@ std::unique_ptr<cudf::column> make_fixed_size_float_list(std::vector<float> cons
              sizeof(int32_t) * offsets.size(),
              cudaMemcpyHostToDevice);
 
-  return cudf::make_lists_column(
-    n_rows, std::move(offsets_col), std::move(child), 0, rmm::device_buffer{});
+  return cudf::make_lists_column(n_rows,
+                                 std::move(offsets_col),
+                                 std::move(child),
+                                 0,
+                                 cudf::create_null_mask(0, cudf::mask_state::UNALLOCATED));
 }
 
 // Copy a device column's raw elements back to the host after the search stream
