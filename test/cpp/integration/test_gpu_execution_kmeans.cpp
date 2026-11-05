@@ -60,6 +60,7 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <numeric>
 #include <random>
 #include <set>
 #include <sstream>
@@ -2207,6 +2208,203 @@ TEST_CASE_METHOD(KMeansFixture,
                "SELECT count(*) FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
                  "_corpus','vec', metric => 'l2', k => 5, " + approx + ");",
                "metric => 'cosine'");
+}
+
+namespace {
+
+/// Every pair's true distance over the rows as stored, in FP64: 1 - cos for cosine, Euclidean for
+/// l2. A FLOAT prints in full, so the text reads back as the stored value.
+struct true_distances {
+  std::int64_t n_probe{0}, n_corpus{0};
+  std::vector<double> at;
+  [[nodiscard]] double operator()(std::int64_t p, std::int64_t c) const
+  {
+    return at[static_cast<std::size_t>(p * n_corpus + c)];
+  }
+};
+
+std::vector<double> rows_as_stored(duckdb::Connection& con,
+                                   std::string const& table,
+                                   std::int64_t rows,
+                                   std::int64_t d)
+{
+  std::vector<double> out(static_cast<std::size_t>(rows * d));
+  for (auto const& r : ok_rows(con, "SELECT id, vec FROM " + table + ";")) {
+    auto const row  = std::stoll(r.at(0));
+    auto const text = r.at(1);
+    std::size_t at  = text.find('[') + 1;
+    for (std::int64_t j = 0; j < d; ++j) {
+      std::size_t used                           = 0;
+      out[static_cast<std::size_t>(row * d + j)] = std::stod(text.substr(at), &used);
+      at += used + 1;
+    }
+  }
+  return out;
+}
+
+true_distances distances_of(std::vector<double> const& probes,
+                            std::vector<double> const& corpus,
+                            std::int64_t d,
+                            bool cosine)
+{
+  true_distances t;
+  t.n_probe  = static_cast<std::int64_t>(probes.size()) / d;
+  t.n_corpus = static_cast<std::int64_t>(corpus.size()) / d;
+  t.at.resize(static_cast<std::size_t>(t.n_probe * t.n_corpus));
+  auto const norm = [&](double const* v) {
+    return std::sqrt(std::inner_product(v, v + d, v, 0.0));
+  };
+  for (std::int64_t p = 0; p < t.n_probe; ++p) {
+    auto const* q = probes.data() + p * d;
+    for (std::int64_t c = 0; c < t.n_corpus; ++c) {
+      auto const* x = corpus.data() + c * d;
+      if (cosine) {
+        t.at[static_cast<std::size_t>(p * t.n_corpus + c)] =
+          1.0 - std::inner_product(q, q + d, x, 0.0) / (norm(q) * norm(x));
+      } else {
+        double s = 0;
+        for (std::int64_t j = 0; j < d; ++j) {
+          s += (q[j] - x[j]) * (q[j] - x[j]);
+        }
+        t.at[static_cast<std::size_t>(p * t.n_corpus + c)] = std::sqrt(s);
+      }
+    }
+  }
+  return t;
+}
+
+/// Lists over `prefix`'s 16-d tables, of 8,000 rows and 500 probe rows, whose half rows are off by
+/// more than an FP32 search can tell apart: a join must answer as the FP32 rows do. Every cluster
+/// probed, top-k and radius, ids and distances; two clusters probed, the distances it reports.
+void check_answers_from_fp32_rows(KMeansFixture& fixture,
+                                  std::string const& prefix,
+                                  std::string const& tier,
+                                  std::string const& metric,
+                                  std::string const& list_args)
+{
+  auto const gen = [](std::string const& seed) {
+    return "list_transform(range(16), lambda d: ((hash(i * 1000 + d + " + seed +
+           ") % 2000001)::DOUBLE / 1000000.0 - 1.0)::FLOAT)::FLOAT[16]";
+  };
+  auto const corpus = prefix + "_corpus";
+  auto const probe  = prefix + "_probe";
+  fixture.run_ok("CREATE TABLE " + corpus + " AS SELECT i::INTEGER AS id, " + gen("0") +
+                 " AS vec FROM range(8000) t(i);");
+  fixture.run_ok("CREATE TABLE " + probe + " AS SELECT i::INTEGER AS id, " + gen("100000000") +
+                 " AS vec FROM range(500) t(i);");
+  fixture.run_ok("CHECKPOINT;");
+  fixture.run_ok("SELECT * FROM pin_table(name => '" + corpus + "', tier => '" + tier +
+                 "', format => 'duckdb');");
+  fixture.run_ok("SELECT * FROM pin_table(name => '" + probe +
+                 "', tier => 'gpu', format => "
+                 "'duckdb');");
+  fixture.run_ok("SELECT * FROM sirius_kmeans_fit('" + corpus + "','vec', name => '" + prefix +
+                 "_c', n_clusters => 8);");
+  fixture.run_ok("SELECT * FROM sirius_kmeans_build_lists('" + corpus + "','vec','" + prefix +
+                 "_c', storage => 'float16'" + list_args + ");");
+
+  auto& con        = *fixture.con;
+  auto const truth = distances_of(rows_as_stored(con, probe, 500, 16),
+                                  rows_as_stored(con, corpus, 8000, 16),
+                                  16,
+                                  metric == "cosine");
+  auto const fetch = [&](std::string const& args) {
+    return ok_rows(con,
+                   "SELECT left_id, right_id, distance FROM sirius_knn_join('" + probe +
+                     "','vec','" + corpus + "','vec', metric => '" + metric +
+                     "', output_type => 'distance', search_mode => 'approx', clustering => '" +
+                     prefix + "_c', " + args + ");");
+  };
+  auto const tolerance      = [](double v) { return 2e-6 * std::max(std::fabs(v), 1.0); };
+  auto const check_reported = [&](std::vector<std::vector<std::string>> const& rows) {
+    std::size_t wrong = 0;
+    for (auto const& r : rows) {
+      auto const t = truth(std::stoll(r.at(0)), std::stoll(r.at(1)));
+      wrong += std::fabs(std::stod(r.at(2)) - t) > tolerance(t);
+    }
+    CHECK(wrong == 0);
+  };
+
+  auto const top = fetch("k => 10, n_probes => 8");
+  REQUIRE(top.size() == 5000);
+  check_reported(top);
+  std::vector<std::vector<double>> got(500);
+  for (auto const& r : top) {
+    got[static_cast<std::size_t>(std::stoll(r.at(0)))].push_back(
+      truth(std::stoll(r.at(0)), std::stoll(r.at(1))));
+  }
+  std::size_t wrong_rows = 0;
+  std::vector<double> all(truth.at.begin(), truth.at.end());
+  for (std::int64_t p = 0; p < 500; ++p) {
+    auto first = truth.at.begin() + p * truth.n_corpus;
+    std::vector<double> row(first, first + truth.n_corpus);
+    std::partial_sort(row.begin(), row.begin() + 10, row.end());
+    auto& mine = got[static_cast<std::size_t>(p)];
+    REQUIRE(mine.size() == 10);
+    std::sort(mine.begin(), mine.end());
+    for (std::size_t i = 0; i < 10; ++i) {
+      if (mine[i] > row[i] + tolerance(row[i])) {
+        ++wrong_rows;
+        break;
+      }
+    }
+  }
+  CHECK(wrong_rows == 0);
+
+  std::nth_element(all.begin(), all.begin() + all.size() / 256, all.end());
+  auto const eps_text = std::to_string(all[all.size() / 256]);
+  auto const eps      = std::stod(eps_text);
+  auto const radius   = fetch("join_mode => 'threshold', eps => " + eps_text + ", n_probes => 8");
+  check_reported(radius);
+  std::set<std::pair<std::int64_t, std::int64_t>> have;
+  std::size_t extra = 0;
+  for (auto const& r : radius) {
+    std::pair<std::int64_t, std::int64_t> const pair{std::stoll(r.at(0)), std::stoll(r.at(1))};
+    have.insert(pair);
+    extra += truth(pair.first, pair.second) > eps + tolerance(eps);
+  }
+  std::size_t missed = 0, inside = 0;
+  for (std::int64_t p = 0; p < truth.n_probe; ++p) {
+    for (std::int64_t c = 0; c < truth.n_corpus; ++c) {
+      if (truth(p, c) < eps - tolerance(eps)) {
+        ++inside;
+        missed += have.count({p, c}) == 0;
+      }
+    }
+  }
+  REQUIRE(inside > 1000);
+  CHECK(missed == 0);
+  CHECK(extra == 0);
+
+  check_reported(fetch("k => 10, n_probes => 2"));
+  check_reported(fetch("join_mode => 'threshold', eps => " + eps_text + ", n_probes => 2"));
+}
+
+}  // namespace
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "a cosine join over FLOAT16 lists of rows as they are answers from the FP32 rows",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists][cosine]")
+{
+  // Lists built without metric => 'cosine' are not unit rows, so no coded search takes the join;
+  // the FP32 search then has to read the kept FP32 rows, on both tiers.
+  auto const tier = GENERATE(std::string("gpu"), std::string("host"));
+  check_answers_from_fp32_rows(*this, "kmcr_" + tier, tier, "cosine", "");
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "FLOAT16 lists answer from the FP32 rows with the bounded search switched off",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][lists]")
+{
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_BOUND_GEMM"); }
+  } unset_env;
+  ::setenv("SIRIUS_VSS_BOUND_GEMM", "0", 1);
+  SECTION("an l2 join") { check_answers_from_fp32_rows(*this, "kmcr_off_l2", "gpu", "l2", ""); }
+  SECTION("a cosine join over unit rows")
+  {
+    check_answers_from_fp32_rows(*this, "kmcr_off_u", "gpu", "cosine", ", metric => 'cosine'");
+  }
 }
 
 TEST_CASE_METHOD(KMeansFixture,

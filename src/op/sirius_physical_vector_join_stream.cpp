@@ -2513,7 +2513,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // Every cluster probed is the exact join through lists. A cosine join over lists of rows as
     // they are (not unit rows) then ranks as the exhaustive fold does: the probe and each chunk
     // normalized in FP32, L2 from the differences between them, halved at the end. No coded
-    // search takes such lists, so only plain FP32 slices are affected.
+    // search takes such lists, so only FP32 slices are affected: FLOAT16 lists stage theirs from
+    // the kept FP32 rows (exact_lists_corpus).
     bool const direct_cosine =
       !unit_cosine && _request.metric == "cosine" && n_probes >= _n_clusters;
     if (unit_cosine || direct_cosine) { radius_scale = 0.5f; }
@@ -2973,21 +2974,20 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     }
     bool const scan_f16    = scan_f16_shape && probe_in_f16_range;
     bool const f16_bounded = scan_f16 || (f16_lists_shape && probe_in_f16_range);
-    // FLOAT16 lists searched without the bounded search for such a probe: their chunks are staged
-    // from the kept FP32 rows (in layout order), so the FP32 search scores what the rows hold.
+    // FLOAT16 lists the bounded search does not answer (a cosine join over rows as they are, a
+    // probe row past half's range, the bounded search switched off): their chunks are staged from
+    // the kept FP32 rows, in layout order, so the FP32 search scores what the rows hold. Over the
+    // half rows it would be exact for the rounded rows, and report their distances.
     std::optional<cluster_lists_chunk_source> exact_lists_corpus;
-    if (f16_lists_shape && !probe_in_f16_range) {
+    if (_lists != nullptr && _lists->encoding == vss::list_encoding::float16 && !f16_bounded) {
+      if (!_lists->has_exact_rows()) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_stream] these float16 cluster lists kept no FP32 rows, "
+          "which a " +
+          _request.metric +
+          " join outside the bounded search reads; rebuild the lists with storage => 'float32'");
+      }
       exact_lists_corpus.emplace(*_lists, /*exact_rows=*/true);
-    }
-    // An inner-product join reads FLOAT16 lists only through the bounded search, which re-scores
-    // every pair from the FP32 rows, or from the FP32 rows themselves (above); ranked on the half
-    // rows alone its scores would be the half rows' inner products.
-    if (ip && _lists != nullptr && _lists->encoding == vss::list_encoding::float16 &&
-        !f16_bounded && !exact_lists_corpus) {
-      throw std::runtime_error(
-        "[sirius_physical_vector_join_stream] an inner-product join reads float16 cluster lists "
-        "only through the bounded search (vector width a multiple of 16, the FP32 rows kept, "
-        "SIRIUS_VSS_BOUND_GEMM on); rebuild the lists with storage => 'float32'");
     }
     bool const any_bounded = bounded || f16_bounded;
     // FP16 and INT8 lists filter with inexact distances: their bounded search keeps layout rows as
