@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/function/aggregate_function.hpp"
 
 #include <cstddef>
 
@@ -57,5 +58,8 @@ bool plan_has_vector_distance(duckdb::LogicalOperator& plan);
 /// producing them, and the aggregate sums the one count each probe batch returns. Returns how
 /// many joins were changed. For a plan Sirius is about to run, after the plain-SQL rewrite.
 std::size_t push_count_into_vector_joins(duckdb::LogicalOperator& plan);
+
+/// The aggregate push_count_into_vector_joins plans, which the extension registers in the catalog.
+duckdb::AggregateFunction vector_join_count_sum_function();
 
 }  // namespace sirius::vss

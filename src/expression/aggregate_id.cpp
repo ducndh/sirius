@@ -30,9 +30,10 @@ namespace {
 
 // Forward table: DuckDB aggregate name -> Sirius aggregate id.
 // Linear scan; called once per BoundAggregateExpression at translator entry.
-constexpr std::array<std::pair<std::string_view, aggregate_id>, 9> kForwardTable = {{
+constexpr std::array<std::pair<std::string_view, aggregate_id>, 10> kForwardTable = {{
   {"sum", aggregate_id::sum},
   {"sum_no_overflow", aggregate_id::sum_no_overflow},
+  {"sirius_knn_count_sum", aggregate_id::sum_no_overflow},  // a vector join's pushed-down count
   {"count", aggregate_id::count},
   {"count_star", aggregate_id::count_star},
   {"min", aggregate_id::min},
@@ -60,8 +61,8 @@ static_assert(static_cast<std::size_t>(aggregate_id::stddev_samp) + 1 == 9,
               "aggregate_id::stddev_samp must be the last entry; cardinality locked at 9.");
 static_assert(kReverseTable.size() == 9,
               "kReverseTable must have one slot per aggregate_id value.");
-static_assert(kForwardTable.size() == 9,
-              "kForwardTable must have one entry per aggregate_id value.");
+static_assert(kForwardTable.size() == 10,
+              "kForwardTable must have one entry per aggregate_id value, and one alias.");
 
 // Walks both tables to ensure every enum value has exactly one canonical
 // forward entry whose name matches the reverse table at the same index.

@@ -62,6 +62,7 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/column_list.hpp"
+#include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
@@ -3709,6 +3710,11 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   vector_join_rel.SetDeserializeCallback(sirius::vss::deserialize_vector_join_bind_data);
   CreateTableFunctionInfo vector_join_rel_info(vector_join_rel);
   catalog.CreateTableFunction(transaction, vector_join_rel_info);
+
+  // The aggregate a vector join's pushed-down count plans: a plan copied by serialization finds it
+  // here.
+  CreateAggregateFunctionInfo count_sum_info(sirius::vss::vector_join_count_sum_function());
+  catalog.CreateFunction(transaction, count_sum_info);
 
   // Drop and rebuild the prefetching caches — a benchmark that wants each
   // iteration to pay its own IO has no other way to get a cold cache.

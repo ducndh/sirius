@@ -3166,14 +3166,14 @@ bool is_bare_count_star(duckdb::LogicalAggregate const& agg)
          !bound.GetOrderBys() && bound.GetAggregateType() == duckdb::AggregateType::NON_DISTINCT;
 }
 
-// The aggregate that sums the per-batch counts. Sirius plans aggregates by name, and
-// sum_no_overflow is the one whose BIGINT input it sums without widening; DuckDB's own carries a
-// HUGEINT result and a bind callback that refuses callers, so the function is built here with the
-// count's BIGINT type. It never runs on the CPU: a plan Sirius cannot execute is re-planned from
-// the SQL without this pass, and these callbacks make that explicit rather than silent.
+// The aggregate that sums the per-batch counts. Sirius plans aggregates by name, and this one sums
+// its BIGINT input without widening; DuckDB's sum_no_overflow carries a HUGEINT result, and its
+// deserializer rebinds to that signature when the plan is copied. So this is a function of its own
+// in the catalog, with the count's BIGINT type. It never runs on the CPU: a plan Sirius cannot
+// execute is re-planned from the SQL without this pass, and these callbacks make that explicit.
 [[noreturn]] void count_sum_cpu()
 {
-  throw duckdb::InternalException(
+  throw duckdb::InvalidInputException(
     "sirius_knn_join: the pushed-down count of a vector join runs on the GPU only");
 }
 duckdb::idx_t count_sum_state_size(duckdb::AggregateStateInput&) { return sizeof(std::int64_t); }
@@ -3199,38 +3199,20 @@ void count_sum_finalize(
 {
   count_sum_cpu();
 }
-// The transparent path copies a plan by serialization. A function without serialization
-// callbacks is re-bound on the way back, and sum_no_overflow's bind refuses that; with them, the
-// copy carries the BIGINT result type and binds nothing, as DuckDB's own deserializer of the
-// function does.
-void count_sum_serialize(duckdb::Serializer&,
-                         duckdb::optional_ptr<duckdb::FunctionData>,
-                         duckdb::BoundAggregateFunction const&)
-{
-}
-duckdb::unique_ptr<duckdb::FunctionData> count_sum_deserialize(
-  duckdb::Deserializer& deserializer, duckdb::BoundAggregateFunction& function)
-{
-  function.SetReturnType(deserializer.Get<duckdb::LogicalType const&>());
-  return nullptr;
-}
-duckdb::AggregateFunction count_sum_function()
-{
-  duckdb::AggregateFunction f("sum_no_overflow",
-                              {duckdb::LogicalType::BIGINT},
-                              duckdb::LogicalType::BIGINT,
-                              count_sum_state_size,
-                              count_sum_initialize,
-                              count_sum_update,
-                              count_sum_combine,
-                              count_sum_finalize,
-                              duckdb::FunctionNullHandling::DEFAULT_NULL_HANDLING);
-  f.SetSerializeCallback(count_sum_serialize);
-  f.SetDeserializeCallback(count_sum_deserialize);
-  return f;
-}
-
 }  // namespace
+
+duckdb::AggregateFunction vector_join_count_sum_function()
+{
+  return duckdb::AggregateFunction("sirius_knn_count_sum",
+                                   {duckdb::LogicalType::BIGINT},
+                                   duckdb::LogicalType::BIGINT,
+                                   count_sum_state_size,
+                                   count_sum_initialize,
+                                   count_sum_update,
+                                   count_sum_combine,
+                                   count_sum_finalize,
+                                   duckdb::FunctionNullHandling::DEFAULT_NULL_HANDLING);
+}
 
 std::size_t push_count_into_vector_joins(LogicalOperator& plan)
 {
@@ -3279,7 +3261,7 @@ std::size_t push_count_into_vector_joins(LogicalOperator& plan)
   children.push_back(duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
     duckdb::LogicalType::BIGINT, duckdb::ColumnBinding(get.table_index, duckdb::ProjectionIndex(0))));
   auto summed =
-    duckdb::make_uniq<duckdb::BoundAggregateExpression>(duckdb::BoundAggregateFunction(count_sum_function()),
+    duckdb::make_uniq<duckdb::BoundAggregateExpression>(duckdb::BoundAggregateFunction(vector_join_count_sum_function()),
                                                         std::move(children),
                                                         nullptr,
                                                         nullptr,
