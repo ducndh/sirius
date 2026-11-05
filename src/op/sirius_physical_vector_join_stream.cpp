@@ -114,6 +114,10 @@ constexpr double kSweep0RankedSliceMacs = 0x1p24;
 /// Share of the device one probe block over a scanned corpus may plan for.
 constexpr double kScannedBlockDeviceShare = 0.8;
 
+/// Share of the host pool host lists may fill and still be read from memory: where the host's
+/// downgrade monitor stops by default.
+constexpr double kListsHostShare = 0.8;
+
 /// Share of the host pool the probe rows of the blocks in flight may plan for. Below the 80 % at
 /// which the host's downgrade monitor stops by default, so they do not spill themselves.
 constexpr double kBlockRowsHostShare = 0.6;
@@ -1750,9 +1754,25 @@ bool sirius_physical_vector_join_stream::corpus_reread() const
 
 bool sirius_physical_vector_join_stream::pair_tasks_wanted() const
 {
-  return _request.pair_tasks && _request.mode == vss::vector_join_mode::threshold &&
-         _request.earlier_by.empty() && !_request.best_only && !_request.probe_scalar &&
-         _right_total_rows > 0 && corpus_reread();
+  if (!(_request.pair_tasks && _request.mode == vss::vector_join_mode::threshold &&
+        _request.earlier_by.empty() && !_request.best_only && !_request.probe_scalar &&
+        _right_total_rows > 0 && corpus_reread())) {
+    return false;
+  }
+  if (_lists == nullptr) { return true; }
+  // Host lists that stay in host memory are cheap to read again, and a pair task per list chunk
+  // then costs more than the reads it saves: Deep10M over host lists with 1M probes took 0.67 s in
+  // one task per probe chunk, 0.90 s in pair tasks. Lists the host cannot keep come back from disk,
+  // which is what pair tasks are for. SIRIUS_VSS_LIST_PAIR_TASKS=1 or 0 decides either way.
+  if (auto const* v = std::getenv("SIRIUS_VSS_LIST_PAIR_TASKS")) {
+    return std::string_view{v} != "0";
+  }
+  if (_sirius_ctx == nullptr) { return true; }
+  auto const hosts =
+    _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  if (hosts.empty()) { return true; }
+  auto const bytes = static_cast<double>(_lists->n_rows) * static_cast<double>(_lists->row_bytes());
+  return bytes > kListsHostShare * static_cast<double>(hosts.front()->get_max_memory());
 }
 
 double sirius_physical_vector_join_stream::pair_block_row_bytes(bool building) const
