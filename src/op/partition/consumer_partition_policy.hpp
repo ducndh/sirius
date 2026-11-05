@@ -25,6 +25,9 @@ class sirius_physical_nested_loop_join;
 class sirius_physical_dense_count_join;
 class sirius_physical_grouped_aggregate_merge;
 class sirius_physical_concat;
+class sirius_physical_vector_threshold_join;
+class sirius_physical_vector_topk_join;
+class sirius_physical_vector_join_stream;
 
 void bind_partition_inputs(sirius_physical_hash_join& join,
                            sirius_physical_partition& build,
@@ -39,5 +42,16 @@ void bind_partition_inputs(sirius_physical_dense_count_join& join,
                            sirius_physical_partition& counted);
 void bind_partition_input(sirius_physical_grouped_aggregate_merge& merge,
                           sirius_physical_partition& input);
+void bind_partition_inputs(sirius_physical_vector_threshold_join& join,
+                           sirius_physical_partition& build,
+                           sirius_physical_partition& probe);
+void bind_partition_inputs(sirius_physical_vector_topk_join& join,
+                           sirius_physical_partition& build,
+                           sirius_physical_partition& probe);
+/// A fed side of the streaming vector join. Each side binds alone: every probe row sees the whole
+/// corpus, so neither side's size says anything about the other's single destination.
+void bind_partition_input(sirius_physical_vector_join_stream& join,
+                          sirius_physical_partition& input,
+                          bool is_build);
 
 }  // namespace sirius::op

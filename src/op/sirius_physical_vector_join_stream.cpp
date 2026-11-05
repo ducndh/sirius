@@ -5082,7 +5082,9 @@ std::string_view sirius_physical_vector_join_stream::input_port_for(
   sirius_physical_operator const& producer) const
 {
   if (producer.type == SiriusPhysicalOperatorType::CONCAT) {
-    return producer.Cast<sirius_physical_concat>().is_build_concat() ? "build" : "default";
+    // Children follow the probe-then-corpus order, and a side read from its pin has no child.
+    bool const probe_is_first = _request.probe_from_scan && !_request.probe_shares_build;
+    return probe_is_first && children[0].get() == &producer ? "default" : "build";
   }
   if (producer.type == SiriusPhysicalOperatorType::PASSTHROUGH_SINK) {
     return producer.Cast<sirius_physical_passthrough_sink>().union_port_label();

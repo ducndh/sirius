@@ -83,6 +83,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAnyJoin& op)
   D_ASSERT(op.children.size() == 2);
   D_ASSERT(op.condition);
 
+  if (auto plan = try_plan_vector_threshold_join(op)) { return plan; }
+
   // DuckDB plans an ANY join as a blockwise nested loop join that evaluates the condition on each
   // (left, right) pair. For INNER that equals filtering the cross product by the condition, whose
   // references already index the left columns followed by the right columns. Outer, semi, anti and

@@ -461,7 +461,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_side_scan(
     projected_types.push_back(types[idx]);
   }
 
-  return duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(
+  auto const projected_output_count = projected_types.size();
+  auto scan                         = duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(
     sirius::from_duckdb_vec(projected_types),
     scan_function,
     std::move(bind_data),
@@ -473,7 +474,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_side_scan(
     table_entry.GetStorage().GetTotalRows(),
     duckdb::ExtraOperatorInfo{},
     duckdb::vector<duckdb::Value>{},
-    table_entry.GetVirtualColumns());
+    table_entry.GetVirtualColumns(),
+    projected_output_count,
+    projected_types);
+  return scan;
 }
 
 }  // namespace
@@ -1177,6 +1181,19 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   return std::move(node);
 }
 
+namespace {
+// A view's scans are this plan's own: DuckDB's plan holds only the join's table function.
+void exempt_scans_from_correspondence(sirius::op::sirius_physical_operator& plan)
+{
+  if (plan.type == sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+    plan.Cast<sirius::op::sirius_physical_table_scan>().correspondence_exempt = true;
+  }
+  for (auto& child : plan.children) {
+    exempt_scans_from_correspondence(*child);
+  }
+}
+}  // namespace
+
 // A view corpus: bind its SELECT, optimize it, plan it on the GPU and reorder its columns into
 // the layout the fold expects (vector, emitted columns, cluster column) -- the shape
 // make_side_scan produces from a base table. The nested bind runs under the internal-query
@@ -1196,6 +1213,7 @@ sirius_physical_plan_generator::make_view_side(const sirius::vss::vector_join_si
   auto const child_types = plan->types;
   auto const card        = plan->estimated_cardinality;
   auto planned           = create_plan(*plan);
+  exempt_scans_from_correspondence(*planned);
 
   auto index_of = [&](const std::string& col) -> std::size_t {
     for (std::size_t i = 0; i < bound.names.size(); ++i) {
@@ -1571,11 +1589,24 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
                                                                         probe_side,
                                                                         centroids,
                                                                         prune_stats);
+    // These scans belong to this plan, not to any read of DuckDB's plan: the same contract wiring
+    // create_plan(LogicalGet&) gives a scan, with no CPU read to compare it with.
+    auto wired_side_scan = [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan) {
+      auto& scan                        = plan->Cast<sirius::op::sirius_physical_table_scan>();
+      scan.read_views                   = read_views;
+      scan.scan_node_id                 = next_scan_node_id++;
+      scan.contract_window_id           = contract_provenance.window_id;
+      scan.contract_finalize_generation = contract_provenance.finalize_generation;
+      scan.host_export_available        = contract_provenance.host_export_available;
+      scan.correspondence_exempt        = true;
+      return plan;
+    };
     // Probe first, then corpus: wrap_vector_join walks the children in that order to decide
     // which is the build side, matching wrap_join's probe=0 / build=1 convention.
     if (req.probe_from_scan && !req.probe_shares_build) {
-      stream_op->children.push_back(probe_child.has_value() ? std::move(*probe_child)
-                                                            : make_side_scan(context, req.left));
+      stream_op->children.push_back(probe_child.has_value()
+                                      ? std::move(*probe_child)
+                                      : wired_side_scan(make_side_scan(context, req.left)));
     }
     if (req.build_from_scan) {
       // The cluster ids ride along with the corpus so the fold can read them from the same
@@ -1585,7 +1616,8 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
         corpus_child.has_value() ? std::move(*corpus_child)
         : req.right.is_view
           ? make_view_side(req.right, req.build_cluster_column)
-          : make_side_scan(context, req.right, req.build_cluster_column, probe_only_columns));
+          : wired_side_scan(
+              make_side_scan(context, req.right, req.build_cluster_column, probe_only_columns)));
     }
     join_stage = std::move(stream_op);
   } else {

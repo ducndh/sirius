@@ -156,13 +156,10 @@ std::optional<threshold_match> match_threshold_join(duckdb::LogicalAnyJoin& op)
 }  // namespace
 
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
-sirius_physical_plan_generator::create_plan(duckdb::LogicalAnyJoin& op)
+sirius_physical_plan_generator::try_plan_vector_threshold_join(duckdb::LogicalAnyJoin& op)
 {
   auto match = match_threshold_join(op);
-  if (!match) {
-    // Only the vector-distance ANY_JOIN is supported on GPU; anything else falls back to CPU.
-    throw duckdb::NotImplementedException("Any join not supported");
-  }
+  if (!match) { return nullptr; }
 
   auto left_child  = create_plan(*op.children[0]);
   auto right_child = create_plan(*op.children[1]);

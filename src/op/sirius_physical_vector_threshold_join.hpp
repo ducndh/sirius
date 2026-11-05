@@ -98,7 +98,7 @@ class sirius_physical_vector_threshold_join : public sirius_physical_partition_c
 
   //! Streams both sides through per-batch-pair threshold joins on a single partition; never
   //! hash-partitions, broadcasts, or enters build-probe.
-  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
+  [[nodiscard]] partition_strategy get_partition_strategy() const;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;

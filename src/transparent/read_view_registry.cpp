@@ -404,9 +404,15 @@ std::vector<candidate_binding> read_view_registry::candidate_bindings() const
   std::vector<candidate_binding> result;
   result.reserve(entries_.size());
   for (auto const& entry : entries_) {
+    if (entry.contract.correspondence_exempt) { continue; }
     result.push_back({entry.contract.table_index, entry.contract.view});
   }
   return result;
+}
+
+void read_view_registry::exempt_from_correspondence(op::scan::scan_contract_id id)
+{
+  entries_.at(by_contract_id_.at(id)).contract.correspondence_exempt = true;
 }
 
 void read_view_registry::record_delete_preparation(op::scan::scan_contract_id id,
@@ -529,6 +535,7 @@ void read_view_registry::publish_correspondence(
     }
     entry.eligibility.evidence_scope = scope;
     entry.eligibility.correspondence = correspondence;
+    if (entry.contract.correspondence_exempt) { continue; }
     if (entry.contract.view && entry.contract.view->identity) {
       entry.eligibility.cpu_gpu_view_identity =
         fingerprint_summary(entry.contract.view->identity->fingerprint);

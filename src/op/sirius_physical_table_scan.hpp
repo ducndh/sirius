@@ -108,6 +108,8 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   /// Number of projected entries that belong to the scan output, before Sirius
   /// appends columns needed only by pushed-down filters.
   std::size_t projected_output_count = 0;
+  /// See bound_table_scan::correspondence_exempt.
+  bool correspondence_exempt = false;
   //! The names of the columns
   duckdb::vector<std::string> names;
   //! The table filters

@@ -158,7 +158,7 @@ class sirius_physical_vector_topk_join : public sirius_physical_partition_consum
     sirius_physical_operator const& producer) const override;
 
   //! Pairs are independent; the merge does the cross-batch combine, so never partition.
-  partition_strategy get_partition_strategy(const partition_sizing_input& in) override;
+  [[nodiscard]] partition_strategy get_partition_strategy() const;
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;

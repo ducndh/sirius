@@ -25,7 +25,10 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "op/sirius_physical_vector_threshold_join.hpp"
+#include "op/sirius_physical_vector_topk_join.hpp"
 #include "sirius/exception.hpp"
+#include "vss/sirius_physical_vector_join_stream.hpp"
 
 #include <algorithm>
 
@@ -147,6 +150,50 @@ void bind_partition_input(sirius_physical_grouped_aggregate_merge& merge,
       merge.get_partition_strategy({stats[0].bytes, false, false, stats[0].bytes, stats[0].rows});
     install_placement(merge, strategy);
     return hash_layouts(1, merge);
+  });
+}
+
+namespace {
+
+// Both vector pair joins take one (left batch, right batch) pair per task on one destination.
+template <typename VectorJoin>
+void bind_vector_pair_join(VectorJoin& join,
+                           sirius_physical_partition& build,
+                           sirius_physical_partition& probe)
+{
+  build.set_input_barrier(MemoryBarrierType::FULL);
+  probe.set_input_barrier(MemoryBarrierType::PARTIAL);
+  partition_exchange::bind({&build, &probe}, 0, false, [&join](auto const&, bool) {
+    install_placement(join, join.get_partition_strategy());
+    return std::vector<partition_layout>(2, {partition_mode::single, join.placement()});
+  });
+}
+
+}  // namespace
+
+void bind_partition_inputs(sirius_physical_vector_threshold_join& join,
+                           sirius_physical_partition& build,
+                           sirius_physical_partition& probe)
+{
+  bind_vector_pair_join(join, build, probe);
+}
+
+void bind_partition_inputs(sirius_physical_vector_topk_join& join,
+                           sirius_physical_partition& build,
+                           sirius_physical_partition& probe)
+{
+  bind_vector_pair_join(join, build, probe);
+}
+
+void bind_partition_input(sirius_physical_vector_join_stream& join,
+                          sirius_physical_partition& input,
+                          bool is_build)
+{
+  input.set_input_barrier(is_build ? MemoryBarrierType::FULL : MemoryBarrierType::PARTIAL);
+  partition_exchange::bind({&input}, 0, false, [&join](auto const&, bool) {
+    install_placement(
+      join, partition_strategy{1, false, false, partition_placement::unpinned(1)});
+    return std::vector<partition_layout>{{partition_mode::single, join.placement()}};
   });
 }
 

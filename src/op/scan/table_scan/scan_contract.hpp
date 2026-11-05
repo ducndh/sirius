@@ -502,6 +502,9 @@ struct bound_table_scan {
   predicate_contract predicates;
   materializer_contract_identity materializer;
   scan_contract_id contract_id = 0;
+  /// A scan the GPU plan adds under an operator with no CPU form: DuckDB's plan holds no read of
+  /// this table, so there is nothing to compare this view with.
+  bool correspondence_exempt = false;
 };
 struct split_materializer_certificate {
   scan_contract_id contract_id = 0;

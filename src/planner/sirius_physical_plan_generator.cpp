@@ -62,6 +62,8 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
+#include "op/sirius_physical_vector_threshold_join.hpp"
+#include "op/sirius_physical_vector_topk_join.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_passthrough_sink.hpp"
@@ -1201,6 +1203,7 @@ void certify_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
         entry->capture(scan.function, scan.bind_data.get(), context));
     }
     scan.contract_id = scan.read_views->allocate_declined_scan(scan, *entry);
+    if (scan.correspondence_exempt) { scan.read_views->exempt_from_correspondence(scan.contract_id); }
     certification_result result;
     result.verdict     = scan.pre_declined->verdict;
     result.reason      = scan.pre_declined->reason;
@@ -1249,6 +1252,7 @@ void certify_table_scan(duckdb::unique_ptr<sirius::op::sirius_physical_operator>
                                              {materializer_kind, entry->registry_profile},
                                              scan.duckdb_types,
                                              scan.table_index);
+  if (scan.correspondence_exempt) { scan.read_views->exempt_from_correspondence(scan.contract_id); }
   auto started = std::chrono::steady_clock::now();
   certification_result result;
   try {
@@ -1520,6 +1524,19 @@ void wrap_order_by(duckdb::unique_ptr<sirius::op::sirius_physical_operator>& slo
 bool join_concat_all(sirius::op::sirius_physical_operator const& join, bool is_build)
 {
   using T = sirius::op::SiriusPhysicalOperatorType;
+  // Coalesce to the batch-size target and no further: folding the corpus into one batch would put
+  // the whole corpus on the GPU at once, which is the constraint the streaming fold exists to lift.
+  if (join.type == T::VECTOR_JOIN_STREAM) { return false; }
+  // Top-k pairs are independent and the merge stage combines them, so both sides stream.
+  if (join.type == T::VECTOR_TOPK_JOIN) { return false; }
+  if (join.type == T::VECTOR_THRESHOLD_JOIN) {
+    // LEFT preserves every left row, so the right side is folded to a single batch: each left batch
+    // is then joined against the whole right table, making unmatched-left rows knowable in one
+    // pass. INNER streams both sides.
+    return join.Cast<sirius::op::sirius_physical_vector_threshold_join>().join_type ==
+             duckdb::JoinType::LEFT &&
+           is_build;
+  }
   if (join.type == T::NESTED_LOOP_JOIN) {
     // The join runs one task per batch pair, so the side that rows are padded, kept or marked
     // against must arrive whole.
@@ -1682,6 +1699,12 @@ void bind_wrapped_join(sirius::op::sirius_physical_operator& join_op, bool probe
                                       probe,
                                       &build_concat,
                                       probe_drives);
+  } else if (join_op.type == sirius::op::SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN) {
+    sirius::op::bind_partition_inputs(
+      join_op.Cast<sirius::op::sirius_physical_vector_threshold_join>(), build, probe);
+  } else if (join_op.type == sirius::op::SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN) {
+    sirius::op::bind_partition_inputs(
+      join_op.Cast<sirius::op::sirius_physical_vector_topk_join>(), build, probe);
   } else {
     sirius::op::bind_partition_inputs(
       join_op.Cast<sirius::op::sirius_physical_nested_loop_join>(), build, probe);
@@ -1707,6 +1730,10 @@ void wrap_vector_join_child(sirius::op::sirius_physical_operator& join_op,
   if (join_op.children[child_idx]->type != sirius::op::SiriusPhysicalOperatorType::GPU_SCAN ||
       (chain != nullptr && std::string_view{chain} != "0")) {
     wrap_join_child(join_op, child_idx, is_build, op_params, compressed_materialization_observer);
+    sirius::op::bind_partition_input(
+      join_op.Cast<sirius::op::sirius_physical_vector_join_stream>(),
+      join_op.children[child_idx]->children[0]->Cast<sirius::op::sirius_physical_partition>(),
+      is_build);
     return;
   }
   wrap_child(
