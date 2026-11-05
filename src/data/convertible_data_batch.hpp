@@ -127,6 +127,9 @@ class convertible_data_batch : public convertible_data {
       const auto* space = target_spaces[idx];
       auto* mem_space   = res_mgr.get_memory_space(space->get_tier(), space->get_id().device_id);
       if (!mem_space) { continue; }
+      // Past a space's whole size a reservation is an error rather than a null: the batch can only
+      // go on to the next tier.
+      if (data_size > mem_space->get_max_memory()) { continue; }
 
       // Non-blocking reservation
       auto reservation = mem_space->make_reservation_or_null(data_size);
