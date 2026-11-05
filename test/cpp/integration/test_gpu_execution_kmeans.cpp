@@ -81,7 +81,7 @@ std::unique_ptr<duckdb::QueryResult> query_ok(duckdb::Connection& con, const std
 {
   auto r = con.Query(sql);
   REQUIRE(r);
-  if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
+  if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError() << "\nin: " << sql); }
   REQUIRE_FALSE(r->HasError());
   return std::unique_ptr<duckdb::QueryResult>(r.release());
 }
