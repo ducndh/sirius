@@ -86,7 +86,6 @@
 #include <cstring>
 #include <deque>
 #include <format>
-#include <functional>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -2190,8 +2189,6 @@ struct sirius_physical_vector_join_stream::block_state {
     std::vector<std::int64_t> stretch_pairs;
   };
 
-  std::size_t left_idx{0};
-  probe_block const* block{nullptr};
   std::int64_t n_left{0};
 
   // The probe rows.
@@ -2278,8 +2275,6 @@ class sirius_physical_vector_join_stream::block_task {
   // plans ~4M rows, past 2^31 values at 1,024-d).
   void load_rows()
   {
-    st.left_idx = left_idx;
-    st.block    = block;
     // Every pass of a block over a scanned corpus reads the corpus again, so the rows a block holds
     // set the cost, and a block's FP32 rows are its largest part on the device (4 KB of ~10 KB a
     // row at 1,024-d). The filter reads their FP16 copy; only routing, rounding and the re-score
@@ -2483,2441 +2478,6 @@ class sirius_physical_vector_join_stream::block_task {
     }
   }
 
-  /// The search that walks (probe run x neighbouring cluster) pairs.
-  void search_clusters()
-  {
-    auto& s        = st.search.emplace(_op._host_pair_blocks);
-    auto const dbg = std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr;
-    auto phase_t0  = std::chrono::steady_clock::now();
-    auto phase     = [&](const char* name) {
-      if (!dbg) { return; }
-      stream.sync();
-      auto const now = std::chrono::steady_clock::now();
-      std::fprintf(
-        stderr,
-        "[vecjoin-phase] %-22s %8.3f s, device in use %.2f GiB\n",
-        name,
-        std::chrono::duration<double>(now - phase_t0).count(),
-        static_cast<double>(mem_space->get_max_memory() - mem_space->get_available_memory(stream)) /
-          1073741824.0);
-      phase_t0 = now;
-    };
-
-    _op.ensure_cluster_index(*mem_space, stream, mr);
-    phase("cluster index");
-
-    // Lists of unit rows answer a cosine join as L2 over unit vectors, |q - x|^2 = 2 (1 - cos):
-    // the probe rows are normalized too, the radius doubled, and the distances halved at the end.
-    // Routing below keeps the join's metric; it only picks clusters.
-    s.unit_cosine = _lists != nullptr && _lists->unit_rows;
-    if (s.unit_cosine && _request.metric != "cosine") {
-      throw std::runtime_error(
-        "[sirius_physical_vector_join_stream] cluster lists built with metric => 'cosine' hold "
-        "unit rows and answer only cosine joins; rebuild them without it for an " +
-        _request.metric + " join");
-    }
-    s.n_probes = std::clamp<std::int64_t>(_request.n_probes, 1, _op._n_clusters);
-    // Every cluster probed is the exact join through lists. A cosine join over lists of rows as
-    // they are (not unit rows) then ranks as the exhaustive fold does: the probe and each chunk
-    // normalized in FP32, L2 from the differences between them, halved at the end. No coded
-    // search takes such lists, so only FP32 slices are affected: FLOAT16 lists stage theirs from
-    // the kept FP32 rows (exact_lists_corpus).
-    s.direct_cosine =
-      !s.unit_cosine && _request.metric == "cosine" && s.n_probes >= _op._n_clusters;
-    if (s.unit_cosine || s.direct_cosine) { st.radius_scale = 0.5f; }
-    s.search_metric = s.unit_cosine ? cuvs::distance::DistanceType::L2Expanded : metric;
-    s.search_radius = s.unit_cosine || s.direct_cosine ? 2.f * radius_eps : radius_eps;
-    if (s.unit_cosine || s.direct_cosine) {
-      s.unit_probe.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
-      vss::normalize_rows(st.queries.data_handle(), n_left, dim, s.unit_probe->data(), stream);
-    }
-    s.search_queries =
-      s.unit_cosine || s.direct_cosine
-        ? raft::make_device_matrix_view<const float, int64_t>(s.unit_probe->data(), n_left, dim)
-        : st.queries;
-    // One piece of a block's host rows at a time on the device.
-    auto for_each_host_piece = [&](auto&& use) {
-      constexpr std::int64_t kPieceRows = std::int64_t{1} << 17;
-      for (std::int64_t at = 0; at < n_left; at += kPieceRows) {
-        auto const rows = std::min(kPieceRows, n_left - at);
-        rmm::device_uvector<float> piece(static_cast<std::size_t>(rows * dim), stream, mr);
-        st.host_rows->copy_to_device(at, rows, piece.data());
-        use(piece.data(), at, rows);
-        stream.sync();
-      }
-    };
-
-    // Rows that a plain FP32 search ranks (FP32 lists, or rows the coded searches below do not
-    // take) then rank as the exhaustive fold's do, L2 from the differences; the coded searches
-    // keep their own FP32 re-score.
-    s.ranked_metric = [&] {
-      if (s.n_probes < _op._n_clusters) { return s.search_metric; }
-      if (s.direct_cosine) { return cuvs::distance::DistanceType::L2Unexpanded; }
-      if (s.search_metric == cuvs::distance::DistanceType::L2Expanded) {
-        return cuvs::distance::DistanceType::L2Unexpanded;
-      }
-      if (s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
-        return cuvs::distance::DistanceType::L2SqrtUnexpanded;
-      }
-      return s.search_metric;
-    }();
-
-    // Each probe row picks its own n_probes nearest centroids, the way an IVF index routes a
-    // query. Routing a whole probe cluster through its centroid's nearest centroids kept a
-    // run contiguous, but a row at the edge of its cluster has its neighbours next door, and
-    // that cost about 3x the probes at equal recall. Contiguity comes back below by sorting
-    // the (row, cluster) edges by cluster instead.
-    auto const n_edges = n_left * s.n_probes;  // row-major [n_left x n_probes]
-    auto edge_clusters = [&] {
-      if (!st.probe_rows_on_host) {
-        return vss::nearest_centroid_ids(
-          res, st.queries, _op._centroids->view(), dim, s.n_probes, metric, stream, mr);
-      }
-      rmm::device_uvector<std::int32_t> all(
-        static_cast<std::size_t>(vss::column_size(n_edges, "vector join routing")), stream, mr);
-      for_each_host_piece([&](float const* rows, std::int64_t at, std::int64_t n) {
-        auto const part = vss::nearest_centroid_ids(
-          res,
-          raft::make_device_matrix_view<float const, std::int64_t>(rows, n, dim),
-          _op._centroids->view(),
-          dim,
-          s.n_probes,
-          metric,
-          stream,
-          mr);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(all.data() + at * s.n_probes,
-                                      part.data(),
-                                      part.size() * sizeof(std::int32_t),
-                                      cudaMemcpyDeviceToDevice,
-                                      stream.get()));
-        stream.sync();
-      });
-      return all;
-    }();
-    phase("assign probe->clusters");
-
-    // A row whose clusters cannot supply k is refused before a single search is issued, rather
-    // than after the merge has silently padded its answer out with misses.
-    auto edge_keys = vss::key_routed_edges(
-      std::move(edge_clusters), n_left, s.n_probes, _op._cluster_rows, k_join, stream, mr);
-    if (edge_keys.refused_row >= 0) {
-      auto const r            = edge_keys.refused_row;
-      std::int64_t candidates = 0;
-      for (auto const c : edge_keys.refused_clusters) {
-        if (c < 0 || c >= _op._n_clusters) {
-          throw std::runtime_error("[sirius_physical_vector_join_stream] probe row " +
-                                   std::to_string(r) + " was routed to cluster id " +
-                                   std::to_string(c) + ", outside the clustering's " +
-                                   std::to_string(_op._n_clusters) + " clusters");
-        }
-        candidates += _op._cluster_rows[static_cast<std::size_t>(c)];
-      }
-      if (candidates == 0) {
-        throw std::runtime_error("[sirius_physical_vector_join_stream] probe row " +
-                                 std::to_string(r) + " reached no non-empty corpus cluster");
-      }
-      throw std::runtime_error("[sirius_physical_vector_join_stream] probe row " +
-                               std::to_string(r) + " reaches only " + std::to_string(candidates) +
-                               " corpus rows, fewer than k=" + std::to_string(k_join) +
-                               "; raise n_probes or cluster with fewer, larger clusters");
-    }
-    s.nearest_cluster = std::move(edge_keys.nearest_cluster);
-    phase("edges to host");
-
-    // Sorted by cluster, each cluster's rows are one contiguous range of the edge list. That
-    // range is what a slice's search gathers its queries from and what its answer folds back
-    // through. Within a cluster, the rows for which it is the nearest cluster come first: the
-    // bounded search below seeds every row from its nearest cluster before it searches any of the
-    // others. Rows then run in probe order, which keeps a tile's probe-row loads close together.
-    s.routed.emplace(vss::sort_routed_edges(std::move(edge_keys), stream, mr));
-    auto const& edge_begin    = s.routed->edge_begin;
-    auto const& nearest_edges = s.routed->nearest_edges;
-    std::vector<bool> wanted(static_cast<std::size_t>(_op._n_clusters));
-    for (std::size_t c = 0; c < wanted.size(); ++c) {
-      wanted[c] = edge_begin[c + 1] > edge_begin[c] && _op._cluster_rows[c] > 0;
-    }
-    phase("sort edges");
-
-    // The prune, made explicit: a chunk holding no cluster any row wants is never staged, so
-    // an out-of-core clustered corpus pays no transfer for the part it skips.
-    for (std::size_t j = 0; j < _op._chunk_cluster_runs.size(); ++j) {
-      for (auto const& slice : _op._chunk_cluster_runs[j]) {
-        if (wanted[static_cast<std::size_t>(slice.cluster)]) {
-          s.needed_chunks.push_back(j);
-          break;
-        }
-      }
-    }
-
-    // A miss -- id -1 at infinite distance -- is what the accumulator is seeded with, so a row's
-    // first answer merges against nothing. It can only survive the fold when a row had fewer
-    // than k real candidates, which was refused above.
-    cudf::numeric_scalar<std::int64_t> const miss_id(-1, true, stream);
-    cudf::numeric_scalar<float> const miss_distance(
-      std::numeric_limits<float>::infinity(), true, stream);
-
-    // The per-slice query matrix, sized for the busiest cluster and reused by every slice: the
-    // slices are issued in stream order, so each one's gather waits for the last one's search.
-    for (std::size_t c = 0; c < static_cast<std::size_t>(_op._n_clusters); ++c) {
-      s.max_routed = std::max(s.max_routed, edge_begin[c + 1] - edge_begin[c]);
-    }
-    // Over host rows only sweep 0 gathers FP32 rows, each row's nearest cluster: the filter reads
-    // the FP16 copy.
-    s.max_nearest = nearest_edges.empty()
-                      ? std::int64_t{0}
-                      : *std::max_element(nearest_edges.begin(), nearest_edges.end());
-    rmm::device_uvector<float> routed_queries(
-      static_cast<std::size_t>((st.probe_rows_on_host ? s.max_nearest : s.max_routed) * dim),
-      stream,
-      mr);
-    s.routed_rows = reinterpret_cast<std::int64_t const*>(s.routed->rows.data());
-
-    // Running [n_left x k_join] accumulator in the caller's row order, seeded with misses so
-    // a row's first answer merges against nothing. Each slice folds its answer in through the
-    // rows it served, so device memory does not grow with n_probes: a row's answers from its
-    // n_probes clusters never coexist.
-    {
-      auto const total = vss::column_size(n_left * k_join, "vector join output");
-      st.acc_neighbors = cudf::make_column_from_scalar(miss_id, total, stream, mr);
-      st.acc_distances = cudf::make_column_from_scalar(miss_distance, total, stream, mr);
-    }
-
-    // Staging runs on its own stream so the next needed chunk's H2D overlaps this one's
-    // compute, exactly as in the exhaustive fold below.
-    std::optional<rmm::cuda_stream> staging_stream;
-    if (_op._corpus->is_streaming()) { staging_stream.emplace(); }
-    auto const stage_on = staging_stream ? staging_stream->view() : stream;
-    borrow_window borrowed{stream};
-    auto release_staged = [&](staged_vector_chunk& chunk) {
-      if (chunk.owner) {
-        auto mut = chunk.owner->to_mutable();
-        mut.rebind_stream(stream);
-      }
-      if (chunk.buffer) { chunk.buffer->set_stream(stream); }
-      if (chunk.reader) { borrowed.hold(std::move(*chunk.reader)); }
-      chunk = staged_vector_chunk{};
-    };
-
-    bool const bound_gemm_enabled = [] {
-      auto const* v = std::getenv("SIRIUS_VSS_BOUND_GEMM");
-      return v == nullptr || std::strcmp(v, "0") != 0;
-    }();
-    // Byte-valued lists, searched by a byte-valued probe side, run on the int8 tensor cores
-    // straight from the stored bytes: no chunk is widened, the row norms were
-    // computed at build time, and every dot product is exact. Only the probe is converted, once.
-    // A radius join has only the bounded form of that search.
-    bool const l2 = s.search_metric == cuvs::distance::DistanceType::L2Expanded ||
-                    s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded;
-    // INT8 codes are only ever answered by the bounded search below, which filters with them and
-    // re-scores what passes in FP32; decoded on their own they would give approximate distances.
-    s.codes_int8 = _lists != nullptr && _lists->encoding == vss::list_encoding::int8;
-    if (s.codes_int8 &&
-        !(gemm_search_enabled() && bound_gemm_enabled && l2 && _lists->has_exact_rows() &&
-          _lists->row_sq != nullptr && vss::bound_filter_int8_supports(dim))) {
-      throw std::runtime_error(
-        "[sirius_physical_vector_join_stream] int8 cluster lists answer only l2 joins through the "
-        "bounded search (vector width a multiple of 16, at most 256, and the FP32 rows kept); "
-        "rebuild the lists with storage => 'float16' or 'float32'");
-    }
-    std::optional<rmm::device_uvector<std::int8_t>> routed_i8;
-    std::optional<rmm::device_uvector<std::int32_t>> routed_sq;
-    s.int8_search =
-      gemm_search_enabled() && _lists != nullptr &&
-      (!radius_join || (bound_gemm_enabled && vss::bound_filter_int8_supports(dim))) &&
-      (_lists->encoding == vss::list_encoding::uint8 || s.codes_int8) &&
-      _lists->row_sq != nullptr && l2 && dim % 4 == 0;
-    if (s.int8_search && !s.codes_int8) {
-      rmm::device_uvector<unsigned long long> non_bytes(1, stream, mr);
-      CUDF_CUDA_TRY(cudaMemsetAsync(non_bytes.data(), 0, sizeof(unsigned long long), stream.get()));
-      vss::count_non_uint8(s.search_queries.data_handle(), n_left * dim, non_bytes.data(), stream);
-      unsigned long long non_bytes_host = 0;
-      CUDF_CUDA_TRY(cudaMemcpyAsync(&non_bytes_host,
-                                    non_bytes.data(),
-                                    sizeof(non_bytes_host),
-                                    cudaMemcpyDeviceToHost,
-                                    stream.get()));
-      stream.sync();
-      s.int8_search = non_bytes_host == 0;
-    }
-    if (s.int8_search) {
-      s.probe_i8.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
-      s.probe_sq.emplace(static_cast<std::size_t>(n_left), stream, mr);
-      routed_i8.emplace(static_cast<std::size_t>(s.max_routed * dim), stream, mr);
-      routed_sq.emplace(static_cast<std::size_t>(s.max_routed), stream, mr);
-      if (s.codes_int8) {
-        // The probe gets the lists' codes too, and its own exact coding error per row -- rotated
-        // first, like the rows, when the lists were (the FP32 re-score keeps the unrotated probe).
-        s.probe_code_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
-        if (_lists->code_rotation) {
-          s.rotated_probe.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
-          vss::rotate_rows(s.search_queries.data_handle(),
-                           n_left,
-                           dim,
-                           static_cast<float const*>(_lists->code_rotation->data()),
-                           s.rotated_probe->data(),
-                           stream);
-        }
-        vss::quantize_rows_int8(
-          s.rotated_probe ? s.rotated_probe->data() : s.search_queries.data_handle(),
-          n_left,
-          dim,
-          static_cast<float const*>(_lists->code_offset->data()),
-          _lists->code_scale,
-          s.probe_i8->data(),
-          s.probe_code_error->data(),
-          nullptr,
-          stream,
-          _lists->code_rotation ? vss::rotation_slack(dim) : 0.f);
-      } else {
-        vss::narrow_to_shifted_int8(
-          s.search_queries.data_handle(), n_left * dim, s.probe_i8->data(), stream);
-      }
-      vss::int8_row_sq_norms(s.probe_i8->data(), n_left, dim, s.probe_sq->data(), stream);
-    }
-
-    // Bounded search: sweep 0 searches each row's nearest cluster and folds as usual, which gives
-    // every row a k-th distance; sweep 1 searches the remaining clusters with a GEMM that keeps
-    // only pairs under that bound, so the scores of the other n_probes - 1 clusters never reach
-    // memory. Distances stay squared until the end, where the bound is compared.
-    // A radius join is the same search with the radius as every row's bound, in one sweep: there
-    // is no k-th distance to seed, and a pair under the bound is final when found.
-    // Lists on the device can seed sweep 0 (below), which makes even one probe a bounded search.
-    // SIRIUS_VSS_SEED=0 turns the seed off (sweep 0 then ranks each row's nearest cluster in full);
-    // SIRIUS_VSS_SEED=force seeds INT8 lists on the device past the partition-size test below.
-    std::string_view const seed_switch = [] {
-      auto const* v = std::getenv("SIRIUS_VSS_SEED");
-      return v == nullptr ? std::string_view{} : std::string_view{v};
-    }();
-    bool const seed_enabled = seed_switch != "0";
-    bool const seed_forced  = seed_switch == "force";
-    // A seeded sweep 0 is each row's exact join with its nearest cluster, filtered in stretches
-    // that double from the seed's sample and merged in between (stretch_sweep0, below), so its cost
-    // grows with the number of stretches -- the log of the partition -- while the unseeded pass
-    // ranks the whole partition on CUDA cores, linear in it. FLOAT16 lists take the seed at every
-    // partition size measured (Deep10M, 1M and 10k probes, ~2.4k-19.5k rows a partition: 0.69-0.92x
-    // the unseeded pass). INT8 codes pass about 2k pairs a row a stretch (FLOAT16 about 1k), so for
-    // INT8 the seed pays only once a partition is large: per 1M probes 1.04x the unseeded pass at
-    // ~2.4k rows a partition, 0.99x at ~4.9k, 0.82x at ~9.8k, 0.84x at ~19.5k (10-30
-    // nearest-as-join, RTX A5000). INT8 lists averaging under kSeedInt8Rows rows a partition keep
-    // the unseeded pass. Lossless UINT8 rows seed exactly at any size.
-    constexpr std::int64_t kSeedInt8Rows = 5'000;
-    bool const large_partitions =
-      _lists != nullptr && _lists->offsets.size() > 1 &&
-      _lists->offsets.back() >=
-        static_cast<std::int64_t>(_lists->offsets.size() - 1) * kSeedInt8Rows;
-    // A single list -- the exact join's compact layout, no partitioning -- lowers each row's bound
-    // as its bounded sweep goes: every slice is cut into pieces whose merge points double from the
-    // first piece, and what passes is merged before the next, so after the first pieces the filter
-    // runs under a bound near the final one (Deep10M INT8, 10k probes: 0.33 s, against 0.37 s
-    // through its best partitioning). On the device the seed's sample bounds the first piece; host
-    // lists, with no device rows to sample, start from an unbounded first piece instead. Either way
-    // the first piece is cut to the batch, so that what it lets through -- every row of an
-    // unbounded piece, about k per sample's worth under the seed -- stays near 2^24 pairs: a 1M-row
-    // probe batch over host lists would otherwise buffer a billion. Later pieces pass about k a
-    // row. SIRIUS_VSS_RUNNING_BOUND=<rows> sets the first piece for any lists, 0 turns it off.
-    // A single list of FLOAT16 rows takes no sample on the device either: its codes give each row's
-    // bound after the first piece (see hold_codes_pairs, below). Exact, with no FP32 read for the
-    // bound. INT8 and byte codes keep the seed: measured slower without it, at every probe count.
-    // The first piece's pairs all pass, so a device too full for their buffer keeps the seed too.
-    // SIRIUS_VSS_F16_NO_SEED=0 keeps the seed here too, and setting SIRIUS_VSS_SEED or
-    // SIRIUS_VSS_RUNNING_BOUND asks for the schedule they name.
-    auto const unbounded_piece_rows = [&] {
-      constexpr std::int64_t kFirstPiecePairs = std::int64_t{1} << 24;
-      auto const at_least                     = std::max<std::int64_t>(4 * k_join, 64);
-      return std::clamp<std::int64_t>(kFirstPiecePairs / std::max<std::int64_t>(n_left, 1),
-                                      at_least,
-                                      std::max<std::int64_t>(at_least, vss::kSeedSample));
-    };
-    s.f16_list_no_seed =
-      _lists != nullptr && _lists->offsets.size() == 2 && !s.int8_search &&
-      _lists->encoding == vss::list_encoding::float16 && !radius_join && !ip &&
-      st.earlier_cut == nullptr && seed_switch.empty() &&
-      std::getenv("SIRIUS_VSS_RUNNING_BOUND") == nullptr &&
-      static_cast<std::size_t>(n_left * unbounded_piece_rows()) * 20 + (std::size_t{1} << 28) <=
-        mem_space->get_available_memory(stream) &&
-      [] {
-        auto const* v = std::getenv("SIRIUS_VSS_F16_NO_SEED");
-        return v == nullptr || std::string_view{v} != "0";
-      }();
-    s.running_bound_rows = [&] {
-      if (auto const* v = std::getenv("SIRIUS_VSS_RUNNING_BOUND"); v != nullptr) {
-        return std::max<std::int64_t>(0, std::atoll(v));
-      }
-      if (_lists == nullptr || _lists->offsets.size() != 2) { return std::int64_t{0}; }
-      constexpr std::int64_t kFirstPiecePairs = std::int64_t{1} << 24;
-      auto const rows                         = std::max<std::int64_t>(n_left, 1);
-      auto const at_least                     = std::max<std::int64_t>(4 * k_join, 64);
-      // The seed is the k-th of max(kSeedSample, 8k) sample rows (seed_rows), so about k / that of
-      // a piece's rows pass it.
-      auto const sample = std::max<std::int64_t>(vss::kSeedSample, 8 * k_join);
-      // The upper bounds give way to at_least for a large k (std::clamp needs lo <= hi).
-      return _lists->tier == cucascade::memory::Tier::GPU && !s.f16_list_no_seed
-               ? std::clamp<std::int64_t>(
-                   kFirstPiecePairs / rows * sample / std::max<std::int64_t>(k_join, 1),
-                   at_least,
-                   std::max<std::int64_t>(at_least, 10'000))
-               : unbounded_piece_rows();
-    }();
-    // Lists in host memory have no device rows to sample; with the bound lowered as it goes, their
-    // sweep starts from an unbounded first piece instead, which serves as the sample.
-    // The seed's sample grows with k (seed_rows), so any k is seeded; unseeded, the sweep would
-    // rank every row first, a full GEMM and selection.
-    bool const seedable =
-      s.int8_search && !radius_join &&
-      (_lists->tier == cucascade::memory::Tier::GPU || s.running_bound_rows > 0) && seed_enabled &&
-      (!s.codes_int8 || large_partitions || s.running_bound_rows > 0 || seed_forced);
-    s.bounded = s.int8_search && (s.n_probes > 1 || radius_join || s.codes_int8 || seedable) &&
-                vss::bound_filter_int8_supports(dim) && bound_gemm_enabled;
-    // FLOAT16 lists that kept their FP32 rows get the same two sweeps with the half-precision
-    // GEMM, and an exact answer: sweep 0's nearest-cluster answers are re-scored in FP32 only to
-    // give each row a bound (their largest distance) and then dropped, and sweep 1 searches every
-    // routed cluster, nearest one included, keeping pairs whose FP16 distance is within the bound
-    // plus the FP16 rounding slack. What passes is re-scored in FP32 before it is merged, and ids
-    // stay layout rows until the end, where the re-scoring needs them.
-    // A scanned corpus has no lists, but every chunk it stages can be coded on the device and
-    // searched the same way: sweep 0 ranks each row's nearest cluster in FP32 and re-scores that
-    // answer exactly, so its largest distance bounds the row; sweep 1 codes each staged chunk to
-    // FLOAT16 and filters every routed cluster under the bound, re-scoring what passes from the
-    // chunk's FP32 rows before the chunk is released. Deep10M self-join (k 10, 32 probes) spent 82
-    // % of its GPU time in the FP32 GEMM and the top-k selection of the ranked search this
-    // replaces. With one probe sweep 0 is the whole search already, and sweep 1 would only repeat
-    // it.
-    bool const scan_f16_shape = _lists == nullptr && !s.int8_search && gemm_search_enabled() &&
-                                bound_gemm_enabled && l2 && !radius_join &&
-                                st.earlier_cut == nullptr && s.n_probes > 1 &&
-                                vss::bound_filter_f16_supports(dim) && scan_bounded_enabled();
-    bool const f16_lists_shape =
-      !s.int8_search && gemm_search_enabled() && _lists != nullptr &&
-      _lists->encoding == vss::list_encoding::float16 && _lists->has_exact_rows() &&
-      (s.search_metric == cuvs::distance::DistanceType::L2Expanded ||
-       s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded || ip) &&
-      vss::bound_filter_f16_supports(dim) && bound_gemm_enabled;
-    // The probe is rounded like the rows, with its rounded norms and its own rounding error. A
-    // probe row past half's range (a component of 65520 or more becomes infinite) would make its
-    // pairs' filter values infinite or NaN, which no limit admits: its true pairs would be dropped
-    // with no error. So the probe rows are held to the rows' own check (kmeans_functions.cpp: a
-    // norm under 65504), and a batch with one outside it is searched in FP32 instead: a scanned
-    // corpus from its staged FP32 chunks, FLOAT16 lists from their kept FP32 rows.
-    bool probe_in_f16_range = true;
-    // A search that needs every FP32 row at hand (rare: see below) gets them back.
-    auto block_rows_to_device = [&] {
-      if (!st.probe_rows_on_host) { return; }
-      st.block_probe.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
-      st.host_rows->copy_to_device(0, n_left, st.block_probe->data());
-      s.search_queries = raft::make_device_matrix_view<float const, std::int64_t>(
-        st.block_probe->data(), n_left, dim);
-      routed_queries.resize(static_cast<std::size_t>(s.max_routed * dim), stream);
-      st.host_rows.reset();
-      st.probe_rows_on_host = false;
-    };
-    if (!scan_f16_shape) { block_rows_to_device(); }
-    if (scan_f16_shape || f16_lists_shape) {
-      s.probe_f16.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
-      s.probe_sqf.emplace(static_cast<std::size_t>(n_left), stream, mr);
-      s.probe_half_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
-      rmm::device_uvector<unsigned int> max_sq_bits(1, stream, mr);
-      CUDF_CUDA_TRY(cudaMemsetAsync(max_sq_bits.data(), 0, sizeof(unsigned int), stream.get()));
-      if (st.probe_rows_on_host) {
-        for_each_host_piece([&](float const* rows, std::int64_t at, std::int64_t n) {
-          vss::narrow_to_float16(rows, n * dim, s.probe_f16->data() + at * dim, stream);
-          vss::half_rows_norms(rows,
-                               s.probe_f16->data() + at * dim,
-                               n,
-                               dim,
-                               s.probe_sqf->data() + at,
-                               s.probe_half_error->data() + at,
-                               nullptr,
-                               max_sq_bits.data(),
-                               stream);
-        });
-      } else {
-        vss::narrow_to_float16(
-          s.search_queries.data_handle(), n_left * dim, s.probe_f16->data(), stream);
-        vss::half_rows_norms(s.search_queries.data_handle(),
-                             s.probe_f16->data(),
-                             n_left,
-                             dim,
-                             s.probe_sqf->data(),
-                             s.probe_half_error->data(),
-                             nullptr,
-                             max_sq_bits.data(),
-                             stream);
-      }
-      unsigned int bits = 0;
-      CUDF_CUDA_TRY(cudaMemcpyAsync(
-        &bits, max_sq_bits.data(), sizeof(bits), cudaMemcpyDeviceToHost, stream.get()));
-      stream.sync();
-      float max_sq = 0;
-      std::memcpy(&max_sq, &bits, sizeof(max_sq));
-      float const probe_norm_max = std::sqrt(max_sq);
-      probe_in_f16_range         = probe_norm_max < 65504.f;
-      if (!probe_in_f16_range) {
-        SIRIUS_LOG_INFO(
-          "[sirius_physical_vector_join_stream] a probe row norm of {} is outside float16's "
-          "range; searching this batch of {} rows in FP32",
-          probe_norm_max,
-          n_left);
-        s.probe_f16.reset();
-        s.probe_sqf.reset();
-        s.probe_half_error.reset();
-        block_rows_to_device();
-      }
-    }
-    s.scan_f16    = scan_f16_shape && probe_in_f16_range;
-    s.f16_bounded = s.scan_f16 || (f16_lists_shape && probe_in_f16_range);
-    // FLOAT16 lists the bounded search does not answer (a cosine join over rows as they are, a
-    // probe row past half's range, the bounded search switched off): their chunks are staged from
-    // the kept FP32 rows, in layout order, so the FP32 search scores what the rows hold. Over the
-    // half rows it would be exact for the rounded rows, and report their distances.
-    if (_lists != nullptr && _lists->encoding == vss::list_encoding::float16 && !s.f16_bounded) {
-      if (!_lists->has_exact_rows()) {
-        throw std::runtime_error(
-          "[sirius_physical_vector_join_stream] these float16 cluster lists kept no FP32 rows, "
-          "which a " +
-          _request.metric +
-          " join outside the bounded search reads; rebuild the lists with storage => 'float32'");
-      }
-      s.exact_lists_corpus.emplace(*_lists, /*exact_rows=*/true);
-    }
-    s.any_bounded = s.bounded || s.f16_bounded;
-    // FP16 and INT8 lists filter with inexact distances: their bounded search keeps layout rows as
-    // ids and re-scores every candidate in FP32 from the kept rows. Unseeded, they search the
-    // nearest cluster again in sweep 1 (sweep 0 only sets the bound). INT8 filters in code space,
-    // under a per-row limit derived from the FP32 bound and both sides' coding errors.
-    s.rescore = s.f16_bounded || s.codes_int8;
-    // A radius join whose score is never read keeps the filter's verdict where it already proves
-    // the pair is inside the radius, and re-scores only the rest.
-    s.skip_certain = radius_join && s.rescore && !_request.score_read && !best_only;
-    // The FLOAT16 rows' largest rounding error and norm, which the filter limit allows for: the
-    // lists' own, or for a scanned corpus the staged chunk's, set as each chunk is coded.
-    float row_half_error = _lists != nullptr ? _lists->half_error : 0.f;
-    float row_norm_max   = _lists != nullptr ? _lists->max_row_norm : 0.f;
-    auto code_limits     = [&](float const* bound_rows, float* limit, bool lower) {
-      if (s.codes_int8) {
-        vss::int8_code_limit(bound_rows,
-                             s.probe_code_error->data(),
-                             _lists->code_error,
-                             _lists->code_scale,
-                             n_left,
-                             limit,
-                             stream,
-                             lower);
-      } else if (s.f16_bounded) {
-        vss::float16_bound_limit(bound_rows,
-                                 s.probe_sqf->data(),
-                                 s.probe_half_error->data(),
-                                 row_half_error,
-                                 row_norm_max,
-                                 dim,
-                                 n_left,
-                                 limit,
-                                 stream,
-                                 lower,
-                                 ip);
-      }
-    };
-    auto refresh_code_limit = [&](float const* bound_rows) {
-      code_limits(bound_rows, s.code_limit->data(), false);
-    };
-    s.sqrt_at_end =
-      s.any_bounded && s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded;
-    // Lists on the device run sweep 0 -- each row's nearest cluster, which only sets the bounded
-    // sweep's starting bound -- as a bounded search too, a few grouped launches instead of a GEMM
-    // and a selection per cluster. Its own bound comes from the first kSeedSample rows of that
-    // cluster: their k-th smallest distance, which for INT8 codes and FLOAT16 rows is first raised
-    // by both sides' coding or rounding error so it bounds the FP32 distance. What passes is merged
-    // (re-scored in FP32 where the rows are inexact), so sweep 1 starts from the nearest cluster's
-    // exact k-th and need not search that cluster again. SIRIUS_VSS_SEED=0 keeps the GEMM.
-    // The seed is CUDA-core work per probe row (a warp per row against a quarter of its nearest
-    // cluster, at most kSeedSample rows); ranking each row's nearest cluster on the tensor cores
-    // instead (gemm_f16_topk below, as host lists do) costs a GEMM and a selection per (task,
-    // cluster) slice plus a second search of that cluster in sweep 1. So the seed pays while the
-    // slices carry little seed work -- few probe rows a cluster, as in a small probe batch -- and
-    // the ranked pass once they carry much. A task over clustered FLOAT16 lists on the device ranks
-    // when its mean seed work per slice (nearest-cluster probe rows x sample rows x width) reaches
-    // SIRIUS_VSS_SWEEP0_SLICE_MACS. SIRIUS_VSS_SWEEP0=seed | ranked forces either;
-    // SIRIUS_VSS_SEED=0 still means the grouped CUDA-core ranking (nearest_cluster_topk).
-    s.ranked_sweep0 = false;
-    if (s.f16_bounded && _lists != nullptr && _lists->tier == cucascade::memory::Tier::GPU &&
-        _lists->offsets.size() > 2 && s.running_bound_rows == 0 && !radius_join && !ip &&
-        seed_enabled && s.probe_f16) {
-      auto const* sw = std::getenv("SIRIUS_VSS_SWEEP0");
-      std::string_view const how{sw == nullptr ? "auto" : sw};
-      auto const floor    = std::max<std::int64_t>(64, 8 * k_join);
-      double seed_macs    = 0;
-      std::int64_t slices = 0;
-      for (std::size_t c = 0; c + 1 < _lists->offsets.size(); ++c) {
-        auto const rows = nearest_edges[c];
-        if (rows == 0) { continue; }
-        auto const size   = _lists->offsets[c + 1] - _lists->offsets[c];
-        auto const sample = std::min<std::int64_t>(
-          size,
-          std::clamp<std::int64_t>(
-            size / 4, floor, std::max<std::int64_t>(floor, vss::kSeedSample)));
-        seed_macs += static_cast<double>(rows) * static_cast<double>(sample) * dim;
-        ++slices;
-      }
-      auto const* t          = std::getenv("SIRIUS_VSS_SWEEP0_SLICE_MACS");
-      double const threshold = t != nullptr ? std::atof(t) : kSweep0RankedSliceMacs;
-      s.ranked_sweep0 = how == "ranked" || (how != "seed" && slices > 0 &&
-                                            seed_macs >= threshold * static_cast<double>(slices));
-      if (dbg) {
-        std::fprintf(stderr,
-                     "[vecjoin-phase] sweep-0 rule: %lld probe rows over %lld nearest slices, "
-                     "seed work %.3g MACs a slice (ranked from %.3g, SIRIUS_VSS_SWEEP0=%s): %s\n",
-                     static_cast<long long>(n_left),
-                     static_cast<long long>(slices),
-                     slices > 0 ? seed_macs / static_cast<double>(slices) : 0.0,
-                     threshold,
-                     std::string(how).c_str(),
-                     s.ranked_sweep0 ? "ranked" : "seed");
-      }
-    }
-    bool const seed_f16 =
-      s.f16_bounded && _lists != nullptr && !radius_join &&
-      (_lists->tier == cucascade::memory::Tier::GPU || s.running_bound_rows > 0) && seed_enabled &&
-      !s.ranked_sweep0;
-    s.seed = (s.bounded && seedable) || seed_f16;
-    // Unseeded, sweep 0 ranks each row's nearest cluster on the half-precision tensor cores from
-    // the stored rows; only the bound it leaves is used.
-    // SIRIUS_VSS_F16_GEMM=0 widens the rows and ranks them with the FP32 GEMM instead.
-    // An inner-product join keeps to the searches it was verified on: the seed, the bounded
-    // filter, and the FP32 GEMM ranking of an unseeded sweep 0.
-    s.f16_sweep0 = s.f16_bounded && !s.scan_f16 && !s.seed && !ip && [] {
-      auto const* v = std::getenv("SIRIUS_VSS_F16_GEMM");
-      return v == nullptr || std::string_view{v} != "0";
-    }();
-    // That bound comes from the codes alone, with no FP32 read, across PCIe when the rows are in
-    // host memory. Row r's k pairs of sweep 0 are distinct, and the largest of their codes is
-    // c_(k), so all k have c(r, s) <= c_(k), hence delta(r, s) <= U_r(c_(k)) (the lemma above
-    // gap_trim), which therefore bounds delta*_r and may stand as b_r wherever their re-scored k-th
-    // did. It is never below that k-th, so what a re-scored bound keeps it keeps too. U_r holds for
-    // sweep 0's codes as for the filter's, in all of its kernels, with N = |q^| + max|x^|:
-    //  1. A product of two halves has at most 22 significant bits and is at least 2^-48: exact in
-    //     FP32, with no denormal.
-    //  2. Any summation tree over d terms has depth at most d - 1, so a dot's error is at most
-    //     1.001 d u |q^| |x^|, u = 2^-24, whatever the order.
-    //  3. c doubles that, adds the two FP32 norms' errors and the last additions: at most
-    //     (d/2 + d/32 + 8) u N^2 with 4 |q^| |x^| <= N^2, inside eta_r = 2 d u N^2. Clamping at 0
-    //     only raises c. So |q^ - x^|^2 <= c + eta_r, with room left of about 1.47 d u N^2.
-    //  4. |q - x| <= |q^ - x^| + e_r + e by the triangle inequality.
-    //  5. The re-score is at most |q - x|^2 (1 + (d/32 + 7) u), one lane's FMA chain, 5 shuffle
-    //     additions and the subtraction, which 2^-20 and the room in (3) cover for d >= 16.
-    // A row with a miss in sweep 0 has an infinite c_(k), which stays infinite.
-    // SIRIUS_VSS_SWEEP0_CODE_BOUND=0 re-scores the k pairs instead.
-    s.sweep0_bound_from_codes = s.f16_sweep0 && !radius_join && [] {
-      auto const* v = std::getenv("SIRIUS_VSS_SWEEP0_CODE_BOUND");
-      return v == nullptr || std::string_view{v} != "0";
-    }();
-    std::optional<rmm::device_uvector<std::uint16_t>> routed_f16;
-    std::optional<rmm::device_uvector<float>> routed_sqf;
-    if (s.f16_sweep0) {
-      routed_f16.emplace(static_cast<std::size_t>(s.max_routed * dim), stream, mr);
-      routed_sqf.emplace(static_cast<std::size_t>(s.max_routed), stream, mr);
-    }
-    if (s.f16_bounded) {
-      // The probe was rounded above, and is within half's range.
-      if (ip) {
-        // The filter kernels compute |q|^2 + |x|^2 - 2 q.x from the norms they are handed: with
-        // zeros on both sides that is -2 q.x, the inner-product distance, exactly.
-        s.ip_probe_zero_sq.emplace(static_cast<std::size_t>(n_left), stream, mr);
-        CUDF_CUDA_TRY(cudaMemsetAsync(
-          s.ip_probe_zero_sq->data(), 0, s.ip_probe_zero_sq->size() * sizeof(float), stream.get()));
-        if (_lists != nullptr && !_lists->offsets.empty()) {
-          s.ip_row_zero_sq.emplace(
-            static_cast<std::size_t>(std::max<std::int64_t>(_lists->offsets.back(), 1)),
-            stream,
-            mr);
-          CUDF_CUDA_TRY(cudaMemsetAsync(
-            s.ip_row_zero_sq->data(), 0, s.ip_row_zero_sq->size() * sizeof(float), stream.get()));
-        }
-      }
-    }
-    // The probe norms the filter kernels read: zeros for an inner product (see above).
-    auto probe_filter_sq = [&]() -> float const* {
-      return s.ip_probe_zero_sq ? s.ip_probe_zero_sq->data() : s.probe_sqf->data();
-    };
-    // Where the FP32 re-score reads a layout row: the lists' kept rows, or for a scanned corpus the
-    // staged chunk, pointed at as each chunk is coded (its candidates are flushed before it goes).
-    auto exact_source = s.rescore && _lists != nullptr ? _lists->exact_source() : vss::exact_rows{};
-    // The kernels compare squared distances.
-    s.radius_bound = s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded
-                       ? s.search_radius * s.search_radius
-                       : s.search_radius;
-    // Gap-checked re-score (top-k joins over inexact rows only): before a stretch's candidates are
-    // re-scored, each row's k-th FP32 distance is bounded from its k best codes and its running
-    // top-k, and the candidates past the filter limit of that bound -- which cannot be in the row's
-    // top-k -- are dropped without reading their FP32 rows. SIRIUS_VSS_GAP_RESCORE=0 re-scores
-    // every candidate; SIRIUS_VSS_GAP_RESCORE_STATS=1 counts what it trims (also under the phase
-    // debug).
-    s.gap_rescore = s.rescore && !radius_join && [] {
-      auto const* v = std::getenv("SIRIUS_VSS_GAP_RESCORE");
-      return v == nullptr || std::string_view{v} != "0";
-    }();
-    s.gap_stats_on = s.gap_rescore && (dbg || [] {
-                       auto const* v = std::getenv("SIRIUS_VSS_GAP_RESCORE_STATS");
-                       return v != nullptr && std::string_view{v} == "1";
-                     }());
-    // The terms the filter limit widens by (code_limits), turned around: a code distance as an
-    // FP32 bound, exactly as the seeds raise theirs.
-    auto code_terms = [&] {
-      vss::code_bound_terms t{};
-      if (s.codes_int8) {
-        t.int8        = true;
-        t.probe_error = s.probe_code_error->data();
-        t.row_error   = _lists->code_error;
-        t.scale       = _lists->code_scale;
-      } else {
-        t.probe_error   = s.probe_half_error->data();
-        t.row_error     = row_half_error;
-        t.probe_sq      = s.probe_sqf->data();
-        t.row_norm      = row_norm_max;
-        t.d             = dim;
-        t.inner_product = ip;
-      }
-      return t;
-    };
-    // Exactness, in the notation of the lemma (sections/3-motiv.tex, "Error-bounded filtering").
-    // For probe row r and build row s let c(r, s) be the filter value (the code distance) and
-    // delta(r, s) the re-scored FP32 distance. b_r, the row's bound (the k-th re-scored distance it
-    // holds, or the seed's), never falls below delta*_r, its true k-th FP32 distance. The lemma's
-    // widened limit (code_limits: float16_bound_limit, int8_code_limit)
-    //   L_r(b) = ((sqrt(b) + e_r + e)^2 + eta_r)(1 + 2^-20)
-    // keeps every pair within b:  delta(r, s) <= b  =>  c(r, s) <= L_r(b).  Its converse, the bound
-    // the seeds raise a k-th code distance to (float16_seed_upper_bound, int8_seed_upper_bound),
-    //   U_r(c) = (sqrt(c + eta_r) + e_r + e)^2 (1 + 2^-20),
-    // gives  c(r, s) <= c  =>  delta(r, s) <= U_r(c),  from the same e_r, e and eta_r (INT8: eta_r
-    // = 0, codes exact in int32, and c in units of the codes' scale squared). Let a stretch hold
-    // row r's candidates with codes c_(1) <= c_(2) <= ..., none of them a pair r's accumulator
-    // holds, and acc_(i) its i-th re-scored distance (acc_(0) = -inf). Each of b_r and
-    // max(acc_(k-j), U_r(c_(j))) for j = 0..k has k distinct pairs within it, so
-    //   B_r = min(b_r, min_j max(acc_(k-j), U_r(c_(j))))  >=  delta*_r,
-    // and a candidate with  c > L_r(B_r)  has delta > B_r >= delta*_r: strictly past the k-th, not
-    // in r's top-k under any order of ties. It is dropped without reading its FP32 row.
-    // The gap check: the first m k candidates are all that can be in r's top-k when
-    // c_(mk) > L_r(B_r), which, as B_r <= U_r(c_(k)), holds whenever
-    //   c_(mk) > L_r(U_r(c_(k))) ~ (sqrt(c_(k) + eta_r) + 2 (e_r + e))^2 + eta_r,
-    // i.e. "c_(mk) - e_r > c_(k) + e_r" in distance units with e_r + e the error of a pair.
-    // Comparing every candidate with L_r(B_r) applies that test at every m at once: it keeps fewer
-    // than m k exactly where the check passes for m (2, then 4), and where both fail it still drops
-    // what lies past L_r(B_r) instead of re-scoring all. Nothing within B_r is dropped, so the
-    // merge keeps the same pairs as without the trim, up to which of several pairs tied at exactly
-    // the k-th distance it keeps -- which the filter's appends, in no fixed order, already leave
-    // open from one run to the next. (The kernels use 1 + 1e-6 for 1 + 2^-20, in the limits and
-    // seeds alike.)
-    auto debug_mark = [&] {
-      if (!dbg) { return std::chrono::steady_clock::time_point{}; }
-      stream.sync();
-      return std::chrono::steady_clock::now();
-    };
-    auto gap_trim = [&] {
-      if (!s.gap_rescore || s.pending == 0) { return; }
-      auto const t0 = debug_mark();
-      if (!s.gap_limit) { s.gap_limit.emplace(static_cast<std::size_t>(n_left), stream, mr); }
-      vss::gap_rescore_bound(s.candidates->rows.data(),
-                             s.candidates->distances.data(),
-                             s.pending,
-                             st.acc_distances->view().data<float>(),
-                             n_left,
-                             k_join,
-                             s.bound->data(),
-                             code_terms(),
-                             s.gap_limit->data(),
-                             stream,
-                             mr);
-      // In place: each row's limit is computed from its own bound alone.
-      code_limits(s.gap_limit->data(), s.gap_limit->data(), false);
-      s.pending = vss::keep_within_row_limit(s.candidates->rows.data(),
-                                             s.candidates->ids.data(),
-                                             s.candidates->distances.data(),
-                                             s.pending,
-                                             s.gap_limit->data(),
-                                             n_left,
-                                             k_join,
-                                             s.gap_stats_on ? &s.gap_stats : nullptr,
-                                             stream,
-                                             mr);
-      if (dbg) { s.trim_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
-    };
-    // The candidates' FP32 distances, over host probe rows: their rows are brought over a slice of
-    // the candidates at a time, each distinct row once, up to kRows of them. The rows and their
-    // slots are read on the host, where each slice's copy starts from.
-    auto rescore_from_host_rows = [&] {
-      constexpr std::size_t kRescoreBytes = std::size_t{256} << 20;
-      auto const row_bytes                = static_cast<std::size_t>(dim) * sizeof(float);
-      auto const kRows                    = std::max<std::size_t>(1, kRescoreBytes / row_bytes);
-      if (s.host_row_slot.empty()) { s.host_row_slot.assign(static_cast<std::size_t>(n_left), -1); }
-      std::vector<std::int32_t> rows(static_cast<std::size_t>(s.pending));
-      CUDF_CUDA_TRY(cudaMemcpyAsync(rows.data(),
-                                    s.candidates->rows.data(),
-                                    rows.size() * sizeof(std::int32_t),
-                                    cudaMemcpyDeviceToHost,
-                                    stream.get()));
-      stream.sync();
-      std::vector<std::int32_t> distinct;
-      std::vector<float> staged;
-      for (std::size_t from = 0; from < rows.size();) {
-        distinct.clear();
-        auto to = from;
-        for (; to < rows.size(); ++to) {
-          auto& slot = s.host_row_slot[static_cast<std::size_t>(rows[to])];
-          if (slot < 0) {
-            if (distinct.size() == kRows) { break; }
-            slot = static_cast<std::int32_t>(distinct.size());
-            distinct.push_back(rows[to]);
-          }
-          rows[to] = slot;
-        }
-        staged.resize(distinct.size() * static_cast<std::size_t>(dim));
-        st.host_rows->gather(distinct.data(), distinct.size(), staged.data());
-        for (auto const row : distinct) {
-          s.host_row_slot[static_cast<std::size_t>(row)] = -1;
-        }
-        rmm::device_uvector<float> device_rows(staged.size(), stream, mr);
-        rmm::device_uvector<std::int32_t> slots(to - from, stream, mr);
-        // From pageable vectors, so the copies have completed when the calls return.
-        CUDF_CUDA_TRY(cudaMemcpyAsync(device_rows.data(),
-                                      staged.data(),
-                                      staged.size() * sizeof(float),
-                                      cudaMemcpyHostToDevice,
-                                      stream.get()));
-        CUDF_CUDA_TRY(cudaMemcpyAsync(slots.data(),
-                                      rows.data() + from,
-                                      slots.size() * sizeof(std::int32_t),
-                                      cudaMemcpyHostToDevice,
-                                      stream.get()));
-        vss::exact_distances(device_rows.data(),
-                             slots.data(),
-                             0,
-                             s.candidates->ids.data() + from,
-                             s.candidates->distances.data() + from,
-                             static_cast<std::int64_t>(to - from),
-                             exact_source,
-                             dim,
-                             stream,
-                             mr,
-                             nullptr,
-                             0.f,
-                             ip);
-        stream.sync();
-        from = to;
-      }
-    };
-    auto flush = [&] {
-      if (s.pending == 0) { return; }
-      ++s.bounded_merges;
-      s.bounded_emitted += s.pending - s.pairs_back;
-      s.pairs_back       = 0;
-      auto const t0      = debug_mark();
-      auto const* c_rows = s.candidates->rows.data();
-      auto const* c_ids  = s.candidates->ids.data();
-      auto const* c_dist = s.candidates->distances.data();
-      auto const done    = [&] {
-        CUDF_CUDA_TRY(
-          cudaMemsetAsync(s.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
-        s.pending = 0;
-        if (dbg) { s.rescore_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
-      };
-      if (keyed && !best_only) {
-        // The pairs the keys drop are dropped before anything is re-scored; the rest are held to
-        // the radius as every pair of a threshold join is.
-        auto const no_limit = std::numeric_limits<float>::infinity();
-        auto const* row_map =
-          s.rescore ? static_cast<std::int64_t const*>(_lists->row_ids->data()) : nullptr;
-        auto kept = s.rescore ? vss::take_pairs(c_rows,
-                                                c_ids,
-                                                c_dist,
-                                                s.pending,
-                                                st.layout_keys,
-                                                no_limit,
-                                                nullptr,
-                                                false,
-                                                stream,
-                                                mr)
-                              : vss::take_pairs(c_rows,
-                                                c_ids,
-                                                c_dist,
-                                                s.pending,
-                                                st.pin_keys,
-                                                s.radius_bound,
-                                                nullptr,
-                                                s.sqrt_at_end,
-                                                stream,
-                                                mr);
-        if (s.rescore && kept.rows.size() > 0) {
-          auto const n = static_cast<std::int64_t>(kept.rows.size());
-          vss::exact_distances(s.search_queries.data_handle(),
-                               kept.rows.data(),
-                               0,
-                               kept.ids.data(),
-                               kept.distances.data(),
-                               n,
-                               exact_source,
-                               dim,
-                               stream,
-                               mr,
-                               s.certain_limit ? s.certain_limit->data() : nullptr,
-                               s.radius_bound,
-                               ip);
-          kept = vss::take_pairs(kept.rows.data(),
-                                 kept.ids.data(),
-                                 kept.distances.data(),
-                                 n,
-                                 {},
-                                 s.radius_bound,
-                                 row_map,
-                                 s.sqrt_at_end,
-                                 stream,
-                                 mr);
-        }
-        if (kept.rows.size() > 0) {
-          auto const pairs = static_cast<std::int64_t>(kept.rows.size());
-          if (!count_only) {
-            st.radius_left.push_back(
-              std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
-            st.radius_neighbors.push_back(
-              std::make_unique<cudf::column>(std::move(kept.ids), rmm::device_buffer{}, 0));
-            st.radius_distances.push_back(
-              std::make_unique<cudf::column>(std::move(kept.distances), rmm::device_buffer{}, 0));
-          }
-          note_radius_part(pairs);
-        }
-        done();
-        return;
-      }
-      if (best_only) {
-        if (s.rescore) {
-          // The filter's distances are inexact, so a row's nearest by them is re-scored first: its
-          // exact distance bounds the row's best match, and the filter limit of that bound admits
-          // few of the row's other pairs. Those are re-scored too, and the rest never are.
-          rmm::device_uvector<std::int64_t> winner(static_cast<std::size_t>(n_left), stream, mr);
-          vss::best_match_winners(c_rows,
-                                  c_ids,
-                                  c_dist,
-                                  s.pending,
-                                  st.layout_keys,
-                                  s.code_limit->data(),
-                                  st.best_scratch->data(),
-                                  winner.data(),
-                                  n_left,
-                                  stream);
-          for (bool const winners : {true, false}) {
-            auto taken   = vss::best_match_take(c_rows,
-                                                c_ids,
-                                                c_dist,
-                                                s.pending,
-                                                st.layout_keys,
-                                                s.code_limit->data(),
-                                                winner.data(),
-                                                winners,
-                                                stream,
-                                                mr);
-            auto const n = static_cast<std::int64_t>(taken.rows.size());
-            if (n == 0) { continue; }
-            vss::exact_distances(s.search_queries.data_handle(),
-                                 taken.rows.data(),
-                                 0,
-                                 taken.ids.data(),
-                                 taken.distances.data(),
-                                 n,
-                                 exact_source,
-                                 dim,
-                                 stream,
-                                 mr,
-                                 nullptr,
-                                 0.f,
-                                 ip);
-            fold_best(taken.rows.data(),
-                      taken.ids.data(),
-                      taken.distances.data(),
-                      n,
-                      s.radius_bound,
-                      {},
-                      s.bound->data());
-            refresh_code_limit(s.bound->data());
-            st.best_rescored += n;
-          }
-        } else {
-          fold_best(c_rows, c_ids, c_dist, s.pending, s.radius_bound, st.pin_keys, s.bound->data());
-        }
-        done();
-        return;
-      }
-      if (!radius_join) { gap_trim(); }
-      s.gap_rescored += s.rescore ? s.pending : 0;
-      auto const t_rescore = debug_mark();
-      if (s.rescore && st.probe_rows_on_host) {
-        rescore_from_host_rows();
-      } else if (s.rescore) {
-        vss::exact_distances(s.search_queries.data_handle(),
-                             s.candidates->rows.data(),
-                             0,
-                             s.candidates->ids.data(),
-                             s.candidates->distances.data(),
-                             s.pending,
-                             exact_source,
-                             dim,
-                             stream,
-                             mr,
-                             s.certain_limit ? s.certain_limit->data() : nullptr,
-                             s.radius_bound,
-                             ip);
-      }
-      auto const t1 = debug_mark();
-      if (dbg) { s.rescore_seconds += std::chrono::duration<double>(t1 - t_rescore).count(); }
-      if (radius_join) {
-        // FP16 survivors were re-scored above and are held to the radius again in FP32; int8
-        // distances are already exact. Their ids stay layout rows until here.
-        auto kept = vss::take_within(
-          *s.candidates,
-          s.pending,
-          s.radius_bound,
-          s.rescore ? static_cast<std::int64_t const*>(_lists->row_ids->data()) : nullptr,
-          s.sqrt_at_end,
-          stream,
-          mr);
-        if (kept.rows.size() > 0) {
-          auto const pairs = static_cast<std::int64_t>(kept.rows.size());
-          if (!count_only) {
-            st.radius_left.push_back(
-              std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
-            st.radius_neighbors.push_back(
-              std::make_unique<cudf::column>(std::move(kept.ids), rmm::device_buffer{}, 0));
-            st.radius_distances.push_back(
-              std::make_unique<cudf::column>(std::move(kept.distances), rmm::device_buffer{}, 0));
-          }
-          note_radius_part(pairs);
-        }
-        CUDF_CUDA_TRY(
-          cudaMemsetAsync(s.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
-        s.pending = 0;
-        if (dbg) { s.take_seconds += std::chrono::duration<double>(debug_mark() - t1).count(); }
-        return;
-      }
-      vss::merge_bound_candidates(st.acc_distances->mutable_view().data<float>(),
-                                  st.acc_neighbors->mutable_view().data<std::int64_t>(),
-                                  n_left,
-                                  k_join,
-                                  *s.candidates,
-                                  s.pending,
-                                  s.bound->data(),
-                                  stream,
-                                  mr);
-      refresh_code_limit(s.bound->data());
-      CUDF_CUDA_TRY(
-        cudaMemsetAsync(s.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
-      s.pending = 0;
-      if (dbg) { s.take_seconds += std::chrono::duration<double>(debug_mark() - t1).count(); }
-    };
-    // The buffer's fill is read back once per group of slices, not per slice: a group that
-    // overflowed is rolled back to the count before it and replayed a slice at a time, first
-    // after the buffered pairs are merged, which tightens the bound, then into a bigger buffer.
-    using bounded_slice = vss::bound_slice;
-    // With the lists on the device every slice's rows stay put, so a group's slices of one probe
-    // tile at most are launched together, a few grouped launches in place of one per slice. A
-    // Host-tier lists are staged a chunk at a time and released as the sweep moves on, so there
-    // each slice launches at once.
-    // SIRIUS_VSS_GROUP=0 launches each slice on its own.
-    // A scanned chunk stays staged until its group is checked, so its slices group too.
-    // With the CUTLASS tile kernel, lists staged from the host group as well: a chunk's slices are
-    // launched together before the next chunk's copy starts, and checked before the chunk goes.
-    bool const cutlass_tiles = s.f16_bounded && vss::bound_filter_f16_uses_cutlass(dim);
-    s.group_launch =
-      (s.scan_f16 ||
-       (_lists != nullptr && (_lists->tier == cucascade::memory::Tier::GPU || cutlass_tiles))) &&
-      [] {
-        auto const* v = std::getenv("SIRIUS_VSS_GROUP");
-        return v == nullptr || std::string_view{v} != "0";
-      }();
-    s.bounded_group = s.group_launch ? 256 : 64;
-    // Which slices join the grouped launch. Narrow slices (<= 128 probe rows) always do. A wide
-    // slice launched alone keeps its corpus tiles in L2 across its probe tiles, which pays when the
-    // slice's GEMM is large and costs a launch when it is small; measured 2026-10-05: SIFT1M 10k x
-    // 16 lists (156 probes x 977 rows per slice) went 15 -> 8 ms grouped, SIFT100M (98k-row lists)
-    // and a 1M-probe self-join over 64 lists (250k probes x 15k rows) lost 3-13 % grouped. So a
-    // wide slice joins the group when probes x rows is at most 4M. SIRIUS_VSS_GROUP_M_MAX and
-    // SIRIUS_VSS_GROUP_WORK_MAX override. The CUTLASS kernel's grouped launch keeps a slice's rows
-    // in L2 itself while they fit, so such a slice joins at any size; past that it reads them again
-    // for every probe tile. 1M rows, 256-1,536 wide: slices up to half the L2 ran 0.98-1.03x their
-    // lone launches, from 4 MB (6 MB L2) alone won by 1-15 %.
-    auto const env_i64 = [](char const* name, std::int64_t dflt) {
-      auto const* v = std::getenv(name);
-      return v == nullptr ? dflt : std::max<std::int64_t>(0, std::atoll(v));
-    };
-    s.group_m_max      = env_i64("SIRIUS_VSS_GROUP_M_MAX", 128);
-    s.group_work_max   = env_i64("SIRIUS_VSS_GROUP_WORK_MAX", 4'000'000);
-    s.group_slice_rows = cutlass_tiles ? vss::bound_filter_f16_group_slice_bytes() / (dim * 2) : 0;
-    auto const joins_group = [&](std::int64_t m, std::int64_t n) {
-      return s.group_launch &&
-             (m <= s.group_m_max || m * n <= s.group_work_max || n <= s.group_slice_rows);
-    };
-    std::vector<bounded_slice> group, deferred;
-    auto launch_bounded = [&](bounded_slice const& sl) {
-      if (s.f16_bounded) {
-        vss::bound_filter_f16(static_cast<std::uint16_t const*>(sl.x),
-                              static_cast<float const*>(sl.x_sq),
-                              sl.n,
-                              sl.id_base,
-                              s.probe_f16->data(),
-                              probe_filter_sq(),
-                              sl.rows,
-                              sl.m,
-                              dim,
-                              s.code_limit->data(),
-                              vss::float16_slack{},
-                              *s.candidates,
-                              stream);
-        return;
-      }
-      vss::bound_filter_int8(static_cast<std::int8_t const*>(sl.x),
-                             static_cast<std::int32_t const*>(sl.x_sq),
-                             sl.n,
-                             sl.id_base,
-                             sl.id_map,
-                             s.probe_i8->data(),
-                             s.probe_sq->data(),
-                             sl.rows,
-                             sl.m,
-                             dim,
-                             s.codes_int8 ? s.code_limit->data() : s.bound->data(),
-                             *s.candidates,
-                             stream);
-    };
-    auto read_count = [&] {
-      unsigned long long total = 0;
-      CUDF_CUDA_TRY(cudaMemcpyAsync(
-        &total, s.candidates->count.data(), sizeof(total), cudaMemcpyDeviceToHost, stream.get()));
-      stream.sync();
-      return static_cast<std::int64_t>(total);
-    };
-    auto rollback = [&] {
-      auto const keep = static_cast<unsigned long long>(s.pending);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(
-        s.candidates->count.data(), &keep, sizeof(keep), cudaMemcpyHostToDevice, stream.get()));
-    };
-    auto launch_deferred = [&] {
-      if (!deferred.empty()) {
-        vss::bound_filter_group(
-          deferred,
-          s.f16_bounded,
-          s.f16_bounded ? static_cast<void const*>(s.probe_f16->data())
-                        : static_cast<void const*>(s.probe_i8->data()),
-          s.f16_bounded ? static_cast<void const*>(probe_filter_sq())
-                        : static_cast<void const*>(s.probe_sq->data()),
-          dim,
-          s.f16_bounded || s.codes_int8 ? s.code_limit->data() : s.bound->data(),
-          *s.candidates,
-          stream,
-          mr);
-        deferred.clear();
-      }
-    };
-    // A single FLOAT16 list holds its pairs through the pieces instead of re-scoring between them.
-    // Each row's bound falls to B_r of the lemma above gap_trim, from the k smallest codes held and
-    // its accumulator: the codes are of k distinct pairs, none in the accumulator, as a piece's
-    // rows are new and a rollback discards what was not committed. A pair past its limit has
-    // delta > B_r >= delta*_r, strictly past the k-th, and is dropped unread; the limit is applied
-    // to the next piece too. Each trim's B_r stands on its own, so seeing a pair in several trims
-    // changes nothing, and bounds only fall. All that is left reaches the last flush, or an
-    // earlier one when the buffer stays too full. The first piece's bound is infinite, so all its
-    // pairs pass, and the buffer has room for them. The same codes and U_r as the seed's bound.
-    s.hold_codes_pairs = s.f16_list_no_seed && s.gap_rescore && s.running_bound_rows > 0;
-    auto hold_trim     = [&] {
-      if (s.pending == 0) { return; }
-      auto const t0 = debug_mark();
-      s.bounded_emitted += s.pending - s.pairs_back;
-      if (!s.gap_limit) { s.gap_limit.emplace(static_cast<std::size_t>(n_left), stream, mr); }
-      vss::gap_rescore_bound(s.candidates->rows.data(),
-                             s.candidates->distances.data(),
-                             s.pending,
-                             st.acc_distances->view().data<float>(),
-                             n_left,
-                             k_join,
-                             s.bound->data(),
-                             code_terms(),
-                             s.gap_limit->data(),
-                             stream,
-                             mr);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(s.bound->data(),
-                                    s.gap_limit->data(),
-                                    static_cast<std::size_t>(n_left) * sizeof(float),
-                                    cudaMemcpyDeviceToDevice,
-                                    stream.get()));
-      refresh_code_limit(s.bound->data());
-      s.pending    = vss::keep_within_row_limit(s.candidates->rows.data(),
-                                                s.candidates->ids.data(),
-                                                s.candidates->distances.data(),
-                                                s.pending,
-                                                s.code_limit->data(),
-                                                n_left,
-                                                k_join,
-                                                nullptr,
-                                                stream,
-                                                mr);
-      s.pairs_back = s.pending;
-      rollback();
-      if (dbg) { s.trim_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
-    };
-    // A top-k join's pairs wait in the buffer for their FP32 re-score, and a flush needs far more
-    // than the buffer holds: the re-score's and the merge's working space, about 64 B a pair beside
-    // the buffer's 16. Next to device lists that leave little free, a full buffer cannot flush, and
-    // on a corpus stored in cluster order, where a slice's pairs can themselves overflow the
-    // buffer, the task runs out of memory on every retry. So when a flush would not fit, the
-    // buffer's pairs move to pinned host blocks with no FP32 read and the sweep goes on; they come
-    // back at the end of the task in pieces small enough to flush. A slice that alone would need a
-    // buffer past what the device has is cut in two instead.
-    // Exactness, in the notation of the lemma above gap_trim. A moved pair is not in the
-    // accumulator and keeps its code. moved_codes holds row r's k smallest codes among all moved
-    // pairs, those trimmed since included. They are k distinct pairs, as a row visits a cluster
-    // once and a rollback discards what was not committed, each with delta <= U_r(c_(k)), so
-    // min(b_r, U_r(c_(k))) >= delta*_r may stand as b_r, whether or not earlier flushes filled the
-    // accumulator: those pairs are not in moved_codes, and they only lower b_r. A pair past its
-    // limit has delta > b_r >= delta*_r, strictly past the k-th, and is dropped. One float a row
-    // would not do: j pairs of one move could not count with k - j of a later one, the buffer being
-    // empty between them. Every pair kept goes through flush as any other does, whose merge takes
-    // the k smallest, so the answer is what flushing the whole buffer gives, up to which of several
-    // pairs tied at exactly the k-th it keeps.
-    // What waits on the host can reach probes x rows x 16 B when limits drop nothing, as in a large
-    // group of duplicates, so the blocks have a budget, shared by the join's tasks. Past it the
-    // pairs flush where they are if that fits, which the argument above allows: they stay among
-    // moved_codes' distinct pairs and leave the buffer. If it does not fit the query fails, with
-    // the numbers, instead of pinning until the process is killed.
-    // The shape is an FP16 sweep 1 over lists, which starts from a bound its codes gave and holds
-    // no pair yet. SIRIUS_VSS_PAIRS_TO_HOST=0 turns it off. For tests: =force moves after every
-    // group and cuts every slice that overflows the buffer, =force_no_flush also takes any flush
-    // past the budget not to fit, and SIRIUS_VSS_PAIRS_TO_HOST_BUDGET sets the budget in bytes.
-    constexpr std::size_t kFlushBytesPerPair     = 80;
-    constexpr std::size_t kFlushMargin           = std::size_t{1} << 28;
-    constexpr std::int64_t kBackPiecePairs       = std::int64_t{1} << 23;
-    std::string_view const pairs_to_host_setting = [] {
-      auto const* v = std::getenv("SIRIUS_VSS_PAIRS_TO_HOST");
-      return v == nullptr ? std::string_view{} : std::string_view{v};
-    }();
-    s.pairs_to_host        = s.sweep0_bound_from_codes && s.gap_rescore && !keyed && !best_only &&
-                             st.earlier_cut == nullptr && s.running_bound_rows == 0 &&
-                             pairs_to_host_setting != "0";
-    s.budget_flush_refused = pairs_to_host_setting == "force_no_flush";
-    s.pairs_to_host_forced =
-      s.pairs_to_host && (pairs_to_host_setting == "force" || s.budget_flush_refused);
-    // Pairs can wait on the host only on that one path. A scanned chunk, for one, stays staged
-    // until its group has been checked, and its candidates are re-scored from those rows. But any
-    // slice can be cut, each part flushed before the next: a large group of near duplicates passes
-    // hundreds of millions of pairs in one slice, more than the device holds beside a large block.
-    // The parts are pieces like the running bound's, disjoint rows with a flush between them, which
-    // every bounded search already takes.
-    s.cut_large_slices = s.any_bounded && pairs_to_host_setting != "0";
-    s.slice_cuts_forced =
-      s.cut_large_slices && (pairs_to_host_setting == "force" || s.budget_flush_refused);
-    s.pair_budget = s.pairs_to_host ? _op.host_pair_budget() : 0;
-    if (dbg) {
-      std::fprintf(stderr,
-                   "[vecjoin-phase] paths: sweep-0 bound from codes %d, pairs to host %d, single "
-                   "list without a seed %d\n",
-                   static_cast<int>(s.sweep0_bound_from_codes),
-                   static_cast<int>(s.pairs_to_host),
-                   static_cast<int>(s.hold_codes_pairs));
-    }
-    auto device_room    = [&] {
-      auto const free_bytes = mem_space->get_available_memory(stream);
-      return free_bytes > kFlushMargin ? free_bytes - kFlushMargin : std::size_t{0};
-    };
-    auto move_pairs_to_host = [&] {
-      if (s.pending == 0) { return; }
-      auto const t0 = debug_mark();
-      s.bounded_emitted += s.pending - s.pairs_back;
-      s.pairs_back = 0;
-      if (!s.moved_codes) {
-        s.moved_codes.emplace(static_cast<std::size_t>(n_left * k_join), stream, mr);
-        vss::fill_bound(
-          s.moved_codes->data(), n_left * k_join, std::numeric_limits<float>::infinity(), stream);
-      }
-      vss::code_topk_merge(s.candidates->rows.data(),
-                           s.candidates->distances.data(),
-                           s.pending,
-                           s.moved_codes->data(),
-                           n_left,
-                           k_join,
-                           s.bound->data(),
-                           code_terms(),
-                           stream,
-                           mr);
-      refresh_code_limit(s.bound->data());
-      s.pending = vss::keep_within_row_limit(s.candidates->rows.data(),
-                                             s.candidates->ids.data(),
-                                             s.candidates->distances.data(),
-                                             s.pending,
-                                             s.code_limit->data(),
-                                             n_left,
-                                             k_join,
-                                             nullptr,
-                                             stream,
-                                             mr);
-      if (!s.host_pairs.reserve(s.pending, s.pair_budget)) {
-        s.pairs_back    = s.pending;
-        auto const need = static_cast<std::size_t>(s.pending) * kFlushBytesPerPair;
-        auto const room = device_room();
-        if (s.budget_flush_refused || need > room) {
-          throw std::runtime_error(
-            std::format("[sirius_physical_vector_join_stream] vector join of '{}' and '{}' (k {}, "
-                        "{} probes): {} pairs of this task wait on the host and {} more in the "
-                        "buffer have nowhere to go. The host budget for waiting pairs is {} MiB "
-                        "(half the host pool, less what the join already holds beside it), and a "
-                        "flush needs about {} MiB with {} MiB free on the device. A larger host "
-                        "pool or a smaller k may let it run.",
-                        _request.left.table,
-                        _request.right.table,
-                        k_join,
-                        _request.n_probes,
-                        s.pairs_moved,
-                        s.pending,
-                        s.pair_budget >> 20,
-                        need >> 20,
-                        room >> 20));
-        }
-        ++s.budget_flushes;
-        rollback();
-        flush();
-        return;
-      }
-      for (std::int64_t at = 0; at < s.pending;) {
-        auto& block      = s.host_pairs.tail();
-        auto const take  = std::min(s.pending - at, kHostBlockPairs - block.n);
-        auto const count = static_cast<std::size_t>(take);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(block.rows() + block.n,
-                                      s.candidates->rows.data() + at,
-                                      count * sizeof(std::int32_t),
-                                      cudaMemcpyDeviceToHost,
-                                      stream.get()));
-        CUDF_CUDA_TRY(cudaMemcpyAsync(block.ids() + block.n,
-                                      s.candidates->ids.data() + at,
-                                      count * sizeof(std::int64_t),
-                                      cudaMemcpyDeviceToHost,
-                                      stream.get()));
-        CUDF_CUDA_TRY(cudaMemcpyAsync(block.codes() + block.n,
-                                      s.candidates->distances.data() + at,
-                                      count * sizeof(float),
-                                      cudaMemcpyDeviceToHost,
-                                      stream.get()));
-        block.n += take;
-        at += take;
-      }
-      stream.sync();
-      s.pairs_moved += s.pending;
-      ++s.pair_moves;
-      s.pending = 0;
-      rollback();
-      if (dbg) { s.host_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
-    };
-    // The task's end: every row's bound is final once the last pairs have moved, and each piece's
-    // flush trims against it.
-    auto bring_pairs_back = [&] {
-      move_pairs_to_host();
-      auto const piece = std::clamp<std::int64_t>(
-        static_cast<std::int64_t>(device_room() / kFlushBytesPerPair),
-        std::min<std::int64_t>(std::int64_t{1} << 16, s.candidates->capacity()),
-        std::min(kBackPiecePairs, s.candidates->capacity()));
-      std::int64_t filled = 0;
-      auto flush_piece    = [&] {
-        if (filled == 0) { return; }
-        s.pending    = filled;
-        s.pairs_back = filled;
-        rollback();
-        flush();
-        filled = 0;
-      };
-      while (!s.host_pairs.empty()) {
-        auto const& block = s.host_pairs.front();
-        for (std::int64_t at = 0; at < block.n;) {
-          auto const take  = std::min(block.n - at, piece - filled);
-          auto const count = static_cast<std::size_t>(take);
-          CUDF_CUDA_TRY(cudaMemcpyAsync(s.candidates->rows.data() + filled,
-                                        block.rows() + at,
-                                        count * sizeof(std::int32_t),
-                                        cudaMemcpyHostToDevice,
-                                        stream.get()));
-          CUDF_CUDA_TRY(cudaMemcpyAsync(s.candidates->ids.data() + filled,
-                                        block.ids() + at,
-                                        count * sizeof(std::int64_t),
-                                        cudaMemcpyHostToDevice,
-                                        stream.get()));
-          CUDF_CUDA_TRY(cudaMemcpyAsync(s.candidates->distances.data() + filled,
-                                        block.codes() + at,
-                                        count * sizeof(float),
-                                        cudaMemcpyHostToDevice,
-                                        stream.get()));
-          stream.sync();
-          at += take;
-          filled += take;
-          if (filled == piece) { flush_piece(); }
-        }
-        s.host_pairs.drop_front();
-      }
-      flush_piece();
-    };
-    auto make_room = [&] {
-      if (s.hold_codes_pairs) {
-        auto const before = s.pending;
-        hold_trim();
-        if (s.pending == before || s.pending > s.candidates->capacity() / 2) { flush(); }
-      } else if (s.pairs_to_host &&
-                 (s.pairs_to_host_forced ||
-                  static_cast<std::size_t>(s.pending) * kFlushBytesPerPair > device_room())) {
-        move_pairs_to_host();
-      } else {
-        flush();
-      }
-    };
-    // The slice is launched again after each change: the buffer's room, and the bound.
-    std::function<void(bounded_slice const&)> replay_slice = [&](bounded_slice const& sl) {
-      while (true) {
-        launch_bounded(sl);
-        auto const total = read_count();
-        if (total <= s.candidates->capacity()) {
-          s.pending = total;
-          return;
-        }
-        auto const slice_pairs = total - s.pending;
-        rollback();
-        if (s.pending > 0) {
-          make_room();
-          continue;
-        }
-        auto const want = slice_pairs + slice_pairs / 4;
-        if (s.cut_large_slices && sl.n > 1 &&
-            (s.slice_cuts_forced ||
-             static_cast<std::size_t>(want) * kFlushBytesPerPair >
-               device_room() + static_cast<std::size_t>(s.candidates->capacity()) * 16)) {
-          ++s.slice_cuts;
-          auto lo = sl;
-          lo.n    = sl.n / 2;
-          auto hi = sl;
-          hi.x    = static_cast<std::byte const*>(sl.x) + static_cast<std::size_t>(lo.n) *
-                                                            static_cast<std::size_t>(dim) *
-                                                            (s.f16_bounded ? 2 : 1);
-          hi.x_sq = static_cast<std::byte const*>(sl.x_sq) + static_cast<std::size_t>(lo.n) * 4;
-          hi.n    = sl.n - lo.n;
-          hi.id_base += lo.n;
-          if (hi.id_map != nullptr) { hi.id_map += lo.n; }
-          replay_slice(lo);
-          make_room();
-          replay_slice(hi);
-          return;
-        }
-        s.candidates.reset();
-        s.candidates.emplace(want, stream, mr);
-      }
-    };
-    auto check_group = [&] {
-      if (group.empty()) { return; }
-      launch_deferred();
-      auto total = read_count();
-      if (total > s.candidates->capacity()) {
-        rollback();
-        for (auto const& sl : group) {
-          replay_slice(sl);
-        }
-        total = s.pending;
-      }
-      s.pending = total;
-      group.clear();
-      if (s.pairs_to_host_forced || s.pending > s.candidates->capacity() / 2) { make_room(); }
-    };
-
-    s.running_piece = s.running_bound_rows;
-    staged_vector_chunk prefetched;
-
-    // Lists that did not fit the device are read by the same searches: a sweep that reads the
-    // lists in place copies each needed chunk's stored rows in as they are, still compact, and
-    // points the search at the copy. Four rows of slack, as on the device.
-    s.lists_on_host = _lists != nullptr && _lists->tier == cucascade::memory::Tier::HOST;
-    // The per-row norms the searches read (INT32 for byte rows, FP32 for half rows) are copied in
-    // behind the rows, so lists on the host keep none of their size on the device.
-    // An inner product's filter reads zeros in their place (see probe_filter_sq).
-    s.list_norms = _lists == nullptr  ? nullptr
-                   : s.ip_row_zero_sq ? static_cast<void const*>(s.ip_row_zero_sq->data())
-                   : _lists->encoding == vss::list_encoding::float16
-                     ? (_lists->row_sq_f32 ? _lists->row_sq_f32->data() : nullptr)
-                     : (_lists->row_sq ? _lists->row_sq->data() : nullptr);
-    auto const staged_rows_bytes = [&](std::int64_t rows) {
-      return (static_cast<std::size_t>(rows + 4) * _lists->row_bytes() + 255) / 256 * 256;
-    };
-    auto stage_compact = [&](std::size_t j) {
-      auto const rows = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
-      auto const bytes = staged_rows_bytes(rows) +
-                         (s.list_norms != nullptr ? static_cast<std::size_t>(rows) * 4 : 0);
-      std::shared_ptr<cucascade::memory::reservation> reservation{
-        mem_space->make_reservation_or_null(bytes)};
-      if (!reservation) {
-        vss::throw_staging_shortfall(
-          *mem_space,
-          bytes,
-          "[sirius_physical_vector_join_stream] lists chunk " + std::to_string(j));
-      }
-      auto buffer =
-        std::make_unique<rmm::device_buffer>(bytes, stage_on, reservation->get_memory_resource());
-      auto* out       = static_cast<std::byte*>(buffer->data());
-      auto const lock = vss::lock_host_list_chunk(*_lists, j, stage_on);
-      vss::copy_host_list_rows(*_lists, lock, 0, rows, out, stage_on);
-      if (s.list_norms != nullptr) {
-        CUDF_CUDA_TRY(cudaMemcpyAsync(
-          out + staged_rows_bytes(rows),
-          static_cast<std::byte const*>(s.list_norms) +
-            static_cast<std::size_t>(static_cast<std::int64_t>(j) * _lists->chunk_rows) * 4,
-          static_cast<std::size_t>(rows) * 4,
-          cudaMemcpyDefault,
-          stage_on.get()));
-      }
-      // As the chunk sources do: the host waits on the copy while the device runs what the
-      // previous chunk issued, and the copy is complete before anything reads it. The read lock
-      // ends with it.
-      stage_on.sync();
-      staged_vector_chunk staged{cudf::column_view{}, nullptr, std::move(reservation)};
-      staged.buffer = std::move(buffer);
-      return staged;
-    };
-
-    // Sweep 0 of a bounded search only reads each row's nearest cluster, so only the chunks
-    // holding one; with few probe rows that is a small part of what sweep 1 reads.
-    if (s.any_bounded) {
-      for (auto const j : s.needed_chunks) {
-        for (auto const& slice : _op._chunk_cluster_runs[j]) {
-          if (nearest_edges[static_cast<std::size_t>(slice.cluster)] > 0) {
-            s.nearest_chunks.push_back(j);
-            break;
-          }
-        }
-      }
-    }
-
-    // The compact chunks sweep 0 copied in stay on the device for sweep 1 while the budget still
-    // has a margin free, and sweep 1 starts with them: lists that nearly fit are read about once.
-    std::map<std::size_t, staged_vector_chunk> kept;
-    // Probe blocks are sized to share the device, so only a lone small one keeps chunks: a ~1M-row
-    // task that kept them filled the device and ran out of memory in sweep 1.
-    bool const small_lone_block = block != nullptr && _op._blocks.size() == 1 &&
-                                  _op.estimate_for_rows(static_cast<std::size_t>(block->rows)) <=
-                                    mem_space->get_max_memory() / 8;
-    s.keep_chunks = s.lists_on_host && s.any_bounded && !radius_join &&
-                    (block == nullptr || small_lone_block) && [] {
-                      auto const* v = std::getenv("SIRIUS_VSS_KEEP_LIST_CHUNKS");
-                      return v == nullptr || std::strcmp(v, "0") != 0;
-                    }();
-    auto const keep_margin = mem_space->get_max_memory() / 12;
-    auto can_keep = [&] { return mem_space->make_reservation_or_null(keep_margin) != nullptr; };
-    std::vector<std::size_t> kept_first;
-    auto check_chunk_base = [&](std::size_t j, std::int64_t chunk_base) {
-      if (chunk_base != static_cast<std::int64_t>(j) * _lists->chunk_rows) {
-        throw std::runtime_error("[sirius_physical_vector_join_stream] lists chunk " +
-                                 std::to_string(j) + " starts at row " +
-                                 std::to_string(static_cast<std::int64_t>(j) * _lists->chunk_rows) +
-                                 " but its cluster runs at " + std::to_string(chunk_base));
-      }
-    };
-
-    // A sample is a quarter of its cluster, at least eight times k rows (and 64) and at most the
-    // larger of that and kSeedSample: a sample near the whole cluster is the sweep again, on CUDA
-    // cores. Past kSeedSample rows the seed ranks it through device memory, not shared memory.
-    auto seed_rows = [&](std::int64_t size) {
-      auto const floor = std::max<std::int64_t>(64, 8 * k_join);
-      return std::min(
-        size,
-        std::clamp<std::int64_t>(size / 4, floor, std::max<std::int64_t>(floor, vss::kSeedSample)));
-    };
-    auto seed_bound = [&] {
-      std::vector<std::int64_t> first(static_cast<std::size_t>(n_left));
-      std::vector<std::int32_t> count(static_cast<std::size_t>(n_left));
-      std::int64_t max_count = 0;
-      for (std::int64_t r = 0; r < n_left; ++r) {
-        auto const c = static_cast<std::size_t>(s.nearest_cluster[static_cast<std::size_t>(r)]);
-        auto const lo                      = _lists->offsets[c];
-        first[static_cast<std::size_t>(r)] = lo;
-        count[static_cast<std::size_t>(r)] =
-          static_cast<std::int32_t>(seed_rows(_lists->offsets[c + 1] - lo));
-        max_count = std::max<std::int64_t>(max_count, count[static_cast<std::size_t>(r)]);
-      }
-      // Probe rows by nearest cluster, so the kernel reads one cluster's sample at a time.
-      std::vector<std::int64_t> order(static_cast<std::size_t>(n_left));
-      {
-        std::vector<std::int64_t> at(_lists->offsets.size(), 0);
-        for (std::int64_t r = 0; r < n_left; ++r) {
-          ++at[static_cast<std::size_t>(s.nearest_cluster[static_cast<std::size_t>(r)]) + 1];
-        }
-        std::partial_sum(at.begin(), at.end(), at.begin());
-        for (std::int64_t r = 0; r < n_left; ++r) {
-          auto const c = static_cast<std::size_t>(s.nearest_cluster[static_cast<std::size_t>(r)]);
-          order[static_cast<std::size_t>(at[c]++)] = r;
-        }
-      }
-      rmm::device_uvector<std::int64_t> order_d(order.size(), stream, mr);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(order_d.data(),
-                                    order.data(),
-                                    order.size() * sizeof(std::int64_t),
-                                    cudaMemcpyHostToDevice,
-                                    stream.get()));
-      rmm::device_uvector<std::int64_t> first_d(first.size(), stream, mr);
-      rmm::device_uvector<std::int32_t> count_d(count.size(), stream, mr);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(first_d.data(),
-                                    first.data(),
-                                    first.size() * sizeof(std::int64_t),
-                                    cudaMemcpyHostToDevice,
-                                    stream.get()));
-      CUDF_CUDA_TRY(cudaMemcpyAsync(count_d.data(),
-                                    count.data(),
-                                    count.size() * sizeof(std::int32_t),
-                                    cudaMemcpyHostToDevice,
-                                    stream.get()));
-      if (s.f16_bounded) {
-        vss::seed_bound_f16(static_cast<std::uint16_t const*>(_lists->device_vectors->data()),
-                            s.ip_row_zero_sq
-                              ? s.ip_row_zero_sq->data()
-                              : static_cast<float const*>(_lists->row_sq_f32->data()),
-                            s.probe_f16->data(),
-                            probe_filter_sq(),
-                            first_d.data(),
-                            count_d.data(),
-                            order_d.data(),
-                            n_left,
-                            dim,
-                            static_cast<int>(k_join),
-                            max_count,
-                            s.bound->data(),
-                            stream,
-                            mr);
-        vss::float16_seed_upper_bound(s.bound->data(),
-                                      s.probe_sqf->data(),
-                                      s.probe_half_error->data(),
-                                      _lists->half_error,
-                                      _lists->max_row_norm,
-                                      dim,
-                                      n_left,
-                                      stream,
-                                      ip);
-      } else {
-        vss::seed_bound_int8(static_cast<std::int8_t const*>(_lists->device_vectors->data()),
-                             static_cast<std::int32_t const*>(_lists->row_sq->data()),
-                             s.probe_i8->data(),
-                             s.probe_sq->data(),
-                             first_d.data(),
-                             count_d.data(),
-                             order_d.data(),
-                             n_left,
-                             dim,
-                             static_cast<int>(k_join),
-                             max_count,
-                             s.bound->data(),
-                             stream,
-                             mr);
-        if (s.codes_int8) {
-          vss::int8_seed_upper_bound(s.bound->data(),
-                                     s.probe_code_error->data(),
-                                     _lists->code_error,
-                                     _lists->code_scale,
-                                     n_left,
-                                     stream);
-        }
-      }
-      if (s.rescore) {
-        s.code_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
-        refresh_code_limit(s.bound->data());
-      }
-    };
-    // A seeded sweep 0 over lists on the device is each row's exact join with its nearest cluster,
-    // run as the exact join runs: the sample's seed bounds the first stretch of the cluster (the
-    // sample itself), and what passes is merged before the next stretch, so each row's bound falls
-    // to the k-th of all the cluster rows filtered so far. Each stretch is as long as all those
-    // before it, so about k pairs a row pass each one; under the seed alone a cluster's every
-    // sample's worth of rows passes about k (Deep10M at 4,096 clusters, 1M probes: 1.7x (FP16) and
-    // 2.3x (INT8) the pairs of the unseeded sweep). Stretch i of every cluster is filtered in one
-    // round of grouped launches, and the rounds merge in between. SIRIUS_VSS_SEED_TIGHTEN=0 filters
-    // each cluster whole under the seed. Lists in host memory, and the running bound, keep their
-    // own schedule.
-    s.stretch_sweep0 = s.seed && !s.lists_on_host && s.running_bound_rows == 0 && [] {
-      auto const* v = std::getenv("SIRIUS_VSS_SEED_TIGHTEN");
-      return v == nullptr || std::string_view{v} != "0";
-    }();
-    // Where each stretch of a cluster of @p size rows ends, in rows from its start: the sample,
-    // then doubling; a last stretch under a quarter of the one before it joins that one.
-    auto stretch_ends = [&](std::int64_t size) {
-      std::vector<std::int64_t> ends;
-      for (auto e = seed_rows(size);; e *= 2) {
-        if (size - e < e / 4 + 1) {
-          ends.push_back(size);
-          return ends;
-        }
-        ends.push_back(e);
-      }
-    };
-    for (int sweep = radius_join && s.any_bounded ? 1 : 0; sweep < (s.any_bounded ? 2 : 1);
-         ++sweep) {
-      if (sweep == 1 && !kept.empty()) {
-        for (auto const& entry : kept) {
-          kept_first.push_back(entry.first);
-        }
-        for (auto const j : s.needed_chunks) {
-          if (kept.count(j) == 0) { kept_first.push_back(j); }
-        }
-      }
-      auto const& chunks = s.any_bounded && sweep == 0 ? s.nearest_chunks
-                           : kept_first.empty()        ? s.needed_chunks
-                                                       : kept_first;
-      // A sweep that reads the lists in place stages nothing. FP16 lists on the host are copied
-      // in compact for sweep 0 as well (and widened on the device when it ranks in FP32), so that
-      // copy can be kept.
-      bool const direct =
-        _lists != nullptr &&
-        (s.int8_search || (s.f16_bounded && (sweep == 1 || s.seed)) || s.f16_sweep0);
-      bool const widen_compact = s.lists_on_host && s.f16_bounded && sweep == 0 && !direct;
-      bool const copy_compact  = (direct && s.lists_on_host) || widen_compact;
-      // Sweep 0 over lossy rows only sets each probe row's bound, which sweep 1 re-searches past:
-      // every cluster in one launch over the device lists (nearest_cluster_topk) instead of one
-      // GEMM and top-k call per cluster, whose ~0.18 ms of host setup dwarfs its arithmetic once
-      // each cluster has only tens of probe rows. SIRIUS_VSS_GROUPED_SWEEP0=0 keeps the calls.
-      bool const grouped_sweep0 =
-        sweep == 0 && s.rescore && !s.seed && !s.ranked_sweep0 && !radius_join && !ip &&
-        st.earlier_cut == nullptr && k_join <= 64 && !s.lists_on_host &&
-        ((s.int8_search && s.probe_i8) || (s.f16_sweep0 && s.probe_f16)) && [] {
-          auto const* v = std::getenv("SIRIUS_VSS_GROUPED_SWEEP0");
-          return v == nullptr || std::string_view{v} != "0";
-        }();
-      std::vector<chunk_cluster_run> const no_runs;
-      // The stretched sweep 0's pieces, by stretch (see stretch_sweep0).
-      std::vector<std::vector<bounded_slice>> stretches;
-      auto stage_next = [&](std::size_t j) {
-        if (copy_compact) {
-          if (auto it = kept.find(j); it != kept.end()) {
-            auto chunk = std::move(it->second);
-            kept.erase(it);
-            return chunk;
-          }
-          return stage_compact(j);
-        }
-        return direct ? staged_vector_chunk{}
-                      : stage_for_fold(s.exact_lists_corpus ? *s.exact_lists_corpus : *_op._corpus,
-                                       j,
-                                       *mem_space,
-                                       stage_on,
-                                       stream);
-      };
-      prefetched = chunks.empty() ? staged_vector_chunk{} : stage_next(chunks[0]);
-      if (sweep == 0 && s.seed) {
-        s.bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
-        if (s.lists_on_host || s.f16_list_no_seed) {
-          vss::fill_bound(s.bound->data(), n_left, std::numeric_limits<float>::infinity(), stream);
-          if (s.rescore) {
-            s.code_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
-            refresh_code_limit(s.bound->data());
-          }
-        } else {
-          seed_bound();
-        }
-        s.candidates.emplace(
-          std::max<std::int64_t>({std::int64_t{1} << 22,
-                                  4 * n_left * k_join,
-                                  s.f16_list_no_seed ? n_left * s.running_bound_rows * 5 / 4 : 0}),
-          stream,
-          mr);
-      }
-      if (sweep == 1) {
-        if (s.seed) {
-          check_group();
-          flush();
-        }
-        if (dbg && s.seed) {
-          std::string per_stretch;
-          for (auto const p : s.stretch_pairs) {
-            per_stretch += " " + std::to_string(p);
-          }
-          std::fprintf(
-            stderr,
-            "[vecjoin-phase] sweep 0: %lld pairs passed, %lld merges, %zu stretches:%s\n",
-            static_cast<long long>(s.bounded_emitted),
-            static_cast<long long>(s.bounded_merges),
-            s.stretch_pairs.size(),
-            per_stretch.c_str());
-        }
-        phase("nearest-cluster sweep");
-        s.bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
-        if (radius_join) {
-          vss::fill_bound(s.bound->data(), n_left, s.radius_bound, stream);
-        } else if (s.rescore && !s.seed) {
-          // A scanned corpus re-scored sweep 0's answers chunk by chunk, while each was staged.
-          if (_lists != nullptr && !s.sweep0_bound_from_codes) {
-            vss::exact_distances(s.search_queries.data_handle(),
-                                 nullptr,
-                                 k_join,
-                                 st.acc_neighbors->view().data<std::int64_t>(),
-                                 st.acc_distances->mutable_view().data<float>(),
-                                 n_left * k_join,
-                                 exact_source,
-                                 dim,
-                                 stream,
-                                 mr,
-                                 nullptr,
-                                 0.f,
-                                 ip);
-          }
-          vss::row_max_bound(
-            st.acc_distances->view().data<float>(), n_left, k_join, s.bound->data(), stream);
-          if (s.sweep0_bound_from_codes) {
-            vss::float16_seed_upper_bound(s.bound->data(),
-                                          s.probe_sqf->data(),
-                                          s.probe_half_error->data(),
-                                          _lists->half_error,
-                                          _lists->max_row_norm,
-                                          dim,
-                                          n_left,
-                                          stream,
-                                          false);
-          }
-          vss::fill_misses(st.acc_distances->mutable_view().data<float>(),
-                           st.acc_neighbors->mutable_view().data<std::int64_t>(),
-                           n_left * k_join,
-                           stream);
-        } else {
-          vss::kth_distance_bound(
-            st.acc_distances->view().data<float>(), n_left, k_join, s.bound->data(), stream);
-        }
-        if (s.rescore) {
-          s.code_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
-          refresh_code_limit(s.bound->data());
-        }
-        if (s.skip_certain) {
-          s.certain_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
-          code_limits(s.bound->data(), s.certain_limit->data(), true);
-        }
-        // A radius join's buffer only has to amortize the flush that appends it to the result.
-        s.candidates.emplace(radius_join
-                               ? std::int64_t{1} << 22
-                               : std::max<std::int64_t>(std::int64_t{1} << 22, 4 * n_left * k_join),
-                             stream,
-                             mr);
-      }
-      if (grouped_sweep0) {
-        // Each cluster is contiguous in the device lists, so one task group covers it whole.
-        std::vector<vss::nearest_task> tasks;
-        auto const& offsets = _lists->offsets;
-        for (std::size_t c = 0; c + 1 < offsets.size(); ++c) {
-          auto const nearest = static_cast<std::int64_t>(nearest_edges[c]);
-          auto const n_rows  = offsets[c + 1] - offsets[c];
-          if (nearest == 0 || n_rows == 0) { continue; }
-          for (std::int64_t e = 0; e < nearest; e += vss::kNearestTaskProbes) {
-            tasks.push_back({offsets[c],
-                             n_rows,
-                             edge_begin[c] + e,
-                             static_cast<std::int32_t>(
-                               std::min<std::int64_t>(vss::kNearestTaskProbes, nearest - e)),
-                             offsets[c]});
-          }
-          s.scanned_pairs += n_rows * nearest;
-        }
-        rmm::device_uvector<vss::nearest_task> device_tasks(tasks.size(), stream, mr);
-        // From a pageable vector, so the copy has completed when the call returns.
-        CUDF_CUDA_TRY(cudaMemcpyAsync(device_tasks.data(),
-                                      tasks.data(),
-                                      tasks.size() * sizeof(vss::nearest_task),
-                                      cudaMemcpyHostToDevice,
-                                      stream.get()));
-        bool const f16 = !s.int8_search;
-        vss::nearest_cluster_topk(
-          device_tasks.data(),
-          static_cast<std::int64_t>(tasks.size()),
-          f16,
-          _lists->device_vectors->data(),
-          static_cast<std::int64_t>(_lists->row_bytes()),
-          f16 ? static_cast<void const*>(_lists->row_sq_f32->data()) : _lists->row_sq->data(),
-          s.routed_rows,
-          f16 ? static_cast<void const*>(s.probe_f16->data()) : s.probe_i8->data(),
-          f16 ? static_cast<void const*>(s.probe_sqf->data()) : s.probe_sq->data(),
-          k_join,
-          st.acc_distances->mutable_view().data<float>(),
-          st.acc_neighbors->mutable_view().data<std::int64_t>(),
-          stream);
-      }
-      for (std::size_t ci = 0; ci < chunks.size(); ++ci) {
-        auto const j            = chunks[ci];
-        auto staged             = std::move(prefetched);
-        auto const chunk_base   = _op._chunk_row_base[j];
-        float const* chunk_data = nullptr;
-        std::int64_t chunk_n    = 0;
-        // Chunk j's stored rows and their norms, where a direct sweep reads them.
-        std::byte const* compact     = nullptr;
-        std::byte const* chunk_norms = nullptr;
-        std::optional<rmm::device_buffer> widened;
-        // A cosine chunk normalized for the every-cluster search (direct_cosine).
-        std::optional<rmm::device_uvector<float>> unit_chunk;
-        if (direct) {
-          chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
-          check_chunk_base(j, chunk_base);
-          compact = copy_compact ? static_cast<std::byte const*>(staged.buffer->data())
-                                 : static_cast<std::byte const*>(_lists->device_vectors->data()) +
-                                     static_cast<std::size_t>(chunk_base) * _lists->row_bytes();
-          if (s.list_norms != nullptr) {
-            chunk_norms = copy_compact ? compact + staged_rows_bytes(chunk_n)
-                                       : static_cast<std::byte const*>(s.list_norms) +
-                                           static_cast<std::size_t>(chunk_base) * 4;
-          }
-        } else if (widen_compact) {
-          chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
-          check_chunk_base(j, chunk_base);
-          widened.emplace(static_cast<std::size_t>(chunk_n * dim) * sizeof(float), stream, mr);
-          vss::widen_float16(static_cast<std::uint16_t const*>(staged.buffer->data()),
-                             chunk_n * dim,
-                             static_cast<float*>(widened->data()),
-                             stream);
-          chunk_data = static_cast<float const*>(widened->data());
-        } else {
-          auto const chunk_view = vss::list_column_as_dataset_view(staged.view, dim);
-          chunk_data            = chunk_view.data_handle();
-          chunk_n               = chunk_view.extent(0);
-          if (s.direct_cosine && chunk_n > 0) {
-            unit_chunk.emplace(static_cast<std::size_t>(chunk_n * dim), stream, mr);
-            vss::normalize_rows(chunk_data, chunk_n, dim, unit_chunk->data(), stream);
-            chunk_data = unit_chunk->data();
-          }
-        }
-        // A scanned chunk read by the re-score: sweep 1's candidates carry corpus rows, which the
-        // one block below maps onto the chunk (rows_per_block past any row, so block 0 always, its
-        // base chunk_base rows before the chunk); sweep 0's ranked answers carry rows local to
-        // their slice, one block per slice.
-        std::optional<rmm::device_uvector<float const*>> scan_blocks;
-        std::optional<rmm::device_uvector<std::uint16_t>> scan_f16_rows;
-        std::optional<rmm::device_uvector<float>> scan_sqf;
-        auto scan_source = [&](std::size_t block) {
-          vss::exact_rows src;
-          src.copy_blocks    = scan_blocks->data() + block;
-          src.rows_per_block = std::numeric_limits<std::int64_t>::max();
-          return src;
-        };
-        if (s.scan_f16 && chunk_n > 0) {
-          auto const& runs = _op._chunk_cluster_runs[j];
-          std::vector<float const*> bases;
-          if (sweep == 1) {
-            // Unsigned arithmetic: the base may lie before the allocation, and only rows of the
-            // chunk are ever added back onto it.
-            bases.push_back(
-              reinterpret_cast<float const*>(reinterpret_cast<std::uintptr_t>(chunk_data) -
-                                             static_cast<std::uintptr_t>(chunk_base) *
-                                               static_cast<std::uintptr_t>(dim) * sizeof(float)));
-          } else {
-            for (auto const& slice : runs) {
-              bases.push_back(chunk_data + slice.begin * dim);
-            }
-          }
-          scan_blocks.emplace(bases.size(), stream, mr);
-          // From a pageable vector, so the copy has completed when the call returns.
-          CUDF_CUDA_TRY(cudaMemcpyAsync(scan_blocks->data(),
-                                        bases.data(),
-                                        bases.size() * sizeof(float const*),
-                                        cudaMemcpyHostToDevice,
-                                        stream.get()));
-          if (sweep == 1) {
-            // The chunk as the FLOAT16 lists would hold it: rounded rows, their norms, and the
-            // largest rounding error and norm, which this chunk's filter limit allows for.
-            scan_f16_rows.emplace(static_cast<std::size_t>(chunk_n * dim), stream, mr);
-            scan_sqf.emplace(static_cast<std::size_t>(chunk_n), stream, mr);
-            rmm::device_uvector<unsigned int> maxima(2, stream, mr);
-            CUDF_CUDA_TRY(
-              cudaMemsetAsync(maxima.data(), 0, 2 * sizeof(unsigned int), stream.get()));
-            vss::narrow_to_float16(chunk_data, chunk_n * dim, scan_f16_rows->data(), stream);
-            vss::half_rows_norms(chunk_data,
-                                 scan_f16_rows->data(),
-                                 chunk_n,
-                                 dim,
-                                 scan_sqf->data(),
-                                 nullptr,
-                                 maxima.data(),
-                                 maxima.data() + 1,
-                                 stream);
-            unsigned int bits[2] = {0, 0};
-            CUDF_CUDA_TRY(cudaMemcpyAsync(
-              bits, maxima.data(), sizeof(bits), cudaMemcpyDeviceToHost, stream.get()));
-            stream.sync();
-            float max_sq = 0;
-            std::memcpy(&row_half_error, &bits[0], sizeof(float));
-            std::memcpy(&max_sq, &bits[1], sizeof(float));
-            row_norm_max = std::sqrt(max_sq);
-            if (!(row_norm_max < 65504.f)) {
-              throw std::runtime_error(
-                "[sirius_physical_vector_join_stream] a corpus row norm of " +
-                std::to_string(row_norm_max) +
-                " is outside float16's range for the bounded search over a scanned corpus; "
-                "SIRIUS_VSS_SCAN_BOUNDED=0 searches it in FP32");
-            }
-            refresh_code_limit(s.bound->data());
-            compact      = reinterpret_cast<std::byte const*>(scan_f16_rows->data());
-            chunk_norms  = reinterpret_cast<std::byte const*>(scan_sqf->data());
-            exact_source = scan_source(0);
-          }
-        }
-
-        for (auto const& slice : grouped_sweep0 ? no_runs : _op._chunk_cluster_runs[j]) {
-          auto eb          = edge_begin[static_cast<std::size_t>(slice.cluster)];
-          auto ee          = edge_begin[static_cast<std::size_t>(slice.cluster) + 1];
-          auto const split = eb + nearest_edges[static_cast<std::size_t>(slice.cluster)];
-          if (s.any_bounded && !radius_join && (!s.rescore || s.seed)) {
-            (sweep == 0 ? ee : eb) = split;
-          }
-          if (s.rescore && sweep == 0) { ee = split; }
-          if (eb == ee) { continue; }
-          // The slice was cut from the cluster column's chunk j; this is the first point at
-          // which the vector column's chunk j is resident and its row count exactly known. The
-          // two are the same pin's row groups, so a mismatch is a broken invariant rather than
-          // a user error -- but it would read past the end of the chunk, so it is checked.
-          if (slice.end > chunk_n) {
-            throw std::runtime_error(
-              "[sirius_physical_vector_join_stream] cluster column chunk " + std::to_string(j) +
-              " describes row " + std::to_string(slice.end) + " but the vector column's chunk " +
-              "holds " + std::to_string(chunk_n) + "; both must come from the same pin");
-          }
-          auto slice_rows = slice.end - slice.begin;
-          if (st.earlier_cut != nullptr) {
-            auto const* first = st.earlier_cut + chunk_base + slice.begin;
-            slice_rows = std::lower_bound(first, first + slice_rows, st.probe_key_max) - first;
-            if (slice_rows == 0) { continue; }
-          }
-          auto const slice_view =
-            raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
-              chunk_data == nullptr ? nullptr : chunk_data + slice.begin * dim, slice_rows, dim);
-          auto const k_eff = std::min<std::int64_t>(k_join, slice_rows);
-
-          // ONE search per slice: every row routed here searches the same dataset, and the
-          // fold's dominant term is per call rather than per pair (X1 measured 278 us/call at
-          // 42-96% of runtime). The rows are gathered into one query matrix; a row is gathered
-          // once per cluster it visits, so the copies total n_probes probe batches per join --
-          // the price of routing rows rather than runs.
-          auto const m       = ee - eb;
-          auto const* rows_c = s.routed_rows + eb;
-          if (st.probe_rows_on_host) {
-            if (sweep == 0) {
-              std::vector<std::int64_t> slice_rows_c(static_cast<std::size_t>(m));
-              CUDF_CUDA_TRY(cudaMemcpyAsync(slice_rows_c.data(),
-                                            rows_c,
-                                            slice_rows_c.size() * sizeof(std::int64_t),
-                                            cudaMemcpyDeviceToHost,
-                                            stream.get()));
-              stream.sync();
-              std::vector<float> gathered(static_cast<std::size_t>(m * dim));
-              st.host_rows->gather(slice_rows_c.data(), slice_rows_c.size(), gathered.data());
-              // From a pageable vector, so the copy has completed when the call returns.
-              CUDF_CUDA_TRY(cudaMemcpyAsync(routed_queries.data(),
-                                            gathered.data(),
-                                            gathered.size() * sizeof(float),
-                                            cudaMemcpyHostToDevice,
-                                            stream.get()));
-            }
-          } else if (!direct) {
-            vss::gather_rows(
-              s.search_queries.data_handle(), dim, rows_c, m, routed_queries.data(), stream);
-          }
-          auto const queries_view =
-            raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
-              routed_queries.data(), m, dim);
-          s.scanned_pairs += slice_rows * m;
-          // Neighbour ids come back local to the slice; the slice's own start in corpus row
-          // space is the base that makes them corpus row ids, exactly as the chunk offset does
-          // in the exhaustive fold.
-          auto const id_base = chunk_base + slice.begin;
-          // Lists are in cluster order, not pin order; their row map turns a layout row back into
-          // the pin row every later stage reads the corpus by.
-          auto const* id_map =
-            _lists != nullptr ? static_cast<const std::int64_t*>(_lists->row_ids->data()) + id_base
-                              : nullptr;
-
-          if (sweep == 1 || s.seed) {
-            bounded_slice const sl =
-              s.f16_bounded
-                ? bounded_slice{reinterpret_cast<std::uint16_t const*>(compact) + slice.begin * dim,
-                                reinterpret_cast<float const*>(chunk_norms) + slice.begin,
-                                slice_rows,
-                                id_base,
-                                nullptr,
-                                rows_c,
-                                m}
-                : bounded_slice{reinterpret_cast<std::int8_t const*>(compact) + slice.begin * dim,
-                                reinterpret_cast<std::int32_t const*>(chunk_norms) + slice.begin,
-                                slice_rows,
-                                id_base,
-                                s.rescore ? nullptr : id_map,
-                                rows_c,
-                                m};
-            if (s.stretch_sweep0 && sweep == 0) {
-              // The slice's rows, from row `at` of its cluster, cut where the cluster's stretches
-              // end; each piece waits for its stretch's round (after this loop).
-              auto const c    = static_cast<std::size_t>(slice.cluster);
-              auto const at   = id_base - _lists->offsets[c];
-              auto const ends = stretch_ends(_lists->offsets[c + 1] - _lists->offsets[c]);
-              if (stretches.size() < ends.size()) { stretches.resize(ends.size()); }
-              for (std::size_t i = 0; i < ends.size(); ++i) {
-                auto const from = std::max(i == 0 ? std::int64_t{0} : ends[i - 1], at);
-                auto const to   = std::min(ends[i], at + slice_rows);
-                if (from >= to) { continue; }
-                auto const o = from - at;
-                auto piece   = sl;
-                piece.x = static_cast<std::byte const*>(sl.x) + o * dim * (s.f16_bounded ? 2 : 1);
-                piece.x_sq = static_cast<std::byte const*>(sl.x_sq) + o * 4;
-                piece.n    = to - from;
-                piece.id_base += o;
-                if (piece.id_map != nullptr) { piece.id_map += o; }
-                stretches[i].push_back(piece);
-              }
-              continue;
-            }
-            if (s.running_bound_rows > 0) {
-              for (std::int64_t o = 0; o < slice_rows;) {
-                auto const n = std::min(slice_rows - o, s.running_piece - s.since_merge);
-                auto piece   = sl;
-                piece.x = static_cast<std::byte const*>(sl.x) + o * dim * (s.f16_bounded ? 2 : 1);
-                piece.x_sq = static_cast<std::byte const*>(sl.x_sq) + o * 4;
-                piece.n    = n;
-                piece.id_base += o;
-                if (piece.id_map != nullptr) { piece.id_map += o; }
-                launch_bounded(piece);
-                ++s.bounded_launches;
-                s.bounded_padded += ((n + 127) / 128) * ((m + 127) / 128);
-                group.push_back(piece);
-                o += n;
-                s.since_merge += n;
-                if (s.since_merge >= s.running_piece) {
-                  check_group();
-                  if (s.hold_codes_pairs) {
-                    hold_trim();
-                  } else {
-                    flush();
-                  }
-                  s.since_merge = 0;
-                  s.running_piece =
-                    std::min<std::int64_t>(2 * s.running_piece, std::int64_t{1} << 22);
-                } else if (group.size() >= s.bounded_group) {
-                  check_group();
-                }
-              }
-              continue;
-            }
-            if (joins_group(m, slice_rows)) {
-              deferred.push_back(sl);
-            } else {
-              launch_bounded(sl);
-            }
-            ++s.bounded_launches;
-            s.bounded_padded += ((slice_rows + 127) / 128) * ((m + 127) / 128);
-            group.push_back(sl);
-            if (group.size() >= s.bounded_group) { check_group(); }
-            continue;
-          }
-
-          if (radius_join) {
-            // Same construction as the exhaustive radius path: a slice's in-range pairs are
-            // final when produced, so they are appended, never folded, and there is no k. The
-            // kernel numbers query rows within the gathered matrix; rows_c maps them back.
-            auto edges = threshold_search(res,
-                                          slice_view,
-                                          queries_view,
-                                          s.search_radius,
-                                          s.ranked_metric,
-                                          mr,
-                                          0,
-                                          count_only && !keyed);
-            if (count_only && !keyed) {
-              note_radius_part(edges.n_edges);
-            } else if (edges.n_edges > 0) {
-              auto left =
-                cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                          vss::column_size(edges.n_edges, "vector join threshold"),
-                                          cudf::mask_state::UNALLOCATED,
-                                          stream,
-                                          mr);
-              vss::remap_radius_edges(edges.query_rows->view().data<std::int64_t>(),
-                                      rows_c,
-                                      left->mutable_view().data<std::int32_t>(),
-                                      edges.neighbors->mutable_view().data<std::int64_t>(),
-                                      edges.n_edges,
-                                      id_base,
-                                      stream,
-                                      id_map);
-              if (best_only) {
-                fold_best(left->view().data<std::int32_t>(),
-                          edges.neighbors->view().data<std::int64_t>(),
-                          edges.distances->view().data<float>(),
-                          edges.n_edges,
-                          std::numeric_limits<float>::infinity(),
-                          st.pin_keys,
-                          nullptr);
-                continue;
-              }
-              if (keyed) {
-                keep_keyed(left->view().data<std::int32_t>(),
-                           edges.neighbors->view().data<std::int64_t>(),
-                           edges.distances->view().data<float>(),
-                           edges.n_edges);
-                continue;
-              }
-              st.radius_left.push_back(std::move(left));
-              st.radius_neighbors.push_back(std::move(edges.neighbors));
-              st.radius_distances.push_back(std::move(edges.distances));
-              note_radius_part(edges.n_edges);
-            }
-            continue;
-          }
-
-          // The GEMM-ranked search, as in the exhaustive fold: it also carries none of cuVS's
-          // per-call device synchronization, which is paid here once per slice.
-          auto const knn = [&] {
-            if (s.f16_sweep0) {
-              vss::gather_bytes(s.probe_f16->data(),
-                                dim * static_cast<std::int64_t>(sizeof(std::uint16_t)),
-                                rows_c,
-                                m,
-                                routed_f16->data(),
-                                stream);
-              vss::gather_rows(s.probe_sqf->data(), 1, rows_c, m, routed_sqf->data(), stream);
-              return vss::gemm_f16_topk(
-                res,
-                reinterpret_cast<std::uint16_t const*>(compact) + slice.begin * dim,
-                reinterpret_cast<float const*>(chunk_norms) + slice.begin,
-                slice_rows,
-                routed_f16->data(),
-                routed_sqf->data(),
-                m,
-                dim,
-                k_eff,
-                /*take_sqrt=*/false,
-                mr);
-            }
-            if (s.int8_search) {
-              vss::gather_bytes(s.probe_i8->data(), dim, rows_c, m, routed_i8->data(), stream);
-              vss::gather_int32(s.probe_sq->data(), rows_c, m, routed_sq->data(), stream);
-              return vss::gemm_int8_topk(
-                res,
-                reinterpret_cast<std::int8_t const*>(compact) + slice.begin * dim,
-                reinterpret_cast<std::int32_t const*>(chunk_norms) + slice.begin,
-                slice_rows,
-                routed_i8->data(),
-                routed_sq->data(),
-                m,
-                dim,
-                k_eff,
-                s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded && !s.bounded,
-                mr);
-            }
-            // A re-scored sweep 0 only sets each row's bound, so it keeps the GEMM.
-            auto const ranked = s.rescore ? s.search_metric : s.ranked_metric;
-            return gemm_search_enabled() && vss::gemm_search_supports(ranked)
-                     ? vss::gemm_topk(res, slice_view, queries_view, k_eff, ranked, mr)
-                     : vss::brute_force_knn_untrimmed(
-                         res,
-                         vss::brute_force_build(res, slice_view, ranked),
-                         queries_view,
-                         k_eff,
-                         mr);
-          }();
-
-          // Over a scanned corpus this sweep only sets each row's bound, the largest of its k
-          // distances, so they are made exact first, read from the slice's rows. The accumulator
-          // may then be out of order; only that largest distance is read before it is reset.
-          if (s.scan_f16) {
-            auto const s = static_cast<std::size_t>(&slice - _op._chunk_cluster_runs[j].data());
-            vss::exact_distances(routed_queries.data(),
-                                 nullptr,
-                                 knn.k,
-                                 knn.neighbors->view().data<std::int64_t>(),
-                                 knn.distances->mutable_view().data<float>(),
-                                 m * knn.k,
-                                 scan_source(s),
-                                 dim,
-                                 stream,
-                                 mr,
-                                 nullptr,
-                                 0.f,
-                                 ip);
-          }
-          // Fold in place: a row is routed to a cluster at most once, so the rows of one slice
-          // are distinct and no two threads of the fold write the same accumulator row.
-          vss::fold_topk_rows(st.acc_distances->mutable_view().data<float>(),
-                              st.acc_neighbors->mutable_view().data<std::int64_t>(),
-                              k_join,
-                              knn.distances->view().data<float>(),
-                              knn.neighbors->view().data<std::int64_t>(),
-                              knn.k,
-                              k_eff,
-                              rows_c,
-                              m,
-                              id_base,
-                              stream,
-                              s.rescore ? nullptr : id_map);
-        }
-
-        // The searches above are issued, not finished. Staging the next needed chunk now runs its
-        // H2D while the GPU works on this one.
-        if (s.lists_on_host) { launch_deferred(); }
-        prefetched = ci + 1 < chunks.size() ? stage_next(chunks[ci + 1]) : staged_vector_chunk{};
-        if (s.keep_chunks && sweep == 0 && can_keep()) {
-          kept.emplace(j, std::move(staged));
-        } else {
-          // A group that overflowed replays its slices, which read this chunk's staged rows: check
-          // it while they are still there. A scanned chunk's candidates are re-scored from its
-          // rows, so they are merged before it goes too.
-          if (s.scan_f16 && sweep == 1) {
-            check_group();
-            flush();
-            exact_source = vss::exact_rows{};
-          } else if (s.any_bounded && (staged.buffer || staged.owner || staged.reader)) {
-            check_group();
-          }
-          release_staged(staged);
-        }
-      }
-      // The stretched sweep 0: round i filters stretch i of every cluster, under the bounds the
-      // merge after round i - 1 left (the seed for round 0). The device lists stay put, so the
-      // pieces' rows are where the slices left them. A group grows past bounded_group slices while
-      // even all of its pairs would fit the buffer, so it cannot overflow: with few probe rows a
-      // round is a few launches, not one per bounded_group clusters (10k probes, 4,096 clusters:
-      // 16 checks a round, each reading the buffer's fill back).
-      for (auto const& round : stretches) {
-        auto const emitted_before = s.bounded_emitted;
-        std::int64_t group_pairs  = 0;  // the group's pairs, were every one to pass
-        for (auto const& piece : round) {
-          if (joins_group(piece.m, piece.n)) {
-            deferred.push_back(piece);
-          } else {
-            launch_bounded(piece);
-          }
-          ++s.bounded_launches;
-          s.bounded_padded += ((piece.n + 127) / 128) * ((piece.m + 127) / 128);
-          group.push_back(piece);
-          group_pairs += piece.m * piece.n;
-          if (group.size() >= s.bounded_group &&
-              group_pairs > s.candidates->capacity() - s.pending) {
-            check_group();
-            group_pairs = 0;
-          }
-        }
-        check_group();
-        flush();
-        if (dbg) { s.stretch_pairs.push_back(s.bounded_emitted - emitted_before); }
-      }
-    }
-    if (s.any_bounded && !kept.empty()) { check_group(); }
-    for (auto& entry : kept) {
-      release_staged(entry.second);
-    }
-    kept.clear();
-    if (s.any_bounded) {
-      check_group();
-      if (s.host_pairs.empty()) {
-        flush();
-      } else {
-        bring_pairs_back();
-      }
-      // Lists hold layout rows; a scanned corpus's candidates already carry corpus rows.
-      if (s.rescore && !radius_join && _lists != nullptr) {
-        vss::map_ids(st.acc_neighbors->mutable_view().data<std::int64_t>(),
-                     n_left * k_join,
-                     static_cast<std::int64_t const*>(_lists->row_ids->data()),
-                     stream);
-      }
-      if (dbg) {
-        std::fprintf(stderr,
-                     "[vecjoin-phase] bounded: %lld pairs passed, %lld merges, %lld launches, "
-                     "%lld 128x128 tiles; re-score %.3f s, take/merge %.3f s\n",
-                     static_cast<long long>(s.bounded_emitted),
-                     static_cast<long long>(s.bounded_merges),
-                     static_cast<long long>(s.bounded_launches),
-                     static_cast<long long>(s.bounded_padded),
-                     s.rescore_seconds,
-                     s.take_seconds);
-        if (s.pair_moves > 0 || s.slice_cuts > 0 || s.budget_flushes > 0) {
-          std::fprintf(stderr,
-                       "[vecjoin-phase] pairs to host: %lld moves, %lld pairs, %lld slice cuts, "
-                       "%lld flushes past the budget, %.3f s\n",
-                       static_cast<long long>(s.pair_moves),
-                       static_cast<long long>(s.pairs_moved),
-                       static_cast<long long>(s.slice_cuts),
-                       static_cast<long long>(s.budget_flushes),
-                       s.host_seconds);
-        }
-        if (s.f16_bounded) {
-          auto const l = vss::f16_filter_launch_counts();
-          std::fprintf(stderr,
-                       "[vecjoin-phase] FP16 filter launches so far in this process: CUTLASS %lld "
-                       "single, %lld grouped; fused %lld single\n",
-                       static_cast<long long>(l.cutlass_single),
-                       static_cast<long long>(l.cutlass_group),
-                       static_cast<long long>(l.fused_single));
-        }
-        if (best_only) {
-          std::fprintf(stderr,
-                       "[vecjoin-phase] best match: %lld of those pairs re-scored\n",
-                       static_cast<long long>(st.best_rescored));
-        }
-        if (s.gap_rescore) {
-          std::fprintf(
-            stderr,
-            "[vecjoin-phase] gap re-score: %lld of %lld candidates re-scored (trim %.3f s); "
-            "row-stretches %llu: %llu under 2k, %llu trimmed at m=2, %llu at m=4, %llu "
-            "fall back; the m-rule would re-score %llu\n",
-            static_cast<long long>(s.gap_rescored),
-            static_cast<long long>(s.bounded_emitted),
-            s.trim_seconds,
-            s.gap_stats.rows,
-            s.gap_stats.short_rows,
-            s.gap_stats.m2_rows,
-            s.gap_stats.m4_rows,
-            s.gap_stats.fallback_rows,
-            s.gap_stats.literal_rescored);
-        }
-      }
-      if (s.gap_stats_on) { vss::add_gap_rescore_totals(s.gap_stats); }
-      if (s.sqrt_at_end && !radius_join) {
-        vss::sqrt_in_place(st.acc_distances->mutable_view().data<float>(), n_left * k_join, stream);
-      }
-    }
-    if (best_only) {
-      st.best_ids_are_layout = s.any_bounded && s.rescore;
-      st.best_take_sqrt      = s.sqrt_at_end;
-      emit_best();
-    }
-    if (s.unit_cosine || s.direct_cosine) {
-      if (radius_join) {
-        for (auto& part : st.radius_distances) {
-          vss::scale_in_place(part->mutable_view().data<float>(), part->size(), 0.5f, stream);
-        }
-      } else {
-        vss::scale_in_place(
-          st.acc_distances->mutable_view().data<float>(), n_left * k_join, 0.5f, stream);
-      }
-    }
-
-    // What the pruning did, reported as a value rather than only a print: an approximate join
-    // that skipped nothing returns a correct answer, so nothing in the result set distinguishes
-    // it from one that pruned hard. This is what a test can assert on.
-    auto const exhaustive_pairs = n_left * _op._right_total_rows;
-    if (_op._sirius_ctx != nullptr) {
-      _op._sirius_ctx->record_vector_join_prune(static_cast<std::uint64_t>(s.scanned_pairs),
-                                                static_cast<std::uint64_t>(exhaustive_pairs),
-                                                s.needed_chunks.size(),
-                                                _op._chunk_cluster_runs.size());
-    }
-
-    if (std::getenv("SIRIUS_VECTOR_JOIN_PRUNE_DEBUG") != nullptr) {
-      std::fprintf(stderr,
-                   "[vecjoin] batch: %lld probe rows x %ld probes, %zu of %zu corpus chunks "
-                   "staged, %lld of %lld probe-row x corpus-row pairs scored (%.2f%%)\n",
-                   static_cast<long long>(n_left),
-                   static_cast<long>(s.n_probes),
-                   s.needed_chunks.size(),
-                   _op._chunk_cluster_runs.size(),
-                   static_cast<long long>(s.scanned_pairs),
-                   static_cast<long long>(exhaustive_pairs),
-                   exhaustive_pairs == 0 ? 0.0
-                                         : 100.0 * static_cast<double>(s.scanned_pairs) /
-                                             static_cast<double>(exhaustive_pairs));
-    }
-    phase("search+fold slices");
-    // What the answer does not read goes before it is shaped, which can take a good part of the
-    // device.
-    st.search.reset();
-  }
-
   /// The whole-corpus fold, chunk by chunk.
   void search_corpus()
   {
@@ -5070,10 +2630,10 @@ class sirius_physical_vector_join_stream::block_task {
         } else if (edges.n_edges > 0) {
           if (kept) {
             auto mapped     = cudf::gather(cudf::table_view{{kept->row_ids->view()}},
-                                       edges.neighbors->view(),
-                                       cudf::out_of_bounds_policy::DONT_CHECK,
-                                       stream,
-                                       mr);
+                                           edges.neighbors->view(),
+                                           cudf::out_of_bounds_policy::DONT_CHECK,
+                                           stream,
+                                           mr);
             edges.neighbors = std::move(mapped->release().front());
           } else if (chunk_base != 0) {
             // Local dataset-batch rows -> right-table row space, the same shift the top-k path
@@ -5129,10 +2689,10 @@ class sirius_physical_vector_join_stream::block_task {
                                             static_cast<std::size_t>(dim + 4) * sizeof(float));
       }
       auto const rows = searched_rows(dataset);
-      auto knn        = gemm_search_enabled() && vss::gemm_search_supports(exhaustive_metric) &&
+      auto knn = gemm_search_enabled() && vss::gemm_search_supports(exhaustive_metric) &&
                      n_left >= kGemmMinProbeRows
-                          ? vss::gemm_topk(res, rows, fold_queries, k_eff, exhaustive_metric, mr)
-                          : vss::brute_force_knn(res, rows, fold_queries, k_eff, exhaustive_metric, mr);
+                   ? vss::gemm_topk(res, rows, fold_queries, k_eff, exhaustive_metric, mr)
+                   : vss::brute_force_knn(res, rows, fold_queries, k_eff, exhaustive_metric, mr);
 
       // The search above is issued, not finished. Staging the next chunk now runs its H2D
       // while the GPU works on this one; the host blocks inside the converter, the device
@@ -5343,7 +2903,7 @@ class sirius_physical_vector_join_stream::block_task {
 
   // The kernel works in distance space. For cosine with a similarity threshold the user's
   // "score >= eps" is the same set as "distance <= 1 - eps"; for a distance threshold it is eps
-  // directly. Identical to what the shape_threshold path below computes. For an inner product,
+  // directly. Identical to what the shape_threshold path computes. For an inner product,
   // "q.x >= eps" is D = -2 q.x <= -2 eps, and a negative-inner-product bound "-q.x <= eps" is
   // D <= 2 eps; past FLOAT's range the radius is infinite (every pair) or -infinite (none).
   [[nodiscard]] float radius_for_kernel() const
@@ -5521,7 +3081,7 @@ class sirius_physical_vector_join_stream::block_task {
   std::int64_t k_join;
   cuvs::distance::DistanceType metric;
   // An inner-product join ranks by D = -2 q.x (smaller is closer, like a distance; the factor is
-  // exact in FP32), so every fold, merge and bound below works on it unchanged. Its scores are
+  // exact in FP32), so every fold, merge and bound works on it unchanged. Its scores are
   // computed from the FP32 rows: by the FP32 GEMM, or by the FP32 re-score of an FP16 filter.
   bool ip;
   // A radius join needs no fold. Top-k folds because chunk j+1 can displace chunk j's winners,
@@ -5531,7 +3091,7 @@ class sirius_physical_vector_join_stream::block_task {
   // it has no k -- and therefore none of the k <= 1024 ceiling that knn_merge_parts imposes.
   bool radius_join;
   // A count-only statement never sees the pairs: each part is counted and dropped, and the task
-  // ends with one BIGINT row, the count, in place of the edge lists and host pieces below.
+  // ends with one BIGINT row, the count, in place of the edge lists and host pieces.
   bool count_only;
   // A threshold join asked for the pairs in one order only (earlier_by / other_by) keeps a pair
   // by its two rows' keys; candidate ids are pin rows, or over inexact lists their layout rows.
@@ -5549,6 +3109,2586 @@ class sirius_physical_vector_join_stream::block_task {
   std::optional<std::int64_t> flush_pairs;
   std::size_t next_search_room;
   std::int64_t max_pairs{0};
+};
+
+//===----------------------------------------------------------------------===//
+// The clustered search
+//===----------------------------------------------------------------------===//
+/// The search that walks (probe run x neighbouring cluster) pairs. @ref prepare builds a block's
+/// routing and probe copies and settles the search's form, @ref begin_sweep and @ref search_chunk
+/// take each pass and each corpus chunk in turn, and @ref finish closes the accumulators. What
+/// these share across chunks is in @ref block_state::search_state; here are this task's gather
+/// buffers and the chunks it holds staged.
+class sirius_physical_vector_join_stream::clustered_search : public block_task {
+ public:
+  explicit clustered_search(block_task const& task)
+    : block_task(task),
+      s(st.search.emplace(_op._host_pair_blocks)),
+      dbg(std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr),
+      phase_t0(std::chrono::steady_clock::now()),
+      stage_on(stream),
+      borrowed{stream}
+  {
+  }
+
+  void run()
+  {
+    prepare();
+    for (int pass = radius_join && s.any_bounded ? 1 : 0; pass < (s.any_bounded ? 2 : 1); ++pass) {
+      begin_sweep(pass);
+      for (std::size_t ci = 0; ci < chunks->size(); ++ci) {
+        search_chunk(ci);
+      }
+      run_stretches();
+    }
+    finish();
+    phase("search+fold slices");
+    // What the answer does not read goes before it is shaped, which can take a good part of the
+    // device.
+    st.search.reset();
+  }
+
+ private:
+  using bounded_slice = vss::bound_slice;
+
+  static constexpr std::size_t kFlushBytesPerPair = 80;
+  static constexpr std::size_t kFlushMargin       = std::size_t{1} << 28;
+  static constexpr std::int64_t kBackPiecePairs   = std::int64_t{1} << 23;
+
+  void phase(const char* name)
+  {
+    if (!dbg) { return; }
+    stream.sync();
+    auto const now = std::chrono::steady_clock::now();
+    std::fprintf(
+      stderr,
+      "[vecjoin-phase] %-22s %8.3f s, device in use %.2f GiB\n",
+      name,
+      std::chrono::duration<double>(now - phase_t0).count(),
+      static_cast<double>(mem_space->get_max_memory() - mem_space->get_available_memory(stream)) /
+        1073741824.0);
+    phase_t0 = now;
+  }
+
+  [[nodiscard]] std::chrono::steady_clock::time_point debug_mark()
+  {
+    if (!dbg) { return std::chrono::steady_clock::time_point{}; }
+    stream.sync();
+    return std::chrono::steady_clock::now();
+  }
+
+  // One piece of a block's host rows at a time on the device.
+  template <typename Use>
+  void for_each_host_piece(Use&& use)
+  {
+    constexpr std::int64_t kPieceRows = std::int64_t{1} << 17;
+    for (std::int64_t at = 0; at < n_left; at += kPieceRows) {
+      auto const rows = std::min(kPieceRows, n_left - at);
+      rmm::device_uvector<float> piece(static_cast<std::size_t>(rows * dim), stream, mr);
+      st.host_rows->copy_to_device(at, rows, piece.data());
+      use(piece.data(), at, rows);
+      stream.sync();
+    }
+  }
+
+  // A search that needs every FP32 row at hand (rare: see plan_search) gets them back.
+  void block_rows_to_device()
+  {
+    if (!st.probe_rows_on_host) { return; }
+    st.block_probe.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
+    st.host_rows->copy_to_device(0, n_left, st.block_probe->data());
+    s.search_queries =
+      raft::make_device_matrix_view<float const, std::int64_t>(st.block_probe->data(), n_left, dim);
+    routed_queries->resize(static_cast<std::size_t>(s.max_routed * dim), stream);
+    st.host_rows.reset();
+    st.probe_rows_on_host = false;
+  }
+
+  void prepare()
+  {
+    route_block();
+    seed_accumulator();
+    // Staging runs on its own stream so the next needed chunk's H2D overlaps this one's
+    // compute, exactly as in the exhaustive fold.
+    if (_op._corpus->is_streaming()) { staging_stream.emplace(); }
+    stage_on = staging_stream ? staging_stream->view() : stream;
+    plan_search();
+  }
+
+  /// Each probe row's clusters, sorted by cluster, and the corpus chunks they need.
+  void route_block()
+  {
+    _op.ensure_cluster_index(*mem_space, stream, mr);
+    phase("cluster index");
+
+    // Lists of unit rows answer a cosine join as L2 over unit vectors, |q - x|^2 = 2 (1 - cos):
+    // the probe rows are normalized too, the radius doubled, and the distances halved at the end.
+    // Routing below keeps the join's metric; it only picks clusters.
+    s.unit_cosine = _lists != nullptr && _lists->unit_rows;
+    if (s.unit_cosine && _request.metric != "cosine") {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] cluster lists built with metric => 'cosine' hold "
+        "unit rows and answer only cosine joins; rebuild them without it for an " +
+        _request.metric + " join");
+    }
+    s.n_probes = std::clamp<std::int64_t>(_request.n_probes, 1, _op._n_clusters);
+    // Every cluster probed is the exact join through lists. A cosine join over lists of rows as
+    // they are (not unit rows) then ranks as the exhaustive fold does: the probe and each chunk
+    // normalized in FP32, L2 from the differences between them, halved at the end. No coded
+    // search takes such lists, so only FP32 slices are affected: FLOAT16 lists stage theirs from
+    // the kept FP32 rows (exact_lists_corpus).
+    s.direct_cosine =
+      !s.unit_cosine && _request.metric == "cosine" && s.n_probes >= _op._n_clusters;
+    if (s.unit_cosine || s.direct_cosine) { st.radius_scale = 0.5f; }
+    s.search_metric = s.unit_cosine ? cuvs::distance::DistanceType::L2Expanded : metric;
+    s.search_radius = s.unit_cosine || s.direct_cosine ? 2.f * radius_eps : radius_eps;
+    if (s.unit_cosine || s.direct_cosine) {
+      s.unit_probe.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
+      vss::normalize_rows(st.queries.data_handle(), n_left, dim, s.unit_probe->data(), stream);
+    }
+    s.search_queries =
+      s.unit_cosine || s.direct_cosine
+        ? raft::make_device_matrix_view<const float, int64_t>(s.unit_probe->data(), n_left, dim)
+        : st.queries;
+
+    // Rows that a plain FP32 search ranks (FP32 lists, or rows the coded searches below do not
+    // take) then rank as the exhaustive fold's do, L2 from the differences; the coded searches
+    // keep their own FP32 re-score.
+    s.ranked_metric = [&] {
+      if (s.n_probes < _op._n_clusters) { return s.search_metric; }
+      if (s.direct_cosine) { return cuvs::distance::DistanceType::L2Unexpanded; }
+      if (s.search_metric == cuvs::distance::DistanceType::L2Expanded) {
+        return cuvs::distance::DistanceType::L2Unexpanded;
+      }
+      if (s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded) {
+        return cuvs::distance::DistanceType::L2SqrtUnexpanded;
+      }
+      return s.search_metric;
+    }();
+
+    // Each probe row picks its own n_probes nearest centroids, the way an IVF index routes a
+    // query. Routing a whole probe cluster through its centroid's nearest centroids kept a
+    // run contiguous, but a row at the edge of its cluster has its neighbours next door, and
+    // that cost about 3x the probes at equal recall. Contiguity comes back below by sorting
+    // the (row, cluster) edges by cluster instead.
+    auto const n_edges = n_left * s.n_probes;  // row-major [n_left x n_probes]
+    auto edge_clusters = [&] {
+      if (!st.probe_rows_on_host) {
+        return vss::nearest_centroid_ids(
+          res, st.queries, _op._centroids->view(), dim, s.n_probes, metric, stream, mr);
+      }
+      rmm::device_uvector<std::int32_t> all(
+        static_cast<std::size_t>(vss::column_size(n_edges, "vector join routing")), stream, mr);
+      for_each_host_piece([&](float const* rows, std::int64_t at, std::int64_t n) {
+        auto const part = vss::nearest_centroid_ids(
+          res,
+          raft::make_device_matrix_view<float const, std::int64_t>(rows, n, dim),
+          _op._centroids->view(),
+          dim,
+          s.n_probes,
+          metric,
+          stream,
+          mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(all.data() + at * s.n_probes,
+                                      part.data(),
+                                      part.size() * sizeof(std::int32_t),
+                                      cudaMemcpyDeviceToDevice,
+                                      stream.get()));
+        stream.sync();
+      });
+      return all;
+    }();
+    phase("assign probe->clusters");
+
+    // A row whose clusters cannot supply k is refused before a single search is issued, rather
+    // than after the merge has silently padded its answer out with misses.
+    auto edge_keys = vss::key_routed_edges(
+      std::move(edge_clusters), n_left, s.n_probes, _op._cluster_rows, k_join, stream, mr);
+    if (edge_keys.refused_row >= 0) {
+      auto const r            = edge_keys.refused_row;
+      std::int64_t candidates = 0;
+      for (auto const c : edge_keys.refused_clusters) {
+        if (c < 0 || c >= _op._n_clusters) {
+          throw std::runtime_error("[sirius_physical_vector_join_stream] probe row " +
+                                   std::to_string(r) + " was routed to cluster id " +
+                                   std::to_string(c) + ", outside the clustering's " +
+                                   std::to_string(_op._n_clusters) + " clusters");
+        }
+        candidates += _op._cluster_rows[static_cast<std::size_t>(c)];
+      }
+      if (candidates == 0) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] probe row " +
+                                 std::to_string(r) + " reached no non-empty corpus cluster");
+      }
+      throw std::runtime_error("[sirius_physical_vector_join_stream] probe row " +
+                               std::to_string(r) + " reaches only " + std::to_string(candidates) +
+                               " corpus rows, fewer than k=" + std::to_string(k_join) +
+                               "; raise n_probes or cluster with fewer, larger clusters");
+    }
+    s.nearest_cluster = std::move(edge_keys.nearest_cluster);
+    phase("edges to host");
+
+    // Sorted by cluster, each cluster's rows are one contiguous range of the edge list. That
+    // range is what a slice's search gathers its queries from and what its answer folds back
+    // through. Within a cluster, the rows for which it is the nearest cluster come first: the
+    // bounded search below seeds every row from its nearest cluster before it searches any of the
+    // others. Rows then run in probe order, which keeps a tile's probe-row loads close together.
+    s.routed.emplace(vss::sort_routed_edges(std::move(edge_keys), stream, mr));
+    auto const& edge_begin    = s.routed->edge_begin;
+    auto const& nearest_edges = s.routed->nearest_edges;
+    std::vector<bool> wanted(static_cast<std::size_t>(_op._n_clusters));
+    for (std::size_t c = 0; c < wanted.size(); ++c) {
+      wanted[c] = edge_begin[c + 1] > edge_begin[c] && _op._cluster_rows[c] > 0;
+    }
+    phase("sort edges");
+
+    // The prune, made explicit: a chunk holding no cluster any row wants is never staged, so
+    // an out-of-core clustered corpus pays no transfer for the part it skips.
+    for (std::size_t j = 0; j < _op._chunk_cluster_runs.size(); ++j) {
+      for (auto const& slice : _op._chunk_cluster_runs[j]) {
+        if (wanted[static_cast<std::size_t>(slice.cluster)]) {
+          s.needed_chunks.push_back(j);
+          break;
+        }
+      }
+    }
+
+    // The per-slice query matrix, sized for the busiest cluster and reused by every slice: the
+    // slices are issued in stream order, so each one's gather waits for the last one's search.
+    for (std::size_t c = 0; c < static_cast<std::size_t>(_op._n_clusters); ++c) {
+      s.max_routed = std::max(s.max_routed, edge_begin[c + 1] - edge_begin[c]);
+    }
+    // Over host rows only sweep 0 gathers FP32 rows, each row's nearest cluster: the filter reads
+    // the FP16 copy.
+    s.max_nearest = nearest_edges.empty()
+                      ? std::int64_t{0}
+                      : *std::max_element(nearest_edges.begin(), nearest_edges.end());
+    routed_queries.emplace(
+      static_cast<std::size_t>((st.probe_rows_on_host ? s.max_nearest : s.max_routed) * dim),
+      stream,
+      mr);
+    s.routed_rows = reinterpret_cast<std::int64_t const*>(s.routed->rows.data());
+  }
+
+  void seed_accumulator()
+  {
+    // A miss -- id -1 at infinite distance -- is what the accumulator is seeded with, so a row's
+    // first answer merges against nothing. It can only survive the fold when a row had fewer
+    // than k real candidates, which was refused above.
+    cudf::numeric_scalar<std::int64_t> const miss_id(-1, true, stream);
+    cudf::numeric_scalar<float> const miss_distance(
+      std::numeric_limits<float>::infinity(), true, stream);
+
+    // Running [n_left x k_join] accumulator in the caller's row order, seeded with misses so
+    // a row's first answer merges against nothing. Each slice folds its answer in through the
+    // rows it served, so device memory does not grow with n_probes: a row's answers from its
+    // n_probes clusters never coexist.
+    {
+      auto const total = vss::column_size(n_left * k_join, "vector join output");
+      st.acc_neighbors = cudf::make_column_from_scalar(miss_id, total, stream, mr);
+      st.acc_distances = cudf::make_column_from_scalar(miss_distance, total, stream, mr);
+    }
+  }
+
+  /// Settles the search's form, from the join, the lists and the probe's rows, coding the probe on
+  /// the way.
+  void plan_search()
+  {
+    auto const& nearest_edges     = s.routed->nearest_edges;
+    bool const bound_gemm_enabled = [] {
+      auto const* v = std::getenv("SIRIUS_VSS_BOUND_GEMM");
+      return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    // Byte-valued lists, searched by a byte-valued probe side, run on the int8 tensor cores
+    // straight from the stored bytes: no chunk is widened, the row norms were
+    // computed at build time, and every dot product is exact. Only the probe is converted, once.
+    // A radius join has only the bounded form of that search.
+    bool const l2 = s.search_metric == cuvs::distance::DistanceType::L2Expanded ||
+                    s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+    // INT8 codes are only ever answered by the bounded search below, which filters with them and
+    // re-scores what passes in FP32; decoded on their own they would give approximate distances.
+    s.codes_int8 = _lists != nullptr && _lists->encoding == vss::list_encoding::int8;
+    if (s.codes_int8 &&
+        !(gemm_search_enabled() && bound_gemm_enabled && l2 && _lists->has_exact_rows() &&
+          _lists->row_sq != nullptr && vss::bound_filter_int8_supports(dim))) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] int8 cluster lists answer only l2 joins through the "
+        "bounded search (vector width a multiple of 16, at most 256, and the FP32 rows kept); "
+        "rebuild the lists with storage => 'float16' or 'float32'");
+    }
+    s.int8_search =
+      gemm_search_enabled() && _lists != nullptr &&
+      (!radius_join || (bound_gemm_enabled && vss::bound_filter_int8_supports(dim))) &&
+      (_lists->encoding == vss::list_encoding::uint8 || s.codes_int8) &&
+      _lists->row_sq != nullptr && l2 && dim % 4 == 0;
+    code_probe_int8();
+
+    // Bounded search: sweep 0 searches each row's nearest cluster and folds as usual, which gives
+    // every row a k-th distance; sweep 1 searches the remaining clusters with a GEMM that keeps
+    // only pairs under that bound, so the scores of the other n_probes - 1 clusters never reach
+    // memory. Distances stay squared until the end, where the bound is compared.
+    // A radius join is the same search with the radius as every row's bound, in one sweep: there
+    // is no k-th distance to seed, and a pair under the bound is final when found.
+    // Lists on the device can seed sweep 0 (below), which makes even one probe a bounded search.
+    // SIRIUS_VSS_SEED=0 turns the seed off (sweep 0 then ranks each row's nearest cluster in full);
+    // SIRIUS_VSS_SEED=force seeds INT8 lists on the device past the partition-size test below.
+    std::string_view const seed_switch = [] {
+      auto const* v = std::getenv("SIRIUS_VSS_SEED");
+      return v == nullptr ? std::string_view{} : std::string_view{v};
+    }();
+    bool const seed_enabled = seed_switch != "0";
+    bool const seed_forced  = seed_switch == "force";
+    // A seeded sweep 0 is each row's exact join with its nearest cluster, filtered in stretches
+    // that double from the seed's sample and merged in between (stretch_sweep0, below), so its cost
+    // grows with the number of stretches -- the log of the partition -- while the unseeded pass
+    // ranks the whole partition on CUDA cores, linear in it. FLOAT16 lists take the seed at every
+    // partition size measured (Deep10M, 1M and 10k probes, ~2.4k-19.5k rows a partition: 0.69-0.92x
+    // the unseeded pass). INT8 codes pass about 2k pairs a row a stretch (FLOAT16 about 1k), so for
+    // INT8 the seed pays only once a partition is large: per 1M probes 1.04x the unseeded pass at
+    // ~2.4k rows a partition, 0.99x at ~4.9k, 0.82x at ~9.8k, 0.84x at ~19.5k (10-30
+    // nearest-as-join, RTX A5000). INT8 lists averaging under kSeedInt8Rows rows a partition keep
+    // the unseeded pass. Lossless UINT8 rows seed exactly at any size.
+    constexpr std::int64_t kSeedInt8Rows = 5'000;
+    bool const large_partitions =
+      _lists != nullptr && _lists->offsets.size() > 1 &&
+      _lists->offsets.back() >=
+        static_cast<std::int64_t>(_lists->offsets.size() - 1) * kSeedInt8Rows;
+    // A single list -- the exact join's compact layout, no partitioning -- lowers each row's bound
+    // as its bounded sweep goes: every slice is cut into pieces whose merge points double from the
+    // first piece, and what passes is merged before the next, so after the first pieces the filter
+    // runs under a bound near the final one (Deep10M INT8, 10k probes: 0.33 s, against 0.37 s
+    // through its best partitioning). On the device the seed's sample bounds the first piece; host
+    // lists, with no device rows to sample, start from an unbounded first piece instead. Either way
+    // the first piece is cut to the batch, so that what it lets through -- every row of an
+    // unbounded piece, about k per sample's worth under the seed -- stays near 2^24 pairs: a 1M-row
+    // probe batch over host lists would otherwise buffer a billion. Later pieces pass about k a
+    // row. SIRIUS_VSS_RUNNING_BOUND=<rows> sets the first piece for any lists, 0 turns it off.
+    // A single list of FLOAT16 rows takes no sample on the device either: its codes give each row's
+    // bound after the first piece (see hold_codes_pairs, below). Exact, with no FP32 read for the
+    // bound. INT8 and byte codes keep the seed: measured slower without it, at every probe count.
+    // The first piece's pairs all pass, so a device too full for their buffer keeps the seed too.
+    // SIRIUS_VSS_F16_NO_SEED=0 keeps the seed here too, and setting SIRIUS_VSS_SEED or
+    // SIRIUS_VSS_RUNNING_BOUND asks for the schedule they name.
+    auto const unbounded_piece_rows = [&] {
+      constexpr std::int64_t kFirstPiecePairs = std::int64_t{1} << 24;
+      auto const at_least                     = std::max<std::int64_t>(4 * k_join, 64);
+      return std::clamp<std::int64_t>(kFirstPiecePairs / std::max<std::int64_t>(n_left, 1),
+                                      at_least,
+                                      std::max<std::int64_t>(at_least, vss::kSeedSample));
+    };
+    s.f16_list_no_seed =
+      _lists != nullptr && _lists->offsets.size() == 2 && !s.int8_search &&
+      _lists->encoding == vss::list_encoding::float16 && !radius_join && !ip &&
+      st.earlier_cut == nullptr && seed_switch.empty() &&
+      std::getenv("SIRIUS_VSS_RUNNING_BOUND") == nullptr &&
+      static_cast<std::size_t>(n_left * unbounded_piece_rows()) * 20 + (std::size_t{1} << 28) <=
+        mem_space->get_available_memory(stream) &&
+      [] {
+        auto const* v = std::getenv("SIRIUS_VSS_F16_NO_SEED");
+        return v == nullptr || std::string_view{v} != "0";
+      }();
+    s.running_bound_rows = [&] {
+      if (auto const* v = std::getenv("SIRIUS_VSS_RUNNING_BOUND"); v != nullptr) {
+        return std::max<std::int64_t>(0, std::atoll(v));
+      }
+      if (_lists == nullptr || _lists->offsets.size() != 2) { return std::int64_t{0}; }
+      constexpr std::int64_t kFirstPiecePairs = std::int64_t{1} << 24;
+      auto const rows                         = std::max<std::int64_t>(n_left, 1);
+      auto const at_least                     = std::max<std::int64_t>(4 * k_join, 64);
+      // The seed is the k-th of max(kSeedSample, 8k) sample rows (seed_rows), so about k / that of
+      // a piece's rows pass it.
+      auto const sample = std::max<std::int64_t>(vss::kSeedSample, 8 * k_join);
+      // The upper bounds give way to at_least for a large k (std::clamp needs lo <= hi).
+      return _lists->tier == cucascade::memory::Tier::GPU && !s.f16_list_no_seed
+               ? std::clamp<std::int64_t>(
+                   kFirstPiecePairs / rows * sample / std::max<std::int64_t>(k_join, 1),
+                   at_least,
+                   std::max<std::int64_t>(at_least, 10'000))
+               : unbounded_piece_rows();
+    }();
+    // Lists in host memory have no device rows to sample; with the bound lowered as it goes, their
+    // sweep starts from an unbounded first piece instead, which serves as the sample.
+    // The seed's sample grows with k (seed_rows), so any k is seeded; unseeded, the sweep would
+    // rank every row first, a full GEMM and selection.
+    bool const seedable =
+      s.int8_search && !radius_join &&
+      (_lists->tier == cucascade::memory::Tier::GPU || s.running_bound_rows > 0) && seed_enabled &&
+      (!s.codes_int8 || large_partitions || s.running_bound_rows > 0 || seed_forced);
+    s.bounded = s.int8_search && (s.n_probes > 1 || radius_join || s.codes_int8 || seedable) &&
+                vss::bound_filter_int8_supports(dim) && bound_gemm_enabled;
+    // FLOAT16 lists that kept their FP32 rows get the same two sweeps with the half-precision
+    // GEMM, and an exact answer: sweep 0's nearest-cluster answers are re-scored in FP32 only to
+    // give each row a bound (their largest distance) and then dropped, and sweep 1 searches every
+    // routed cluster, nearest one included, keeping pairs whose FP16 distance is within the bound
+    // plus the FP16 rounding slack. What passes is re-scored in FP32 before it is merged, and ids
+    // stay layout rows until the end, where the re-scoring needs them.
+    // A scanned corpus has no lists, but every chunk it stages can be coded on the device and
+    // searched the same way: sweep 0 ranks each row's nearest cluster in FP32 and re-scores that
+    // answer exactly, so its largest distance bounds the row; sweep 1 codes each staged chunk to
+    // FLOAT16 and filters every routed cluster under the bound, re-scoring what passes from the
+    // chunk's FP32 rows before the chunk is released. Deep10M self-join (k 10, 32 probes) spent 82
+    // % of its GPU time in the FP32 GEMM and the top-k selection of the ranked search this
+    // replaces. With one probe sweep 0 is the whole search already, and sweep 1 would only repeat
+    // it.
+    bool const scan_f16_shape = _lists == nullptr && !s.int8_search && gemm_search_enabled() &&
+                                bound_gemm_enabled && l2 && !radius_join &&
+                                st.earlier_cut == nullptr && s.n_probes > 1 &&
+                                vss::bound_filter_f16_supports(dim) && scan_bounded_enabled();
+    bool const f16_lists_shape =
+      !s.int8_search && gemm_search_enabled() && _lists != nullptr &&
+      _lists->encoding == vss::list_encoding::float16 && _lists->has_exact_rows() &&
+      (s.search_metric == cuvs::distance::DistanceType::L2Expanded ||
+       s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded || ip) &&
+      vss::bound_filter_f16_supports(dim) && bound_gemm_enabled;
+    // The probe is rounded like the rows, with its rounded norms and its own rounding error. A
+    // probe row past half's range (a component of 65520 or more becomes infinite) would make its
+    // pairs' filter values infinite or NaN, which no limit admits: its true pairs would be dropped
+    // with no error. So the probe rows are held to the rows' own check (kmeans_functions.cpp: a
+    // norm under 65504), and a batch with one outside it is searched in FP32 instead: a scanned
+    // corpus from its staged FP32 chunks, FLOAT16 lists from their kept FP32 rows.
+    bool probe_in_f16_range = true;
+    if (!scan_f16_shape) { block_rows_to_device(); }
+    if (scan_f16_shape || f16_lists_shape) { probe_in_f16_range = code_probe_f16(); }
+    s.scan_f16    = scan_f16_shape && probe_in_f16_range;
+    s.f16_bounded = s.scan_f16 || (f16_lists_shape && probe_in_f16_range);
+    // FLOAT16 lists the bounded search does not answer (a cosine join over rows as they are, a
+    // probe row past half's range, the bounded search switched off): their chunks are staged from
+    // the kept FP32 rows, in layout order, so the FP32 search scores what the rows hold. Over the
+    // half rows it would be exact for the rounded rows, and report their distances.
+    if (_lists != nullptr && _lists->encoding == vss::list_encoding::float16 && !s.f16_bounded) {
+      if (!_lists->has_exact_rows()) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_stream] these float16 cluster lists kept no FP32 rows, "
+          "which a " +
+          _request.metric +
+          " join outside the bounded search reads; rebuild the lists with storage => 'float32'");
+      }
+      s.exact_lists_corpus.emplace(*_lists, /*exact_rows=*/true);
+    }
+    s.any_bounded = s.bounded || s.f16_bounded;
+    // FP16 and INT8 lists filter with inexact distances: their bounded search keeps layout rows as
+    // ids and re-scores every candidate in FP32 from the kept rows. Unseeded, they search the
+    // nearest cluster again in sweep 1 (sweep 0 only sets the bound). INT8 filters in code space,
+    // under a per-row limit derived from the FP32 bound and both sides' coding errors.
+    s.rescore = s.f16_bounded || s.codes_int8;
+    // A radius join whose score is never read keeps the filter's verdict where it already proves
+    // the pair is inside the radius, and re-scores only the rest.
+    s.skip_certain = radius_join && s.rescore && !_request.score_read && !best_only;
+    // The FLOAT16 rows' largest rounding error and norm, which the filter limit allows for: the
+    // lists' own, or for a scanned corpus the staged chunk's, set as each chunk is coded.
+    row_half_error = _lists != nullptr ? _lists->half_error : 0.f;
+    row_norm_max   = _lists != nullptr ? _lists->max_row_norm : 0.f;
+    s.sqrt_at_end =
+      s.any_bounded && s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded;
+    // Lists on the device run sweep 0 -- each row's nearest cluster, which only sets the bounded
+    // sweep's starting bound -- as a bounded search too, a few grouped launches instead of a GEMM
+    // and a selection per cluster. Its own bound comes from the first kSeedSample rows of that
+    // cluster: their k-th smallest distance, which for INT8 codes and FLOAT16 rows is first raised
+    // by both sides' coding or rounding error so it bounds the FP32 distance. What passes is merged
+    // (re-scored in FP32 where the rows are inexact), so sweep 1 starts from the nearest cluster's
+    // exact k-th and need not search that cluster again. SIRIUS_VSS_SEED=0 keeps the GEMM.
+    // The seed is CUDA-core work per probe row (a warp per row against a quarter of its nearest
+    // cluster, at most kSeedSample rows); ranking each row's nearest cluster on the tensor cores
+    // instead (gemm_f16_topk below, as host lists do) costs a GEMM and a selection per (task,
+    // cluster) slice plus a second search of that cluster in sweep 1. So the seed pays while the
+    // slices carry little seed work -- few probe rows a cluster, as in a small probe batch -- and
+    // the ranked pass once they carry much. A task over clustered FLOAT16 lists on the device ranks
+    // when its mean seed work per slice (nearest-cluster probe rows x sample rows x width) reaches
+    // SIRIUS_VSS_SWEEP0_SLICE_MACS. SIRIUS_VSS_SWEEP0=seed | ranked forces either;
+    // SIRIUS_VSS_SEED=0 still means the grouped CUDA-core ranking (nearest_cluster_topk).
+    s.ranked_sweep0 = false;
+    if (s.f16_bounded && _lists != nullptr && _lists->tier == cucascade::memory::Tier::GPU &&
+        _lists->offsets.size() > 2 && s.running_bound_rows == 0 && !radius_join && !ip &&
+        seed_enabled && s.probe_f16) {
+      auto const* sw = std::getenv("SIRIUS_VSS_SWEEP0");
+      std::string_view const how{sw == nullptr ? "auto" : sw};
+      auto const floor    = std::max<std::int64_t>(64, 8 * k_join);
+      double seed_macs    = 0;
+      std::int64_t slices = 0;
+      for (std::size_t c = 0; c + 1 < _lists->offsets.size(); ++c) {
+        auto const rows = nearest_edges[c];
+        if (rows == 0) { continue; }
+        auto const size   = _lists->offsets[c + 1] - _lists->offsets[c];
+        auto const sample = std::min<std::int64_t>(
+          size,
+          std::clamp<std::int64_t>(
+            size / 4, floor, std::max<std::int64_t>(floor, vss::kSeedSample)));
+        seed_macs += static_cast<double>(rows) * static_cast<double>(sample) * dim;
+        ++slices;
+      }
+      auto const* t          = std::getenv("SIRIUS_VSS_SWEEP0_SLICE_MACS");
+      double const threshold = t != nullptr ? std::atof(t) : kSweep0RankedSliceMacs;
+      s.ranked_sweep0 = how == "ranked" || (how != "seed" && slices > 0 &&
+                                            seed_macs >= threshold * static_cast<double>(slices));
+      if (dbg) {
+        std::fprintf(stderr,
+                     "[vecjoin-phase] sweep-0 rule: %lld probe rows over %lld nearest slices, "
+                     "seed work %.3g MACs a slice (ranked from %.3g, SIRIUS_VSS_SWEEP0=%s): %s\n",
+                     static_cast<long long>(n_left),
+                     static_cast<long long>(slices),
+                     slices > 0 ? seed_macs / static_cast<double>(slices) : 0.0,
+                     threshold,
+                     std::string(how).c_str(),
+                     s.ranked_sweep0 ? "ranked" : "seed");
+      }
+    }
+    bool const seed_f16 =
+      s.f16_bounded && _lists != nullptr && !radius_join &&
+      (_lists->tier == cucascade::memory::Tier::GPU || s.running_bound_rows > 0) && seed_enabled &&
+      !s.ranked_sweep0;
+    s.seed = (s.bounded && seedable) || seed_f16;
+    // Unseeded, sweep 0 ranks each row's nearest cluster on the half-precision tensor cores from
+    // the stored rows; only the bound it leaves is used.
+    // SIRIUS_VSS_F16_GEMM=0 widens the rows and ranks them with the FP32 GEMM instead.
+    // An inner-product join keeps to the searches it was verified on: the seed, the bounded
+    // filter, and the FP32 GEMM ranking of an unseeded sweep 0.
+    s.f16_sweep0 = s.f16_bounded && !s.scan_f16 && !s.seed && !ip && [] {
+      auto const* v = std::getenv("SIRIUS_VSS_F16_GEMM");
+      return v == nullptr || std::string_view{v} != "0";
+    }();
+    // That bound comes from the codes alone, with no FP32 read, across PCIe when the rows are in
+    // host memory. Row r's k pairs of sweep 0 are distinct, and the largest of their codes is
+    // c_(k), so all k have c(r, s) <= c_(k), hence delta(r, s) <= U_r(c_(k)) (the lemma above
+    // gap_trim), which therefore bounds delta*_r and may stand as b_r wherever their re-scored k-th
+    // did. It is never below that k-th, so what a re-scored bound keeps it keeps too. U_r holds for
+    // sweep 0's codes as for the filter's, in all of its kernels, with N = |q^| + max|x^|:
+    //  1. A product of two halves has at most 22 significant bits and is at least 2^-48: exact in
+    //     FP32, with no denormal.
+    //  2. Any summation tree over d terms has depth at most d - 1, so a dot's error is at most
+    //     1.001 d u |q^| |x^|, u = 2^-24, whatever the order.
+    //  3. c doubles that, adds the two FP32 norms' errors and the last additions: at most
+    //     (d/2 + d/32 + 8) u N^2 with 4 |q^| |x^| <= N^2, inside eta_r = 2 d u N^2. Clamping at 0
+    //     only raises c. So |q^ - x^|^2 <= c + eta_r, with room left of about 1.47 d u N^2.
+    //  4. |q - x| <= |q^ - x^| + e_r + e by the triangle inequality.
+    //  5. The re-score is at most |q - x|^2 (1 + (d/32 + 7) u), one lane's FMA chain, 5 shuffle
+    //     additions and the subtraction, which 2^-20 and the room in (3) cover for d >= 16.
+    // A row with a miss in sweep 0 has an infinite c_(k), which stays infinite.
+    // SIRIUS_VSS_SWEEP0_CODE_BOUND=0 re-scores the k pairs instead.
+    s.sweep0_bound_from_codes = s.f16_sweep0 && !radius_join && [] {
+      auto const* v = std::getenv("SIRIUS_VSS_SWEEP0_CODE_BOUND");
+      return v == nullptr || std::string_view{v} != "0";
+    }();
+    if (s.f16_sweep0) {
+      routed_f16.emplace(static_cast<std::size_t>(s.max_routed * dim), stream, mr);
+      routed_sqf.emplace(static_cast<std::size_t>(s.max_routed), stream, mr);
+    }
+    if (s.f16_bounded) {
+      // The probe was rounded above, and is within half's range.
+      if (ip) {
+        // The filter kernels compute |q|^2 + |x|^2 - 2 q.x from the norms they are handed: with
+        // zeros on both sides that is -2 q.x, the inner-product distance, exactly.
+        s.ip_probe_zero_sq.emplace(static_cast<std::size_t>(n_left), stream, mr);
+        CUDF_CUDA_TRY(cudaMemsetAsync(
+          s.ip_probe_zero_sq->data(), 0, s.ip_probe_zero_sq->size() * sizeof(float), stream.get()));
+        if (_lists != nullptr && !_lists->offsets.empty()) {
+          s.ip_row_zero_sq.emplace(
+            static_cast<std::size_t>(std::max<std::int64_t>(_lists->offsets.back(), 1)),
+            stream,
+            mr);
+          CUDF_CUDA_TRY(cudaMemsetAsync(
+            s.ip_row_zero_sq->data(), 0, s.ip_row_zero_sq->size() * sizeof(float), stream.get()));
+        }
+      }
+    }
+    // Where the FP32 re-score reads a layout row: the lists' kept rows, or for a scanned corpus the
+    // staged chunk, pointed at as each chunk is coded (its candidates are flushed before it goes).
+    exact_source = s.rescore && _lists != nullptr ? _lists->exact_source() : vss::exact_rows{};
+    // The kernels compare squared distances.
+    s.radius_bound = s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded
+                       ? s.search_radius * s.search_radius
+                       : s.search_radius;
+    // Gap-checked re-score (top-k joins over inexact rows only): before a stretch's candidates are
+    // re-scored, each row's k-th FP32 distance is bounded from its k best codes and its running
+    // top-k, and the candidates past the filter limit of that bound -- which cannot be in the row's
+    // top-k -- are dropped without reading their FP32 rows. SIRIUS_VSS_GAP_RESCORE=0 re-scores
+    // every candidate; SIRIUS_VSS_GAP_RESCORE_STATS=1 counts what it trims (also under the phase
+    // debug).
+    s.gap_rescore = s.rescore && !radius_join && [] {
+      auto const* v = std::getenv("SIRIUS_VSS_GAP_RESCORE");
+      return v == nullptr || std::string_view{v} != "0";
+    }();
+    s.gap_stats_on = s.gap_rescore && (dbg || [] {
+                       auto const* v = std::getenv("SIRIUS_VSS_GAP_RESCORE_STATS");
+                       return v != nullptr && std::string_view{v} == "1";
+                     }());
+    // With the lists on the device every slice's rows stay put, so a group's slices of one probe
+    // tile at most are launched together, a few grouped launches in place of one per slice. A
+    // Host-tier lists are staged a chunk at a time and released as the sweep moves on, so there
+    // each slice launches at once.
+    // SIRIUS_VSS_GROUP=0 launches each slice on its own.
+    // A scanned chunk stays staged until its group is checked, so its slices group too.
+    // With the CUTLASS tile kernel, lists staged from the host group as well: a chunk's slices are
+    // launched together before the next chunk's copy starts, and checked before the chunk goes.
+    bool const cutlass_tiles = s.f16_bounded && vss::bound_filter_f16_uses_cutlass(dim);
+    s.group_launch =
+      (s.scan_f16 ||
+       (_lists != nullptr && (_lists->tier == cucascade::memory::Tier::GPU || cutlass_tiles))) &&
+      [] {
+        auto const* v = std::getenv("SIRIUS_VSS_GROUP");
+        return v == nullptr || std::string_view{v} != "0";
+      }();
+    s.bounded_group = s.group_launch ? 256 : 64;
+    // Which slices join the grouped launch. Narrow slices (<= 128 probe rows) always do. A wide
+    // slice launched alone keeps its corpus tiles in L2 across its probe tiles, which pays when the
+    // slice's GEMM is large and costs a launch when it is small; measured 2026-10-05: SIFT1M 10k x
+    // 16 lists (156 probes x 977 rows per slice) went 15 -> 8 ms grouped, SIFT100M (98k-row lists)
+    // and a 1M-probe self-join over 64 lists (250k probes x 15k rows) lost 3-13 % grouped. So a
+    // wide slice joins the group when probes x rows is at most 4M. SIRIUS_VSS_GROUP_M_MAX and
+    // SIRIUS_VSS_GROUP_WORK_MAX override. The CUTLASS kernel's grouped launch keeps a slice's rows
+    // in L2 itself while they fit, so such a slice joins at any size; past that it reads them again
+    // for every probe tile. 1M rows, 256-1,536 wide: slices up to half the L2 ran 0.98-1.03x their
+    // lone launches, from 4 MB (6 MB L2) alone won by 1-15 %.
+    auto const env_i64 = [](char const* name, std::int64_t dflt) {
+      auto const* v = std::getenv(name);
+      return v == nullptr ? dflt : std::max<std::int64_t>(0, std::atoll(v));
+    };
+    s.group_m_max      = env_i64("SIRIUS_VSS_GROUP_M_MAX", 128);
+    s.group_work_max   = env_i64("SIRIUS_VSS_GROUP_WORK_MAX", 4'000'000);
+    s.group_slice_rows = cutlass_tiles ? vss::bound_filter_f16_group_slice_bytes() / (dim * 2) : 0;
+    s.hold_codes_pairs = s.f16_list_no_seed && s.gap_rescore && s.running_bound_rows > 0;
+    // A top-k join's pairs wait in the buffer for their FP32 re-score, and a flush needs far more
+    // than the buffer holds: the re-score's and the merge's working space, about 64 B a pair beside
+    // the buffer's 16. Next to device lists that leave little free, a full buffer cannot flush, and
+    // on a corpus stored in cluster order, where a slice's pairs can themselves overflow the
+    // buffer, the task runs out of memory on every retry. So when a flush would not fit, the
+    // buffer's pairs move to pinned host blocks with no FP32 read and the sweep goes on; they come
+    // back at the end of the task in pieces small enough to flush. A slice that alone would need a
+    // buffer past what the device has is cut in two instead.
+    // Exactness, in the notation of the lemma above gap_trim. A moved pair is not in the
+    // accumulator and keeps its code. moved_codes holds row r's k smallest codes among all moved
+    // pairs, those trimmed since included. They are k distinct pairs, as a row visits a cluster
+    // once and a rollback discards what was not committed, each with delta <= U_r(c_(k)), so
+    // min(b_r, U_r(c_(k))) >= delta*_r may stand as b_r, whether or not earlier flushes filled the
+    // accumulator: those pairs are not in moved_codes, and they only lower b_r. A pair past its
+    // limit has delta > b_r >= delta*_r, strictly past the k-th, and is dropped. One float a row
+    // would not do: j pairs of one move could not count with k - j of a later one, the buffer being
+    // empty between them. Every pair kept goes through flush as any other does, whose merge takes
+    // the k smallest, so the answer is what flushing the whole buffer gives, up to which of several
+    // pairs tied at exactly the k-th it keeps.
+    // What waits on the host can reach probes x rows x 16 B when limits drop nothing, as in a large
+    // group of duplicates, so the blocks have a budget, shared by the join's tasks. Past it the
+    // pairs flush where they are if that fits, which the argument above allows: they stay among
+    // moved_codes' distinct pairs and leave the buffer. If it does not fit the query fails, with
+    // the numbers, instead of pinning until the process is killed.
+    // The shape is an FP16 sweep 1 over lists, which starts from a bound its codes gave and holds
+    // no pair yet. SIRIUS_VSS_PAIRS_TO_HOST=0 turns it off. For tests: =force moves after every
+    // group and cuts every slice that overflows the buffer, =force_no_flush also takes any flush
+    // past the budget not to fit, and SIRIUS_VSS_PAIRS_TO_HOST_BUDGET sets the budget in bytes.
+    std::string_view const pairs_to_host_setting = [] {
+      auto const* v = std::getenv("SIRIUS_VSS_PAIRS_TO_HOST");
+      return v == nullptr ? std::string_view{} : std::string_view{v};
+    }();
+    s.pairs_to_host        = s.sweep0_bound_from_codes && s.gap_rescore && !keyed && !best_only &&
+                             st.earlier_cut == nullptr && s.running_bound_rows == 0 &&
+                             pairs_to_host_setting != "0";
+    s.budget_flush_refused = pairs_to_host_setting == "force_no_flush";
+    s.pairs_to_host_forced =
+      s.pairs_to_host && (pairs_to_host_setting == "force" || s.budget_flush_refused);
+    // Pairs can wait on the host only on that one path. A scanned chunk, for one, stays staged
+    // until its group has been checked, and its candidates are re-scored from those rows. But any
+    // slice can be cut, each part flushed before the next: a large group of near duplicates passes
+    // hundreds of millions of pairs in one slice, more than the device holds beside a large block.
+    // The parts are pieces like the running bound's, disjoint rows with a flush between them, which
+    // every bounded search already takes.
+    s.cut_large_slices = s.any_bounded && pairs_to_host_setting != "0";
+    s.slice_cuts_forced =
+      s.cut_large_slices && (pairs_to_host_setting == "force" || s.budget_flush_refused);
+    s.pair_budget = s.pairs_to_host ? _op.host_pair_budget() : 0;
+    if (dbg) {
+      std::fprintf(stderr,
+                   "[vecjoin-phase] paths: sweep-0 bound from codes %d, pairs to host %d, single "
+                   "list without a seed %d\n",
+                   static_cast<int>(s.sweep0_bound_from_codes),
+                   static_cast<int>(s.pairs_to_host),
+                   static_cast<int>(s.hold_codes_pairs));
+    }
+
+    s.running_piece = s.running_bound_rows;
+
+    // Lists that did not fit the device are read by the same searches: a sweep that reads the
+    // lists in place copies each needed chunk's stored rows in as they are, still compact, and
+    // points the search at the copy. Four rows of slack, as on the device.
+    s.lists_on_host = _lists != nullptr && _lists->tier == cucascade::memory::Tier::HOST;
+    // The per-row norms the searches read (INT32 for byte rows, FP32 for half rows) are copied in
+    // behind the rows, so lists on the host keep none of their size on the device.
+    // An inner product's filter reads zeros in their place (see probe_filter_sq).
+    s.list_norms = _lists == nullptr  ? nullptr
+                   : s.ip_row_zero_sq ? static_cast<void const*>(s.ip_row_zero_sq->data())
+                   : _lists->encoding == vss::list_encoding::float16
+                     ? (_lists->row_sq_f32 ? _lists->row_sq_f32->data() : nullptr)
+                     : (_lists->row_sq ? _lists->row_sq->data() : nullptr);
+
+    // Sweep 0 of a bounded search only reads each row's nearest cluster, so only the chunks
+    // holding one; with few probe rows that is a small part of what sweep 1 reads.
+    if (s.any_bounded) {
+      for (auto const j : s.needed_chunks) {
+        for (auto const& slice : _op._chunk_cluster_runs[j]) {
+          if (nearest_edges[static_cast<std::size_t>(slice.cluster)] > 0) {
+            s.nearest_chunks.push_back(j);
+            break;
+          }
+        }
+      }
+    }
+
+    // Probe blocks are sized to share the device, so only a lone small one keeps chunks: a ~1M-row
+    // task that kept them filled the device and ran out of memory in sweep 1.
+    bool const small_lone_block = block != nullptr && _op._blocks.size() == 1 &&
+                                  _op.estimate_for_rows(static_cast<std::size_t>(block->rows)) <=
+                                    mem_space->get_max_memory() / 8;
+    s.keep_chunks               = s.lists_on_host && s.any_bounded && !radius_join &&
+                                  (block == nullptr || small_lone_block) && [] {
+                      auto const* v = std::getenv("SIRIUS_VSS_KEEP_LIST_CHUNKS");
+                      return v == nullptr || std::strcmp(v, "0") != 0;
+                    }();
+
+    // A seeded sweep 0 over lists on the device is each row's exact join with its nearest cluster,
+    // run as the exact join runs: the sample's seed bounds the first stretch of the cluster (the
+    // sample itself), and what passes is merged before the next stretch, so each row's bound falls
+    // to the k-th of all the cluster rows filtered so far. Each stretch is as long as all those
+    // before it, so about k pairs a row pass each one; under the seed alone a cluster's every
+    // sample's worth of rows passes about k (Deep10M at 4,096 clusters, 1M probes: 1.7x (FP16) and
+    // 2.3x (INT8) the pairs of the unseeded sweep). Stretch i of every cluster is filtered in one
+    // round of grouped launches, and the rounds merge in between. SIRIUS_VSS_SEED_TIGHTEN=0 filters
+    // each cluster whole under the seed. Lists in host memory, and the running bound, keep their
+    // own schedule.
+    s.stretch_sweep0 = s.seed && !s.lists_on_host && s.running_bound_rows == 0 && [] {
+      auto const* v = std::getenv("SIRIUS_VSS_SEED_TIGHTEN");
+      return v == nullptr || std::string_view{v} != "0";
+    }();
+  }
+
+  /// The probe in the lists' codes, with its norms; a probe with a non-byte value leaves the search
+  /// to the FP32 rows.
+  void code_probe_int8()
+  {
+    if (s.int8_search && !s.codes_int8) {
+      rmm::device_uvector<unsigned long long> non_bytes(1, stream, mr);
+      CUDF_CUDA_TRY(cudaMemsetAsync(non_bytes.data(), 0, sizeof(unsigned long long), stream.get()));
+      vss::count_non_uint8(s.search_queries.data_handle(), n_left * dim, non_bytes.data(), stream);
+      unsigned long long non_bytes_host = 0;
+      CUDF_CUDA_TRY(cudaMemcpyAsync(&non_bytes_host,
+                                    non_bytes.data(),
+                                    sizeof(non_bytes_host),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      stream.sync();
+      s.int8_search = non_bytes_host == 0;
+    }
+    if (s.int8_search) {
+      s.probe_i8.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
+      s.probe_sq.emplace(static_cast<std::size_t>(n_left), stream, mr);
+      routed_i8.emplace(static_cast<std::size_t>(s.max_routed * dim), stream, mr);
+      routed_sq.emplace(static_cast<std::size_t>(s.max_routed), stream, mr);
+      if (s.codes_int8) {
+        // The probe gets the lists' codes too, and its own exact coding error per row -- rotated
+        // first, like the rows, when the lists were (the FP32 re-score keeps the unrotated probe).
+        s.probe_code_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
+        if (_lists->code_rotation) {
+          s.rotated_probe.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
+          vss::rotate_rows(s.search_queries.data_handle(),
+                           n_left,
+                           dim,
+                           static_cast<float const*>(_lists->code_rotation->data()),
+                           s.rotated_probe->data(),
+                           stream);
+        }
+        vss::quantize_rows_int8(
+          s.rotated_probe ? s.rotated_probe->data() : s.search_queries.data_handle(),
+          n_left,
+          dim,
+          static_cast<float const*>(_lists->code_offset->data()),
+          _lists->code_scale,
+          s.probe_i8->data(),
+          s.probe_code_error->data(),
+          nullptr,
+          stream,
+          _lists->code_rotation ? vss::rotation_slack(dim) : 0.f);
+      } else {
+        vss::narrow_to_shifted_int8(
+          s.search_queries.data_handle(), n_left * dim, s.probe_i8->data(), stream);
+      }
+      vss::int8_row_sq_norms(s.probe_i8->data(), n_left, dim, s.probe_sq->data(), stream);
+    }
+  }
+
+  /// The probe rounded to FP16, with its norms and rounding error. False, with its FP32 rows on the
+  /// device, when a row is outside FP16's range.
+  [[nodiscard]] bool code_probe_f16()
+  {
+    s.probe_f16.emplace(static_cast<std::size_t>(n_left * dim), stream, mr);
+    s.probe_sqf.emplace(static_cast<std::size_t>(n_left), stream, mr);
+    s.probe_half_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
+    rmm::device_uvector<unsigned int> max_sq_bits(1, stream, mr);
+    CUDF_CUDA_TRY(cudaMemsetAsync(max_sq_bits.data(), 0, sizeof(unsigned int), stream.get()));
+    if (st.probe_rows_on_host) {
+      for_each_host_piece([&](float const* rows, std::int64_t at, std::int64_t n) {
+        vss::narrow_to_float16(rows, n * dim, s.probe_f16->data() + at * dim, stream);
+        vss::half_rows_norms(rows,
+                             s.probe_f16->data() + at * dim,
+                             n,
+                             dim,
+                             s.probe_sqf->data() + at,
+                             s.probe_half_error->data() + at,
+                             nullptr,
+                             max_sq_bits.data(),
+                             stream);
+      });
+    } else {
+      vss::narrow_to_float16(
+        s.search_queries.data_handle(), n_left * dim, s.probe_f16->data(), stream);
+      vss::half_rows_norms(s.search_queries.data_handle(),
+                           s.probe_f16->data(),
+                           n_left,
+                           dim,
+                           s.probe_sqf->data(),
+                           s.probe_half_error->data(),
+                           nullptr,
+                           max_sq_bits.data(),
+                           stream);
+    }
+    unsigned int bits = 0;
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &bits, max_sq_bits.data(), sizeof(bits), cudaMemcpyDeviceToHost, stream.get()));
+    stream.sync();
+    float max_sq = 0;
+    std::memcpy(&max_sq, &bits, sizeof(max_sq));
+    float const probe_norm_max = std::sqrt(max_sq);
+    bool const in_range        = probe_norm_max < 65504.f;
+    if (!in_range) {
+      SIRIUS_LOG_INFO(
+        "[sirius_physical_vector_join_stream] a probe row norm of {} is outside float16's "
+        "range; searching this batch of {} rows in FP32",
+        probe_norm_max,
+        n_left);
+      s.probe_f16.reset();
+      s.probe_sqf.reset();
+      s.probe_half_error.reset();
+      block_rows_to_device();
+    }
+    return in_range;
+  }
+
+  void code_limits(float const* bound_rows, float* limit, bool lower)
+  {
+    if (s.codes_int8) {
+      vss::int8_code_limit(bound_rows,
+                           s.probe_code_error->data(),
+                           _lists->code_error,
+                           _lists->code_scale,
+                           n_left,
+                           limit,
+                           stream,
+                           lower);
+    } else if (s.f16_bounded) {
+      vss::float16_bound_limit(bound_rows,
+                               s.probe_sqf->data(),
+                               s.probe_half_error->data(),
+                               row_half_error,
+                               row_norm_max,
+                               dim,
+                               n_left,
+                               limit,
+                               stream,
+                               lower,
+                               ip);
+    }
+  }
+
+  void refresh_code_limit(float const* bound_rows)
+  { code_limits(bound_rows, s.code_limit->data(), false); }
+
+  // The probe norms the filter kernels read: zeros for an inner product (see above).
+  [[nodiscard]] float const* probe_filter_sq()
+  { return s.ip_probe_zero_sq ? s.ip_probe_zero_sq->data() : s.probe_sqf->data(); }
+
+  // The terms the filter limit widens by (code_limits), turned around: a code distance as an
+  // FP32 bound, exactly as the seeds raise theirs.
+  [[nodiscard]] vss::code_bound_terms code_terms()
+  {
+    vss::code_bound_terms t{};
+    if (s.codes_int8) {
+      t.int8        = true;
+      t.probe_error = s.probe_code_error->data();
+      t.row_error   = _lists->code_error;
+      t.scale       = _lists->code_scale;
+    } else {
+      t.probe_error   = s.probe_half_error->data();
+      t.row_error     = row_half_error;
+      t.probe_sq      = s.probe_sqf->data();
+      t.row_norm      = row_norm_max;
+      t.d             = dim;
+      t.inner_product = ip;
+    }
+    return t;
+  }
+
+  // Exactness, in the notation of the lemma (sections/3-motiv.tex, "Error-bounded filtering").
+  // For probe row r and build row s let c(r, s) be the filter value (the code distance) and
+  // delta(r, s) the re-scored FP32 distance. b_r, the row's bound (the k-th re-scored distance it
+  // holds, or the seed's), never falls below delta*_r, its true k-th FP32 distance. The lemma's
+  // widened limit (code_limits: float16_bound_limit, int8_code_limit)
+  //   L_r(b) = ((sqrt(b) + e_r + e)^2 + eta_r)(1 + 2^-20)
+  // keeps every pair within b:  delta(r, s) <= b  =>  c(r, s) <= L_r(b).  Its converse, the bound
+  // the seeds raise a k-th code distance to (float16_seed_upper_bound, int8_seed_upper_bound),
+  //   U_r(c) = (sqrt(c + eta_r) + e_r + e)^2 (1 + 2^-20),
+  // gives  c(r, s) <= c  =>  delta(r, s) <= U_r(c),  from the same e_r, e and eta_r (INT8: eta_r
+  // = 0, codes exact in int32, and c in units of the codes' scale squared). Let a stretch hold
+  // row r's candidates with codes c_(1) <= c_(2) <= ..., none of them a pair r's accumulator
+  // holds, and acc_(i) its i-th re-scored distance (acc_(0) = -inf). Each of b_r and
+  // max(acc_(k-j), U_r(c_(j))) for j = 0..k has k distinct pairs within it, so
+  //   B_r = min(b_r, min_j max(acc_(k-j), U_r(c_(j))))  >=  delta*_r,
+  // and a candidate with  c > L_r(B_r)  has delta > B_r >= delta*_r: strictly past the k-th, not
+  // in r's top-k under any order of ties. It is dropped without reading its FP32 row.
+  // The gap check: the first m k candidates are all that can be in r's top-k when
+  // c_(mk) > L_r(B_r), which, as B_r <= U_r(c_(k)), holds whenever
+  //   c_(mk) > L_r(U_r(c_(k))) ~ (sqrt(c_(k) + eta_r) + 2 (e_r + e))^2 + eta_r,
+  // i.e. "c_(mk) - e_r > c_(k) + e_r" in distance units with e_r + e the error of a pair.
+  // Comparing every candidate with L_r(B_r) applies that test at every m at once: it keeps fewer
+  // than m k exactly where the check passes for m (2, then 4), and where both fail it still drops
+  // what lies past L_r(B_r) instead of re-scoring all. Nothing within B_r is dropped, so the
+  // merge keeps the same pairs as without the trim, up to which of several pairs tied at exactly
+  // the k-th distance it keeps -- which the filter's appends, in no fixed order, already leave
+  // open from one run to the next. (The kernels use 1 + 1e-6 for 1 + 2^-20, in the limits and
+  // seeds alike.)
+  void gap_trim()
+  {
+    if (!s.gap_rescore || s.pending == 0) { return; }
+    auto const t0 = debug_mark();
+    if (!s.gap_limit) { s.gap_limit.emplace(static_cast<std::size_t>(n_left), stream, mr); }
+    vss::gap_rescore_bound(s.candidates->rows.data(),
+                           s.candidates->distances.data(),
+                           s.pending,
+                           st.acc_distances->view().data<float>(),
+                           n_left,
+                           k_join,
+                           s.bound->data(),
+                           code_terms(),
+                           s.gap_limit->data(),
+                           stream,
+                           mr);
+    // In place: each row's limit is computed from its own bound alone.
+    code_limits(s.gap_limit->data(), s.gap_limit->data(), false);
+    s.pending = vss::keep_within_row_limit(s.candidates->rows.data(),
+                                           s.candidates->ids.data(),
+                                           s.candidates->distances.data(),
+                                           s.pending,
+                                           s.gap_limit->data(),
+                                           n_left,
+                                           k_join,
+                                           s.gap_stats_on ? &s.gap_stats : nullptr,
+                                           stream,
+                                           mr);
+    if (dbg) { s.trim_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
+  }
+
+  // The candidates' FP32 distances, over host probe rows: their rows are brought over a slice of
+  // the candidates at a time, each distinct row once, up to kRows of them. The rows and their
+  // slots are read on the host, where each slice's copy starts from.
+  void rescore_from_host_rows()
+  {
+    constexpr std::size_t kRescoreBytes = std::size_t{256} << 20;
+    auto const row_bytes                = static_cast<std::size_t>(dim) * sizeof(float);
+    auto const kRows                    = std::max<std::size_t>(1, kRescoreBytes / row_bytes);
+    if (s.host_row_slot.empty()) { s.host_row_slot.assign(static_cast<std::size_t>(n_left), -1); }
+    std::vector<std::int32_t> rows(static_cast<std::size_t>(s.pending));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(rows.data(),
+                                  s.candidates->rows.data(),
+                                  rows.size() * sizeof(std::int32_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    stream.sync();
+    std::vector<std::int32_t> distinct;
+    std::vector<float> staged;
+    for (std::size_t from = 0; from < rows.size();) {
+      distinct.clear();
+      auto to = from;
+      for (; to < rows.size(); ++to) {
+        auto& slot = s.host_row_slot[static_cast<std::size_t>(rows[to])];
+        if (slot < 0) {
+          if (distinct.size() == kRows) { break; }
+          slot = static_cast<std::int32_t>(distinct.size());
+          distinct.push_back(rows[to]);
+        }
+        rows[to] = slot;
+      }
+      staged.resize(distinct.size() * static_cast<std::size_t>(dim));
+      st.host_rows->gather(distinct.data(), distinct.size(), staged.data());
+      for (auto const row : distinct) {
+        s.host_row_slot[static_cast<std::size_t>(row)] = -1;
+      }
+      rmm::device_uvector<float> device_rows(staged.size(), stream, mr);
+      rmm::device_uvector<std::int32_t> slots(to - from, stream, mr);
+      // From pageable vectors, so the copies have completed when the calls return.
+      CUDF_CUDA_TRY(cudaMemcpyAsync(device_rows.data(),
+                                    staged.data(),
+                                    staged.size() * sizeof(float),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(slots.data(),
+                                    rows.data() + from,
+                                    slots.size() * sizeof(std::int32_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      vss::exact_distances(device_rows.data(),
+                           slots.data(),
+                           0,
+                           s.candidates->ids.data() + from,
+                           s.candidates->distances.data() + from,
+                           static_cast<std::int64_t>(to - from),
+                           exact_source,
+                           dim,
+                           stream,
+                           mr,
+                           nullptr,
+                           0.f,
+                           ip);
+      stream.sync();
+      from = to;
+    }
+  }
+
+  void flush()
+  {
+    if (s.pending == 0) { return; }
+    ++s.bounded_merges;
+    s.bounded_emitted += s.pending - s.pairs_back;
+    s.pairs_back       = 0;
+    auto const t0      = debug_mark();
+    auto const* c_rows = s.candidates->rows.data();
+    auto const* c_ids  = s.candidates->ids.data();
+    auto const* c_dist = s.candidates->distances.data();
+    auto const done    = [&] {
+      CUDF_CUDA_TRY(
+        cudaMemsetAsync(s.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
+      s.pending = 0;
+      if (dbg) { s.rescore_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
+    };
+    if (keyed && !best_only) {
+      // The pairs the keys drop are dropped before anything is re-scored; the rest are held to
+      // the radius as every pair of a threshold join is.
+      auto const no_limit = std::numeric_limits<float>::infinity();
+      auto const* row_map =
+        s.rescore ? static_cast<std::int64_t const*>(_lists->row_ids->data()) : nullptr;
+      auto kept = s.rescore ? vss::take_pairs(c_rows,
+                                              c_ids,
+                                              c_dist,
+                                              s.pending,
+                                              st.layout_keys,
+                                              no_limit,
+                                              nullptr,
+                                              false,
+                                              stream,
+                                              mr)
+                            : vss::take_pairs(c_rows,
+                                              c_ids,
+                                              c_dist,
+                                              s.pending,
+                                              st.pin_keys,
+                                              s.radius_bound,
+                                              nullptr,
+                                              s.sqrt_at_end,
+                                              stream,
+                                              mr);
+      if (s.rescore && kept.rows.size() > 0) {
+        auto const n = static_cast<std::int64_t>(kept.rows.size());
+        vss::exact_distances(s.search_queries.data_handle(),
+                             kept.rows.data(),
+                             0,
+                             kept.ids.data(),
+                             kept.distances.data(),
+                             n,
+                             exact_source,
+                             dim,
+                             stream,
+                             mr,
+                             s.certain_limit ? s.certain_limit->data() : nullptr,
+                             s.radius_bound,
+                             ip);
+        kept = vss::take_pairs(kept.rows.data(),
+                               kept.ids.data(),
+                               kept.distances.data(),
+                               n,
+                               {},
+                               s.radius_bound,
+                               row_map,
+                               s.sqrt_at_end,
+                               stream,
+                               mr);
+      }
+      if (kept.rows.size() > 0) {
+        auto const pairs = static_cast<std::int64_t>(kept.rows.size());
+        if (!count_only) {
+          st.radius_left.push_back(
+            std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
+          st.radius_neighbors.push_back(
+            std::make_unique<cudf::column>(std::move(kept.ids), rmm::device_buffer{}, 0));
+          st.radius_distances.push_back(
+            std::make_unique<cudf::column>(std::move(kept.distances), rmm::device_buffer{}, 0));
+        }
+        note_radius_part(pairs);
+      }
+      done();
+      return;
+    }
+    if (best_only) {
+      if (s.rescore) {
+        // The filter's distances are inexact, so a row's nearest by them is re-scored first: its
+        // exact distance bounds the row's best match, and the filter limit of that bound admits
+        // few of the row's other pairs. Those are re-scored too, and the rest never are.
+        rmm::device_uvector<std::int64_t> winner(static_cast<std::size_t>(n_left), stream, mr);
+        vss::best_match_winners(c_rows,
+                                c_ids,
+                                c_dist,
+                                s.pending,
+                                st.layout_keys,
+                                s.code_limit->data(),
+                                st.best_scratch->data(),
+                                winner.data(),
+                                n_left,
+                                stream);
+        for (bool const winners : {true, false}) {
+          auto taken   = vss::best_match_take(c_rows,
+                                              c_ids,
+                                              c_dist,
+                                              s.pending,
+                                              st.layout_keys,
+                                              s.code_limit->data(),
+                                              winner.data(),
+                                              winners,
+                                              stream,
+                                              mr);
+          auto const n = static_cast<std::int64_t>(taken.rows.size());
+          if (n == 0) { continue; }
+          vss::exact_distances(s.search_queries.data_handle(),
+                               taken.rows.data(),
+                               0,
+                               taken.ids.data(),
+                               taken.distances.data(),
+                               n,
+                               exact_source,
+                               dim,
+                               stream,
+                               mr,
+                               nullptr,
+                               0.f,
+                               ip);
+          fold_best(taken.rows.data(),
+                    taken.ids.data(),
+                    taken.distances.data(),
+                    n,
+                    s.radius_bound,
+                    {},
+                    s.bound->data());
+          refresh_code_limit(s.bound->data());
+          st.best_rescored += n;
+        }
+      } else {
+        fold_best(c_rows, c_ids, c_dist, s.pending, s.radius_bound, st.pin_keys, s.bound->data());
+      }
+      done();
+      return;
+    }
+    if (!radius_join) { gap_trim(); }
+    s.gap_rescored += s.rescore ? s.pending : 0;
+    auto const t_rescore = debug_mark();
+    if (s.rescore && st.probe_rows_on_host) {
+      rescore_from_host_rows();
+    } else if (s.rescore) {
+      vss::exact_distances(s.search_queries.data_handle(),
+                           s.candidates->rows.data(),
+                           0,
+                           s.candidates->ids.data(),
+                           s.candidates->distances.data(),
+                           s.pending,
+                           exact_source,
+                           dim,
+                           stream,
+                           mr,
+                           s.certain_limit ? s.certain_limit->data() : nullptr,
+                           s.radius_bound,
+                           ip);
+    }
+    auto const t1 = debug_mark();
+    if (dbg) { s.rescore_seconds += std::chrono::duration<double>(t1 - t_rescore).count(); }
+    if (radius_join) {
+      // FP16 survivors were re-scored above and are held to the radius again in FP32; int8
+      // distances are already exact. Their ids stay layout rows until here.
+      auto kept = vss::take_within(
+        *s.candidates,
+        s.pending,
+        s.radius_bound,
+        s.rescore ? static_cast<std::int64_t const*>(_lists->row_ids->data()) : nullptr,
+        s.sqrt_at_end,
+        stream,
+        mr);
+      if (kept.rows.size() > 0) {
+        auto const pairs = static_cast<std::int64_t>(kept.rows.size());
+        if (!count_only) {
+          st.radius_left.push_back(
+            std::make_unique<cudf::column>(std::move(kept.rows), rmm::device_buffer{}, 0));
+          st.radius_neighbors.push_back(
+            std::make_unique<cudf::column>(std::move(kept.ids), rmm::device_buffer{}, 0));
+          st.radius_distances.push_back(
+            std::make_unique<cudf::column>(std::move(kept.distances), rmm::device_buffer{}, 0));
+        }
+        note_radius_part(pairs);
+      }
+      CUDF_CUDA_TRY(
+        cudaMemsetAsync(s.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
+      s.pending = 0;
+      if (dbg) { s.take_seconds += std::chrono::duration<double>(debug_mark() - t1).count(); }
+      return;
+    }
+    vss::merge_bound_candidates(st.acc_distances->mutable_view().data<float>(),
+                                st.acc_neighbors->mutable_view().data<std::int64_t>(),
+                                n_left,
+                                k_join,
+                                *s.candidates,
+                                s.pending,
+                                s.bound->data(),
+                                stream,
+                                mr);
+    refresh_code_limit(s.bound->data());
+    CUDF_CUDA_TRY(
+      cudaMemsetAsync(s.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
+    s.pending = 0;
+    if (dbg) { s.take_seconds += std::chrono::duration<double>(debug_mark() - t1).count(); }
+  }
+
+  [[nodiscard]] bool joins_group(std::int64_t m, std::int64_t n)
+  {
+    return s.group_launch &&
+           (m <= s.group_m_max || m * n <= s.group_work_max || n <= s.group_slice_rows);
+  }
+
+  void launch_bounded(bounded_slice const& sl)
+  {
+    if (s.f16_bounded) {
+      vss::bound_filter_f16(static_cast<std::uint16_t const*>(sl.x),
+                            static_cast<float const*>(sl.x_sq),
+                            sl.n,
+                            sl.id_base,
+                            s.probe_f16->data(),
+                            probe_filter_sq(),
+                            sl.rows,
+                            sl.m,
+                            dim,
+                            s.code_limit->data(),
+                            vss::float16_slack{},
+                            *s.candidates,
+                            stream);
+      return;
+    }
+    vss::bound_filter_int8(static_cast<std::int8_t const*>(sl.x),
+                           static_cast<std::int32_t const*>(sl.x_sq),
+                           sl.n,
+                           sl.id_base,
+                           sl.id_map,
+                           s.probe_i8->data(),
+                           s.probe_sq->data(),
+                           sl.rows,
+                           sl.m,
+                           dim,
+                           s.codes_int8 ? s.code_limit->data() : s.bound->data(),
+                           *s.candidates,
+                           stream);
+  }
+
+  [[nodiscard]] std::int64_t read_count()
+  {
+    unsigned long long total = 0;
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &total, s.candidates->count.data(), sizeof(total), cudaMemcpyDeviceToHost, stream.get()));
+    stream.sync();
+    return static_cast<std::int64_t>(total);
+  }
+
+  void rollback()
+  {
+    auto const keep = static_cast<unsigned long long>(s.pending);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      s.candidates->count.data(), &keep, sizeof(keep), cudaMemcpyHostToDevice, stream.get()));
+  }
+
+  void launch_deferred()
+  {
+    if (!deferred.empty()) {
+      vss::bound_filter_group(
+        deferred,
+        s.f16_bounded,
+        s.f16_bounded ? static_cast<void const*>(s.probe_f16->data())
+                      : static_cast<void const*>(s.probe_i8->data()),
+        s.f16_bounded ? static_cast<void const*>(probe_filter_sq())
+                      : static_cast<void const*>(s.probe_sq->data()),
+        dim,
+        s.f16_bounded || s.codes_int8 ? s.code_limit->data() : s.bound->data(),
+        *s.candidates,
+        stream,
+        mr);
+      deferred.clear();
+    }
+  }
+
+  // A single FLOAT16 list holds its pairs through the pieces instead of re-scoring between them.
+  // Each row's bound falls to B_r of the lemma above gap_trim, from the k smallest codes held and
+  // its accumulator: the codes are of k distinct pairs, none in the accumulator, as a piece's
+  // rows are new and a rollback discards what was not committed. A pair past its limit has
+  // delta > B_r >= delta*_r, strictly past the k-th, and is dropped unread; the limit is applied
+  // to the next piece too. Each trim's B_r stands on its own, so seeing a pair in several trims
+  // changes nothing, and bounds only fall. All that is left reaches the last flush, or an
+  // earlier one when the buffer stays too full. The first piece's bound is infinite, so all its
+  // pairs pass, and the buffer has room for them. The same codes and U_r as the seed's bound.
+  void hold_trim()
+  {
+    if (s.pending == 0) { return; }
+    auto const t0 = debug_mark();
+    s.bounded_emitted += s.pending - s.pairs_back;
+    if (!s.gap_limit) { s.gap_limit.emplace(static_cast<std::size_t>(n_left), stream, mr); }
+    vss::gap_rescore_bound(s.candidates->rows.data(),
+                           s.candidates->distances.data(),
+                           s.pending,
+                           st.acc_distances->view().data<float>(),
+                           n_left,
+                           k_join,
+                           s.bound->data(),
+                           code_terms(),
+                           s.gap_limit->data(),
+                           stream,
+                           mr);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(s.bound->data(),
+                                  s.gap_limit->data(),
+                                  static_cast<std::size_t>(n_left) * sizeof(float),
+                                  cudaMemcpyDeviceToDevice,
+                                  stream.get()));
+    refresh_code_limit(s.bound->data());
+    s.pending    = vss::keep_within_row_limit(s.candidates->rows.data(),
+                                              s.candidates->ids.data(),
+                                              s.candidates->distances.data(),
+                                              s.pending,
+                                              s.code_limit->data(),
+                                              n_left,
+                                              k_join,
+                                              nullptr,
+                                              stream,
+                                              mr);
+    s.pairs_back = s.pending;
+    rollback();
+    if (dbg) { s.trim_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
+  }
+
+  [[nodiscard]] std::size_t device_room()
+  {
+    auto const free_bytes = mem_space->get_available_memory(stream);
+    return free_bytes > kFlushMargin ? free_bytes - kFlushMargin : std::size_t{0};
+  }
+
+  void move_pairs_to_host()
+  {
+    if (s.pending == 0) { return; }
+    auto const t0 = debug_mark();
+    s.bounded_emitted += s.pending - s.pairs_back;
+    s.pairs_back = 0;
+    if (!s.moved_codes) {
+      s.moved_codes.emplace(static_cast<std::size_t>(n_left * k_join), stream, mr);
+      vss::fill_bound(
+        s.moved_codes->data(), n_left * k_join, std::numeric_limits<float>::infinity(), stream);
+    }
+    vss::code_topk_merge(s.candidates->rows.data(),
+                         s.candidates->distances.data(),
+                         s.pending,
+                         s.moved_codes->data(),
+                         n_left,
+                         k_join,
+                         s.bound->data(),
+                         code_terms(),
+                         stream,
+                         mr);
+    refresh_code_limit(s.bound->data());
+    s.pending = vss::keep_within_row_limit(s.candidates->rows.data(),
+                                           s.candidates->ids.data(),
+                                           s.candidates->distances.data(),
+                                           s.pending,
+                                           s.code_limit->data(),
+                                           n_left,
+                                           k_join,
+                                           nullptr,
+                                           stream,
+                                           mr);
+    if (!s.host_pairs.reserve(s.pending, s.pair_budget)) {
+      s.pairs_back    = s.pending;
+      auto const need = static_cast<std::size_t>(s.pending) * kFlushBytesPerPair;
+      auto const room = device_room();
+      if (s.budget_flush_refused || need > room) {
+        throw std::runtime_error(
+          std::format("[sirius_physical_vector_join_stream] vector join of '{}' and '{}' (k {}, "
+                      "{} probes): {} pairs of this task wait on the host and {} more in the "
+                      "buffer have nowhere to go. The host budget for waiting pairs is {} MiB "
+                      "(half the host pool, less what the join already holds beside it), and a "
+                      "flush needs about {} MiB with {} MiB free on the device. A larger host "
+                      "pool or a smaller k may let it run.",
+                      _request.left.table,
+                      _request.right.table,
+                      k_join,
+                      _request.n_probes,
+                      s.pairs_moved,
+                      s.pending,
+                      s.pair_budget >> 20,
+                      need >> 20,
+                      room >> 20));
+      }
+      ++s.budget_flushes;
+      rollback();
+      flush();
+      return;
+    }
+    for (std::int64_t at = 0; at < s.pending;) {
+      auto& block      = s.host_pairs.tail();
+      auto const take  = std::min(s.pending - at, kHostBlockPairs - block.n);
+      auto const count = static_cast<std::size_t>(take);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(block.rows() + block.n,
+                                    s.candidates->rows.data() + at,
+                                    count * sizeof(std::int32_t),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(block.ids() + block.n,
+                                    s.candidates->ids.data() + at,
+                                    count * sizeof(std::int64_t),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(block.codes() + block.n,
+                                    s.candidates->distances.data() + at,
+                                    count * sizeof(float),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      block.n += take;
+      at += take;
+    }
+    stream.sync();
+    s.pairs_moved += s.pending;
+    ++s.pair_moves;
+    s.pending = 0;
+    rollback();
+    if (dbg) { s.host_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
+  }
+
+  // The task's end: every row's bound is final once the last pairs have moved, and each piece's
+  // flush trims against it.
+  void bring_pairs_back()
+  {
+    move_pairs_to_host();
+    auto const piece = std::clamp<std::int64_t>(
+      static_cast<std::int64_t>(device_room() / kFlushBytesPerPair),
+      std::min<std::int64_t>(std::int64_t{1} << 16, s.candidates->capacity()),
+      std::min(kBackPiecePairs, s.candidates->capacity()));
+    std::int64_t filled = 0;
+    auto flush_piece    = [&] {
+      if (filled == 0) { return; }
+      s.pending    = filled;
+      s.pairs_back = filled;
+      rollback();
+      flush();
+      filled = 0;
+    };
+    while (!s.host_pairs.empty()) {
+      auto const& block = s.host_pairs.front();
+      for (std::int64_t at = 0; at < block.n;) {
+        auto const take  = std::min(block.n - at, piece - filled);
+        auto const count = static_cast<std::size_t>(take);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(s.candidates->rows.data() + filled,
+                                      block.rows() + at,
+                                      count * sizeof(std::int32_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(s.candidates->ids.data() + filled,
+                                      block.ids() + at,
+                                      count * sizeof(std::int64_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(s.candidates->distances.data() + filled,
+                                      block.codes() + at,
+                                      count * sizeof(float),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        stream.sync();
+        at += take;
+        filled += take;
+        if (filled == piece) { flush_piece(); }
+      }
+      s.host_pairs.drop_front();
+    }
+    flush_piece();
+  }
+
+  void make_room()
+  {
+    if (s.hold_codes_pairs) {
+      auto const before = s.pending;
+      hold_trim();
+      if (s.pending == before || s.pending > s.candidates->capacity() / 2) { flush(); }
+    } else if (s.pairs_to_host &&
+               (s.pairs_to_host_forced ||
+                static_cast<std::size_t>(s.pending) * kFlushBytesPerPair > device_room())) {
+      move_pairs_to_host();
+    } else {
+      flush();
+    }
+  }
+
+  // The slice is launched again after each change: the buffer's room, and the bound.
+  void replay_slice(bounded_slice const& sl)
+  {
+    while (true) {
+      launch_bounded(sl);
+      auto const total = read_count();
+      if (total <= s.candidates->capacity()) {
+        s.pending = total;
+        return;
+      }
+      auto const slice_pairs = total - s.pending;
+      rollback();
+      if (s.pending > 0) {
+        make_room();
+        continue;
+      }
+      auto const want = slice_pairs + slice_pairs / 4;
+      if (s.cut_large_slices && sl.n > 1 &&
+          (s.slice_cuts_forced ||
+           static_cast<std::size_t>(want) * kFlushBytesPerPair >
+             device_room() + static_cast<std::size_t>(s.candidates->capacity()) * 16)) {
+        ++s.slice_cuts;
+        auto lo = sl;
+        lo.n    = sl.n / 2;
+        auto hi = sl;
+        hi.x    = static_cast<std::byte const*>(sl.x) + static_cast<std::size_t>(lo.n) *
+                                                          static_cast<std::size_t>(dim) *
+                                                          (s.f16_bounded ? 2 : 1);
+        hi.x_sq = static_cast<std::byte const*>(sl.x_sq) + static_cast<std::size_t>(lo.n) * 4;
+        hi.n    = sl.n - lo.n;
+        hi.id_base += lo.n;
+        if (hi.id_map != nullptr) { hi.id_map += lo.n; }
+        replay_slice(lo);
+        make_room();
+        replay_slice(hi);
+        return;
+      }
+      s.candidates.reset();
+      s.candidates.emplace(want, stream, mr);
+    }
+  }
+
+  // The buffer's fill is read back once per group of slices, not per slice: a group that
+  // overflowed is rolled back to the count before it and replayed a slice at a time, first
+  // after the buffered pairs are merged, which tightens the bound, then into a bigger buffer.
+  void check_group()
+  {
+    if (group.empty()) { return; }
+    launch_deferred();
+    auto total = read_count();
+    if (total > s.candidates->capacity()) {
+      rollback();
+      for (auto const& sl : group) {
+        replay_slice(sl);
+      }
+      total = s.pending;
+    }
+    s.pending = total;
+    group.clear();
+    if (s.pairs_to_host_forced || s.pending > s.candidates->capacity() / 2) { make_room(); }
+  }
+
+  void release_staged(staged_vector_chunk& chunk)
+  {
+    if (chunk.owner) {
+      auto mut = chunk.owner->to_mutable();
+      mut.rebind_stream(stream);
+    }
+    if (chunk.buffer) { chunk.buffer->set_stream(stream); }
+    if (chunk.reader) { borrowed.hold(std::move(*chunk.reader)); }
+    chunk = staged_vector_chunk{};
+  }
+
+  [[nodiscard]] std::size_t staged_rows_bytes(std::int64_t rows)
+  { return (static_cast<std::size_t>(rows + 4) * _lists->row_bytes() + 255) / 256 * 256; }
+
+  [[nodiscard]] staged_vector_chunk stage_compact(std::size_t j)
+  {
+    auto const rows = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
+    auto const bytes =
+      staged_rows_bytes(rows) + (s.list_norms != nullptr ? static_cast<std::size_t>(rows) * 4 : 0);
+    std::shared_ptr<cucascade::memory::reservation> reservation{
+      mem_space->make_reservation_or_null(bytes)};
+    if (!reservation) {
+      vss::throw_staging_shortfall(
+        *mem_space, bytes, "[sirius_physical_vector_join_stream] lists chunk " + std::to_string(j));
+    }
+    auto buffer =
+      std::make_unique<rmm::device_buffer>(bytes, stage_on, reservation->get_memory_resource());
+    auto* out       = static_cast<std::byte*>(buffer->data());
+    auto const lock = vss::lock_host_list_chunk(*_lists, j, stage_on);
+    vss::copy_host_list_rows(*_lists, lock, 0, rows, out, stage_on);
+    if (s.list_norms != nullptr) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        out + staged_rows_bytes(rows),
+        static_cast<std::byte const*>(s.list_norms) +
+          static_cast<std::size_t>(static_cast<std::int64_t>(j) * _lists->chunk_rows) * 4,
+        static_cast<std::size_t>(rows) * 4,
+        cudaMemcpyDefault,
+        stage_on.get()));
+    }
+    // As the chunk sources do: the host waits on the copy while the device runs what the
+    // previous chunk issued, and the copy is complete before anything reads it. The read lock
+    // ends with it.
+    stage_on.sync();
+    staged_vector_chunk staged{cudf::column_view{}, nullptr, std::move(reservation)};
+    staged.buffer = std::move(buffer);
+    return staged;
+  }
+
+  [[nodiscard]] bool can_keep()
+  { return mem_space->make_reservation_or_null(mem_space->get_max_memory() / 12) != nullptr; }
+
+  void check_chunk_base(std::size_t j, std::int64_t chunk_base)
+  {
+    if (chunk_base != static_cast<std::int64_t>(j) * _lists->chunk_rows) {
+      throw std::runtime_error("[sirius_physical_vector_join_stream] lists chunk " +
+                               std::to_string(j) + " starts at row " +
+                               std::to_string(static_cast<std::int64_t>(j) * _lists->chunk_rows) +
+                               " but its cluster runs at " + std::to_string(chunk_base));
+    }
+  }
+
+  [[nodiscard]] staged_vector_chunk stage_next(std::size_t j)
+  {
+    if (copy_compact) {
+      if (auto it = kept.find(j); it != kept.end()) {
+        auto chunk = std::move(it->second);
+        kept.erase(it);
+        return chunk;
+      }
+      return stage_compact(j);
+    }
+    return direct ? staged_vector_chunk{}
+                  : stage_for_fold(s.exact_lists_corpus ? *s.exact_lists_corpus : *_op._corpus,
+                                   j,
+                                   *mem_space,
+                                   stage_on,
+                                   stream);
+  }
+
+  // A sample is a quarter of its cluster, at least eight times k rows (and 64) and at most the
+  // larger of that and kSeedSample: a sample near the whole cluster is the sweep again, on CUDA
+  // cores. Past kSeedSample rows the seed ranks it through device memory, not shared memory.
+  [[nodiscard]] std::int64_t seed_rows(std::int64_t size)
+  {
+    auto const floor = std::max<std::int64_t>(64, 8 * k_join);
+    return std::min(
+      size,
+      std::clamp<std::int64_t>(size / 4, floor, std::max<std::int64_t>(floor, vss::kSeedSample)));
+  }
+
+  void seed_bound()
+  {
+    std::vector<std::int64_t> first(static_cast<std::size_t>(n_left));
+    std::vector<std::int32_t> count(static_cast<std::size_t>(n_left));
+    std::int64_t max_count = 0;
+    for (std::int64_t r = 0; r < n_left; ++r) {
+      auto const c  = static_cast<std::size_t>(s.nearest_cluster[static_cast<std::size_t>(r)]);
+      auto const lo = _lists->offsets[c];
+      first[static_cast<std::size_t>(r)] = lo;
+      count[static_cast<std::size_t>(r)] =
+        static_cast<std::int32_t>(seed_rows(_lists->offsets[c + 1] - lo));
+      max_count = std::max<std::int64_t>(max_count, count[static_cast<std::size_t>(r)]);
+    }
+    // Probe rows by nearest cluster, so the kernel reads one cluster's sample at a time.
+    std::vector<std::int64_t> order(static_cast<std::size_t>(n_left));
+    {
+      std::vector<std::int64_t> at(_lists->offsets.size(), 0);
+      for (std::int64_t r = 0; r < n_left; ++r) {
+        ++at[static_cast<std::size_t>(s.nearest_cluster[static_cast<std::size_t>(r)]) + 1];
+      }
+      std::partial_sum(at.begin(), at.end(), at.begin());
+      for (std::int64_t r = 0; r < n_left; ++r) {
+        auto const c = static_cast<std::size_t>(s.nearest_cluster[static_cast<std::size_t>(r)]);
+        order[static_cast<std::size_t>(at[c]++)] = r;
+      }
+    }
+    rmm::device_uvector<std::int64_t> order_d(order.size(), stream, mr);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(order_d.data(),
+                                  order.data(),
+                                  order.size() * sizeof(std::int64_t),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
+    rmm::device_uvector<std::int64_t> first_d(first.size(), stream, mr);
+    rmm::device_uvector<std::int32_t> count_d(count.size(), stream, mr);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(first_d.data(),
+                                  first.data(),
+                                  first.size() * sizeof(std::int64_t),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(count_d.data(),
+                                  count.data(),
+                                  count.size() * sizeof(std::int32_t),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
+    if (s.f16_bounded) {
+      vss::seed_bound_f16(static_cast<std::uint16_t const*>(_lists->device_vectors->data()),
+                          s.ip_row_zero_sq ? s.ip_row_zero_sq->data()
+                                           : static_cast<float const*>(_lists->row_sq_f32->data()),
+                          s.probe_f16->data(),
+                          probe_filter_sq(),
+                          first_d.data(),
+                          count_d.data(),
+                          order_d.data(),
+                          n_left,
+                          dim,
+                          static_cast<int>(k_join),
+                          max_count,
+                          s.bound->data(),
+                          stream,
+                          mr);
+      vss::float16_seed_upper_bound(s.bound->data(),
+                                    s.probe_sqf->data(),
+                                    s.probe_half_error->data(),
+                                    _lists->half_error,
+                                    _lists->max_row_norm,
+                                    dim,
+                                    n_left,
+                                    stream,
+                                    ip);
+    } else {
+      vss::seed_bound_int8(static_cast<std::int8_t const*>(_lists->device_vectors->data()),
+                           static_cast<std::int32_t const*>(_lists->row_sq->data()),
+                           s.probe_i8->data(),
+                           s.probe_sq->data(),
+                           first_d.data(),
+                           count_d.data(),
+                           order_d.data(),
+                           n_left,
+                           dim,
+                           static_cast<int>(k_join),
+                           max_count,
+                           s.bound->data(),
+                           stream,
+                           mr);
+      if (s.codes_int8) {
+        vss::int8_seed_upper_bound(s.bound->data(),
+                                   s.probe_code_error->data(),
+                                   _lists->code_error,
+                                   _lists->code_scale,
+                                   n_left,
+                                   stream);
+      }
+    }
+    if (s.rescore) {
+      s.code_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
+      refresh_code_limit(s.bound->data());
+    }
+  }
+
+  // Where each stretch of a cluster of @p size rows ends, in rows from its start: the sample,
+  // then doubling; a last stretch under a quarter of the one before it joins that one.
+  [[nodiscard]] std::vector<std::int64_t> stretch_ends(std::int64_t size)
+  {
+    std::vector<std::int64_t> ends;
+    for (auto e = seed_rows(size);; e *= 2) {
+      if (size - e < e / 4 + 1) {
+        ends.push_back(size);
+        return ends;
+      }
+      ends.push_back(e);
+    }
+  }
+
+  /// Sets up a pass over the corpus: which chunks it reads and how, and the bounds it starts from.
+  void begin_sweep(int which)
+  {
+    sweep                     = which;
+    auto const& edge_begin    = s.routed->edge_begin;
+    auto const& nearest_edges = s.routed->nearest_edges;
+    if (sweep == 1 && !kept.empty()) {
+      for (auto const& entry : kept) {
+        kept_first.push_back(entry.first);
+      }
+      for (auto const j : s.needed_chunks) {
+        if (kept.count(j) == 0) { kept_first.push_back(j); }
+      }
+    }
+    chunks = s.any_bounded && sweep == 0 ? &s.nearest_chunks
+             : kept_first.empty()        ? &s.needed_chunks
+                                         : &kept_first;
+    // A sweep that reads the lists in place stages nothing. FP16 lists on the host are copied
+    // in compact for sweep 0 as well (and widened on the device when it ranks in FP32), so that
+    // copy can be kept.
+    direct        = _lists != nullptr &&
+                    (s.int8_search || (s.f16_bounded && (sweep == 1 || s.seed)) || s.f16_sweep0);
+    widen_compact = s.lists_on_host && s.f16_bounded && sweep == 0 && !direct;
+    copy_compact  = (direct && s.lists_on_host) || widen_compact;
+    // Sweep 0 over lossy rows only sets each probe row's bound, which sweep 1 re-searches past:
+    // every cluster in one launch over the device lists (nearest_cluster_topk) instead of one
+    // GEMM and top-k call per cluster, whose ~0.18 ms of host setup dwarfs its arithmetic once
+    // each cluster has only tens of probe rows. SIRIUS_VSS_GROUPED_SWEEP0=0 keeps the calls.
+    grouped_sweep0 = sweep == 0 && s.rescore && !s.seed && !s.ranked_sweep0 && !radius_join &&
+                     !ip && st.earlier_cut == nullptr && k_join <= 64 && !s.lists_on_host &&
+                     ((s.int8_search && s.probe_i8) || (s.f16_sweep0 && s.probe_f16)) && [] {
+                       auto const* v = std::getenv("SIRIUS_VSS_GROUPED_SWEEP0");
+                       return v == nullptr || std::string_view{v} != "0";
+                     }();
+    stretches.clear();
+    prefetched = chunks->empty() ? staged_vector_chunk{} : stage_next((*chunks)[0]);
+    if (sweep == 0 && s.seed) {
+      s.bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
+      if (s.lists_on_host || s.f16_list_no_seed) {
+        vss::fill_bound(s.bound->data(), n_left, std::numeric_limits<float>::infinity(), stream);
+        if (s.rescore) {
+          s.code_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
+          refresh_code_limit(s.bound->data());
+        }
+      } else {
+        seed_bound();
+      }
+      s.candidates.emplace(
+        std::max<std::int64_t>({std::int64_t{1} << 22,
+                                4 * n_left * k_join,
+                                s.f16_list_no_seed ? n_left * s.running_bound_rows * 5 / 4 : 0}),
+        stream,
+        mr);
+    }
+    if (sweep == 1) {
+      if (s.seed) {
+        check_group();
+        flush();
+      }
+      if (dbg && s.seed) {
+        std::string per_stretch;
+        for (auto const p : s.stretch_pairs) {
+          per_stretch += " " + std::to_string(p);
+        }
+        std::fprintf(stderr,
+                     "[vecjoin-phase] sweep 0: %lld pairs passed, %lld merges, %zu stretches:%s\n",
+                     static_cast<long long>(s.bounded_emitted),
+                     static_cast<long long>(s.bounded_merges),
+                     s.stretch_pairs.size(),
+                     per_stretch.c_str());
+      }
+      phase("nearest-cluster sweep");
+      s.bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
+      if (radius_join) {
+        vss::fill_bound(s.bound->data(), n_left, s.radius_bound, stream);
+      } else if (s.rescore && !s.seed) {
+        // A scanned corpus re-scored sweep 0's answers chunk by chunk, while each was staged.
+        if (_lists != nullptr && !s.sweep0_bound_from_codes) {
+          vss::exact_distances(s.search_queries.data_handle(),
+                               nullptr,
+                               k_join,
+                               st.acc_neighbors->view().data<std::int64_t>(),
+                               st.acc_distances->mutable_view().data<float>(),
+                               n_left * k_join,
+                               exact_source,
+                               dim,
+                               stream,
+                               mr,
+                               nullptr,
+                               0.f,
+                               ip);
+        }
+        vss::row_max_bound(
+          st.acc_distances->view().data<float>(), n_left, k_join, s.bound->data(), stream);
+        if (s.sweep0_bound_from_codes) {
+          vss::float16_seed_upper_bound(s.bound->data(),
+                                        s.probe_sqf->data(),
+                                        s.probe_half_error->data(),
+                                        _lists->half_error,
+                                        _lists->max_row_norm,
+                                        dim,
+                                        n_left,
+                                        stream,
+                                        false);
+        }
+        vss::fill_misses(st.acc_distances->mutable_view().data<float>(),
+                         st.acc_neighbors->mutable_view().data<std::int64_t>(),
+                         n_left * k_join,
+                         stream);
+      } else {
+        vss::kth_distance_bound(
+          st.acc_distances->view().data<float>(), n_left, k_join, s.bound->data(), stream);
+      }
+      if (s.rescore) {
+        s.code_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
+        refresh_code_limit(s.bound->data());
+      }
+      if (s.skip_certain) {
+        s.certain_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
+        code_limits(s.bound->data(), s.certain_limit->data(), true);
+      }
+      // A radius join's buffer only has to amortize the flush that appends it to the result.
+      s.candidates.emplace(radius_join
+                             ? std::int64_t{1} << 22
+                             : std::max<std::int64_t>(std::int64_t{1} << 22, 4 * n_left * k_join),
+                           stream,
+                           mr);
+    }
+    if (grouped_sweep0) {
+      // Each cluster is contiguous in the device lists, so one task group covers it whole.
+      std::vector<vss::nearest_task> tasks;
+      auto const& offsets = _lists->offsets;
+      for (std::size_t c = 0; c + 1 < offsets.size(); ++c) {
+        auto const nearest = static_cast<std::int64_t>(nearest_edges[c]);
+        auto const n_rows  = offsets[c + 1] - offsets[c];
+        if (nearest == 0 || n_rows == 0) { continue; }
+        for (std::int64_t e = 0; e < nearest; e += vss::kNearestTaskProbes) {
+          tasks.push_back({offsets[c],
+                           n_rows,
+                           edge_begin[c] + e,
+                           static_cast<std::int32_t>(
+                             std::min<std::int64_t>(vss::kNearestTaskProbes, nearest - e)),
+                           offsets[c]});
+        }
+        s.scanned_pairs += n_rows * nearest;
+      }
+      rmm::device_uvector<vss::nearest_task> device_tasks(tasks.size(), stream, mr);
+      // From a pageable vector, so the copy has completed when the call returns.
+      CUDF_CUDA_TRY(cudaMemcpyAsync(device_tasks.data(),
+                                    tasks.data(),
+                                    tasks.size() * sizeof(vss::nearest_task),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      bool const f16 = !s.int8_search;
+      vss::nearest_cluster_topk(
+        device_tasks.data(),
+        static_cast<std::int64_t>(tasks.size()),
+        f16,
+        _lists->device_vectors->data(),
+        static_cast<std::int64_t>(_lists->row_bytes()),
+        f16 ? static_cast<void const*>(_lists->row_sq_f32->data()) : _lists->row_sq->data(),
+        s.routed_rows,
+        f16 ? static_cast<void const*>(s.probe_f16->data()) : s.probe_i8->data(),
+        f16 ? static_cast<void const*>(s.probe_sqf->data()) : s.probe_sq->data(),
+        k_join,
+        st.acc_distances->mutable_view().data<float>(),
+        st.acc_neighbors->mutable_view().data<std::int64_t>(),
+        stream);
+    }
+  }
+
+  /// Filters or ranks one chunk of the pass against every probe row routed to its clusters, then
+  /// stages the next chunk while the device works on this one.
+  void search_chunk(std::size_t ci)
+  {
+    auto const& edge_begin    = s.routed->edge_begin;
+    auto const& nearest_edges = s.routed->nearest_edges;
+    auto const j              = (*chunks)[ci];
+    auto staged               = std::move(prefetched);
+    auto const chunk_base     = _op._chunk_row_base[j];
+    float const* chunk_data   = nullptr;
+    std::int64_t chunk_n      = 0;
+    // Chunk j's stored rows and their norms, where a direct sweep reads them.
+    std::byte const* compact     = nullptr;
+    std::byte const* chunk_norms = nullptr;
+    std::optional<rmm::device_buffer> widened;
+    // A cosine chunk normalized for the every-cluster search (direct_cosine).
+    std::optional<rmm::device_uvector<float>> unit_chunk;
+    if (direct) {
+      chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
+      check_chunk_base(j, chunk_base);
+      compact = copy_compact ? static_cast<std::byte const*>(staged.buffer->data())
+                             : static_cast<std::byte const*>(_lists->device_vectors->data()) +
+                                 static_cast<std::size_t>(chunk_base) * _lists->row_bytes();
+      if (s.list_norms != nullptr) {
+        chunk_norms = copy_compact ? compact + staged_rows_bytes(chunk_n)
+                                   : static_cast<std::byte const*>(s.list_norms) +
+                                       static_cast<std::size_t>(chunk_base) * 4;
+      }
+    } else if (widen_compact) {
+      chunk_n = _lists->rows_in_chunk(static_cast<std::int64_t>(j));
+      check_chunk_base(j, chunk_base);
+      widened.emplace(static_cast<std::size_t>(chunk_n * dim) * sizeof(float), stream, mr);
+      vss::widen_float16(static_cast<std::uint16_t const*>(staged.buffer->data()),
+                         chunk_n * dim,
+                         static_cast<float*>(widened->data()),
+                         stream);
+      chunk_data = static_cast<float const*>(widened->data());
+    } else {
+      auto const chunk_view = vss::list_column_as_dataset_view(staged.view, dim);
+      chunk_data            = chunk_view.data_handle();
+      chunk_n               = chunk_view.extent(0);
+      if (s.direct_cosine && chunk_n > 0) {
+        unit_chunk.emplace(static_cast<std::size_t>(chunk_n * dim), stream, mr);
+        vss::normalize_rows(chunk_data, chunk_n, dim, unit_chunk->data(), stream);
+        chunk_data = unit_chunk->data();
+      }
+    }
+    // A scanned chunk read by the re-score: sweep 1's candidates carry corpus rows, which the
+    // one block below maps onto the chunk (rows_per_block past any row, so block 0 always, its
+    // base chunk_base rows before the chunk); sweep 0's ranked answers carry rows local to
+    // their slice, one block per slice.
+    std::optional<rmm::device_uvector<float const*>> scan_blocks;
+    std::optional<rmm::device_uvector<std::uint16_t>> scan_f16_rows;
+    std::optional<rmm::device_uvector<float>> scan_sqf;
+    auto scan_source = [&](std::size_t block) {
+      vss::exact_rows src;
+      src.copy_blocks    = scan_blocks->data() + block;
+      src.rows_per_block = std::numeric_limits<std::int64_t>::max();
+      return src;
+    };
+    if (s.scan_f16 && chunk_n > 0) {
+      auto const& runs = _op._chunk_cluster_runs[j];
+      std::vector<float const*> bases;
+      if (sweep == 1) {
+        // Unsigned arithmetic: the base may lie before the allocation, and only rows of the
+        // chunk are ever added back onto it.
+        bases.push_back(
+          reinterpret_cast<float const*>(reinterpret_cast<std::uintptr_t>(chunk_data) -
+                                         static_cast<std::uintptr_t>(chunk_base) *
+                                           static_cast<std::uintptr_t>(dim) * sizeof(float)));
+      } else {
+        for (auto const& slice : runs) {
+          bases.push_back(chunk_data + slice.begin * dim);
+        }
+      }
+      scan_blocks.emplace(bases.size(), stream, mr);
+      // From a pageable vector, so the copy has completed when the call returns.
+      CUDF_CUDA_TRY(cudaMemcpyAsync(scan_blocks->data(),
+                                    bases.data(),
+                                    bases.size() * sizeof(float const*),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      if (sweep == 1) {
+        // The chunk as the FLOAT16 lists would hold it: rounded rows, their norms, and the
+        // largest rounding error and norm, which this chunk's filter limit allows for.
+        scan_f16_rows.emplace(static_cast<std::size_t>(chunk_n * dim), stream, mr);
+        scan_sqf.emplace(static_cast<std::size_t>(chunk_n), stream, mr);
+        rmm::device_uvector<unsigned int> maxima(2, stream, mr);
+        CUDF_CUDA_TRY(cudaMemsetAsync(maxima.data(), 0, 2 * sizeof(unsigned int), stream.get()));
+        vss::narrow_to_float16(chunk_data, chunk_n * dim, scan_f16_rows->data(), stream);
+        vss::half_rows_norms(chunk_data,
+                             scan_f16_rows->data(),
+                             chunk_n,
+                             dim,
+                             scan_sqf->data(),
+                             nullptr,
+                             maxima.data(),
+                             maxima.data() + 1,
+                             stream);
+        unsigned int bits[2] = {0, 0};
+        CUDF_CUDA_TRY(
+          cudaMemcpyAsync(bits, maxima.data(), sizeof(bits), cudaMemcpyDeviceToHost, stream.get()));
+        stream.sync();
+        float max_sq = 0;
+        std::memcpy(&row_half_error, &bits[0], sizeof(float));
+        std::memcpy(&max_sq, &bits[1], sizeof(float));
+        row_norm_max = std::sqrt(max_sq);
+        if (!(row_norm_max < 65504.f)) {
+          throw std::runtime_error(
+            "[sirius_physical_vector_join_stream] a corpus row norm of " +
+            std::to_string(row_norm_max) +
+            " is outside float16's range for the bounded search over a scanned corpus; "
+            "SIRIUS_VSS_SCAN_BOUNDED=0 searches it in FP32");
+        }
+        refresh_code_limit(s.bound->data());
+        compact      = reinterpret_cast<std::byte const*>(scan_f16_rows->data());
+        chunk_norms  = reinterpret_cast<std::byte const*>(scan_sqf->data());
+        exact_source = scan_source(0);
+      }
+    }
+
+    for (auto const& slice : grouped_sweep0 ? no_runs : _op._chunk_cluster_runs[j]) {
+      auto eb          = edge_begin[static_cast<std::size_t>(slice.cluster)];
+      auto ee          = edge_begin[static_cast<std::size_t>(slice.cluster) + 1];
+      auto const split = eb + nearest_edges[static_cast<std::size_t>(slice.cluster)];
+      if (s.any_bounded && !radius_join && (!s.rescore || s.seed)) {
+        (sweep == 0 ? ee : eb) = split;
+      }
+      if (s.rescore && sweep == 0) { ee = split; }
+      if (eb == ee) { continue; }
+      // The slice was cut from the cluster column's chunk j; this is the first point at
+      // which the vector column's chunk j is resident and its row count exactly known. The
+      // two are the same pin's row groups, so a mismatch is a broken invariant rather than
+      // a user error -- but it would read past the end of the chunk, so it is checked.
+      if (slice.end > chunk_n) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] cluster column chunk " +
+                                 std::to_string(j) + " describes row " + std::to_string(slice.end) +
+                                 " but the vector column's chunk " + "holds " +
+                                 std::to_string(chunk_n) + "; both must come from the same pin");
+      }
+      auto slice_rows = slice.end - slice.begin;
+      if (st.earlier_cut != nullptr) {
+        auto const* first = st.earlier_cut + chunk_base + slice.begin;
+        slice_rows        = std::lower_bound(first, first + slice_rows, st.probe_key_max) - first;
+        if (slice_rows == 0) { continue; }
+      }
+      auto const slice_view =
+        raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+          chunk_data == nullptr ? nullptr : chunk_data + slice.begin * dim, slice_rows, dim);
+      auto const k_eff = std::min<std::int64_t>(k_join, slice_rows);
+
+      // ONE search per slice: every row routed here searches the same dataset, and the
+      // fold's dominant term is per call rather than per pair (X1 measured 278 us/call at
+      // 42-96% of runtime). The rows are gathered into one query matrix; a row is gathered
+      // once per cluster it visits, so the copies total n_probes probe batches per join --
+      // the price of routing rows rather than runs.
+      auto const m       = ee - eb;
+      auto const* rows_c = s.routed_rows + eb;
+      if (st.probe_rows_on_host) {
+        if (sweep == 0) {
+          std::vector<std::int64_t> slice_rows_c(static_cast<std::size_t>(m));
+          CUDF_CUDA_TRY(cudaMemcpyAsync(slice_rows_c.data(),
+                                        rows_c,
+                                        slice_rows_c.size() * sizeof(std::int64_t),
+                                        cudaMemcpyDeviceToHost,
+                                        stream.get()));
+          stream.sync();
+          std::vector<float> gathered(static_cast<std::size_t>(m * dim));
+          st.host_rows->gather(slice_rows_c.data(), slice_rows_c.size(), gathered.data());
+          // From a pageable vector, so the copy has completed when the call returns.
+          CUDF_CUDA_TRY(cudaMemcpyAsync(routed_queries->data(),
+                                        gathered.data(),
+                                        gathered.size() * sizeof(float),
+                                        cudaMemcpyHostToDevice,
+                                        stream.get()));
+        }
+      } else if (!direct) {
+        vss::gather_rows(
+          s.search_queries.data_handle(), dim, rows_c, m, routed_queries->data(), stream);
+      }
+      auto const queries_view =
+        raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+          routed_queries->data(), m, dim);
+      s.scanned_pairs += slice_rows * m;
+      // Neighbour ids come back local to the slice; the slice's own start in corpus row
+      // space is the base that makes them corpus row ids, exactly as the chunk offset does
+      // in the exhaustive fold.
+      auto const id_base = chunk_base + slice.begin;
+      // Lists are in cluster order, not pin order; their row map turns a layout row back into
+      // the pin row every later stage reads the corpus by.
+      auto const* id_map = _lists != nullptr
+                             ? static_cast<const std::int64_t*>(_lists->row_ids->data()) + id_base
+                             : nullptr;
+
+      if (sweep == 1 || s.seed) {
+        bounded_slice const sl =
+          s.f16_bounded
+            ? bounded_slice{reinterpret_cast<std::uint16_t const*>(compact) + slice.begin * dim,
+                            reinterpret_cast<float const*>(chunk_norms) + slice.begin,
+                            slice_rows,
+                            id_base,
+                            nullptr,
+                            rows_c,
+                            m}
+            : bounded_slice{reinterpret_cast<std::int8_t const*>(compact) + slice.begin * dim,
+                            reinterpret_cast<std::int32_t const*>(chunk_norms) + slice.begin,
+                            slice_rows,
+                            id_base,
+                            s.rescore ? nullptr : id_map,
+                            rows_c,
+                            m};
+        if (s.stretch_sweep0 && sweep == 0) {
+          // The slice's rows, from row `at` of its cluster, cut where the cluster's stretches
+          // end; each piece waits for its stretch's round (after this loop).
+          auto const c    = static_cast<std::size_t>(slice.cluster);
+          auto const at   = id_base - _lists->offsets[c];
+          auto const ends = stretch_ends(_lists->offsets[c + 1] - _lists->offsets[c]);
+          if (stretches.size() < ends.size()) { stretches.resize(ends.size()); }
+          for (std::size_t i = 0; i < ends.size(); ++i) {
+            auto const from = std::max(i == 0 ? std::int64_t{0} : ends[i - 1], at);
+            auto const to   = std::min(ends[i], at + slice_rows);
+            if (from >= to) { continue; }
+            auto const o = from - at;
+            auto piece   = sl;
+            piece.x      = static_cast<std::byte const*>(sl.x) + o * dim * (s.f16_bounded ? 2 : 1);
+            piece.x_sq   = static_cast<std::byte const*>(sl.x_sq) + o * 4;
+            piece.n      = to - from;
+            piece.id_base += o;
+            if (piece.id_map != nullptr) { piece.id_map += o; }
+            stretches[i].push_back(piece);
+          }
+          continue;
+        }
+        if (s.running_bound_rows > 0) {
+          for (std::int64_t o = 0; o < slice_rows;) {
+            auto const n = std::min(slice_rows - o, s.running_piece - s.since_merge);
+            auto piece   = sl;
+            piece.x      = static_cast<std::byte const*>(sl.x) + o * dim * (s.f16_bounded ? 2 : 1);
+            piece.x_sq   = static_cast<std::byte const*>(sl.x_sq) + o * 4;
+            piece.n      = n;
+            piece.id_base += o;
+            if (piece.id_map != nullptr) { piece.id_map += o; }
+            launch_bounded(piece);
+            ++s.bounded_launches;
+            s.bounded_padded += ((n + 127) / 128) * ((m + 127) / 128);
+            group.push_back(piece);
+            o += n;
+            s.since_merge += n;
+            if (s.since_merge >= s.running_piece) {
+              check_group();
+              if (s.hold_codes_pairs) {
+                hold_trim();
+              } else {
+                flush();
+              }
+              s.since_merge   = 0;
+              s.running_piece = std::min<std::int64_t>(2 * s.running_piece, std::int64_t{1} << 22);
+            } else if (group.size() >= s.bounded_group) {
+              check_group();
+            }
+          }
+          continue;
+        }
+        if (joins_group(m, slice_rows)) {
+          deferred.push_back(sl);
+        } else {
+          launch_bounded(sl);
+        }
+        ++s.bounded_launches;
+        s.bounded_padded += ((slice_rows + 127) / 128) * ((m + 127) / 128);
+        group.push_back(sl);
+        if (group.size() >= s.bounded_group) { check_group(); }
+        continue;
+      }
+
+      if (radius_join) {
+        // Same construction as the exhaustive radius path: a slice's in-range pairs are
+        // final when produced, so they are appended, never folded, and there is no k. The
+        // kernel numbers query rows within the gathered matrix; rows_c maps them back.
+        auto edges = threshold_search(res,
+                                      slice_view,
+                                      queries_view,
+                                      s.search_radius,
+                                      s.ranked_metric,
+                                      mr,
+                                      0,
+                                      count_only && !keyed);
+        if (count_only && !keyed) {
+          note_radius_part(edges.n_edges);
+        } else if (edges.n_edges > 0) {
+          auto left =
+            cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                      vss::column_size(edges.n_edges, "vector join threshold"),
+                                      cudf::mask_state::UNALLOCATED,
+                                      stream,
+                                      mr);
+          vss::remap_radius_edges(edges.query_rows->view().data<std::int64_t>(),
+                                  rows_c,
+                                  left->mutable_view().data<std::int32_t>(),
+                                  edges.neighbors->mutable_view().data<std::int64_t>(),
+                                  edges.n_edges,
+                                  id_base,
+                                  stream,
+                                  id_map);
+          if (best_only) {
+            fold_best(left->view().data<std::int32_t>(),
+                      edges.neighbors->view().data<std::int64_t>(),
+                      edges.distances->view().data<float>(),
+                      edges.n_edges,
+                      std::numeric_limits<float>::infinity(),
+                      st.pin_keys,
+                      nullptr);
+            continue;
+          }
+          if (keyed) {
+            keep_keyed(left->view().data<std::int32_t>(),
+                       edges.neighbors->view().data<std::int64_t>(),
+                       edges.distances->view().data<float>(),
+                       edges.n_edges);
+            continue;
+          }
+          st.radius_left.push_back(std::move(left));
+          st.radius_neighbors.push_back(std::move(edges.neighbors));
+          st.radius_distances.push_back(std::move(edges.distances));
+          note_radius_part(edges.n_edges);
+        }
+        continue;
+      }
+
+      // The GEMM-ranked search, as in the exhaustive fold: it also carries none of cuVS's
+      // per-call device synchronization, which is paid here once per slice.
+      auto const knn = [&] {
+        if (s.f16_sweep0) {
+          vss::gather_bytes(s.probe_f16->data(),
+                            dim * static_cast<std::int64_t>(sizeof(std::uint16_t)),
+                            rows_c,
+                            m,
+                            routed_f16->data(),
+                            stream);
+          vss::gather_rows(s.probe_sqf->data(), 1, rows_c, m, routed_sqf->data(), stream);
+          return vss::gemm_f16_topk(
+            res,
+            reinterpret_cast<std::uint16_t const*>(compact) + slice.begin * dim,
+            reinterpret_cast<float const*>(chunk_norms) + slice.begin,
+            slice_rows,
+            routed_f16->data(),
+            routed_sqf->data(),
+            m,
+            dim,
+            k_eff,
+            /*take_sqrt=*/false,
+            mr);
+        }
+        if (s.int8_search) {
+          vss::gather_bytes(s.probe_i8->data(), dim, rows_c, m, routed_i8->data(), stream);
+          vss::gather_int32(s.probe_sq->data(), rows_c, m, routed_sq->data(), stream);
+          return vss::gemm_int8_topk(
+            res,
+            reinterpret_cast<std::int8_t const*>(compact) + slice.begin * dim,
+            reinterpret_cast<std::int32_t const*>(chunk_norms) + slice.begin,
+            slice_rows,
+            routed_i8->data(),
+            routed_sq->data(),
+            m,
+            dim,
+            k_eff,
+            s.search_metric == cuvs::distance::DistanceType::L2SqrtExpanded && !s.bounded,
+            mr);
+        }
+        // A re-scored sweep 0 only sets each row's bound, so it keeps the GEMM.
+        auto const ranked = s.rescore ? s.search_metric : s.ranked_metric;
+        return gemm_search_enabled() && vss::gemm_search_supports(ranked)
+                 ? vss::gemm_topk(res, slice_view, queries_view, k_eff, ranked, mr)
+                 : vss::brute_force_knn_untrimmed(
+                     res, vss::brute_force_build(res, slice_view, ranked), queries_view, k_eff, mr);
+      }();
+
+      // Over a scanned corpus this sweep only sets each row's bound, the largest of its k
+      // distances, so they are made exact first, read from the slice's rows. The accumulator
+      // may then be out of order; only that largest distance is read before it is reset.
+      if (s.scan_f16) {
+        auto const s = static_cast<std::size_t>(&slice - _op._chunk_cluster_runs[j].data());
+        vss::exact_distances(routed_queries->data(),
+                             nullptr,
+                             knn.k,
+                             knn.neighbors->view().data<std::int64_t>(),
+                             knn.distances->mutable_view().data<float>(),
+                             m * knn.k,
+                             scan_source(s),
+                             dim,
+                             stream,
+                             mr,
+                             nullptr,
+                             0.f,
+                             ip);
+      }
+      // Fold in place: a row is routed to a cluster at most once, so the rows of one slice
+      // are distinct and no two threads of the fold write the same accumulator row.
+      vss::fold_topk_rows(st.acc_distances->mutable_view().data<float>(),
+                          st.acc_neighbors->mutable_view().data<std::int64_t>(),
+                          k_join,
+                          knn.distances->view().data<float>(),
+                          knn.neighbors->view().data<std::int64_t>(),
+                          knn.k,
+                          k_eff,
+                          rows_c,
+                          m,
+                          id_base,
+                          stream,
+                          s.rescore ? nullptr : id_map);
+    }
+
+    // The searches above are issued, not finished. Staging the next needed chunk now runs its
+    // H2D while the GPU works on this one.
+    if (s.lists_on_host) { launch_deferred(); }
+    prefetched = ci + 1 < chunks->size() ? stage_next((*chunks)[ci + 1]) : staged_vector_chunk{};
+    if (s.keep_chunks && sweep == 0 && can_keep()) {
+      kept.emplace(j, std::move(staged));
+    } else {
+      // A group that overflowed replays its slices, which read this chunk's staged rows: check
+      // it while they are still there. A scanned chunk's candidates are re-scored from its
+      // rows, so they are merged before it goes too.
+      if (s.scan_f16 && sweep == 1) {
+        check_group();
+        flush();
+        exact_source = vss::exact_rows{};
+      } else if (s.any_bounded && (staged.buffer || staged.owner || staged.reader)) {
+        check_group();
+      }
+      release_staged(staged);
+    }
+  }
+
+  void run_stretches()
+  {
+    // The stretched sweep 0: round i filters stretch i of every cluster, under the bounds the
+    // merge after round i - 1 left (the seed for round 0). The device lists stay put, so the
+    // pieces' rows are where the slices left them. A group grows past bounded_group slices while
+    // even all of its pairs would fit the buffer, so it cannot overflow: with few probe rows a
+    // round is a few launches, not one per bounded_group clusters (10k probes, 4,096 clusters:
+    // 16 checks a round, each reading the buffer's fill back).
+    for (auto const& round : stretches) {
+      auto const emitted_before = s.bounded_emitted;
+      std::int64_t group_pairs  = 0;  // the group's pairs, were every one to pass
+      for (auto const& piece : round) {
+        if (joins_group(piece.m, piece.n)) {
+          deferred.push_back(piece);
+        } else {
+          launch_bounded(piece);
+        }
+        ++s.bounded_launches;
+        s.bounded_padded += ((piece.n + 127) / 128) * ((piece.m + 127) / 128);
+        group.push_back(piece);
+        group_pairs += piece.m * piece.n;
+        if (group.size() >= s.bounded_group && group_pairs > s.candidates->capacity() - s.pending) {
+          check_group();
+          group_pairs = 0;
+        }
+      }
+      check_group();
+      flush();
+      if (dbg) { s.stretch_pairs.push_back(s.bounded_emitted - emitted_before); }
+    }
+  }
+
+  /// Takes in what is still waiting, and leaves the accumulators as the answer reads them.
+  void finish()
+  {
+    if (s.any_bounded && !kept.empty()) { check_group(); }
+    for (auto& entry : kept) {
+      release_staged(entry.second);
+    }
+    kept.clear();
+    if (s.any_bounded) {
+      check_group();
+      if (s.host_pairs.empty()) {
+        flush();
+      } else {
+        bring_pairs_back();
+      }
+      // Lists hold layout rows; a scanned corpus's candidates already carry corpus rows.
+      if (s.rescore && !radius_join && _lists != nullptr) {
+        vss::map_ids(st.acc_neighbors->mutable_view().data<std::int64_t>(),
+                     n_left * k_join,
+                     static_cast<std::int64_t const*>(_lists->row_ids->data()),
+                     stream);
+      }
+      if (dbg) {
+        std::fprintf(stderr,
+                     "[vecjoin-phase] bounded: %lld pairs passed, %lld merges, %lld launches, "
+                     "%lld 128x128 tiles; re-score %.3f s, take/merge %.3f s\n",
+                     static_cast<long long>(s.bounded_emitted),
+                     static_cast<long long>(s.bounded_merges),
+                     static_cast<long long>(s.bounded_launches),
+                     static_cast<long long>(s.bounded_padded),
+                     s.rescore_seconds,
+                     s.take_seconds);
+        if (s.pair_moves > 0 || s.slice_cuts > 0 || s.budget_flushes > 0) {
+          std::fprintf(stderr,
+                       "[vecjoin-phase] pairs to host: %lld moves, %lld pairs, %lld slice cuts, "
+                       "%lld flushes past the budget, %.3f s\n",
+                       static_cast<long long>(s.pair_moves),
+                       static_cast<long long>(s.pairs_moved),
+                       static_cast<long long>(s.slice_cuts),
+                       static_cast<long long>(s.budget_flushes),
+                       s.host_seconds);
+        }
+        if (s.f16_bounded) {
+          auto const l = vss::f16_filter_launch_counts();
+          std::fprintf(stderr,
+                       "[vecjoin-phase] FP16 filter launches so far in this process: CUTLASS %lld "
+                       "single, %lld grouped; fused %lld single\n",
+                       static_cast<long long>(l.cutlass_single),
+                       static_cast<long long>(l.cutlass_group),
+                       static_cast<long long>(l.fused_single));
+        }
+        if (best_only) {
+          std::fprintf(stderr,
+                       "[vecjoin-phase] best match: %lld of those pairs re-scored\n",
+                       static_cast<long long>(st.best_rescored));
+        }
+        if (s.gap_rescore) {
+          std::fprintf(
+            stderr,
+            "[vecjoin-phase] gap re-score: %lld of %lld candidates re-scored (trim %.3f s); "
+            "row-stretches %llu: %llu under 2k, %llu trimmed at m=2, %llu at m=4, %llu "
+            "fall back; the m-rule would re-score %llu\n",
+            static_cast<long long>(s.gap_rescored),
+            static_cast<long long>(s.bounded_emitted),
+            s.trim_seconds,
+            s.gap_stats.rows,
+            s.gap_stats.short_rows,
+            s.gap_stats.m2_rows,
+            s.gap_stats.m4_rows,
+            s.gap_stats.fallback_rows,
+            s.gap_stats.literal_rescored);
+        }
+      }
+      if (s.gap_stats_on) { vss::add_gap_rescore_totals(s.gap_stats); }
+      if (s.sqrt_at_end && !radius_join) {
+        vss::sqrt_in_place(st.acc_distances->mutable_view().data<float>(), n_left * k_join, stream);
+      }
+    }
+    if (best_only) {
+      st.best_ids_are_layout = s.any_bounded && s.rescore;
+      st.best_take_sqrt      = s.sqrt_at_end;
+      emit_best();
+    }
+    if (s.unit_cosine || s.direct_cosine) {
+      if (radius_join) {
+        for (auto& part : st.radius_distances) {
+          vss::scale_in_place(part->mutable_view().data<float>(), part->size(), 0.5f, stream);
+        }
+      } else {
+        vss::scale_in_place(
+          st.acc_distances->mutable_view().data<float>(), n_left * k_join, 0.5f, stream);
+      }
+    }
+
+    // What the pruning did, reported as a value rather than only a print: an approximate join
+    // that skipped nothing returns a correct answer, so nothing in the result set distinguishes
+    // it from one that pruned hard. This is what a test can assert on.
+    auto const exhaustive_pairs = n_left * _op._right_total_rows;
+    if (_op._sirius_ctx != nullptr) {
+      _op._sirius_ctx->record_vector_join_prune(static_cast<std::uint64_t>(s.scanned_pairs),
+                                                static_cast<std::uint64_t>(exhaustive_pairs),
+                                                s.needed_chunks.size(),
+                                                _op._chunk_cluster_runs.size());
+    }
+
+    if (std::getenv("SIRIUS_VECTOR_JOIN_PRUNE_DEBUG") != nullptr) {
+      std::fprintf(stderr,
+                   "[vecjoin] batch: %lld probe rows x %ld probes, %zu of %zu corpus chunks "
+                   "staged, %lld of %lld probe-row x corpus-row pairs scored (%.2f%%)\n",
+                   static_cast<long long>(n_left),
+                   static_cast<long>(s.n_probes),
+                   s.needed_chunks.size(),
+                   _op._chunk_cluster_runs.size(),
+                   static_cast<long long>(s.scanned_pairs),
+                   static_cast<long long>(exhaustive_pairs),
+                   exhaustive_pairs == 0 ? 0.0
+                                         : 100.0 * static_cast<double>(s.scanned_pairs) /
+                                             static_cast<double>(exhaustive_pairs));
+    }
+  }
+
+  block_state::search_state& s;
+  bool dbg;
+  std::chrono::steady_clock::time_point phase_t0;
+  // The gather buffers: a slice's probe rows as its search reads them.
+  std::optional<rmm::device_uvector<float>> routed_queries;
+  std::optional<rmm::cuda_stream> staging_stream;
+  rmm::cuda_stream_view stage_on;
+  borrow_window borrowed;
+  std::optional<rmm::device_uvector<std::int8_t>> routed_i8;
+  std::optional<rmm::device_uvector<std::int32_t>> routed_sq;
+  float row_half_error{0.f};
+  float row_norm_max{0.f};
+  std::optional<rmm::device_uvector<std::uint16_t>> routed_f16;
+  std::optional<rmm::device_uvector<float>> routed_sqf;
+  vss::exact_rows exact_source{};
+  std::vector<bounded_slice> group, deferred;
+  staged_vector_chunk prefetched;
+  // The compact chunks sweep 0 copied in stay on the device for sweep 1 while the budget still
+  // has a margin free, and sweep 1 starts with them: lists that nearly fit are read about once.
+  std::map<std::size_t, staged_vector_chunk> kept;
+  std::vector<std::size_t> kept_first;
+
+  // The pass under way.
+  int sweep{0};
+  std::vector<std::size_t> const* chunks{nullptr};
+  bool direct{false};
+  bool widen_compact{false};
+  bool copy_compact{false};
+  bool grouped_sweep0{false};
+  std::vector<chunk_cluster_run> const no_runs;
+  // The stretched sweep 0's pieces, by stretch (see stretch_sweep0).
+  std::vector<std::vector<bounded_slice>> stretches;
 };
 
 std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
@@ -5595,7 +5735,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   // than a predicate inside it because the two iterate different things: the exhaustive fold
   // walks corpus chunks, while this walks (probe run x neighbouring cluster) pairs.
   if (_centroids != nullptr) {
-    task.search_clusters();
+    clustered_search search{task};
+    search.run();
   } else {
     task.search_corpus();
   }

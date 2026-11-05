@@ -414,8 +414,11 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   std::string params_to_string() const override;
 
  private:
+  /// A task's probe rows and what its search holds across corpus chunks, the task's steps over
+  /// them, and the clustered search among those steps. Defined beside execute().
   struct block_state;
   class block_task;
+  class clustered_search;
 
   /// Resolve both pinned tables and snapshot per-batch views plus right-batch row
   /// offsets. Idempotent; caller holds _op_mutex. On the build path this is a no-op until
