@@ -159,6 +159,7 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_kmeans.cpp
     test/cpp/integration/test_gpu_execution_vector_join_exact_per_row.cpp
     test/cpp/integration/test_gpu_execution_vector_join_sql_rewrite.cpp
+    test/cpp/integration/test_gpu_execution_vector_join_uncached.cpp
     test/cpp/integration/test_gpu_execution_vector_join_inner_product.cpp
     test/cpp/integration/test_gpu_execution_window.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp

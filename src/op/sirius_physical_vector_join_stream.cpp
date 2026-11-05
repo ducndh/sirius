@@ -1335,6 +1335,7 @@ void sirius_physical_vector_join_stream::initialize_locked()
     for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
       _max_chunk_bytes = std::max(_max_chunk_bytes, _corpus->chunk_bytes(i));
     }
+    if (_request.statement_clusters > 0) { build_statement_lists_locked(); }
   } else if (_centroids != nullptr && _request.build_cluster_column.empty()) {
     // Lists mode: the corpus is the cluster-ordered copy, and the pin stays behind only as the
     // row space that copy's neighbour ids are reported in.
@@ -1353,20 +1354,7 @@ void sirius_physical_vector_join_stream::initialize_locked()
     for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
       _max_chunk_bytes = std::max(_max_chunk_bytes, _corpus->chunk_bytes(i));
     }
-    // Host-tier chunks are engine batches; registering them in the query's repository manager
-    // is what makes them visible to the downgrade executor, which only sweeps repositories.
-    if (_lists->tier == cucascade::memory::Tier::HOST && _lists_repo == nullptr &&
-        _sirius_ctx != nullptr && get_pipeline() != nullptr) {
-      auto manager = _sirius_ctx->get_data_repository_manager(get_pipeline()->get_query_id());
-      if (manager) {
-        auto repo = std::make_unique<cucascade::shared_data_repository>();
-        for (auto const& batch : _lists->chunk_batches) {
-          repo->add_data_batch(batch);
-        }
-        _lists_repo = repo.get();
-        manager->add_new_repository(get_operator_id(), "lists", std::move(repo));
-      }
-    }
+    register_host_lists_locked();
   } else if (right_pin->tier == cucascade::memory::Tier::HOST) {
     _corpus = make_host_pinned_chunk_source(*right_pin, right.column, batch_telemetry());
     // Sized from the widest chunk, since any one of them may be the one in flight when
@@ -1463,6 +1451,63 @@ void sirius_physical_vector_join_stream::initialize_locked()
     }
   }
   _initialized = true;
+}
+
+void sirius_physical_vector_join_stream::register_host_lists_locked()
+{
+  // Host-tier chunks are engine batches; registering them in the query's repository manager
+  // is what makes them visible to the downgrade executor, which only sweeps repositories.
+  if (_lists->tier != cucascade::memory::Tier::HOST || _lists_repo != nullptr ||
+      _sirius_ctx == nullptr || get_pipeline() == nullptr) {
+    return;
+  }
+  auto manager = _sirius_ctx->get_data_repository_manager(get_pipeline()->get_query_id());
+  if (!manager) { return; }
+  auto repo = std::make_unique<cucascade::shared_data_repository>();
+  for (auto const& batch : _lists->chunk_batches) {
+    repo->add_data_batch(batch);
+  }
+  _lists_repo = repo.get();
+  manager->add_new_repository(get_operator_id(), "lists", std::move(repo));
+}
+
+void sirius_physical_vector_join_stream::build_statement_lists_locked()
+{
+  if (_sirius_ctx == nullptr || _corpus == nullptr || _corpus->num_chunks() == 0) { return; }
+  vector_join_debug_wall_time const wall{"statement lists"};
+  vss::statement_lists built;
+  try {
+    built = vss::build_statement_lists(
+      *_sirius_ctx, *_corpus, _request.dim, _request.metric, _request.statement_clusters);
+  } catch (std::exception const& e) {
+    SIRIUS_LOG_INFO(
+      "[sirius_physical_vector_join_stream] building lists over the scanned corpus declined, "
+      "searching its rows as scanned: {}",
+      e.what());
+    return;
+  }
+  _statement_centroids = std::move(built.centroids);
+  _statement_lists     = std::move(built.lists);
+  _centroids           = _statement_centroids.get();
+  _lists               = _statement_lists.get();
+  // The build clamps the cluster count to the rows the scan delivered; the probes follow it.
+  _request.search_mode = vss::vector_join_search_mode::approx;
+  _request.n_probes    = std::clamp<std::int64_t>(_request.n_probes, 1, _lists->n_clusters);
+  _corpus              = make_cluster_lists_chunk_source(*_lists);
+  _max_chunk_bytes     = 0;
+  for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
+    _max_chunk_bytes = std::max(_max_chunk_bytes, _corpus->chunk_bytes(i));
+  }
+  register_host_lists_locked();
+  SIRIUS_LOG_INFO(
+    "[sirius_physical_vector_join_stream] built {} {} lists over the {} scanned corpus rows "
+    "({} on the {}), searching {} of them",
+    built.result.n_clusters,
+    built.result.encoding,
+    built.result.n_rows,
+    built.result.exact_rows,
+    built.result.tier,
+    _request.n_probes);
 }
 
 void sirius_physical_vector_join_stream::plan_probe_blocks_locked()

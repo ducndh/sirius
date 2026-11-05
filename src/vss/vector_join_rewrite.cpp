@@ -66,6 +66,7 @@
 #include "vss/access_path_cost.hpp"
 #include "vss/bound_gemm.hpp"
 #include "vss/cluster_lists.hpp"
+#include "vss/cuvs_index_cache.hpp"
 #include "vss/device_rates.hpp"
 #include "vss/kmeans_functions.hpp"
 #include "vss/vector_join.hpp"
@@ -604,6 +605,373 @@ bool expression_has_vector_distance(Expression const& e)
   return found;
 }
 
+/// How a join over a corpus runs: the codes, partitions and lists of a pinned corpus, built here
+/// and kept, or those a scanned corpus gets from the join itself; or brute force. The plain-SQL
+/// rewrite and the table function choose the same way.
+class corpus_lists_chooser {
+ public:
+  explicit corpus_lists_chooser(duckdb::ClientContext& context) : _context(context) {}
+
+  /// `SET vector_join_probes = c` (c > 0) makes a join that can go through cluster lists
+  /// approximate, as `ivfflat.probes` does in pgvector: each probe row searches its n_p nearest
+  /// clusters. The lists are those of the clustering `vector_join_clustering` names, when it is
+  /// one of this column's, or else lists that would answer exactly. With no such lists they are
+  /// built inside the query (build_lists_in_query) and kept for later statements, the way a hash
+  /// join builds its table: a join amortizes its index over one statement, so the build is
+  /// charged to it. The setting does not apply when the build is refused or disabled
+  /// (SIRIUS_VSS_BUILD_IN_QUERY=0). c = 0, the default, is the exact join.
+  ///
+  /// How many clusters N such a build makes is `vector_join_clusters`, or when that is 0 the
+  /// count with the least estimated build plus search time for @p probe_rows
+  /// (choose_cluster_count): sqrt(rows) clusters (at most 1,024) for a few thousand probe rows,
+  /// more for a probe side in the millions. On lists Sirius sized itself n_p is then
+  /// min(ceil(c * sqrt(N)), N) (scaled_probes), so the same c gives about the same recall
+  /// whichever N was built. Against lists the user built or named, and under an explicit
+  /// vector_join_clusters, c is the number of clusters searched, rounded up (literal_probes).
+  bool use_approximate_lists(vector_join_request& req,
+                             duckdb::SiriusContext& ctx,
+                             const std::string& catalog,
+                             const std::string& schema,
+                             const std::string& table,
+                             const std::string& column,
+                             std::uint64_t rows,
+                             double probe_rows,
+                             bool scanned)
+  {
+    duckdb::Value setting;
+    if (!_context.TryGetCurrentSetting("vector_join_probes", setting) || setting.IsNull()) {
+      return false;
+    }
+    // Negative and NaN values are refused by the SET; any that reach here run the exact join.
+    auto const c = setting.GetValue<double>();
+    if (!(c > 0.0)) { return false; }
+    bool const cosine           = req.metric == "cosine";
+    bool const ip               = req.metric == "ip";
+    auto const n_rows           = static_cast<std::int64_t>(rows);
+    std::int64_t fixed_clusters = 0;
+    if (_context.TryGetCurrentSetting("vector_join_clusters", setting) && !setting.IsNull()) {
+      fixed_clusters = std::max<std::int64_t>(setting.GetValue<std::int64_t>(), 0);
+    }
+    std::optional<exact_lists_choice> choice;
+    if (!scanned && _context.TryGetCurrentSetting("vector_join_clustering", setting) &&
+        !setting.IsNull() && !setting.ToString().empty()) {
+      choice = find_named_lists(
+        _context, ctx, setting.ToString(), catalog, schema, table, column, cosine, n_rows);
+      // An inner-product join searches FLOAT16 (re-scored) or FP32 rows only.
+      if (choice && ip && !ip_searchable(ctx, *choice)) { choice.reset(); }
+    }
+    if (!choice && !scanned) {
+      choice =
+        find_exact_lists(_context, ctx, catalog, schema, table, column, cosine, n_rows, 2, ip);
+    }
+    if (!choice) {
+      auto const* build_env = std::getenv("SIRIUS_VSS_BUILD_IN_QUERY");
+      if (build_env != nullptr && std::strcmp(build_env, "0") == 0) { return false; }
+      if (req.dim % 16 != 0) { return false; }
+      auto n_clusters = std::min(fixed_clusters, n_rows);
+      if (n_clusters == 0) {
+        // UINT8 lists if every value is a byte, FLOAT16 otherwise; on the device either way.
+        access_path_shape shape;
+        shape.probe_rows           = std::max(probe_rows, 1.0);
+        shape.corpus_rows          = static_cast<double>(rows);
+        shape.dim                  = static_cast<double>(req.dim);
+        shape.list_bytes_per_value = cosine || ip ? 2 : 1;
+        n_clusters =
+          choose_cluster_count(access_path_cost{current_device_scale()}, shape, c).n_clusters;
+      }
+      choice = scanned ? lists_in_statement(req, n_clusters)
+                       : build_lists_in_query(ctx,
+                                              req,
+                                              catalog,
+                                              schema,
+                                              table,
+                                              column,
+                                              rows,
+                                              n_clusters,
+                                              auto_lists_name(table, column, req.metric));
+    }
+    if (!choice) { return false; }
+    req.n_probes = fixed_clusters == 0 &&
+                       (scanned || choice->clustering == auto_lists_name(table, column, req.metric))
+                     ? scaled_probes(c, choice->n_clusters)
+                     : literal_probes(c, choice->n_clusters);
+    if (!scanned) {
+      req.search_mode = vector_join_search_mode::approx;
+      req.clustering  = choice->clustering;
+    }
+    SIRIUS_LOG_INFO(
+      "[vector_join_rewrite] searching '{}' through {} of the {} clusters of '{}' "
+      "(vector_join_probes = {})",
+      table,
+      req.n_probes,
+      choice->n_clusters,
+      choice->clustering,
+      c);
+    return true;
+  }
+
+  /// Picks how a join over a pinned corpus runs. Under vector_join_probes, approximately through
+  /// cluster lists (use_approximate_lists). Otherwise exactly: brute force over the pinned rows,
+  /// or every cluster of its lists searched (the same answer, from fewer bytes and on tensor
+  /// cores), by access_path_cost on the estimated probe rows. With no lists it builds them first
+  /// (kept for later queries, like an index) when building and searching beats brute force,
+  /// unless SIRIUS_VSS_BUILD_IN_QUERY=0. SIRIUS_VSS_ACCESS_PATH=lists|brute forces the choice;
+  /// SIRIUS_VSS_REWRITE_LISTS=0 is brute.
+  bool use_lists(vector_join_request& req,
+                 duckdb::TableCatalogEntry& table,
+                 const std::string& column,
+                 std::uint64_t rows,
+                 double probe_rows)
+  {
+    return use_lists(req,
+                     table.ParentCatalog().GetName().GetIdentifierName(),
+                     table.ParentSchema().name.GetIdentifierName(),
+                     table.name.GetIdentifierName(),
+                     column,
+                     rows,
+                     probe_rows,
+                     &table);
+  }
+
+  /// use_lists for a corpus the join scans itself (@p pinned_table null): the same choices over
+  /// the same costs, but the lists are the join's own, built once its scan is done
+  /// (lists_in_statement), since there is no pin to build them from now or to keep them beside.
+  bool use_lists(vector_join_request& req,
+                 const std::string& catalog,
+                 const std::string& schema,
+                 const std::string& table_name,
+                 const std::string& column,
+                 std::uint64_t rows,
+                 double probe_rows,
+                 duckdb::TableCatalogEntry* pinned_table,
+                 bool approximate = true)
+  {
+    bool const scanned = pinned_table == nullptr;
+    auto const* env    = std::getenv("SIRIUS_VSS_REWRITE_LISTS");
+    if (env != nullptr && std::strcmp(env, "0") == 0) { return false; }
+    auto const* forced = std::getenv("SIRIUS_VSS_ACCESS_PATH");
+    std::string_view const force{forced != nullptr ? forced : "cost"};
+    if (force == "brute") { return false; }
+    auto sirius_ctx = _context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    if (!sirius_ctx) { return false; }
+    if (approximate &&
+        use_approximate_lists(
+          req, *sirius_ctx, catalog, schema, table_name, column, rows, probe_rows, scanned)) {
+      return true;
+    }
+    bool const cosine = req.metric == "cosine";
+    bool const ip     = req.metric == "ip";
+    auto choice       = scanned ? std::nullopt
+                                : find_exact_lists(_context,
+                                             *sirius_ctx,
+                                             catalog,
+                                             schema,
+                                             table_name,
+                                             column,
+                                             cosine,
+                                             static_cast<std::int64_t>(rows),
+                                             1,
+                                             ip);
+    auto pin          = scanned ? nullptr
+                                : sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
+                           catalog, schema, table_name, sirius::vss::table_identity_of(*pinned_table));
+    access_path_shape shape;
+    shape.probe_rows       = std::max(probe_rows, 1.0);
+    shape.corpus_rows      = static_cast<double>(rows);
+    shape.dim              = static_cast<double>(req.dim);
+    shape.corpus_on_device = pin != nullptr && pin->tier == cucascade::memory::Tier::GPU;
+    access_path_cost const cost{current_device_scale()};
+    double const brute = cost.brute(shape);
+    auto describe      = [&](exact_lists_choice const& c) {
+      shape.list_bytes_per_value = c.encoding == list_encoding::uint8     ? 1
+                                        : c.encoding == list_encoding::float16 ? 2
+                                                                               : 4;
+      shape.lists_on_device      = c.on_device;
+      shape.n_clusters           = static_cast<double>(c.n_clusters);
+      shape.inexact_unseeded     = c.encoding == list_encoding::float16 && !c.seeded;
+    };
+    if (!choice) {
+      auto const* build_env = std::getenv("SIRIUS_VSS_BUILD_IN_QUERY");
+      if (force == "cost" && build_env != nullptr && std::strcmp(build_env, "0") == 0) {
+        return false;
+      }
+      // The exact join's compact layout, when it beats brute force: one list of codes, UINT8 if
+      // every value is a byte, FLOAT16 otherwise (FP32 lists hold the same bytes as the pin and
+      // never pay). It is searched whole, its bound lowered as it goes, so there is no clustering
+      // to fit: partitions would only cut the corpus into smaller GEMMs.
+      if (req.dim % 16 != 0) { return false; }
+      shape.list_bytes_per_value = cosine || ip ? 2 : 1;
+      shape.lists_on_device      = true;
+      shape.n_clusters           = 1;
+      shape.unit_rows            = cosine;
+      double const built         = cost.codes(shape) + cost.lists(shape);
+      if (force == "cost" && built >= brute) {
+        SIRIUS_LOG_INFO(
+          "[vector_join_rewrite] '{}': brute force ({:.3f} s est.) over writing its codes "
+          "({:.3f} s)",
+          table_name,
+          brute,
+          built);
+        return false;
+      }
+      SIRIUS_LOG_INFO(
+        "[vector_join_rewrite] '{}': writing its codes and searching them ({:.3f} s est.) over "
+        "brute force ({:.3f} s)",
+        table_name,
+        built,
+        brute);
+      choice = scanned ? lists_in_statement(req, 1)
+                       : build_lists_in_query(*sirius_ctx,
+                                              req,
+                                              catalog,
+                                              schema,
+                                              table_name,
+                                              column,
+                                              rows,
+                                              1,
+                                              codes_lists_name(table_name, column, req.metric));
+      if (!choice) { return false; }
+    }
+    describe(*choice);
+    double const listed = cost.lists(shape);
+    bool const fp32     = choice->encoding == list_encoding::float32;
+    if (force == "cost" && (fp32 || listed >= brute)) {
+      SIRIUS_LOG_INFO(
+        "[vector_join_rewrite] '{}': brute force ({:.3f} s est.) over the lists of '{}' ({:.3f} s)",
+        table_name,
+        brute,
+        choice->clustering,
+        listed);
+      req.statement_clusters = 0;
+      return false;
+    }
+    req.n_probes = choice->n_clusters;
+    if (!scanned) {
+      req.search_mode = vector_join_search_mode::approx;
+      req.clustering  = choice->clustering;
+    }
+    SIRIUS_LOG_INFO(
+      "[vector_join_rewrite] searching '{}' through the lists of clustering '{}' ({:.3f} s est. vs "
+      "brute force {:.3f} s)",
+      table_name,
+      choice->clustering,
+      listed,
+      brute);
+    return true;
+  }
+
+  /// The suffix that keeps one metric's in-query lists apart from another's: cosine lists hold
+  /// unit rows, and inner-product lists are FLOAT16 where an l2 join's may be UINT8.
+  static std::string lists_suffix(const std::string& metric)
+  {
+    return metric == "cosine" ? "_cosine" : metric == "ip" ? "_ip" : "";
+  }
+
+  /// Lists an inner-product join can search: FLOAT16 rows with their FP32 rows kept (the bounded
+  /// search, re-scored in FP32), or FP32 rows.
+  static bool ip_searchable(duckdb::SiriusContext& ctx, exact_lists_choice const& choice)
+  {
+    if (choice.encoding == list_encoding::float32) { return true; }
+    if (choice.encoding != list_encoding::float16) { return false; }
+    auto const* lists = find_cluster_lists(ctx, choice.clustering);
+    return lists != nullptr && lists->has_exact_rows() && bound_filter_f16_supports(lists->dim);
+  }
+
+  /// The name lists built inside a query are kept under.
+  static std::string auto_lists_name(const std::string& table,
+                                     const std::string& column,
+                                     const std::string& metric)
+  {
+    return "__sirius_auto_" + table + "_" + column + lists_suffix(metric);
+  }
+
+  /// The name the exact join's single list of codes, built inside a query, is kept under: apart
+  /// from the approximate join's partitions, which it must not stand in for.
+  static std::string codes_lists_name(const std::string& table,
+                                      const std::string& column,
+                                      const std::string& metric)
+  {
+    return "__sirius_auto_codes_" + table + "_" + column + lists_suffix(metric);
+  }
+
+  /// The lists build_lists_in_query would write, left to the join to build over the corpus it
+  /// scans (vector_join_request::statement_clusters): described as the FLOAT16 lists they are
+  /// unless every value turns out to be a byte, for the costs that choose between them and brute
+  /// force.
+  static std::optional<exact_lists_choice> lists_in_statement(vector_join_request& req,
+                                                              std::int64_t n_clusters)
+  {
+    req.statement_clusters = std::max<std::int64_t>(n_clusters, 1);
+    return exact_lists_choice{
+      std::string{"(built by the join over its scan)"},
+      req.statement_clusters,
+      list_encoding::float16,
+      true,
+      n_clusters == 1};
+  }
+
+  /// Fits a clustering of the pinned column into @p n_clusters and writes its lists, under @p name,
+  /// which later queries find them by: UINT8 when every value is a byte (the build checks), else
+  /// FLOAT16, which keeps the FP32 rows to re-score against. Nullopt, and the join runs by brute
+  /// force, when the build is refused (no room for the lists or their FP32 copy).
+  std::optional<exact_lists_choice> build_lists_in_query(duckdb::SiriusContext& ctx,
+                                                         vector_join_request const& req,
+                                                         const std::string& catalog,
+                                                         const std::string& schema,
+                                                         const std::string& table,
+                                                         const std::string& column,
+                                                         std::uint64_t rows,
+                                                         std::int64_t n_clusters,
+                                                         std::string const& name)
+  {
+    bool const cosine = req.metric == "cosine";
+    try {
+      auto const table_identity = pinned_table_identity(_context, catalog, schema, table);
+      kmeans_fit_request fit;
+      fit.name           = name;
+      fit.catalog        = catalog;
+      fit.schema         = schema;
+      fit.table          = table;
+      fit.table_identity = table_identity;
+      fit.column         = column;
+      fit.dim     = req.dim;
+      fit.spec.n_clusters =
+        std::clamp<std::int64_t>(n_clusters, 1, static_cast<std::int64_t>(rows));
+      run_kmeans_fit(ctx, fit);
+      kmeans_assign_request lists;
+      lists.clustering = name;
+      lists.catalog    = catalog;
+      lists.schema     = schema;
+      lists.table      = table;
+      lists.table_identity = table_identity;
+      lists.column     = column;
+      lists.dim        = req.dim;
+      // Inner-product lists are FLOAT16 like cosine's, but of the rows as they are.
+      run_kmeans_build_lists(
+        ctx,
+        lists,
+        cosine || req.metric == "ip" ? list_storage::float16 : list_storage::exact,
+        false,
+        cosine);
+    } catch (std::exception const& e) {
+      SIRIUS_LOG_INFO(
+        "[vector_join_rewrite] building lists for '{}' declined: {}", table, e.what());
+      return std::nullopt;
+    }
+    SIRIUS_LOG_INFO(
+      "[vector_join_rewrite] built lists '{}' ({} clusters) for '{}' inside the query",
+      name,
+      n_clusters,
+      table);
+    return find_named_lists(
+      _context, ctx, name, catalog, schema, table, column, cosine, static_cast<std::int64_t>(rows));
+  }
+
+
+ private:
+  duckdb::ClientContext& _context;
+};
+
 class rewriter {
  public:
   rewriter(duckdb::ClientContext& context,
@@ -1007,311 +1375,21 @@ class rewriter {
     return copy;
   }
 
-  /// `SET vector_join_probes = c` (c > 0) makes a join that can go through cluster lists
-  /// approximate, as `ivfflat.probes` does in pgvector: each probe row searches its n_p nearest
-  /// clusters. The lists are those of the clustering `vector_join_clustering` names, when it is
-  /// one of this column's, or else lists that would answer exactly. With no such lists they are
-  /// built inside the query (build_lists_in_query) and kept for later statements, the way a hash
-  /// join builds its table: a join amortizes its index over one statement, so the build is
-  /// charged to it. The setting does not apply when the build is refused or disabled
-  /// (SIRIUS_VSS_BUILD_IN_QUERY=0). c = 0, the default, is the exact join.
-  ///
-  /// How many clusters N such a build makes is `vector_join_clusters`, or when that is 0 the
-  /// count with the least estimated build plus search time for @p probe_rows
-  /// (choose_cluster_count): sqrt(rows) clusters (at most 1,024) for a few thousand probe rows,
-  /// more for a probe side in the millions. On lists Sirius sized itself n_p is then
-  /// min(ceil(c * sqrt(N)), N) (scaled_probes), so the same c gives about the same recall
-  /// whichever N was built. Against lists the user built or named, and under an explicit
-  /// vector_join_clusters, c is the number of clusters searched, rounded up (literal_probes).
-  bool use_approximate_lists(vector_join_request& req,
-                             duckdb::SiriusContext& ctx,
-                             const std::string& catalog,
-                             const std::string& schema,
-                             const std::string& table,
-                             const std::string& column,
-                             std::uint64_t rows,
-                             double probe_rows)
+  /// use_lists for a corpus relation the join scans: named after the table it reads, when it is
+  /// one, for the log.
+  bool use_lists_over_scan(vector_join_request& req,
+                           LogicalOperator& corpus,
+                           std::uint64_t rows,
+                           double probe_rows)
   {
-    duckdb::Value setting;
-    if (!_context.TryGetCurrentSetting("vector_join_probes", setting) || setting.IsNull()) {
-      return false;
-    }
-    // Negative and NaN values are refused by the SET; any that reach here run the exact join.
-    auto const c = setting.GetValue<double>();
-    if (!(c > 0.0)) { return false; }
-    bool const cosine           = req.metric == "cosine";
-    bool const ip               = req.metric == "ip";
-    auto const n_rows           = static_cast<std::int64_t>(rows);
-    std::int64_t fixed_clusters = 0;
-    if (_context.TryGetCurrentSetting("vector_join_clusters", setting) && !setting.IsNull()) {
-      fixed_clusters = std::max<std::int64_t>(setting.GetValue<std::int64_t>(), 0);
-    }
-    std::optional<exact_lists_choice> choice;
-    if (_context.TryGetCurrentSetting("vector_join_clustering", setting) && !setting.IsNull() &&
-        !setting.ToString().empty()) {
-      choice = find_named_lists(
-        _context, ctx, setting.ToString(), catalog, schema, table, column, cosine, n_rows);
-      // An inner-product join searches FLOAT16 (re-scored) or FP32 rows only.
-      if (choice && ip && !ip_searchable(ctx, *choice)) { choice.reset(); }
-    }
-    if (!choice) {
-      choice =
-        find_exact_lists(_context, ctx, catalog, schema, table, column, cosine, n_rows, 2, ip);
-    }
-    if (!choice) {
-      auto const* build_env = std::getenv("SIRIUS_VSS_BUILD_IN_QUERY");
-      if (build_env != nullptr && std::strcmp(build_env, "0") == 0) { return false; }
-      if (req.dim % 16 != 0) { return false; }
-      auto n_clusters = std::min(fixed_clusters, n_rows);
-      if (n_clusters == 0) {
-        // UINT8 lists if every value is a byte, FLOAT16 otherwise; on the device either way.
-        access_path_shape shape;
-        shape.probe_rows           = std::max(probe_rows, 1.0);
-        shape.corpus_rows          = static_cast<double>(rows);
-        shape.dim                  = static_cast<double>(req.dim);
-        shape.list_bytes_per_value = cosine || ip ? 2 : 1;
-        n_clusters =
-          choose_cluster_count(access_path_cost{current_device_scale()}, shape, c).n_clusters;
+    std::string name = "corpus";
+    if (corpus.type == LogicalOperatorType::LOGICAL_GET) {
+      if (auto table = corpus.Cast<duckdb::LogicalGet>().GetTable()) {
+        name = table->name.GetIdentifierName();
       }
-      choice = build_lists_in_query(ctx,
-                                    req,
-                                    catalog,
-                                    schema,
-                                    table,
-                                    column,
-                                    rows,
-                                    n_clusters,
-                                    auto_lists_name(table, column, req.metric));
     }
-    if (!choice) { return false; }
-    req.search_mode = vector_join_search_mode::approx;
-    req.clustering  = choice->clustering;
-    req.n_probes =
-      fixed_clusters == 0 && choice->clustering == auto_lists_name(table, column, req.metric)
-        ? scaled_probes(c, choice->n_clusters)
-        : literal_probes(c, choice->n_clusters);
-    SIRIUS_LOG_INFO(
-      "[vector_join_rewrite] searching '{}' through {} of the {} clusters of '{}' "
-      "(vector_join_probes = {})",
-      table,
-      req.n_probes,
-      choice->n_clusters,
-      choice->clustering,
-      c);
-    return true;
-  }
-
-  /// Picks how a join over a pinned corpus runs. Under vector_join_probes, approximately through
-  /// cluster lists (use_approximate_lists). Otherwise exactly: brute force over the pinned rows,
-  /// or every cluster of its lists searched (the same answer, from fewer bytes and on tensor
-  /// cores), by access_path_cost on the estimated probe rows. With no lists it builds them first
-  /// (kept for later queries, like an index) when building and searching beats brute force,
-  /// unless SIRIUS_VSS_BUILD_IN_QUERY=0. SIRIUS_VSS_ACCESS_PATH=lists|brute forces the choice;
-  /// SIRIUS_VSS_REWRITE_LISTS=0 is brute.
-  bool use_lists(vector_join_request& req,
-                 duckdb::TableCatalogEntry& table,
-                 const std::string& column,
-                 std::uint64_t rows,
-                 double probe_rows)
-  {
-    auto const* env = std::getenv("SIRIUS_VSS_REWRITE_LISTS");
-    if (env != nullptr && std::strcmp(env, "0") == 0) { return false; }
-    auto const* forced = std::getenv("SIRIUS_VSS_ACCESS_PATH");
-    std::string_view const force{forced != nullptr ? forced : "cost"};
-    if (force == "brute") { return false; }
-    auto sirius_ctx = _context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-    if (!sirius_ctx) { return false; }
-    auto const& catalog    = table.ParentCatalog().GetName().GetIdentifierName();
-    auto const& schema     = table.ParentSchema().name.GetIdentifierName();
-    auto const& table_name = table.name.GetIdentifierName();
-    if (use_approximate_lists(
-          req, *sirius_ctx, catalog, schema, table_name, column, rows, probe_rows)) {
-      return true;
-    }
-    bool const cosine = req.metric == "cosine";
-    bool const ip     = req.metric == "ip";
-    auto choice       = find_exact_lists(_context,
-                                         *sirius_ctx,
-                                         catalog,
-                                         schema,
-                                         table_name,
-                                         column,
-                                         cosine,
-                                         static_cast<std::int64_t>(rows),
-                                         1,
-                                         ip);
-    auto pin          = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
-      catalog, schema, table_name, sirius::vss::table_identity_of(table));
-    access_path_shape shape;
-    shape.probe_rows       = std::max(probe_rows, 1.0);
-    shape.corpus_rows      = static_cast<double>(rows);
-    shape.dim              = static_cast<double>(req.dim);
-    shape.corpus_on_device = pin != nullptr && pin->tier == cucascade::memory::Tier::GPU;
-    access_path_cost const cost{current_device_scale()};
-    double const brute = cost.brute(shape);
-    auto describe      = [&](exact_lists_choice const& c) {
-      shape.list_bytes_per_value = c.encoding == list_encoding::uint8     ? 1
-                                        : c.encoding == list_encoding::float16 ? 2
-                                                                               : 4;
-      shape.lists_on_device      = c.on_device;
-      shape.n_clusters           = static_cast<double>(c.n_clusters);
-      shape.inexact_unseeded     = c.encoding == list_encoding::float16 && !c.seeded;
-    };
-    if (!choice) {
-      auto const* build_env = std::getenv("SIRIUS_VSS_BUILD_IN_QUERY");
-      if (force == "cost" && build_env != nullptr && std::strcmp(build_env, "0") == 0) {
-        return false;
-      }
-      // The exact join's compact layout, when it beats brute force: one list of codes, UINT8 if
-      // every value is a byte, FLOAT16 otherwise (FP32 lists hold the same bytes as the pin and
-      // never pay). It is searched whole, its bound lowered as it goes, so there is no clustering
-      // to fit: partitions would only cut the corpus into smaller GEMMs.
-      if (req.dim % 16 != 0) { return false; }
-      shape.list_bytes_per_value = cosine || ip ? 2 : 1;
-      shape.lists_on_device      = true;
-      shape.n_clusters           = 1;
-      shape.unit_rows            = cosine;
-      double const built         = cost.codes(shape) + cost.lists(shape);
-      if (force == "cost" && built >= brute) {
-        SIRIUS_LOG_INFO(
-          "[vector_join_rewrite] '{}': brute force ({:.3f} s est.) over writing its codes "
-          "({:.3f} s)",
-          table_name,
-          brute,
-          built);
-        return false;
-      }
-      SIRIUS_LOG_INFO(
-        "[vector_join_rewrite] '{}': writing its codes and searching them ({:.3f} s est.) over "
-        "brute force ({:.3f} s)",
-        table_name,
-        built,
-        brute);
-      choice = build_lists_in_query(*sirius_ctx,
-                                    req,
-                                    catalog,
-                                    schema,
-                                    table_name,
-                                    column,
-                                    rows,
-                                    1,
-                                    codes_lists_name(table_name, column, req.metric));
-      if (!choice) { return false; }
-    }
-    describe(*choice);
-    double const listed = cost.lists(shape);
-    bool const fp32     = choice->encoding == list_encoding::float32;
-    if (force == "cost" && (fp32 || listed >= brute)) {
-      SIRIUS_LOG_INFO(
-        "[vector_join_rewrite] '{}': brute force ({:.3f} s est.) over the lists of '{}' ({:.3f} s)",
-        table_name,
-        brute,
-        choice->clustering,
-        listed);
-      return false;
-    }
-    req.search_mode = vector_join_search_mode::approx;
-    req.clustering  = choice->clustering;
-    req.n_probes    = choice->n_clusters;
-    SIRIUS_LOG_INFO(
-      "[vector_join_rewrite] searching '{}' through the lists of clustering '{}' ({:.3f} s est. vs "
-      "brute force {:.3f} s)",
-      table_name,
-      choice->clustering,
-      listed,
-      brute);
-    return true;
-  }
-
-  /// The suffix that keeps one metric's in-query lists apart from another's: cosine lists hold
-  /// unit rows, and inner-product lists are FLOAT16 where an l2 join's may be UINT8.
-  static std::string lists_suffix(const std::string& metric)
-  {
-    return metric == "cosine" ? "_cosine" : metric == "ip" ? "_ip" : "";
-  }
-
-  /// Lists an inner-product join can search: FLOAT16 rows with their FP32 rows kept (the bounded
-  /// search, re-scored in FP32), or FP32 rows.
-  static bool ip_searchable(duckdb::SiriusContext& ctx, exact_lists_choice const& choice)
-  {
-    if (choice.encoding == list_encoding::float32) { return true; }
-    if (choice.encoding != list_encoding::float16) { return false; }
-    auto const* lists = find_cluster_lists(ctx, choice.clustering);
-    return lists != nullptr && lists->has_exact_rows() && bound_filter_f16_supports(lists->dim);
-  }
-
-  /// The name lists built inside a query are kept under.
-  static std::string auto_lists_name(const std::string& table,
-                                     const std::string& column,
-                                     const std::string& metric)
-  {
-    return "__sirius_auto_" + table + "_" + column + lists_suffix(metric);
-  }
-
-  /// The name the exact join's single list of codes, built inside a query, is kept under: apart
-  /// from the approximate join's partitions, which it must not stand in for.
-  static std::string codes_lists_name(const std::string& table,
-                                      const std::string& column,
-                                      const std::string& metric)
-  {
-    return "__sirius_auto_codes_" + table + "_" + column + lists_suffix(metric);
-  }
-
-  /// Fits a clustering of the pinned column into @p n_clusters and writes its lists, under @p name,
-  /// which later queries find them by: UINT8 when every value is a byte (the build checks), else
-  /// FLOAT16, which keeps the FP32 rows to re-score against. Nullopt, and the join runs by brute
-  /// force, when the build is refused (no room for the lists or their FP32 copy).
-  std::optional<exact_lists_choice> build_lists_in_query(duckdb::SiriusContext& ctx,
-                                                         vector_join_request const& req,
-                                                         const std::string& catalog,
-                                                         const std::string& schema,
-                                                         const std::string& table,
-                                                         const std::string& column,
-                                                         std::uint64_t rows,
-                                                         std::int64_t n_clusters,
-                                                         std::string const& name)
-  {
-    bool const cosine = req.metric == "cosine";
-    try {
-      auto const table_identity = pinned_table_identity(_context, catalog, schema, table);
-      kmeans_fit_request fit;
-      fit.name           = name;
-      fit.catalog        = catalog;
-      fit.schema         = schema;
-      fit.table          = table;
-      fit.table_identity = table_identity;
-      fit.column         = column;
-      fit.dim     = req.dim;
-      fit.spec.n_clusters =
-        std::clamp<std::int64_t>(n_clusters, 1, static_cast<std::int64_t>(rows));
-      run_kmeans_fit(ctx, fit);
-      kmeans_assign_request lists;
-      lists.clustering = name;
-      lists.catalog    = catalog;
-      lists.schema     = schema;
-      lists.table      = table;
-      lists.table_identity = table_identity;
-      lists.column     = column;
-      lists.dim        = req.dim;
-      // Inner-product lists are FLOAT16 like cosine's, but of the rows as they are.
-      run_kmeans_build_lists(
-        ctx,
-        lists,
-        cosine || req.metric == "ip" ? list_storage::float16 : list_storage::exact,
-        false,
-        cosine);
-    } catch (std::exception const& e) {
-      SIRIUS_LOG_INFO(
-        "[vector_join_rewrite] building lists for '{}' declined: {}", table, e.what());
-      return std::nullopt;
-    }
-    SIRIUS_LOG_INFO(
-      "[vector_join_rewrite] built lists '{}' ({} clusters) for '{}' inside the query",
-      name,
-      n_clusters,
-      table);
-    return find_named_lists(
-      _context, ctx, name, catalog, schema, table, column, cosine, static_cast<std::int64_t>(rows));
+    return corpus_lists_chooser{_context}.use_lists(
+      req, "", "", name, req.right.column, rows, probe_rows, nullptr);
   }
 
   /// DuckDB's join order can push an inner join or a filter from above a LATERAL into its subquery
@@ -2201,7 +2279,7 @@ class rewriter {
               returned_names.push_back(rn[j]);
             }
             pinned = true;
-            use_lists(req,
+            corpus_lists_chooser{_context}.use_lists(req,
                       *table,
                       *name_of(corpus_vec),
                       right_rows,
@@ -2245,6 +2323,10 @@ class rewriter {
     bind.right_rows = right_rows;
     bind.probe_is_relation = !probe_pinned;
     auto const probe_rows  = bind.left_rows;
+    // A corpus the join scans gets the codes or lists a pinned one would, built by the join.
+    if (!pinned && !best_match) {
+      use_lists_over_scan(req, *corpus, right_rows, static_cast<double>(probe_rows));
+    }
 
     auto& entry = duckdb::Catalog::GetEntry<duckdb::TableFunctionCatalogEntry>(
       _context, SYSTEM_CATALOG, DEFAULT_SCHEMA, "sirius_knn_join_rel");
@@ -2657,6 +2739,7 @@ class rewriter {
     bind.left_rows         = probe_rows;
     bind.right_rows        = corpus_rows;
     bind.probe_is_relation = true;
+    use_lists_over_scan(req, *corpus, corpus_rows, static_cast<double>(probe_rows));
 
     auto& entry = duckdb::Catalog::GetEntry<duckdb::TableFunctionCatalogEntry>(
       _context, SYSTEM_CATALOG, DEFAULT_SCHEMA, "sirius_knn_join_rel");
@@ -3052,7 +3135,7 @@ class rewriter {
     // A constant comparison the operator evaluates itself, masking the corpus before the search
     // (as for the table function's own pushdown); anything else filters the join's output, and so
     // does everything when the search goes through the lists, which take no corpus predicates.
-    bool const via_lists = use_lists(
+    bool const via_lists = corpus_lists_chooser{_context}.use_lists(
       get_ptr->bind_data->Cast<SiriusVectorJoinBindData>().req,
       *table,
       *vec_name,
@@ -3156,36 +3239,76 @@ namespace {
 
 namespace {
 
-/// A table @p op reads whose pin no longer holds its rows (pinned_rows_mismatch), and why.
-std::optional<std::string> stale_pinned_table(duckdb::ClientContext& context,
-                                              duckdb::SiriusContext& ctx,
-                                              LogicalOperator& op)
+/// Drops what the pin of each table @p op reads kept beside it -- its clusterings and their lists,
+/// on every vector column -- once the pin no longer holds the table's rows (pinned_rows_mismatch).
+/// They describe rows the table may no longer hold. The rewrite then reads such a table through a
+/// scan, as an unpinned one, and builds what it needs from that.
+void drop_kept_for_stale_pins(duckdb::ClientContext& context,
+                              duckdb::SiriusContext& ctx,
+                              LogicalOperator& op)
 {
   if (op.type == LogicalOperatorType::LOGICAL_GET) {
     auto table = op.Cast<duckdb::LogicalGet>().GetTable();
     if (table && table->IsDuckTable()) {
-      auto const pin = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
-        table->ParentCatalog().GetName().GetIdentifierName(),
-        table->ParentSchema().name.GetIdentifierName(),
-        table->name.GetIdentifierName(),
-        sirius::vss::table_identity_of(*table));
+      auto const& catalog = table->ParentCatalog().GetName().GetIdentifierName();
+      auto const& schema  = table->ParentSchema().name.GetIdentifierName();
+      auto const& name    = table->name.GetIdentifierName();
+      auto const pin      = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
+        catalog, schema, name, sirius::vss::table_identity_of(*table));
       if (pin != nullptr) {
         if (auto const why =
               pinned_rows_mismatch(context, *pin, table->Cast<duckdb::DuckTableEntry>())) {
-          return "'" + table->name.GetIdentifierName() + "' no longer holds its rows (" + *why +
-                 ")";
+          std::size_t dropped = 0;
+          auto const names = table->GetColumns().GetColumnNames();
+          auto const types = table->GetColumns().GetColumnTypes();
+          for (std::size_t i = 0; i < names.size(); ++i) {
+            if (types[i].id() != duckdb::LogicalTypeId::ARRAY) { continue; }
+            for (auto const& clustering : ctx.get_cuvs_index_cache().names_on_column(
+                   catalog, schema, name, names[i], index_kind::kmeans_centroids)) {
+              erase_cluster_lists(ctx, clustering);
+              ctx.get_cuvs_index_cache().erase(clustering);
+              ++dropped;
+            }
+          }
+          SIRIUS_LOG_INFO(
+            "[vector_join_rewrite] the pin of '{}' no longer holds its rows ({}): dropped {} "
+            "clusterings kept beside it, and the join reads the table through a scan",
+            name,
+            *why,
+            dropped);
         }
       }
     }
   }
   for (auto& child : op.children) {
-    if (!child) { continue; }
-    if (auto why = stale_pinned_table(context, ctx, *child)) { return why; }
+    if (child) { drop_kept_for_stale_pins(context, ctx, *child); }
   }
-  return std::nullopt;
 }
 
 }  // namespace
+
+bool choose_corpus_lists(duckdb::ClientContext& context,
+                         vector_join_request& req,
+                         duckdb::TableCatalogEntry* pinned_corpus,
+                         std::uint64_t rows,
+                         double probe_rows,
+                         bool approximate)
+{
+  corpus_lists_chooser chooser{context};
+  if (pinned_corpus != nullptr) {
+    return chooser.use_lists(req,
+                             pinned_corpus->ParentCatalog().GetName().GetIdentifierName(),
+                             pinned_corpus->ParentSchema().name.GetIdentifierName(),
+                             pinned_corpus->name.GetIdentifierName(),
+                             req.right.column,
+                             rows,
+                             probe_rows,
+                             pinned_corpus,
+                             approximate);
+  }
+  return chooser.use_lists(
+    req, "", "", req.right.table, req.right.column, rows, probe_rows, nullptr, approximate);
+}
 
 bool plan_has_vector_distance(LogicalOperator& plan)
 {
@@ -3205,13 +3328,11 @@ std::size_t rewrite_plain_sql_vector_joins(duckdb::ClientContext& context,
 {
   if (!plan || !rewrite_enabled(context)) { return 0; }
   try {
-    // The rewritten join reads pinned rows as they were pinned, which a DELETE or INSERT since
-    // (or a CHECKPOINT) leaves behind the table; such a statement stays DuckDB's.
+    // A pin a DELETE, INSERT or UPDATE since (or a CHECKPOINT) left behind its table is not read:
+    // every pinned side is resolved through resolve_vector_join_side, which declines it, so the
+    // join scans the table instead. What the pin kept beside it goes now.
     if (auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")) {
-      if (auto const why = stale_pinned_table(context, *sirius_ctx, *plan)) {
-        SIRIUS_LOG_INFO("[vector_join_rewrite] left to DuckDB: the pin of {}", *why);
-        return 0;
-      }
+      drop_kept_for_stale_pins(context, *sirius_ctx, *plan);
     }
     rewriter r(context, binder, plan);
     auto const n = r.run();

@@ -128,6 +128,10 @@ struct vector_join_request {
   /// phase is verified against the pin path; the SQL surface that replaces it is the
   /// LATERAL-rewrite rule, which will set this unconditionally.
   bool build_from_scan{false};
+  /// On the build path: clusters of the lists the join builds over the corpus it scanned, once the
+  /// scan is done, and searches through n_probes of them; 1 is the exact join's single list of
+  /// codes. 0 searches the scanned rows as they are. The lists are the statement's own.
+  std::int64_t statement_clusters{0};
   /// Same for the probe side (`probe_source => 'scan'`). Independent of build_from_scan so each
   /// side can be A/B'd against its pinned path on its own.
   bool probe_from_scan{false};

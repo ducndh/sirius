@@ -2845,6 +2845,7 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   bool join_mode_is_set    = false;
   bool output_type_is_set  = false;
   bool eps_is_set          = false;
+  bool search_mode_is_set  = false;
   std::string left_schema  = "main";
   std::string right_schema = "main";
   std::vector<std::string> left_out_cols;
@@ -2870,7 +2871,8 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
     } else if (key == "metric") {
       req.metric = StringUtil::Lower(kv.second.ToString());
     } else if (key == "search_mode") {
-      auto const mode = StringUtil::Lower(kv.second.ToString());
+      search_mode_is_set = true;
+      auto const mode    = StringUtil::Lower(kv.second.ToString());
       // 'exact' is the exact join the SQL rewrite runs; 'exact-gemm' and 'exact-direct' are kept
       // for the harnesses that name them, and run the same search.
       if (mode == "exact" || mode == "exact-gemm") {
@@ -3188,6 +3190,28 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
         req.right.table + "' is pinned in " + std::to_string(right_chunks) +
         " chunks. Unset the variable to use the streaming operator.");
     }
+  }
+
+  // The exact join over the corpus's codes, as the plain-SQL rewrite runs the same join: built
+  // now and kept beside a pinned corpus, or by the join over a corpus it scans. With no
+  // search_mode, the session's vector_join_probes makes it approximate as it does plain SQL.
+  if (req.clustering.empty() && req.build_cluster_column.empty() &&
+      req.search_mode == vector_join_search_mode::exact_gemm) {
+    duckdb::TableCatalogEntry* pinned_corpus = nullptr;
+    if (!req.build_from_scan) {
+      pinned_corpus = &Catalog::GetEntry(context,
+                                         CatalogType::TABLE_ENTRY,
+                                         QualifiedName(Identifier(req.right.catalog),
+                                                       Identifier(req.right.schema),
+                                                       Identifier(req.right.table)))
+                         .Cast<duckdb::TableCatalogEntry>();
+    }
+    std::ignore = sirius::vss::choose_corpus_lists(context,
+                                                   req,
+                                                   pinned_corpus,
+                                                   result->right_rows,
+                                                   static_cast<double>(result->left_rows),
+                                                   /*approximate=*/!search_mode_is_set);
   }
 
   return_types.push_back(LogicalType::FLOAT);

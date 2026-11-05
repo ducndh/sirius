@@ -526,6 +526,7 @@ void serialize_vector_join_bind_data(duckdb::Serializer& serializer,
   serializer.WriteProperty(142, "probe_is_relation", data.probe_is_relation);
   serializer.WriteProperty(143, "key_differs", req.key_differs);
   serializer.WriteProperty(144, "key_is_rowid", req.key_is_rowid);
+  serializer.WriteProperty(145, "statement_clusters", req.statement_clusters);
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
@@ -569,6 +570,7 @@ duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
   result->probe_is_relation = deserializer.ReadProperty<bool>(142, "probe_is_relation");
   req.key_differs           = deserializer.ReadProperty<bool>(143, "key_differs");
   req.key_is_rowid          = deserializer.ReadProperty<bool>(144, "key_is_rowid");
+  req.statement_clusters    = deserializer.ReadProperty<std::int64_t>(145, "statement_clusters");
   return std::move(result);
 }
 

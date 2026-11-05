@@ -30,6 +30,7 @@
 #include "vss/device_context_guard.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/pinned_column.hpp"
+#include "vss/sirius_physical_vector_join_stream.hpp"
 #include "vss/vector_join_binding.hpp"
 #include "vss/vector_search_internal.hpp"
 
@@ -81,12 +82,84 @@ namespace sirius::vss {
 
 namespace {
 
-/// Handles every kmeans function needs before it can touch a pinned column.
+/// Handles every kmeans function needs before it can touch the rows it reads: a pinned column, or
+/// the chunks a statement scanned itself (`chunks`, with no pin).
 struct kmeans_context {
   cucascade::memory::memory_space* space;
   const cucascade::memory::memory_space* host_space;
   std::shared_ptr<const scan_manager::pinned_entry> pin;
   int target_gpu;
+  op::vector_chunk_source* chunks{nullptr};
+
+  [[nodiscard]] std::int64_t n_rows() const
+  {
+    if (pin) { return static_cast<std::int64_t>(pin->num_rows); }
+    std::int64_t rows = 0;
+    for (std::size_t i = 0; i < chunks->num_chunks(); ++i) {
+      rows += static_cast<std::int64_t>(chunks->chunk_rows(i));
+    }
+    return rows;
+  }
+  [[nodiscard]] std::size_t n_chunks(const std::string& column) const
+  {
+    return pin ? pinned_column_chunk_count(*pin, column) : chunks->num_chunks();
+  }
+  /// Scanned chunks the engine may have moved off the device count as host rows: staging them
+  /// can be a copy across PCIe.
+  [[nodiscard]] cucascade::memory::Tier tier() const
+  {
+    if (pin) { return pin->tier; }
+    return chunks->is_streaming() ? cucascade::memory::Tier::HOST : cucascade::memory::Tier::GPU;
+  }
+  [[nodiscard]] std::optional<pinned_rows_map> map_rows(const std::string& column,
+                                                        std::int64_t dim,
+                                                        rmm::cuda_stream_view stream,
+                                                        rmm::device_async_resource_ref mr) const
+  {
+    if (!pin) { return std::nullopt; }
+    return map_pinned_rows(*pin, column, dim, *space, stream, mr);
+  }
+  [[nodiscard]] staged_pinned_chunk stage(const std::string& column,
+                                          std::size_t i,
+                                          rmm::cuda_stream_view stream,
+                                          const telemetry::batch_telemetry_info& telemetry) const
+  {
+    if (pin) { return stage_pinned_column_chunk(*pin, column, i, *space, stream, telemetry); }
+    auto staged = std::make_shared<op::staged_vector_chunk>(chunks->stage(i, *space, stream));
+    staged_pinned_chunk out;
+    out.view = staged->view;
+    out.keep = std::move(staged);
+    return out;
+  }
+};
+
+/// A walk over a kmeans_context's chunks: a pinned column's, prefetching the next HOST-tier chunk
+/// (pinned_chunk_walk), or a statement's own, staged one at a time.
+class context_chunk_walk {
+ public:
+  context_chunk_walk(const kmeans_context& c,
+                     const std::string& column,
+                     rmm::cuda_stream_view stream,
+                     const telemetry::batch_telemetry_info& telemetry)
+    : _c(c), _column(column), _stream(stream), _telemetry(telemetry)
+  {
+    if (c.pin) { _pin_walk.emplace(*c.pin, column, *c.space, stream, telemetry); }
+  }
+  [[nodiscard]] staged_pinned_chunk take(std::size_t i)
+  {
+    return _pin_walk ? _pin_walk->take(i) : _c.stage(_column, i, _stream, _telemetry);
+  }
+  void prefetch_after(std::size_t i)
+  {
+    if (_pin_walk) { _pin_walk->prefetch_after(i); }
+  }
+
+ private:
+  const kmeans_context& _c;
+  std::string _column;
+  rmm::cuda_stream_view _stream;
+  const telemetry::batch_telemetry_info& _telemetry;
+  std::optional<pinned_chunk_walk> _pin_walk;
 };
 
 kmeans_context resolve_context(duckdb::SiriusContext& ctx,
@@ -163,10 +236,17 @@ const cudf::column* find_clustering_centroids(duckdb::SiriusContext& ctx, const 
   return held != nullptr ? held->get() : nullptr;
 }
 
-kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_request& req)
+namespace {
+
+/// The fit of run_kmeans_fit over the rows @p c reads, into @p centroids. @p erase_named drops the
+/// clustering of that name, and its lists, before the fit reserves its memory.
+kmeans_fit_result fit_centroids(duckdb::SiriusContext& ctx,
+                                const std::string& fn,
+                                const kmeans_fit_request& req,
+                                const kmeans_context& c,
+                                bool erase_named,
+                                std::unique_ptr<cudf::column>& centroids)
 {
-  static const std::string fn = "sirius_kmeans_fit";
-  auto const c = resolve_context(ctx, fn, req.catalog, req.schema, req.table, req.table_identity);
   device_context_guard device_guard{c.target_gpu};
   // The centroids outlive this call by design -- they stay in the index cache until the session
   // ends. rmm::device_buffer records the stream it was allocated on and deallocates on that same
@@ -174,7 +254,7 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
   // and the free would run on a dead stream. The default stream outlives both.
   auto stream = cudf::get_default_stream();
 
-  auto const n_rows = static_cast<std::int64_t>(c.pin->num_rows);
+  auto const n_rows = c.n_rows();
   if (n_rows == 0) {
     throw duckdb::InvalidInputException(fn + ": table '" + req.table + "' is empty");
   }
@@ -201,8 +281,10 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
   auto& index_cache = ctx.get_cuvs_index_cache();
   // Free the old clustering's reservation before asking for the new one, so re-fitting under
   // the same name does not have to fit both at once.
-  index_cache.erase(req.name);
-  index_cache.erase(lists_key(req.name));
+  if (erase_named) {
+    index_cache.erase(req.name);
+    index_cache.erase(lists_key(req.name));
+  }
   auto reservation = index_cache.reserve_index_memory(footprint_of(train_rows), c.target_gpu);
   // The default sample shrinks to what the device can train on, down to 32 a centroid; the rows it
   // took are what the function reports. A sample asked for is not shrunk.
@@ -234,9 +316,8 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
   auto const mr = c.space->get_default_allocator();
 
   telemetry::batch_telemetry_info const telemetry_info{};
-  auto const n_chunks = pinned_column_chunk_count(*c.pin, req.column);
+  auto const n_chunks = c.n_chunks(req.column);
 
-  std::unique_ptr<cudf::column> centroids;
   std::int64_t sampled = 0;
   {
     // Each chunk is staged, reduced to its share of the sample, and released before the next
@@ -250,8 +331,8 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
     // pin's mapping. They are a few percent of the column, which staging moved whole to take them.
     // One cluster's few hundred rows are read so on either tier, without a sync per chunk.
     bool const one_mean = n_clusters == 1 && !req.spec.rows_are_centroids && one_list_fast();
-    auto const map      = c.pin->tier == cucascade::memory::Tier::HOST || one_mean
-                            ? map_pinned_rows(*c.pin, req.column, req.dim, *c.space, stream, mr)
+    auto const map      = c.tier() == cucascade::memory::Tier::HOST || one_mean
+                            ? c.map_rows(req.column, req.dim, stream, mr)
                             : std::nullopt;
     for (std::size_t i = 0; map && i < n_chunks; ++i) {
       auto const first = map->chunk_first_row[i];
@@ -265,8 +346,7 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
       sampled += take;
     }
     for (std::size_t i = 0; !map && i < n_chunks; ++i) {
-      auto staged =
-        stage_pinned_column_chunk(*c.pin, req.column, i, *c.space, stream, telemetry_info);
+      auto staged     = c.stage(req.column, i, stream, telemetry_info);
       auto const rows = static_cast<std::int64_t>(staged.view.size());
       if (rows == 0) { continue; }
 
@@ -308,6 +388,23 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
       centroids            = train_centroids(views, req.dim, spec, stream, mr);
     }
   }
+  (void)reserved_bytes;
+  return kmeans_fit_result{n_clusters, req.dim, sampled, n_rows};
+}
+
+}  // namespace
+
+kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_request& req)
+{
+  static const std::string fn = "sirius_kmeans_fit";
+  auto const c = resolve_context(ctx, fn, req.catalog, req.schema, req.table, req.table_identity);
+  device_context_guard device_guard{c.target_gpu};
+  std::unique_ptr<cudf::column> centroids;
+  auto const fitted = fit_centroids(ctx, fn, req, c, /*erase_named=*/true, centroids);
+  auto const n_rows     = fitted.n_rows;
+  auto const n_clusters = fitted.n_clusters;
+  auto const metric     = ann_distance_type_from_metric(req.metric);
+  auto& index_cache     = ctx.get_cuvs_index_cache();
   index_metadata meta;
   meta.kind           = index_kind::kmeans_centroids;
   meta.catalog_name   = req.catalog;
@@ -319,11 +416,9 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
   meta.n_lists        = n_clusters;
   meta.metric         = metric;
   meta.resident_bytes = static_cast<std::size_t>(centroids->size()) * sizeof(float);
-  (void)reserved_bytes;
   index_cache.insert(
     req.name, std::move(meta), make_cuvs_index(std::move(centroids)), rmm::cuda_stream{});
-
-  return kmeans_fit_result{n_clusters, req.dim, sampled, n_rows};
+  return fitted;
 }
 
 std::unique_ptr<cucascade::host_data_representation> run_kmeans_assign(
@@ -508,39 +603,17 @@ void erase_cluster_lists(duckdb::SiriusContext& ctx, const std::string& clusteri
   ctx.get_cuvs_index_cache().erase(lists_key(clustering));
 }
 
-cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
-                                            const kmeans_assign_request& req,
-                                            list_storage storage,
-                                            bool host_tier,
-                                            bool unit_rows)
+namespace {
+
+/// The refusals of run_kmeans_build_lists that come before any lists are dropped or built.
+void check_lists_storage(const std::string& fn,
+                         const kmeans_assign_request& req,
+                         list_storage storage,
+                         bool unit_rows)
 {
-  static const std::string fn = "sirius_kmeans_build_lists";
   if (unit_rows && (storage == list_storage::uint8 || storage == list_storage::int8)) {
     throw duckdb::InvalidInputException(
       fn + ": metric => 'cosine' stores unit rows, which need storage => 'float16' or 'float32'");
-  }
-  auto const c = resolve_context(ctx, fn, req.catalog, req.schema, req.table, req.table_identity);
-  device_context_guard device_guard{c.target_gpu};
-  // The lists outlive this call in the index cache, and a device_buffer frees on the stream it
-  // was allocated on, so the persistent buffers use the default stream (as the fit's centroids
-  // do); per-chunk scratch uses the owned one.
-  auto const persistent = cudf::get_default_stream();
-  rmm::cuda_stream stream_owner;
-  auto stream       = stream_owner.view();
-  auto const mr     = c.space->get_default_allocator();
-  auto& index_cache = ctx.get_cuvs_index_cache();
-
-  const auto* entry     = find_clustering_entry(ctx, req.clustering);
-  const auto* centroids = find_clustering_centroids(ctx, req.clustering);
-  if (entry == nullptr || centroids == nullptr) {
-    throw duckdb::InvalidInputException(fn + ": no clustering named '" + req.clustering +
-                                        "'; run sirius_kmeans_fit first");
-  }
-  if (entry->meta.dim != req.dim) {
-    throw duckdb::InvalidInputException(fn + ": clustering '" + req.clustering +
-                                        "' is over FLOAT[" + std::to_string(entry->meta.dim) +
-                                        "] vectors but column '" + req.column + "' is FLOAT[" +
-                                        std::to_string(req.dim) + "]");
   }
   // INT8 and FLOAT16 lists only filter; exact answers come from the bounded search's FP32
   // re-check, which needs these widths. Without it every join would refuse the lists (INT8) or
@@ -558,13 +631,36 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                         "a multiple of 16, not " +
                                         std::to_string(req.dim) + "; use 'float32'");
   }
+}
 
-  // Built afresh every time, so the old copy is freed before the new one is allocated.
-  index_cache.erase(lists_key(req.clustering));
+/// The build of run_kmeans_build_lists over the rows @p c reads, under @p centroids (@p n_clusters
+/// of them, fitted for @p centroid_metric), into @p lists. @p reserved_bytes is what its admission
+/// check reserved.
+cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
+                                 const std::string& fn,
+                                 const kmeans_assign_request& req,
+                                 list_storage storage,
+                                 bool host_tier,
+                                 bool unit_rows,
+                                 const kmeans_context& c,
+                                 const cudf::column* centroids,
+                                 std::int64_t const n_clusters,
+                                 cuvs::distance::DistanceType const centroid_metric,
+                                 cluster_lists& lists,
+                                 std::size_t& reserved_bytes)
+{
+  device_context_guard device_guard{c.target_gpu};
+  // The lists outlive this call in the index cache, and a device_buffer frees on the stream it
+  // was allocated on, so the persistent buffers use the default stream (as the fit's centroids
+  // do); per-chunk scratch uses the owned one.
+  auto const persistent = cudf::get_default_stream();
+  rmm::cuda_stream stream_owner;
+  auto stream       = stream_owner.view();
+  auto const mr     = c.space->get_default_allocator();
+  auto& index_cache = ctx.get_cuvs_index_cache();
 
-  auto const n_rows     = static_cast<std::int64_t>(c.pin->num_rows);
+  auto const n_rows     = c.n_rows();
   auto const dim        = req.dim;
-  auto const n_clusters = entry->meta.n_lists;
   if (n_rows == 0) {
     throw duckdb::InvalidInputException(fn + ": table '" + req.table + "' is empty");
   }
@@ -574,7 +670,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   bool const one_list = n_clusters == 1 && one_list_fast();
 
   telemetry::batch_telemetry_info const telemetry_info{};
-  auto const n_chunks = pinned_column_chunk_count(*c.pin, req.column);
+  auto const n_chunks = c.n_chunks(req.column);
   raft::device_resources res{stream};
   // Same switch as the join's phase timer; synchronizes, so only for attribution.
   auto const dbg = std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr;
@@ -609,7 +705,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   // a pass of its own would copy every row across PCIe once more. A column that is not bytes is
   // then refused after the build rather than before it.
   bool const check_in_pass_2 = check_uint8 && one_list && storage == list_storage::uint8 &&
-                               c.pin->tier != cucascade::memory::Tier::GPU;
+                               c.tier() != cucascade::memory::Tier::GPU;
   rmm::device_uvector<unsigned long long> non_uint8(1, stream, mr);
   CUDF_CUDA_TRY(cudaMemsetAsync(non_uint8.data(), 0, sizeof(unsigned long long), stream.get()));
   auto const refuse_non_uint8 = [&](unsigned long long count) {
@@ -676,10 +772,10 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     // One list (the exact join's compact layout) labels nothing: every row is in it, and the
     // labels are already zero.
     std::optional<centroid_labeler> labeler;
-    if (n_clusters > 1) { labeler.emplace(res, centroids->view(), dim, entry->meta.metric, mr); }
+    if (n_clusters > 1) { labeler.emplace(res, centroids->view(), dim, centroid_metric, mr); }
     bool check_pass_1  = check_uint8 && !check_in_pass_2;
     bool settled_early = false;
-    pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
+    context_chunk_walk walk{c, req.column, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0; i < n_chunks; ++i) {
       auto staged     = walk.take(i);
@@ -773,8 +869,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     bool const bytes = check_uint8 && non_uint8_host == 0;
     bool f16         = !bytes && bound_filter_f16_supports(req.dim);
     if (f16 && !unit_rows && !exact_copy_asked()) {
-      early_pin = map_pinned_rows(
-        *c.pin, req.column, dim, *c.space, persistent, c.space->get_default_allocator());
+      early_pin = c.map_rows(req.column, dim, persistent, c.space->get_default_allocator());
       if (early_pin && early_pin->n_rows() != n_rows) { early_pin.reset(); }
     }
     if (f16 && !early_pin) {
@@ -858,9 +953,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     throw std::runtime_error(fn + ": assignment produced a label outside the clustering");
   }
 
-  cluster_lists lists;
-  lists.pin            = c.pin.get();
-  lists.pin_snapshot   = c.pin->snapshot_identity;
+  lists.pin = c.pin.get();
+  if (c.pin) { lists.pin_snapshot = c.pin->snapshot_identity; }
   lists.table          = req.table;
   lists.column         = req.column;
   lists.n_rows         = n_rows;
@@ -923,7 +1017,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   std::unique_ptr<cucascade::memory::reservation> reservation;
   // FP32 lists live where the pin does; UINT8 ones are a quarter of the corpus and go to the
   // device whenever they fit, which is what takes the corpus stream off the query path.
-  bool on_device = !host_tier && (c.pin->tier == cucascade::memory::Tier::GPU ||
+  bool on_device = !host_tier && (c.tier() == cucascade::memory::Tier::GPU ||
                                   encoding != list_encoding::float32);
   if (on_device) {
     reservation = index_cache.reserve_index_memory(
@@ -952,7 +1046,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   // made on a stream it is attached to, and these buffers outlive every stream here, so drawing
   // them through it would count each byte twice -- reserved and allocated -- which at 100M rows is
   // enough to exhaust the pool. They are allocated from the space directly and counted once.
-  auto const reserved_bytes = reservation->size();
+  reserved_bytes = reservation->size();
   reservation.reset();
   auto const persistent_mr = c.space->get_default_allocator();
 
@@ -1013,7 +1107,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     lists.exact_pin = std::move(early_pin);
   } else if ((encoding == list_encoding::float16 || encoding == list_encoding::int8) &&
              !unit_rows && !exact_copy_asked()) {
-    lists.exact_pin = map_pinned_rows(*c.pin, req.column, dim, *c.space, persistent, persistent_mr);
+    lists.exact_pin = c.map_rows(req.column, dim, persistent, persistent_mr);
     if (lists.exact_pin && lists.exact_pin->n_rows() != n_rows) { lists.exact_pin.reset(); }
   }
   if ((encoding == list_encoding::float16 || encoding == list_encoding::int8) && !lists.exact_pin) {
@@ -1138,7 +1232,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         bytes -= now;
       }
     };
-    pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
+    context_chunk_walk walk{c, req.column, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0; i < n_chunks; ++i) {
       auto staged     = walk.take(i);
@@ -1331,7 +1425,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     bool const grouped_copies = !on_device || lists.exact_vectors != nullptr;
     std::vector<std::int64_t> order, grouped_dest;
     std::vector<std::int64_t> count(grouped_copies ? static_cast<std::size_t>(n_clusters) : 0);
-    pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
+    context_chunk_walk walk{c, req.column, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0, turn = 0; i < n_chunks; ++i) {
       auto staged     = walk.take(i);
@@ -1572,20 +1666,126 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     if (size == 0) { ++result.empty_lists; }
   }
 
+  (void)index_cache;
+  return result;
+}
+
+}  // namespace
+
+cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
+                                            const kmeans_assign_request& req,
+                                            list_storage storage,
+                                            bool host_tier,
+                                            bool unit_rows)
+{
+  static const std::string fn = "sirius_kmeans_build_lists";
+  // Unit rows refused before the pin is looked for, the width once the clustering is known.
+  if (unit_rows && (storage == list_storage::uint8 || storage == list_storage::int8)) {
+    check_lists_storage(fn, req, storage, unit_rows);
+  }
+  auto const c = resolve_context(ctx, fn, req.catalog, req.schema, req.table, req.table_identity);
+  device_context_guard device_guard{c.target_gpu};
+  auto& index_cache = ctx.get_cuvs_index_cache();
+
+  const auto* entry     = find_clustering_entry(ctx, req.clustering);
+  const auto* centroids = find_clustering_centroids(ctx, req.clustering);
+  if (entry == nullptr || centroids == nullptr) {
+    throw duckdb::InvalidInputException(fn + ": no clustering named '" + req.clustering +
+                                        "'; run sirius_kmeans_fit first");
+  }
+  if (entry->meta.dim != req.dim) {
+    throw duckdb::InvalidInputException(fn + ": clustering '" + req.clustering +
+                                        "' is over FLOAT[" + std::to_string(entry->meta.dim) +
+                                        "] vectors but column '" + req.column + "' is FLOAT[" +
+                                        std::to_string(req.dim) + "]");
+  }
+  check_lists_storage(fn, req, storage, unit_rows);
+
+  // Built afresh every time, so the old copy is freed before the new one is allocated.
+  index_cache.erase(lists_key(req.clustering));
+
+  cluster_lists lists;
+  std::size_t reserved_bytes = 0;
+  auto const metric          = entry->meta.metric;
+  auto const n_clusters      = entry->meta.n_lists;
+  auto result                = build_lists(ctx,
+                                fn,
+                                req,
+                                storage,
+                                host_tier,
+                                unit_rows,
+                                c,
+                                centroids,
+                                n_clusters,
+                                metric,
+                                lists,
+                                reserved_bytes);
+
   index_metadata meta;
   meta.kind           = index_kind::cluster_lists;
   meta.table_name     = req.table;
   meta.column_name    = req.column;
-  meta.dim            = dim;
-  meta.num_rows       = n_rows;
+  meta.dim            = req.dim;
+  meta.num_rows       = result.n_rows;
   meta.n_lists        = n_clusters;
-  meta.metric         = entry->meta.metric;
+  meta.metric         = metric;
   meta.resident_bytes = reserved_bytes;
   index_cache.insert(lists_key(req.clustering),
                      std::move(meta),
                      make_cuvs_index(std::move(lists)),
                      rmm::cuda_stream{});
   return result;
+}
+
+statement_lists build_statement_lists(duckdb::SiriusContext& ctx,
+                                      op::vector_chunk_source& chunks,
+                                      std::int64_t dim,
+                                      const std::string& metric,
+                                      std::int64_t n_clusters)
+{
+  static const std::string fn = "vector join";
+  auto& memory_manager = ctx.get_memory_manager();
+  auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  auto host_spaces     = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  if (gpu_spaces.empty() || host_spaces.empty()) {
+    throw duckdb::InvalidInputException(fn + ": no GPU or HOST memory space available");
+  }
+  auto* space = const_cast<cucascade::memory::memory_space*>(gpu_spaces.front());
+  kmeans_context const c{space, host_spaces.front(), nullptr, space->get_device_id(), &chunks};
+  device_context_guard device_guard{c.target_gpu};
+
+  // What build_lists_in_query asks of a pinned column: the fit's defaults, and lists that answer
+  // exactly, FLOAT16 for the metrics that score from them.
+  bool const cosine = metric == "cosine";
+  auto const storage =
+    cosine || metric == "ip" ? list_storage::float16 : list_storage::exact;
+  kmeans_assign_request assign;
+  assign.column = "vector";
+  assign.dim    = dim;
+  check_lists_storage(fn, assign, storage, cosine);
+
+  kmeans_fit_request fit;
+  fit.column          = assign.column;
+  fit.dim             = dim;
+  fit.spec.n_clusters = std::clamp<std::int64_t>(n_clusters, 1, std::max<std::int64_t>(c.n_rows(), 1));
+  statement_lists out;
+  auto const fitted =
+    fit_centroids(ctx, fn, fit, c, /*erase_named=*/false, out.centroids);
+  out.lists                  = std::make_unique<cluster_lists>();
+  std::size_t reserved_bytes = 0;
+  out.result                 = build_lists(ctx,
+                           fn,
+                           assign,
+                           storage,
+                           /*host_tier=*/false,
+                           cosine,
+                           c,
+                           out.centroids.get(),
+                           fitted.n_clusters,
+                           ann_distance_type_from_metric(fit.metric),
+                           *out.lists,
+                           reserved_bytes);
+  return out;
 }
 
 cucascade::read_only_data_batch lock_host_list_chunk(const cluster_lists& lists,

@@ -42,6 +42,14 @@ class ClientContext;
 class SiriusContext;
 }  // namespace duckdb
 
+namespace cudf {
+class column;
+}  // namespace cudf
+
+namespace sirius::op {
+class vector_chunk_source;
+}  // namespace sirius::op
+
 namespace sirius::scan_manager {
 struct pinned_entry;
 }  // namespace sirius::scan_manager
@@ -228,6 +236,24 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                             list_storage storage = list_storage::automatic,
                                             bool host_tier       = false,
                                             bool unit_rows       = false);
+
+/// Lists a statement builds for itself over the corpus rows it scanned, and the clustering they
+/// follow. Neither goes into the index cache: they live as long as the join that built them, and
+/// their row ids are positions in @p chunks' order.
+struct statement_lists {
+  std::unique_ptr<cudf::column> centroids;
+  std::unique_ptr<cluster_lists> lists;
+  cluster_lists_result result;
+};
+
+/// What build_lists_in_query builds over a pinned column -- a fit into @p n_clusters, then lists
+/// that answer exactly (UINT8 when every value is a byte, else FLOAT16 with an FP32 copy; FLOAT16
+/// of unit rows for cosine) -- built over the chunks of a corpus a statement scanned.
+[[nodiscard]] statement_lists build_statement_lists(duckdb::SiriusContext& ctx,
+                                                    op::vector_chunk_source& chunks,
+                                                    std::int64_t dim,
+                                                    const std::string& metric,
+                                                    std::int64_t n_clusters);
 
 /// The lists built for @p clustering, or nullptr when there are none.
 [[nodiscard]] const cluster_lists* find_cluster_lists(duckdb::SiriusContext& ctx,

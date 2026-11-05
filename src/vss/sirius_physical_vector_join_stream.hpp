@@ -411,6 +411,13 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// @ref build_side_ready_locked, so callers must check that first.
   void ensure_initialized_locked();
   void initialize_locked();
+  /// Lists of a corpus this join scanned, built once the scan is done (@c
+  /// vector_join_request::statement_clusters), and searched in place of the scanned chunks. A
+  /// build that is refused leaves the scanned chunks to be searched as they are. Caller holds
+  /// _op_mutex.
+  void build_statement_lists_locked();
+  /// HOST-tier lists' chunks into this query's repository manager. Caller holds _op_mutex.
+  void register_host_lists_locked();
 
   /// Build @c _chunk_cluster_runs and @c _cluster_rows on first use. Deferred out of init
   /// because reading the cluster column needs a memory space, which only a running task
@@ -474,6 +481,10 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// is what lets the downgrade executor spill them when the host fills; emptied when the
   /// operator finishes so the manager does not report them as leaked.
   ::cucascade::shared_data_repository* _lists_repo{nullptr};
+  /// What @c _centroids and @c _lists point at when this join built them over its scanned corpus,
+  /// rather than borrowing them from the index cache.
+  std::shared_ptr<const cudf::column> _statement_centroids;
+  std::shared_ptr<const sirius::vss::cluster_lists> _statement_lists;
   /// Probe blocks' FP32 rows while their tasks run, registered the same way under port "host_rows".
   /// Each task's vss::block_host_rows owns its entries. The sweep takes this operator's ports in
   /// name order, so the rows spill after the idle build and probe batches.

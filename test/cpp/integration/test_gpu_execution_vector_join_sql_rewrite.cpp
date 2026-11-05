@@ -1062,13 +1062,13 @@ bool any_line_has(std::vector<std::string> const& lines, std::string const& need
 }  // namespace
 
 TEST_CASE_METHOD(SqlRewriteFixture,
-                 "a DELETE or INSERT on a pinned corpus leaves the vector join to DuckDB",
+                 "a DELETE or INSERT on a pinned corpus has the vector join scan it",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
   // The pin holds the rows as they were pinned, a deleted row included and an inserted one
   // missing; ordinary scans reconcile that with DuckDB's visibility, but the vector join reads the
   // pinned rows as they are. It returned the deleted row 5 and missed the inserted 9999. Now the
-  // rewrite leaves such a statement to DuckDB, the table function refuses to read the pin, and
+  // rewrite reads such a table through a scan, the table function refuses to read the pin, and
   // the table function over a scan (which applies the visibility) answers.
   auto const floats = [](const std::string& seed) {
     return "list_transform(range(16), lambda d: ((hash(i * 100 + d + " + seed +
@@ -1103,9 +1103,13 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     UNSCOPED_INFO("query: " << sql);
     auto const expected = on_duckdb(sql);
     std::vector<std::vector<std::string>> got;
-    auto const lines = rewrite_log([&] { got = sorted_rows(*con, sql); });
+    auto const before = sirius::test::get_transparent_execution_stats(*con);
+    auto const lines  = rewrite_log([&] { got = sorted_rows(*con, sql); });
+    sirius::test::require_transparent_execution_delta(
+      before, sirius::test::get_transparent_execution_stats(*con), 1, 0, 1);
     CHECK(rows_match(got, expected));
-    CHECK(any_line_has(lines, "left to DuckDB: the pin of 'sr_dml' no longer holds its rows"));
+    CHECK(any_line_has(lines, "the pin of 'sr_dml' no longer holds its rows"));
+    CHECK(any_line_has(lines, "reads the table through a scan"));
   }
   auto const after = on_duckdb(lateral);
   REQUIRE(std::any_of(after.begin(), after.end(), [](auto const& r) { return r[1] == "9999"; }));
@@ -1125,7 +1129,7 @@ TEST_CASE_METHOD(SqlRewriteFixture,
   CHECK(rows_match(scanned_tvf, after));
 
   // A pin taken after a CHECKPOINT answers as DuckDB does too: from its rows, or, while the
-  // deleted rows are still in storage (and so in the pin), by leaving the statement to DuckDB.
+  // deleted rows are still in storage (and so in the pin), through a scan.
   run_ok("SELECT * FROM unpin_table('sr_dml');");
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'sr_dml', tier => 'gpu', format => 'duckdb');");
@@ -1177,7 +1181,7 @@ TEST_CASE_METHOD(SqlRewriteFixture,
   CHECK(built(rewrite_log([&] { require_gpu_matches_duckdb(*con, lateral); })));
 
   // An UPDATE while unpinned, then a re-pin: DuckDB updates a vector as a delete and an insert,
-  // so the pin holds the old row too, and the statement is DuckDB's.
+  // so the pin holds the old row too, and the join scans the table.
   run_ok("SELECT * FROM unpin_table('sr_rp');");
   run_ok(
     "UPDATE sr_rp SET vec = list_transform(range(16), lambda d: 1000.0::FLOAT)::FLOAT[16] "
