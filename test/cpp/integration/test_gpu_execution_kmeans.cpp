@@ -3420,14 +3420,14 @@ TEST_CASE_METHOD(KMeansFixture,
   auto const free_blocked = space.get_available_memory();
   for (int attempt = 0; attempt < 3; ++attempt) {
     CHECK_THROWS_AS(materialize.execute(input, stream), rmm::out_of_memory);
-    stream.sync();
+    stream.view().sync();
     CHECK(space.get_available_memory() == free_blocked);
   }
 
   // With the room back the same operator finishes its init.
   blocker.reset();
   auto const output = materialize.execute(input, stream);
-  stream.sync();
+  stream.view().sync();
   auto const* out = dynamic_cast<sirius::op::pipelineable_operator_data const*>(output.get());
   REQUIRE(out != nullptr);
   auto const batches = out->get_data_batches();

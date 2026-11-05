@@ -1407,7 +1407,7 @@ TEST_CASE_METHOD(VectorJoinFixture,
     REQUIRE(r);
     if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
     REQUIRE_FALSE(r->HasError());
-    return std::vector<std::string>(r->names.begin(), r->names.end());
+    return duckdb::IdentifiersToStrings(r->GetNames());
   };
 
   run_ok("CREATE TABLE dv_corpus (id INTEGER, tag VARCHAR, vec FLOAT[3]);");
