@@ -43,7 +43,6 @@ namespace sirius::vss {
 
 /// Which cuVS index algorithm a pinned entry holds. Drives how a search
 /// operator down-casts the type-erased index back to its concrete cuVS type.
-/// Only @c ivf_flat is built today; the rest are placeholders.
 enum class index_kind : std::uint8_t {
   ivf_flat,
   /// Not a search index: the centroid matrix of a clustering (sirius_kmeans_fit), held here
@@ -51,8 +50,9 @@ enum class index_kind : std::uint8_t {
   kmeans_centroids,
   /// The cluster-ordered copy of a corpus a clustering was built into (cluster_lists).
   cluster_lists,
+  /// One global graph and its rows, for an index nested-loop vector join (sirius_knn_join).
+  cagra,
   // ivf_pq,  // not supported yet
-  // cagra,  // not supported yet
 };
 
 /// Small, copyable description of a pinned cuVS index. Kept separate from the
@@ -271,12 +271,14 @@ class cuvs_index_cache {
   /// @p metric, only the entry for that metric is removed (compared up to
   /// canonicalization); with no metric, every index on the column is removed
   /// regardless of metric. Incarnation-blind, so a rebuild reclaims a superseded
-  /// index's memory. Returns the number of entries removed.
+  /// index's memory. With a @p kind, only entries of that kind. Returns the number of entries
+  /// removed.
   std::size_t erase_by_column(std::string_view catalog,
                               std::string_view schema,
                               std::string_view table,
                               std::string_view column,
-                              std::optional<cuvs::distance::DistanceType> metric = std::nullopt);
+                              std::optional<cuvs::distance::DistanceType> metric = std::nullopt,
+                              std::optional<index_kind> kind                     = std::nullopt);
 
   /// Drop all pinned indexes.
   void clear();

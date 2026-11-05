@@ -1451,6 +1451,7 @@ void sirius_physical_vector_join_stream::initialize_locked()
       }
     }
   }
+  if (_request.search_mode == vss::vector_join_search_mode::index) { prepare_index_join_locked(); }
   _initialized = true;
 }
 
@@ -1704,6 +1705,7 @@ void host_pair_block_pool::release()
 void sirius_physical_vector_join_stream::on_finalize_operator()
 {
   std::lock_guard<std::mutex> lg(_op_mutex);
+  _index_join.reset();
   _host_pair_blocks.release();
   auto drain = [](cucascade::shared_data_repository* repo) {
     if (repo == nullptr) { return; }
@@ -2294,6 +2296,18 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         std::format("{:.1f}", mem_space->get_max_memory() / 1073741824.0) +
         " GiB); ask for a smaller k or join fewer probe rows at a time");
     }
+  }
+
+  if (_request.search_mode == vss::vector_join_search_mode::index) {
+    auto shaped = index_join_task(queries, k_join, *mem_space, stream, mr);
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(std::move(shaped.left_rows));
+    cols.push_back(std::move(shaped.neighbors));
+    cols.push_back(std::move(shaped.distances));
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+    batches.push_back(sirius::make_data_batch(
+      std::make_unique<cudf::table>(std::move(cols)), *mem_space, stream, batch_telemetry()));
+    return output(std::move(batches));
   }
 
   raft::device_resources res{stream};
@@ -5569,6 +5583,9 @@ std::size_t sirius_physical_vector_join_stream::estimate_for_rows(std::size_t n_
                                                                   bool with_routing,
                                                                   bool planning_a_block) const
 {
+  if (_request.search_mode == vss::vector_join_search_mode::index) {
+    return index_join_estimate(n_left);
+  }
   // Live at once: the accumulator, one batch's partial, and the stacked pair the
   // merge reads (2x), plus the merge output. Six [n_left x k] blocks covers it, with
   // the same 1 MiB floor the split design used. Notably independent of the right

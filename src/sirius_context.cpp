@@ -1680,6 +1680,49 @@ void SiriusContext::record_transparent_decline(sirius::transparent::decline_reas
   }
 }
 
+void SiriusContext::begin_vector_join_index_stats(std::string index_event)
+{
+  std::lock_guard lock{vector_join_index_stats_mutex_};
+  vector_join_index_stats_             = {};
+  vector_join_index_stats_.index_event = std::move(index_event);
+}
+
+void SiriusContext::record_vector_join_index_build(double convert_seconds,
+                                                   double build_seconds,
+                                                   uint64_t peak_bytes,
+                                                   uint64_t resident_bytes)
+{
+  std::lock_guard lock{vector_join_index_stats_mutex_};
+  auto& s                 = vector_join_index_stats_;
+  s.build_convert_seconds = convert_seconds;
+  s.build_seconds         = build_seconds;
+  s.build_peak_bytes      = peak_bytes;
+  s.index_bytes           = resident_bytes;
+}
+
+void SiriusContext::record_vector_join_index_task(double convert_seconds,
+                                                  double search_seconds,
+                                                  double rescore_seconds,
+                                                  int64_t batches,
+                                                  int64_t probe_rows,
+                                                  int64_t misses)
+{
+  std::lock_guard lock{vector_join_index_stats_mutex_};
+  auto& s = vector_join_index_stats_;
+  s.probe_convert_seconds += convert_seconds;
+  s.search_seconds += search_seconds;
+  s.rescore_seconds += rescore_seconds;
+  s.batches += static_cast<uint64_t>(batches);
+  s.probe_rows += static_cast<uint64_t>(probe_rows);
+  s.misses += static_cast<uint64_t>(misses);
+}
+
+SiriusContext::vector_join_index_stats SiriusContext::get_vector_join_index_stats() const
+{
+  std::lock_guard lock{vector_join_index_stats_mutex_};
+  return vector_join_index_stats_;
+}
+
 SiriusContext::vector_join_prune_stats SiriusContext::get_vector_join_prune_stats() const noexcept
 {
   return vector_join_prune_stats{

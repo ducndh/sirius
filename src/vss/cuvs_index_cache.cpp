@@ -182,7 +182,8 @@ std::size_t cuvs_index_cache::erase_by_column(std::string_view catalog,
                                               std::string_view schema,
                                               std::string_view table,
                                               std::string_view column,
-                                              std::optional<cuvs::distance::DistanceType> metric)
+                                              std::optional<cuvs::distance::DistanceType> metric,
+                                              std::optional<index_kind> kind)
 {
   std::scoped_lock lock(_mutex);
   // With a metric, match that one canonically; with none, match every metric.
@@ -192,7 +193,8 @@ std::size_t cuvs_index_cache::erase_by_column(std::string_view catalog,
   for (auto it = _entries.begin(); it != _entries.end();) {
     auto const& meta = it->second->meta;
     if (meta.catalog_name == catalog && meta.schema_name == schema && meta.table_name == table &&
-        meta.column_name == column && (!wanted || canonical_metric(meta.metric) == *wanted)) {
+        meta.column_name == column && (!wanted || canonical_metric(meta.metric) == *wanted) &&
+        (!kind || meta.kind == *kind)) {
       it = _entries.erase(it);
       ++removed;
     } else {

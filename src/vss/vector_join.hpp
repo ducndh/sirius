@@ -19,6 +19,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb_table_identity.hpp"
+#include "vss/cagra_settings.hpp"
 
 #include <cstdint>
 #include <string>
@@ -41,10 +42,14 @@ enum class vector_join_mode : std::uint8_t {
 /// - exact_direct: search_mode => 'exact-direct' (undocumented): the same exhaustive search;
 ///                 kept for the harnesses that name it.
 /// - approx:       search_mode => 'approx': through the lists of a clustering, n_probes of them.
+/// - index:        search_mode => 'index': an index nested-loop join, every probe row walking one
+///                 global index over the pinned corpus (index_type => 'cagra'), built inside the
+///                 statement or reused. Approximate, and top-k per row only.
 enum class vector_join_search_mode : std::uint8_t {
   exact_direct,
   exact_gemm,
   approx,
+  index,
 };
 
 /// The type of score to emit for each result pair, and which value space the join
@@ -153,6 +158,8 @@ struct vector_join_request {
   /// The probe relation replaces a scalar subquery (the plain-SQL rewrite unwrapped it), so it
   /// must hold exactly one row, as the subquery had to.
   bool probe_scalar{false};
+  /// search_mode => 'index' only.
+  cagra_join_settings cagra;
 };
 
 struct SiriusVectorJoinBindData : public duckdb::TableFunctionData {

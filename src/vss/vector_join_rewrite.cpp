@@ -723,6 +723,16 @@ class corpus_lists_chooser {
                  std::uint64_t rows,
                  double probe_rows)
   {
+    // `SET vector_join_index = cagra`: a top-k join over a pinned corpus walks a graph over it,
+    // built in the statement or reused. A threshold join is not one, and stays on the lists.
+    duckdb::Value index_setting;
+    if (_context.TryGetCurrentSetting("vector_join_index", index_setting) &&
+        !index_setting.IsNull() && index_setting.ToString() == "cagra" &&
+        req.mode == vector_join_mode::per_row_top_k &&
+        (req.metric == "l2" || req.metric == "cosine")) {
+      req.search_mode = vector_join_search_mode::index;
+      return true;
+    }
     return use_lists(req,
                      table.ParentCatalog().GetName().GetIdentifierName(),
                      table.ParentSchema().name.GetIdentifierName(),
