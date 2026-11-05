@@ -2388,14 +2388,15 @@ static int64_t ResolveVectorColumn(ClientContext& context,
                                    std::string& out_table)
 {
   auto const qname          = QualifiedName::Parse(table_arg);
-  std::string const catalog = qname.catalog;
-  std::string const schema  = !qname.schema.empty() ? qname.schema : schema_arg;
+  auto const schema_name    = !qname.Schema().empty() ? qname.Schema() : Identifier(schema_arg);
   auto& entry_base =
-    Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog, schema, qname.name);
+    Catalog::GetEntry(context,
+                      CatalogType::TABLE_ENTRY,
+                      QualifiedName(qname.Catalog(), schema_name, qname.Name()));
   auto& entry = entry_base.Cast<DuckTableEntry>();
-  out_catalog = entry.ParentCatalog().GetName();
-  out_schema  = entry.ParentSchema().name;
-  out_table   = entry.name;
+  out_catalog = entry.ParentCatalog().GetName().GetIdentifierName();
+  out_schema  = entry.ParentSchema().name.GetIdentifierName();
+  out_table   = entry.name.GetIdentifierName();
 
   auto const& columns     = entry.GetColumns();
   auto const schema_names = columns.GetColumnNames();
@@ -2421,7 +2422,7 @@ struct KMeansFitData : public TableFunctionData {
 static unique_ptr<FunctionData> SiriusKMeansFitBind(ClientContext& context,
                                                     TableFunctionBindInput& input,
                                                     vector<LogicalType>& return_types,
-                                                    vector<string>& names)
+                                                    vector<Identifier>& names)
 {
   auto result = make_uniq<KMeansFitData>();
   auto& req   = result->req;
@@ -2504,6 +2505,8 @@ static void SiriusKMeansFitFunction(ClientContext& context,
     throw InvalidInputException("sirius_kmeans_fit requires the Sirius context to be initialized");
   }
 
+  data.req.table_identity =
+    sirius::vss::pinned_table_identity(context, data.req.catalog, data.req.schema, data.req.table);
   auto const fit = sirius::vss::run_kmeans_fit(*sirius_ctx, data.req);
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BIGINT(fit.n_clusters));
@@ -2524,7 +2527,7 @@ struct KMeansBuildListsData : public TableFunctionData {
 static unique_ptr<FunctionData> SiriusKMeansBuildListsBind(ClientContext& context,
                                                            TableFunctionBindInput& input,
                                                            vector<LogicalType>& return_types,
-                                                           vector<string>& names)
+                                                           vector<Identifier>& names)
 {
   auto result = make_uniq<KMeansBuildListsData>();
   auto& req   = result->req;
@@ -2618,6 +2621,8 @@ static void SiriusKMeansBuildListsFunction(ClientContext& context,
     throw InvalidInputException(
       "sirius_kmeans_build_lists requires the Sirius context to be initialized");
   }
+  data.req.table_identity =
+    sirius::vss::pinned_table_identity(context, data.req.catalog, data.req.schema, data.req.table);
   auto const built = sirius::vss::run_kmeans_build_lists(
     *sirius_ctx, data.req, data.storage, data.host_tier, data.unit_rows);
   output.SetCardinality(1);
@@ -2645,7 +2650,7 @@ struct KMeansAssignGlobalState : public GlobalTableFunctionState {
 static unique_ptr<FunctionData> SiriusKMeansAssignBind(ClientContext& context,
                                                        TableFunctionBindInput& input,
                                                        vector<LogicalType>& return_types,
-                                                       vector<string>& names)
+                                                       vector<Identifier>& names)
 {
   auto result = make_uniq<KMeansAssignBindData>();
   auto& req   = result->req;
@@ -2751,7 +2756,7 @@ struct KMeansCentroidsBindData : public TableFunctionData {
 static unique_ptr<FunctionData> SiriusKMeansCentroidsBind(ClientContext& context,
                                                           TableFunctionBindInput& input,
                                                           vector<LogicalType>& return_types,
-                                                          vector<string>& names)
+                                                          vector<Identifier>& names)
 {
   auto result = make_uniq<KMeansCentroidsBindData>();
   if (input.inputs.empty() || input.inputs[0].IsNull()) {
@@ -2803,7 +2808,7 @@ using sirius::vss::vector_join_search_mode;
 static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
                                                    TableFunctionBindInput& input,
                                                    vector<LogicalType>& return_types,
-                                                   vector<string>& names,
+                                                   vector<Identifier>& names,
                                                    bool relational)
 {
   auto result = make_uniq<SiriusVectorJoinBindData>();
@@ -3406,7 +3411,7 @@ static void SiriusPostOptimizeVectorJoin(OptimizerExtensionInput& input,
 static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
                                                      TableFunctionBindInput& input,
                                                      vector<LogicalType>& return_types,
-                                                     vector<string>& names)
+                                                     vector<Identifier>& names)
 {
   return VectorJoinBindImpl(context, input, return_types, names, /*relational=*/false);
 }
@@ -3414,7 +3419,7 @@ static unique_ptr<FunctionData> SiriusVectorJoinBind(ClientContext& context,
 static unique_ptr<FunctionData> SiriusVectorJoinRelBind(ClientContext& context,
                                                         TableFunctionBindInput& input,
                                                         vector<LogicalType>& return_types,
-                                                        vector<string>& names)
+                                                        vector<Identifier>& names)
 {
   return VectorJoinBindImpl(context, input, return_types, names, /*relational=*/true);
 }

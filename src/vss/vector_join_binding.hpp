@@ -44,11 +44,11 @@ namespace sirius::vss {
 /// so a copied plan keeps what the bind (or the plain-SQL rewrite) decided instead of re-binding.
 void serialize_vector_join_bind_data(duckdb::Serializer& serializer,
                                      const duckdb::optional_ptr<duckdb::FunctionData> bind_data,
-                                     const duckdb::TableFunction& function);
+                                     const duckdb::BoundTableFunction& function);
 
 /// The matching deserialize callback.
 duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
-  duckdb::Deserializer& deserializer, duckdb::TableFunction& function);
+  duckdb::Deserializer& deserializer, duckdb::BoundTableFunction& function);
 
 /// Resolve one join side (left or right) at bind time, returning its vector dimensionality
 /// and, through @p out_num_rows, its row count.
@@ -64,6 +64,12 @@ void note_pinned_table_written(sirius::scan_manager::pinned_entry const& pin);
 
 /// The identity a pin of @p table is matched against.
 [[nodiscard]] sirius::duckdb_table_identity table_identity_of(duckdb::TableCatalogEntry& table);
+
+/// The same for the table the catalog holds under these names now.
+[[nodiscard]] sirius::duckdb_table_identity pinned_table_identity(duckdb::ClientContext& context,
+                                                                  const std::string& catalog,
+                                                                  const std::string& schema,
+                                                                  const std::string& table);
 
 /// One conjunct of a filter pushed onto a single column: `column <comparison> constant`.
 struct constant_comparison {

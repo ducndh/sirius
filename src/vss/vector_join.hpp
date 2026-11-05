@@ -18,6 +18,7 @@
 
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/function.hpp"
+#include "duckdb_table_identity.hpp"
 
 #include <cstdint>
 #include <string>
@@ -74,6 +75,9 @@ struct vector_join_side {
   /// @c relation_columns, positionally, and @c column / @c output_columns name among them.
   bool from_relation{false};
   std::vector<std::string> relation_columns;
+  /// The table incarnation a side read from its pin was planned against: a pin serves only that
+  /// incarnation. Not serialized, the planner sets it (create_plan_knn_join).
+  sirius::duckdb_table_identity table_identity;
 };
 
 /// `column <op> constant` on a corpus column, taken from a filter over the join's output that

@@ -258,18 +258,14 @@ class gpu_expression_translator {
     return _ast_tree.emplace<cudf::ast::operation>(OP, *left_expr, *right_expr);
   }
 
-  /// @brief Construct and own a scalar, then add a literal referencing it to the AST.
-  /// One-argument math function (abs/sqrt/floor/ceil/exp/ln). DuckDB types sqrt/exp/ln as
+  /// One-argument math function (sqrt/floor/ceil/exp/ln). DuckDB types sqrt/exp/ln as
   /// DOUBLE whatever the input and cuDF's unary operators keep the input type, so a FLOAT
   /// argument is widened first when the declared return type is DOUBLE.
   std::optional<expr_ref> add_unary_function_expression(sirius::ast::function_call const& alt,
                                                         cudf::ast::table_reference const table_src,
                                                         cudf::ast::ast_operator op);
 
-  /// round(x) and round(x, n) with a constant n, as RINT(x * 10^n) / 10^n.
-  std::optional<expr_ref> add_round_expression(sirius::ast::function_call const& alt,
-                                               cudf::ast::table_reference const table_src);
-
+  /// @brief Construct and own a scalar, then add a literal referencing it to the AST.
   template <typename SCALAR_T, typename... ARGS>
   std::optional<expr_ref> add_literal_expression(ARGS&&... args)
   {

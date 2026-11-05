@@ -69,12 +69,12 @@ std::optional<std::pair<std::size_t, std::int64_t>> as_float_array_ref(
 {
   if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { return std::nullopt; }
   auto const& ref  = expr.Cast<duckdb::BoundReferenceExpression>();
-  auto const& type = ref.return_type;
+  auto const& type = ref.GetReturnType();
   if (type.id() != duckdb::LogicalTypeId::ARRAY ||
       duckdb::ArrayType::GetChildType(type).id() != duckdb::LogicalTypeId::FLOAT) {
     return std::nullopt;
   }
-  return std::make_pair(static_cast<std::size_t>(ref.index),
+  return std::make_pair(static_cast<std::size_t>(ref.Index()),
                         static_cast<std::int64_t>(duckdb::ArrayType::GetSize(type)));
 }
 
@@ -104,9 +104,9 @@ std::optional<topk_delim_match> match_topk_delim_join(duckdb::LogicalComparisonJ
   }
 
   auto const& cond = op.conditions[0];
-  if (cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) { return std::nullopt; }
-  auto const lhs = as_float_array_ref(*cond.left);
-  auto const rhs = as_float_array_ref(*cond.right);
+  if (cond.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) { return std::nullopt; }
+  auto const lhs = as_float_array_ref(cond.GetLHS());
+  auto const rhs = as_float_array_ref(cond.GetRHS());
   if (!lhs || !rhs || lhs->second != rhs->second) { return std::nullopt; }
 
   // Condition sides follow child order: cond.left is bound against children[0].
@@ -138,8 +138,8 @@ bool is_topk_aggregate(const duckdb::Expression& expr)
 {
   if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_AGGREGATE) { return false; }
   auto const& aggr = expr.Cast<duckdb::BoundAggregateExpression>();
-  if (aggr.filter || aggr.order_bys || aggr.IsDistinct()) { return false; }
-  auto const& name = aggr.function.name;
+  if (aggr.GetFilter() || aggr.GetOrderBys() || aggr.IsDistinct()) { return false; }
+  auto const& name = aggr.Function().GetName().GetIdentifierName();
   return name == "arg_min" || name == "arg_max" || name == "arg_min_nulls_last" ||
          name == "arg_max_nulls_last";
 }
@@ -223,37 +223,37 @@ std::optional<std::pair<std::string, bool>> metric_of(const std::string& name)
 std::optional<topk_params> extract_topk_params(const topk_subquery_match& m, std::int64_t dim)
 {
   auto const& aggr = m.aggregate->expressions[0]->Cast<duckdb::BoundAggregateExpression>();
-  if (aggr.children.size() != 2 && aggr.children.size() != 3) { return std::nullopt; }
+  if (aggr.GetChildren().size() != 2 && aggr.GetChildren().size() != 3) { return std::nullopt; }
 
   // k is the third argument; the 2-argument form is k = 1 and has no UNNEST above it.
   std::int64_t k = 1;
-  if (aggr.children.size() == 3) {
+  if (aggr.GetChildren().size() == 3) {
     if (!m.unnest ||
-        aggr.children[2]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
+        aggr.GetChildren()[2]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
       return std::nullopt;
     }
-    auto const& k_val = aggr.children[2]->Cast<duckdb::BoundConstantExpression>().value;
+    auto const& k_val = aggr.GetChildren()[2]->Cast<duckdb::BoundConstantExpression>().GetValue();
     if (k_val.IsNull()) { return std::nullopt; }
     k = k_val.GetValue<std::int64_t>();
   } else if (m.unnest) {
     return std::nullopt;
   }
   if (k < 1) { return std::nullopt; }
-  bool const keeps_largest = aggr.function.name.starts_with("arg_max");
+  bool const keeps_largest = aggr.Function().GetName().GetIdentifierName().starts_with("arg_max");
 
   // The ranking argument must be a distance column computed by the projection below.
   auto const& projected = m.distance_projection->expressions;
-  if (aggr.children[1]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+  if (aggr.GetChildren()[1]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
     return std::nullopt;
   }
-  auto const dist_idx = aggr.children[1]->Cast<duckdb::BoundReferenceExpression>().index;
+  auto const dist_idx = aggr.GetChildren()[1]->Cast<duckdb::BoundReferenceExpression>().Index();
   if (dist_idx >= projected.size() ||
       projected[dist_idx]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) {
     return std::nullopt;
   }
   auto const& func  = projected[dist_idx]->Cast<duckdb::BoundFunctionExpression>();
-  auto const metric = metric_of(func.function.name);
-  if (!metric || func.children.size() != 2) { return std::nullopt; }
+  auto const metric = metric_of(func.Function().GetName().GetIdentifierName());
+  if (!metric || func.GetChildren().size() != 2) { return std::nullopt; }
   // Nearest means smallest distance or largest similarity; the opposite is a farthest-k query.
   if (keeps_largest != metric->second) { return std::nullopt; }
 
@@ -264,7 +264,7 @@ std::optional<topk_params> extract_topk_params(const topk_subquery_match& m, std
   auto const right_lo   = m.right_child_idx == 0 ? 0 : n_first;
   auto const right_cols = m.inner_join->children[m.right_child_idx]->GetColumnBindings().size();
   std::optional<std::size_t> right_vec, delim_vec;
-  for (auto const& arg : func.children) {
+  for (auto const& arg : func.GetChildren()) {
     auto const ref = as_float_array_ref(*arg);
     if (!ref || ref->second != dim) { return std::nullopt; }
     if (ref->first >= right_lo && ref->first < right_lo + right_cols) {
@@ -278,7 +278,7 @@ std::optional<topk_params> extract_topk_params(const topk_subquery_match& m, std
   // Rows must be ranked per left vector: the group key is the projected DELIM_GET vector.
   auto const& group = *m.aggregate->groups[0];
   if (group.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { return std::nullopt; }
-  auto const group_idx = group.Cast<duckdb::BoundReferenceExpression>().index;
+  auto const group_idx = group.Cast<duckdb::BoundReferenceExpression>().Index();
   if (group_idx >= projected.size()) { return std::nullopt; }
   auto const group_src = as_float_array_ref(*projected[group_idx]);
   if (!group_src || group_src->first != *delim_vec) { return std::nullopt; }
@@ -298,11 +298,11 @@ std::optional<std::size_t> struct_field_of(const duckdb::Expression& expr)
 {
   if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) { return std::nullopt; }
   auto const& func = expr.Cast<duckdb::BoundFunctionExpression>();
-  if ((func.function.name != "struct_extract" && func.function.name != "struct_extract_at") ||
-      !func.bind_info || func.children.empty()) {
+  if ((func.Function().GetName().GetIdentifierName() != "struct_extract" && func.Function().GetName().GetIdentifierName() != "struct_extract_at") ||
+      !func.BindInfo() || func.GetChildren().empty()) {
     return std::nullopt;
   }
-  return func.bind_info->Cast<duckdb::StructExtractBindData>().index;
+  return func.BindInfo()->Cast<duckdb::StructExtractBindData>().index;
 }
 
 //! Step 4: follow one output column of the subquery down to the right table, the left vector, or
@@ -320,10 +320,10 @@ std::optional<topk_output_col> trace_subquery_col(const topk_subquery_match& m,
     duckdb::Expression const* expr = proj->expressions[col].get();
     while (auto field = struct_field_of(*expr)) {
       fields.push_back(*field);
-      expr = expr->Cast<duckdb::BoundFunctionExpression>().children[0].get();
+      expr = expr->Cast<duckdb::BoundFunctionExpression>().GetChildren()[0].get();
     }
     if (expr->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { return std::nullopt; }
-    col = expr->Cast<duckdb::BoundReferenceExpression>().index;
+    col = expr->Cast<duckdb::BoundReferenceExpression>().Index();
   }
 
   // UNNEST output is [aggregate cols..., unnested element]; the element is one payload row.
@@ -335,9 +335,9 @@ std::optional<topk_output_col> trace_subquery_col(const topk_subquery_match& m,
       if (unnest_expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_UNNEST) {
         return std::nullopt;
       }
-      auto const& child = *unnest_expr.Cast<duckdb::BoundUnnestExpression>().child;
+      auto const& child = *unnest_expr.Cast<duckdb::BoundUnnestExpression>().Child();
       if (child.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { return std::nullopt; }
-      col            = child.Cast<duckdb::BoundReferenceExpression>().index;
+      col            = child.Cast<duckdb::BoundReferenceExpression>().Index();
       through_unnest = true;
     } else if (col > n_child) {
       return std::nullopt;
@@ -353,20 +353,20 @@ std::optional<topk_output_col> trace_subquery_col(const topk_subquery_match& m,
   if (col != 1 || through_unnest != (m.unnest != nullptr)) { return std::nullopt; }
 
   duckdb::Expression const* payload =
-    m.aggregate->expressions[0]->Cast<duckdb::BoundAggregateExpression>().children[0].get();
+    m.aggregate->expressions[0]->Cast<duckdb::BoundAggregateExpression>().GetChildren()[0].get();
   while (!fields.empty()) {
     if (payload->GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) {
       return std::nullopt;
     }
     auto const& pack = payload->Cast<duckdb::BoundFunctionExpression>();
-    if (pack.function.name != "struct_pack" || fields.back() >= pack.children.size()) {
+    if (pack.Function().GetName() != "struct_pack" || fields.back() >= pack.GetChildren().size()) {
       return std::nullopt;
     }
-    payload = pack.children[fields.back()].get();
+    payload = pack.GetChildren()[fields.back()].get();
     fields.pop_back();
   }
   if (payload->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { return std::nullopt; }
-  col = payload->Cast<duckdb::BoundReferenceExpression>().index;
+  col = payload->Cast<duckdb::BoundReferenceExpression>().Index();
 
   // Distance projection: the distance itself, or a pass-through of an inner-join column.
   auto const& projected = m.distance_projection->expressions;
@@ -377,7 +377,7 @@ std::optional<topk_output_col> trace_subquery_col(const topk_subquery_match& m,
   if (projected[col]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
     return std::nullopt;
   }
-  col = projected[col]->Cast<duckdb::BoundReferenceExpression>().index;
+  col = projected[col]->Cast<duckdb::BoundReferenceExpression>().Index();
 
   auto const n_first    = m.inner_join->children[0]->GetColumnBindings().size();
   auto const delim_lo   = m.delim_get_child_idx == 0 ? 0 : n_first;
@@ -463,22 +463,22 @@ std::optional<global_topk_match> match_global_topk(duckdb::LogicalTopN& op)
   if (order.expression->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
     return std::nullopt;
   }
-  auto dist_col = order.expression->Cast<duckdb::BoundReferenceExpression>().index;
+  auto dist_col = order.expression->Cast<duckdb::BoundReferenceExpression>().Index();
   for (std::size_t i = 0; i + 1 < projections.size(); ++i) {
     auto const& exprs = projections[i]->expressions;
     if (dist_col >= exprs.size() ||
         exprs[dist_col]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
       return std::nullopt;
     }
-    dist_col = exprs[dist_col]->Cast<duckdb::BoundReferenceExpression>().index;
+    dist_col = exprs[dist_col]->Cast<duckdb::BoundReferenceExpression>().Index();
   }
   if (dist_col >= proj.expressions.size() ||
       proj.expressions[dist_col]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) {
     return std::nullopt;
   }
   auto const& func  = proj.expressions[dist_col]->Cast<duckdb::BoundFunctionExpression>();
-  auto const metric = metric_of(func.function.name);
-  if (!metric || func.children.size() != 2) { return std::nullopt; }
+  auto const metric = metric_of(func.Function().GetName().GetIdentifierName());
+  if (!metric || func.GetChildren().size() != 2) { return std::nullopt; }
   // Nearest means ascending distance or descending similarity.
   auto const nearest_order =
     metric->second ? duckdb::OrderType::DESCENDING : duckdb::OrderType::ASCENDING;
@@ -487,7 +487,7 @@ std::optional<global_topk_match> match_global_topk(duckdb::LogicalTopN& op)
   // One argument from each side of the cross product (output is [left cols..., right cols...]).
   auto const n_left = cross.children[0]->GetColumnBindings().size();
   std::optional<std::pair<std::size_t, std::int64_t>> left_vec, right_vec;
-  for (auto const& arg : func.children) {
+  for (auto const& arg : func.GetChildren()) {
     auto const ref = as_float_array_ref(*arg);
     if (!ref) { return std::nullopt; }
     if (ref->first < n_left) {
@@ -538,7 +538,11 @@ sirius_physical_plan_generator::try_plan_vector_perrow_topk_join(duckdb::Logical
     "inner_join={} delim_get_child={} right_child={}",
     sub->top_projections.size(),
     sub->unnest != nullptr,
-    sub->aggregate->expressions[0]->Cast<duckdb::BoundAggregateExpression>().function.name,
+    sub->aggregate->expressions[0]
+      ->Cast<duckdb::BoundAggregateExpression>()
+      .Function()
+      .GetName()
+      .GetIdentifierName(),
     duckdb::EnumUtil::ToString(sub->inner_join->type),
     sub->delim_get_child_idx,
     sub->right_child_idx);
@@ -693,7 +697,7 @@ sirius_physical_plan_generator::try_plan_vector_global_topk_join(duckdb::Logical
     [&](duckdb::unique_ptr<duckdb::Expression>& expr) {
       if (expr->Equals(distance)) {
         expr =
-          duckdb::make_uniq<duckdb::BoundReferenceExpression>(expr->return_type, n_left + n_right);
+          duckdb::make_uniq<duckdb::BoundReferenceExpression>(expr->GetReturnType(), n_left + n_right);
         return;
       }
       duckdb::ExpressionIterator::EnumerateChildren(*expr, use_ranking_column);
@@ -708,7 +712,7 @@ sirius_physical_plan_generator::try_plan_vector_global_topk_join(duckdb::Logical
   std::vector<std::size_t> left_cols, right_cols;
   std::function<void(duckdb::Expression&)> collect = [&](duckdb::Expression& expr) {
     if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-      auto const idx = expr.Cast<duckdb::BoundReferenceExpression>().index;
+      auto const idx = expr.Cast<duckdb::BoundReferenceExpression>().Index();
       if (idx < n_left) {
         left_cols.push_back(idx);
       } else if (idx < n_left + n_right) {
@@ -734,12 +738,12 @@ sirius_physical_plan_generator::try_plan_vector_global_topk_join(duckdb::Logical
   std::function<void(duckdb::Expression&)> remap = [&](duckdb::Expression& expr) {
     if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
       auto& ref = expr.Cast<duckdb::BoundReferenceExpression>();
-      if (ref.index < n_left) {
-        ref.index = pos_in(left_cols, ref.index);
-      } else if (ref.index < n_left + n_right) {
-        ref.index = left_cols.size() + pos_in(right_cols, ref.index - n_left);
+      if (ref.Index() < n_left) {
+        ref.IndexMutable() = pos_in(left_cols, ref.Index());
+      } else if (ref.Index() < n_left + n_right) {
+        ref.IndexMutable() = left_cols.size() + pos_in(right_cols, ref.Index() - n_left);
       } else {
-        ref.index = left_cols.size() + right_cols.size();
+        ref.IndexMutable() = left_cols.size() + right_cols.size();
       }
       return;
     }

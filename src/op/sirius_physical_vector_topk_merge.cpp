@@ -96,7 +96,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_merge::get_next_task_
   while (auto batch = repo->pop_next_data_batch(topk_partials_partition(ordinal))) {
     batches.push_back(std::move(batch));
   }
-  return std::make_unique<partitioned_operator_data>(std::move(batches), ordinal);
+  return std::make_unique<partitioned_operator_data>(
+    std::move(batches), ordinal, partition_placement::unpinned(ordinal + 1));
 }
 
 std::unique_ptr<operator_data> sirius_physical_vector_topk_merge::execute(
@@ -119,7 +120,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_merge::execute(
 
   std::vector<std::shared_ptr<cucascade::data_batch>> out_batches;
   auto finish = [&]() {
-    return std::make_unique<partitioned_operator_data>(std::move(out_batches), partition_idx);
+    return std::make_unique<partitioned_operator_data>(
+    std::move(out_batches), partition_idx, partition_placement::unpinned(partition_idx + 1));
   };
   auto emit_table = [&](std::unique_ptr<cudf::table> table) {
     out_batches.push_back(make_data_batch(std::move(table), *space, stream, batch_telemetry()));

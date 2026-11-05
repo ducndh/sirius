@@ -374,10 +374,10 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
 
   auto left_pin  = _probe_side ? nullptr
                                : _scan_manager->find_pinned_entry_for_duckdb_table(
-                                  left.catalog, left.schema, left.table);
+                                  left.catalog, left.schema, left.table, left.table_identity);
   auto right_pin = _build_side ? nullptr
                                : _scan_manager->find_pinned_entry_for_duckdb_table(
-                                   right.catalog, right.schema, right.table);
+                                   right.catalog, right.schema, right.table, right.table_identity);
   if ((!_probe_side && left_pin == nullptr) || (!_build_side && right_pin == nullptr)) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_materialize] left/right table is no longer pinned");
@@ -642,7 +642,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::get_next
   }
   auto const partition_idx = _current_partition_index++;
   if (all_batches.empty()) { return nullptr; }
-  return std::make_unique<partitioned_operator_data>(std::move(all_batches), partition_idx);
+  return std::make_unique<partitioned_operator_data>(
+    std::move(all_batches), partition_idx, partition_placement::unpinned(partition_idx + 1));
 }
 
 std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(

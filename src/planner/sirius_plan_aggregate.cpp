@@ -243,9 +243,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> extract_aggregate_expre
       duckdb::FunctionBinder::BindSortedAggregate(context, bound_aggr, groups, grouping_sets);
     }
   }
-  for (auto& aggr : aggregates) {
-    rewrite_filtered_aggregate(context, aggr);
-  }
   for (auto& group : groups) {
     auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(group->GetReturnType(),
                                                                    expressions.size());
@@ -982,7 +979,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
         break;
       }
       auto& aggr = e->Cast<duckdb::BoundAggregateExpression>();
-      if (!aggr.children.empty() || aggr.filter) {
+      if (!aggr.GetChildren().empty() || aggr.GetFilter()) {
         row_count_only = false;
         break;
       }

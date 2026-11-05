@@ -38,6 +38,7 @@
 #include <vector>
 
 namespace duckdb {
+class ClientContext;
 class SiriusContext;
 }  // namespace duckdb
 
@@ -251,7 +252,8 @@ struct exact_lists_choice {
 /// @p min_clusters, which an approximate join sets to 2: one list prunes nothing. With
 /// @p float_rows_only, UINT8 lists are left out too: an inner-product join searches FLOAT16 rows
 /// (re-scored from the kept FP32 rows) or FP32 rows only. Nullopt when there is none.
-[[nodiscard]] std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
+[[nodiscard]] std::optional<exact_lists_choice> find_exact_lists(duckdb::ClientContext& context,
+                                                                 duckdb::SiriusContext& ctx,
                                                                  const std::string& catalog,
                                                                  const std::string& schema,
                                                                  const std::string& table,
@@ -264,7 +266,8 @@ struct exact_lists_choice {
 /// The lists of the clustering @p clustering when it is one of (@p catalog, @p schema, @p table,
 /// @p column)'s and they hold all @p n_rows rows, unit rows exactly when @p cosine: what a join
 /// searches approximately under `vector_join_clustering`, in any encoding. Nullopt otherwise.
-[[nodiscard]] std::optional<exact_lists_choice> find_named_lists(duckdb::SiriusContext& ctx,
+[[nodiscard]] std::optional<exact_lists_choice> find_named_lists(duckdb::ClientContext& context,
+                                                                 duckdb::SiriusContext& ctx,
                                                                  const std::string& clustering,
                                                                  const std::string& catalog,
                                                                  const std::string& schema,

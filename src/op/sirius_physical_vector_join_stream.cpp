@@ -1177,12 +1177,12 @@ void sirius_physical_vector_join_stream::initialize_locked()
 
   auto left_pin = _probe_side ? nullptr
                               : _scan_manager->find_pinned_entry_for_duckdb_table(
-                                  left.catalog, left.schema, left.table);
+                                  left.catalog, left.schema, left.table, left.table_identity);
   // The corpus comes from the build port on the build path, so only the probe side has to be
   // pinned there.
   auto right_pin = _build_side ? nullptr
                                : _scan_manager->find_pinned_entry_for_duckdb_table(
-                                   right.catalog, right.schema, right.table);
+                                   right.catalog, right.schema, right.table, right.table_identity);
   if ((!_probe_side && left_pin == nullptr) || (!_build_side && right_pin == nullptr)) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_stream] left or right table is no longer pinned");
@@ -1686,8 +1686,10 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
                                      batch_telemetry(),
                                      _sirius_ctx);
   } else {
-    pin = _scan_manager->find_pinned_entry_for_duckdb_table(
-      _request.right.catalog, _request.right.schema, _request.right.table);
+    pin = _scan_manager->find_pinned_entry_for_duckdb_table(_request.right.catalog,
+                                                       _request.right.schema,
+                                                       _request.right.table,
+                                                       _request.right.table_identity);
     if (pin == nullptr) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_stream] clustering needs the corpus table '" +
@@ -1971,7 +1973,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       return std::make_unique<vector_join_stream_output>(
         std::move(batches), left_idx, join_in->ticket());
     }
-    return std::make_unique<partitioned_operator_data>(std::move(batches), left_idx);
+    return std::make_unique<partitioned_operator_data>(
+    std::move(batches), left_idx, partition_placement::unpinned(left_idx + 1));
   };
   if (_request.probe_scalar && _scalar_probe_rows != 1) {
     throw std::runtime_error(

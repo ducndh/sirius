@@ -28,6 +28,7 @@
 #include "vss/cluster_lists.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/device_context_guard.hpp"
+#include "vss/vector_join_binding.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/pinned_column.hpp"
 #include "vss/vector_search_internal.hpp"
@@ -92,7 +93,8 @@ kmeans_context resolve_context(duckdb::SiriusContext& ctx,
                                const std::string& fn,
                                const std::string& catalog,
                                const std::string& schema,
-                               const std::string& table)
+                               const std::string& table,
+                               sirius::duckdb_table_identity const& table_identity)
 {
   auto& memory_manager = ctx.get_memory_manager();
   auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
@@ -104,7 +106,8 @@ kmeans_context resolve_context(duckdb::SiriusContext& ctx,
     throw duckdb::InvalidInputException(fn + ": no HOST memory space available");
   }
 
-  auto pin = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(catalog, schema, table);
+  auto pin = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
+    catalog, schema, table, table_identity);
   if (pin == nullptr) {
     throw duckdb::InvalidInputException(fn + ": table '" + table +
                                         "' must be pinned (GPU or HOST tier)");
@@ -163,7 +166,7 @@ const cudf::column* find_clustering_centroids(duckdb::SiriusContext& ctx, const 
 kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_request& req)
 {
   static const std::string fn = "sirius_kmeans_fit";
-  auto const c                = resolve_context(ctx, fn, req.catalog, req.schema, req.table);
+  auto const c                = resolve_context(ctx, fn, req.catalog, req.schema, req.table, req.table_identity);
   device_context_guard device_guard{c.target_gpu};
   // The centroids outlive this call by design -- they stay in the index cache until the session
   // ends. rmm::device_buffer records the stream it was allocated on and deallocates on that same
@@ -327,7 +330,7 @@ std::unique_ptr<cucascade::host_data_representation> run_kmeans_assign(
   duckdb::SiriusContext& ctx, const kmeans_assign_request& req)
 {
   static const std::string fn = "sirius_kmeans_assign";
-  auto const c                = resolve_context(ctx, fn, req.catalog, req.schema, req.table);
+  auto const c                = resolve_context(ctx, fn, req.catalog, req.schema, req.table, req.table_identity);
   device_context_guard device_guard{c.target_gpu};
   rmm::cuda_stream stream_owner;
   auto stream   = stream_owner.view();
@@ -410,20 +413,22 @@ namespace {
 /// Whether @p lists were built from the pin that stands for (@p catalog, @p schema, @p table) now.
 /// After an unpin and re-pin, or a pin_table that replaced the entry, they describe rows the table
 /// may no longer hold; its snapshot identity tells the new pin apart even at the old one's address.
-bool built_from_current_pin(duckdb::SiriusContext& ctx,
+bool built_from_current_pin(duckdb::ClientContext& context,
+                            duckdb::SiriusContext& ctx,
                             cluster_lists const& lists,
                             const std::string& catalog,
                             const std::string& schema,
                             const std::string& table)
 {
-  auto const pin =
-    ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(catalog, schema, table);
+  auto const pin = ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
+    catalog, schema, table, pinned_table_identity(context, catalog, schema, table));
   return pin != nullptr && lists.pin_snapshot.lock() == pin->snapshot_identity;
 }
 
 }  // namespace
 
-std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
+std::optional<exact_lists_choice> find_exact_lists(duckdb::ClientContext& context,
+                                                   duckdb::SiriusContext& ctx,
                                                    const std::string& catalog,
                                                    const std::string& schema,
                                                    const std::string& table,
@@ -440,7 +445,7 @@ std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
     if (lists == nullptr) { continue; }
     // Lists of an earlier pin can never serve again: drop them, and a statement that wants lists
     // builds its own from the pin as it is.
-    if (!built_from_current_pin(ctx, *lists, catalog, schema, table)) {
+    if (!built_from_current_pin(context, ctx, *lists, catalog, schema, table)) {
       erase_cluster_lists(ctx, name);
       continue;
     }
@@ -467,7 +472,8 @@ std::optional<exact_lists_choice> find_exact_lists(duckdb::SiriusContext& ctx,
   return found;
 }
 
-std::optional<exact_lists_choice> find_named_lists(duckdb::SiriusContext& ctx,
+std::optional<exact_lists_choice> find_named_lists(duckdb::ClientContext& context,
+                                                   duckdb::SiriusContext& ctx,
                                                    const std::string& clustering,
                                                    const std::string& catalog,
                                                    const std::string& schema,
@@ -484,7 +490,7 @@ std::optional<exact_lists_choice> find_named_lists(duckdb::SiriusContext& ctx,
   auto const* lists = find_cluster_lists(ctx, clustering);
   auto const entry  = find_clustering_entry(ctx, clustering);
   if (lists == nullptr || entry == nullptr || lists->n_rows != n_rows ||
-      lists->unit_rows != cosine || !built_from_current_pin(ctx, *lists, catalog, schema, table)) {
+      lists->unit_rows != cosine || !built_from_current_pin(context, ctx, *lists, catalog, schema, table)) {
     return std::nullopt;
   }
   auto const clusters = static_cast<std::int64_t>(lists->offsets.size()) - 1;
@@ -512,7 +518,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     throw duckdb::InvalidInputException(
       fn + ": metric => 'cosine' stores unit rows, which need storage => 'float16' or 'float32'");
   }
-  auto const c = resolve_context(ctx, fn, req.catalog, req.schema, req.table);
+  auto const c = resolve_context(ctx, fn, req.catalog, req.schema, req.table, req.table_identity);
   device_context_guard device_guard{c.target_gpu};
   // The lists outlive this call in the index cache, and a device_buffer frees on the stream it
   // was allocated on, so the persistent buffers use the default stream (as the fit's centroids
@@ -1019,7 +1025,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                     device_ptrs.data(),
                                     device_ptrs.size() * sizeof(float const*),
                                     cudaMemcpyHostToDevice,
-                                    persistent.value()));
+                                    persistent.get()));
     }
   }
   if (lists.has_exact_rows()) {
@@ -1030,7 +1036,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     }
     max_norm_bits.emplace(1, persistent, persistent_mr);
     CUDF_CUDA_TRY(
-      cudaMemsetAsync(max_norm_bits->data(), 0, sizeof(unsigned int), persistent.value()));
+      cudaMemsetAsync(max_norm_bits->data(), 0, sizeof(unsigned int), persistent.get()));
   }
   lists.list_offsets = std::make_unique<rmm::device_buffer>(
     static_cast<std::size_t>(lists.chunk_rows + 1) * sizeof(std::int32_t),
@@ -1038,7 +1044,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     persistent_mr);
   fill_list_offsets(
     static_cast<std::int32_t*>(lists.list_offsets->data()), lists.chunk_rows, dim, persistent);
-  persistent.synchronize();
+  persistent.sync();
 
   std::optional<rmm::device_uvector<unsigned int>> code_error_bits, half_error_bits;
   if (encoding == list_encoding::float16 && lists.has_exact_rows()) {
@@ -1054,7 +1060,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                   code_offset_host.data(),
                                   code_offset_host.size() * sizeof(float),
                                   cudaMemcpyHostToDevice,
-                                  persistent.value()));
+                                  persistent.get()));
     if (rotation) {
       lists.code_rotation = std::make_unique<rmm::device_buffer>(
         rotation->data(), rotation->size(), persistent, persistent_mr);
@@ -1062,7 +1068,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     code_error_bits.emplace(1, stream, mr);
     CUDF_CUDA_TRY(
       cudaMemsetAsync(code_error_bits->data(), 0, sizeof(unsigned int), stream.get()));
-    persistent.synchronize();
+    persistent.sync();
   }
 
   phase("allocate");

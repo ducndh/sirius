@@ -68,15 +68,15 @@ std::optional<bool> match_distance_call(const duckdb::Expression& expr,
 {
   if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) { return std::nullopt; }
   auto const& func = expr.Cast<duckdb::BoundFunctionExpression>();
-  if (func.children.size() != 2) { return std::nullopt; }
+  if (func.GetChildren().size() != 2) { return std::nullopt; }
 
   std::string fn_metric;
   bool as_similarity = false;
-  if (func.function.name == "array_distance") {
+  if (func.Function().GetName().GetIdentifierName() == "array_distance") {
     fn_metric = "l2";
-  } else if (func.function.name == "array_cosine_distance") {
+  } else if (func.Function().GetName().GetIdentifierName() == "array_cosine_distance") {
     fn_metric = "cosine";
-  } else if (func.function.name == "array_cosine_similarity") {
+  } else if (func.Function().GetName().GetIdentifierName() == "array_cosine_similarity") {
     fn_metric     = "cosine";
     as_similarity = true;
   } else {
@@ -85,12 +85,12 @@ std::optional<bool> match_distance_call(const duckdb::Expression& expr,
   // A cosine SELECT cannot reuse a Euclidean distance and vice versa.
   if (fn_metric != info.metric) { return std::nullopt; }
 
-  if (func.children[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF ||
-      func.children[1]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
+  if (func.GetChildren()[0]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF ||
+      func.GetChildren()[1]->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
     return std::nullopt;
   }
-  auto const i0           = func.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
-  auto const i1           = func.children[1]->Cast<duckdb::BoundReferenceExpression>().index;
+  auto const i0           = func.GetChildren()[0]->Cast<duckdb::BoundReferenceExpression>().Index();
+  auto const i1           = func.GetChildren()[1]->Cast<duckdb::BoundReferenceExpression>().Index();
   bool const matches_cols = (i0 == info.left_vec_index && i1 == info.right_vec_index) ||
                             (i0 == info.right_vec_index && i1 == info.left_vec_index);
   if (!matches_cols) { return std::nullopt; }
@@ -109,7 +109,7 @@ void rewrite_distance_calls(duckdb::unique_ptr<duckdb::Expression>& expr,
   if (auto as_sim = match_distance_call(*expr, info)) {
     if (!target_as_similarity) { target_as_similarity = *as_sim; }
     if (*target_as_similarity == *as_sim) {
-      expr        = duckdb::make_uniq<duckdb::BoundReferenceExpression>(expr->return_type,
+      expr        = duckdb::make_uniq<duckdb::BoundReferenceExpression>(expr->GetReturnType(),
                                                                  info.distance_col_index);
       rewrote_any = true;
     }

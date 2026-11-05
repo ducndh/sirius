@@ -235,7 +235,9 @@ class vector_join_stream_output : public partitioned_operator_data {
   vector_join_stream_output(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
                             std::size_t partition_idx,
                             std::shared_ptr<void> ticket)
-    : partitioned_operator_data(std::move(data_batches), partition_idx), _ticket(std::move(ticket))
+    : partitioned_operator_data(
+        std::move(data_batches), partition_idx, partition_placement::unpinned(partition_idx + 1)),
+      _ticket(std::move(ticket))
   {
   }
 
@@ -251,7 +253,9 @@ class vector_join_stream_block_output : public partitioned_operator_data {
     std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
     std::vector<std::size_t> partitions,
     std::shared_ptr<void> ticket)
-    : partitioned_operator_data(std::move(data_batches), partitions.front()),
+    : partitioned_operator_data(std::move(data_batches),
+                                partitions.front(),
+                                partition_placement::unpinned(partitions.front() + 1)),
       _partitions(std::move(partitions)),
       _ticket(std::move(ticket))
   {

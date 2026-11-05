@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/common/enums/join_type.hpp"
+#include "op/partition/partition_sizing.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 
 #include <cstddef>

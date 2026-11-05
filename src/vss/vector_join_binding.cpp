@@ -71,6 +71,20 @@ sirius::duckdb_table_identity table_identity_of(duckdb::TableCatalogEntry& table
   return {table.oid, table.GetStorage().GetRowGroupCollection()};
 }
 
+sirius::duckdb_table_identity pinned_table_identity(duckdb::ClientContext& context,
+                                                    const std::string& catalog,
+                                                    const std::string& schema,
+                                                    const std::string& table)
+{
+  auto& entry = duckdb::Catalog::GetEntry(
+    context,
+    duckdb::CatalogType::TABLE_ENTRY,
+    duckdb::QualifiedName(
+      duckdb::Identifier(catalog), duckdb::Identifier(schema), duckdb::Identifier(table)));
+  if (entry.type != duckdb::CatalogType::TABLE_ENTRY) { return {}; }
+  return table_identity_of(entry.Cast<duckdb::TableCatalogEntry>());
+}
+
 std::optional<std::vector<constant_comparison>> constant_comparisons_of(
   duckdb::TableFilter const& filter)
 {
@@ -164,7 +178,7 @@ duckdb::BoundStatement bind_view_select(duckdb::ClientContext& context,
   auto const sql = "SELECT * FROM " + duckdb::KeywordHelper::WriteOptionallyQuoted(side.catalog) +
                    "." + duckdb::KeywordHelper::WriteOptionallyQuoted(side.schema) + "." +
                    duckdb::KeywordHelper::WriteOptionallyQuoted(side.table);
-  duckdb::Parser parser(context.GetParserOptions());
+  duckdb::Parser parser(context);
   parser.ParseQuery(sql);
   if (parser.statements.size() != 1) {
     throw duckdb::BinderException("sirius_knn_join: could not bind view '" + side.table + "'");
@@ -190,10 +204,14 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
 
   // Resolve the table + vector column against the catalog.
   auto const qname          = duckdb::QualifiedName::Parse(table_arg);
-  std::string const catalog = qname.catalog;
-  std::string const schema  = !qname.schema.empty() ? qname.schema : schema_name;
-  auto& entry_base          = duckdb::Catalog::GetEntry(
-    context, duckdb::CatalogType::TABLE_ENTRY, catalog, schema, qname.name);
+  auto const table_name     = qname.Name().GetIdentifierName();
+  std::string const catalog = qname.Catalog().GetIdentifierName();
+  std::string const schema =
+    !qname.Schema().empty() ? qname.Schema().GetIdentifierName() : schema_name;
+  auto& entry_base = duckdb::Catalog::GetEntry(
+    context,
+    duckdb::CatalogType::TABLE_ENTRY,
+    duckdb::QualifiedName(duckdb::Identifier(catalog), duckdb::Identifier(schema), qname.Name()));
   // A VIEW lives in the TABLE_ENTRY namespace, so GetEntry returns one and a Cast to a table
   // entry would be undefined behaviour. A view is a named subquery: on a scanned corpus side the
   // planner binds it and streams its rows into the join, which is what a filtered or joined
@@ -201,24 +219,25 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   bool const is_view = entry_base.type == duckdb::CatalogType::VIEW_ENTRY;
   if (is_view && label == "left") {
     throw duckdb::BinderException(
-      "sirius_knn_join: " + label + " '" + qname.name +
+      "sirius_knn_join: " + label + " '" + table_name +
       "' is a view; a probe-side relation is passed as a subquery via sirius_knn_join_rel");
   }
   if (is_view && require_pin) {
     throw duckdb::BinderException(
-      "sirius_knn_join: " + label + " '" + qname.name +
+      "sirius_knn_join: " + label + " '" + table_name +
       "' is a view; a view corpus streams through a scan, so pass build_source => 'scan'");
   }
   if (!is_view && entry_base.type != duckdb::CatalogType::TABLE_ENTRY) {
     throw duckdb::BinderException(
-      "sirius_knn_join: " + label + " '" + qname.name + "' is a " +
+      "sirius_knn_join: " + label + " '" + table_name + "' is a " +
       duckdb::CatalogTypeToString(entry_base.type) +
       ", not a base table or view. Materialize it (CREATE TABLE ... AS SELECT ...) or wrap it "
       "in a view; a subquery is supported on the probe side via sirius_knn_join_rel.");
   }
-  side.catalog = entry_base.ParentCatalog().GetName();
-  side.schema  = entry_base.ParentSchema().name;
-  side.table   = entry_base.name;  // catalog-resolved name (matches query-side derivation)
+  side.catalog = entry_base.ParentCatalog().GetName().GetIdentifierName();
+  side.schema  = entry_base.ParentSchema().name.GetIdentifierName();
+  // Catalog-resolved name (matches query-side derivation).
+  side.table = entry_base.name.GetIdentifierName();
   side.is_view = is_view;
 
   duckdb::vector<duckdb::string> schema_names;
@@ -226,7 +245,7 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   std::uint64_t table_rows = 0;
   if (is_view) {
     auto bound   = bind_view_select(context, side);
-    schema_names = std::move(bound.names);
+    schema_names = duckdb::IdentifiersToStrings(bound.names);
     schema_types = std::move(bound.types);
   } else {
     auto& entry         = entry_base.Cast<duckdb::DuckTableEntry>();
@@ -234,6 +253,7 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
     schema_names        = columns.GetColumnNames();
     schema_types        = columns.GetColumnTypes();
     table_rows          = static_cast<std::uint64_t>(entry.GetStorage().GetTotalRows());
+    side.table_identity = table_identity_of(entry);
   }
 
   auto type_of = [&](const std::string& col) -> const duckdb::LogicalType& {
@@ -258,7 +278,7 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   // an absent pin is not an error. That is what stops a column-subset pin from making the rest
   // of the table unusable in the same query.
   auto pin = sirius_ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(
-    side.catalog, side.schema, side.table);
+    side.catalog, side.schema, side.table, side.table_identity);
   if (pin == nullptr && require_pin) {
     throw duckdb::BinderException("sirius_knn_join: " + label + " table '" + side.table +
                                   "' must be pinned");
@@ -455,7 +475,7 @@ vector_join_side read_side(duckdb::Deserializer& d, duckdb::field_id_t base)
 
 void serialize_vector_join_bind_data(duckdb::Serializer& serializer,
                                      const duckdb::optional_ptr<duckdb::FunctionData> bind_data,
-                                     const duckdb::TableFunction& /*function*/)
+                                     const duckdb::BoundTableFunction& /*function*/)
 {
   auto const& data = bind_data->Cast<SiriusVectorJoinBindData>();
   auto const& req  = data.req;

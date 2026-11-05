@@ -406,8 +406,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_side_scan(
   const std::string& extra_column                  = {},
   const std::vector<std::string>& trailing_columns = {})
 {
-  auto& entry_base = duckdb::Catalog::GetEntry(
-    context, duckdb::CatalogType::TABLE_ENTRY, side.catalog, side.schema, side.table);
+  auto& entry_base = duckdb::Catalog::GetEntry(context,
+                                               duckdb::CatalogType::TABLE_ENTRY,
+                                               duckdb::QualifiedName(duckdb::Identifier(side.catalog),
+                                                                     duckdb::Identifier(side.schema),
+                                                                     duckdb::Identifier(side.table)));
   auto& table_entry = entry_base.Cast<duckdb::DuckTableEntry>();
 
   auto const& columns = table_entry.GetColumns();
@@ -429,7 +432,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_side_scan(
   // the table afterwards.
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   column_ids.emplace_back(vec_idx);
-  duckdb::vector<duckdb::LogicalType> projected_types{types[vec_idx]};
+  duckdb::vector<duckdb::LogicalType> projected_types;
+  projected_types.push_back(types[vec_idx]);
   for (auto const& out_col : side.output_columns) {
     auto const out_it = std::find(names.begin(), names.end(), out_col);
     if (out_it == names.end()) {
@@ -601,7 +605,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   // sirius_knn_join produces its join result from two pinned tables, so it gets its own leaf
   // builder rather than being routed through the scan path.
-  if (op.function.name == "sirius_knn_join" || op.function.name == "sirius_knn_join_rel") {
+  if (op.function.GetName() == "sirius_knn_join" ||
+      op.function.GetName() == "sirius_knn_join_rel") {
     return create_plan_knn_join(op);
   }
 
@@ -1274,23 +1279,32 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   auto req              = bind_data.req;
   auto const right_rows = static_cast<std::int64_t>(bind_data.right_rows);
 
+  // A side read from its pin is served only by the table incarnation it is planned against.
+  for (auto* side : {&req.left, &req.right}) {
+    if (!side->from_relation && !side->is_view) {
+      side->table_identity =
+        sirius::vss::pinned_table_identity(context, side->catalog, side->schema, side->table);
+    }
+  }
+
   // Corpus predicates the table function took off a filter above it (see
-  // SiriusVectorJoinPushdownFilter), keyed by output column. Only right-side columns are ever
-  // pushed, and only as constant comparisons or conjunctions of them.
-  for (auto const& [out, filter] : op.table_filters.filters) {
+  // SiriusVectorJoinPushdownFilter), keyed by position in column_ids. Only right-side columns are
+  // ever pushed, and only as constant comparisons or conjunctions of them.
+  for (auto const& entry : op.table_filters) {
+    auto const out        = op.GetColumnIds()[entry.GetIndex()].GetPrimaryIndex();
     auto const n_left_out = req.left.output_columns.size();
     if (out < n_left_out || out >= n_left_out + req.right.output_columns.size()) {
       throw duckdb::InternalException("sirius_knn_join: a table filter on a non-corpus column");
     }
-    auto const& column = req.right.output_columns[out - n_left_out];
-    auto add           = [&](duckdb::TableFilter const& f) {
-      if (f.filter_type != duckdb::TableFilterType::CONSTANT_COMPARISON) {
-        throw duckdb::InternalException("sirius_knn_join: unsupported pushed corpus filter");
-      }
-      auto const& c = f.Cast<duckdb::ConstantFilter>();
-      using cmp     = sirius::vss::corpus_predicate::op;
+    auto const& column     = req.right.output_columns[out - n_left_out];
+    auto const comparisons = sirius::vss::constant_comparisons_of(entry.Filter());
+    if (!comparisons) {
+      throw duckdb::InternalException("sirius_knn_join: unsupported pushed corpus filter");
+    }
+    for (auto const& c : *comparisons) {
+      using cmp = sirius::vss::corpus_predicate::op;
       cmp op_kind;
-      switch (c.comparison_type) {
+      switch (c.comparison) {
         case duckdb::ExpressionType::COMPARE_EQUAL: op_kind = cmp::eq; break;
         case duckdb::ExpressionType::COMPARE_NOTEQUAL: op_kind = cmp::ne; break;
         case duckdb::ExpressionType::COMPARE_LESSTHAN: op_kind = cmp::lt; break;
@@ -1300,13 +1314,6 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
         default: throw duckdb::InternalException("sirius_knn_join: unsupported pushed comparison");
       }
       req.right_predicates.push_back({column, op_kind, c.constant});
-    };
-    if (filter->filter_type == duckdb::TableFilterType::CONJUNCTION_AND) {
-      for (auto const& child : filter->Cast<duckdb::ConjunctionAndFilter>().child_filters) {
-        add(*child);
-      }
-    } else {
-      add(*filter);
     }
   }
   // k is per left row except in the global mode, where it counts pairs across all left rows and
@@ -1540,7 +1547,8 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   std::optional<duckdb::unique_ptr<sirius::op::sirius_physical_operator>> probe_child;
   std::optional<duckdb::unique_ptr<sirius::op::sirius_physical_operator>> corpus_child;
   if (bind_data.probe_is_relation) {
-    probe_child = plan_relation_side(*op.children[0], req.left, op.input_table_names);
+    probe_child = plan_relation_side(
+      *op.children[0], req.left, duckdb::IdentifiersToStrings(op.input_table_names));
   }
   if (req.right.from_relation) {
     corpus_child = plan_relation_side(*op.children.back(), req.right, {});
@@ -1682,7 +1690,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       requested.push_back(i);
     }
   } else {
-    requested = op.projection_ids;
+    requested.assign(op.projection_ids.begin(), op.projection_ids.end());
   }
 
   duckdb::vector<duckdb::LogicalType> types;

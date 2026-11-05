@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "duckdb_table_identity.hpp"
 #include "vss/vector_clustering.hpp"
 
 #include <cstdint>
@@ -45,6 +46,7 @@ struct kmeans_fit_request {
   std::string catalog;  ///< Resolved catalog of the pinned table
   std::string schema;   ///< Resolved schema
   std::string table;    ///< Base table holding the vectors to cluster
+  sirius::duckdb_table_identity table_identity;  ///< Which incarnation of it a pin must hold
   std::string column;   ///< Vector column
   std::int64_t dim{0};  ///< Vector dimensionality, from the column's ARRAY type
   std::string metric{"l2"};
@@ -64,6 +66,7 @@ struct kmeans_assign_request {
   std::string catalog;
   std::string schema;
   std::string table;
+  sirius::duckdb_table_identity table_identity;  ///< Which incarnation of it a pin must hold
   std::string column;
   std::int64_t dim{0};
   assignment_spec spec;

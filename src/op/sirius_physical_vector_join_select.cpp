@@ -71,9 +71,11 @@ void sirius_physical_vector_join_select::ensure_initialized_locked()
   auto const& right = _request.right;
 
   auto left_pin =
-    _scan_manager->find_pinned_entry_for_duckdb_table(left.catalog, left.schema, left.table);
+    _scan_manager->find_pinned_entry_for_duckdb_table(
+      left.catalog, left.schema, left.table, left.table_identity);
   auto right_pin =
-    _scan_manager->find_pinned_entry_for_duckdb_table(right.catalog, right.schema, right.table);
+    _scan_manager->find_pinned_entry_for_duckdb_table(
+      right.catalog, right.schema, right.table, right.table_identity);
   if (left_pin == nullptr || right_pin == nullptr) {
     throw std::runtime_error(
       "[sirius_physical_vector_join_select] left or right table is no longer pinned");
@@ -205,7 +207,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_select::execute(
   auto batch = sirius::make_data_batch(std::move(out_table), *mem_space, stream, batch_telemetry());
   std::vector<std::shared_ptr<::cucascade::data_batch>> batches;
   batches.push_back(std::move(batch));
-  return std::make_unique<partitioned_operator_data>(std::move(batches), left_idx);
+  return std::make_unique<partitioned_operator_data>(
+    std::move(batches), left_idx, partition_placement::unpinned(left_idx + 1));
 }
 
 //===----------------------------------------------------------------------===//

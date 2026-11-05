@@ -104,7 +104,7 @@ sirius_physical_vector_threshold_join::sirius_physical_vector_threshold_join(
   auto const n_left  = children[0]->get_types().size();
   auto const n_right = children[1]->get_types().size();
   auto const& join   = op.Cast<duckdb::LogicalJoin>();
-  auto fill          = [](const duckdb::vector<duckdb::idx_t>& projection_map,
+  auto fill          = [](const duckdb::vector<duckdb::ProjectionIndex>& projection_map,
                  std::size_t n_cols,
                  duckdb::vector<std::size_t>& out) {
     if (projection_map.empty()) {
@@ -115,7 +115,7 @@ sirius_physical_vector_threshold_join::sirius_physical_vector_threshold_join(
     } else {
       out.reserve(projection_map.size());
       for (auto idx : projection_map) {
-        out.push_back(static_cast<std::size_t>(idx));
+        out.push_back(idx.GetIndex());
       }
     }
   };

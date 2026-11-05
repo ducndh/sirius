@@ -48,19 +48,19 @@ bool resolve_vector_column(const duckdb::Expression& expr,
   if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) { return false; }
   auto const& ref = expr.Cast<duckdb::BoundReferenceExpression>();
 
-  auto const& type = ref.return_type;
+  auto const& type = ref.GetReturnType();
   if (type.id() != duckdb::LogicalTypeId::ARRAY ||
       duckdb::ArrayType::GetChildType(type).id() != duckdb::LogicalTypeId::FLOAT) {
     return false;
   }
   auto const dim = static_cast<std::int64_t>(duckdb::ArrayType::GetSize(type));
 
-  if (ref.index < n_left_cols) {
+  if (ref.Index() < n_left_cols) {
     if (left_side) { return false; }  // both operands from the left side: not a join predicate
-    left_side = resolved_side{ref.index, dim};
+    left_side = resolved_side{ref.Index(), dim};
   } else {
     if (right_side) { return false; }
-    right_side = resolved_side{ref.index - n_left_cols, dim};
+    right_side = resolved_side{ref.Index() - n_left_cols, dim};
   }
   return true;
 }
@@ -80,35 +80,35 @@ std::optional<threshold_match> match_threshold_join(duckdb::LogicalAnyJoin& op)
     return std::nullopt;
   }
   if (!op.condition || op.children.size() != 2) { return std::nullopt; }
-  if (op.condition->GetExpressionClass() != duckdb::ExpressionClass::BOUND_COMPARISON) {
-    return std::nullopt;
-  }
-  auto const& cmp = op.condition->Cast<duckdb::BoundComparisonExpression>();
+  if (!duckdb::BoundComparisonExpression::IsComparison(*op.condition)) { return std::nullopt; }
+  auto const& cmp = op.condition->Cast<duckdb::BoundFunctionExpression>();
+  auto const& cmp_left  = duckdb::BoundComparisonExpression::Left(cmp);
+  auto const& cmp_right = duckdb::BoundComparisonExpression::Right(cmp);
 
   // Identify which operand is the distance/similarity function and which is the constant.
-  duckdb::Expression* func_expr  = nullptr;
-  duckdb::Expression* const_expr = nullptr;
-  bool func_on_left              = false;
-  if (cmp.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
-      cmp.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
-    func_expr = cmp.left.get(), const_expr = cmp.right.get(), func_on_left = true;
-  } else if (cmp.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
-             cmp.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
-    func_expr = cmp.right.get(), const_expr = cmp.left.get(), func_on_left = false;
+  duckdb::Expression const* func_expr  = nullptr;
+  duckdb::Expression const* const_expr = nullptr;
+  bool func_on_left                    = false;
+  if (cmp_left.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
+      cmp_right.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
+    func_expr = &cmp_left, const_expr = &cmp_right, func_on_left = true;
+  } else if (cmp_right.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION &&
+             cmp_left.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CONSTANT) {
+    func_expr = &cmp_right, const_expr = &cmp_left, func_on_left = false;
   } else {
     return std::nullopt;
   }
 
   auto const& func = func_expr->Cast<duckdb::BoundFunctionExpression>();
-  if (func.children.size() != 2) { return std::nullopt; }
+  if (func.GetChildren().size() != 2) { return std::nullopt; }
   // Map function -> metric and whether it measures similarity (higher = closer) vs distance.
   std::string metric;
   bool is_similarity = false;
-  if (func.function.name == "array_distance") {
+  if (func.Function().GetName().GetIdentifierName() == "array_distance") {
     metric = "l2";
-  } else if (func.function.name == "array_cosine_distance") {
+  } else if (func.Function().GetName().GetIdentifierName() == "array_cosine_distance") {
     metric = "cosine";
-  } else if (func.function.name == "array_cosine_similarity") {
+  } else if (func.Function().GetName().GetIdentifierName() == "array_cosine_similarity") {
     metric        = "cosine";
     is_similarity = true;
   } else {
@@ -135,17 +135,17 @@ std::optional<threshold_match> match_threshold_join(duckdb::LogicalAnyJoin& op)
 
   auto const n_left_cols = op.children[0]->GetColumnBindings().size();
   std::optional<resolved_side> left_side, right_side;
-  if (!resolve_vector_column(*func.children[0], n_left_cols, left_side, right_side)) {
+  if (!resolve_vector_column(*func.GetChildren()[0], n_left_cols, left_side, right_side)) {
     return std::nullopt;
   }
-  if (!resolve_vector_column(*func.children[1], n_left_cols, left_side, right_side)) {
+  if (!resolve_vector_column(*func.GetChildren()[1], n_left_cols, left_side, right_side)) {
     return std::nullopt;
   }
   if (!left_side || !right_side || left_side->dim != right_side->dim) { return std::nullopt; }
 
   auto const& constant = const_expr->Cast<duckdb::BoundConstantExpression>();
   auto const const_val = static_cast<float>(
-    constant.value.DefaultCastAs(duckdb::LogicalType::DOUBLE).GetValue<double>());
+    constant.GetValue().DefaultCastAs(duckdb::LogicalType::DOUBLE).GetValue<double>());
   // brute_force_threshold keeps cosine *distance* <= cutoff. For the similarity form (higher =
   // closer), `similarity >= eps` is equivalent to `distance <= 1 - eps`.
   auto const cutoff = is_similarity ? (1.0F - const_val) : const_val;

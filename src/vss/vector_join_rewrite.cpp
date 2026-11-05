@@ -982,12 +982,12 @@ class rewriter {
     if (_context.TryGetCurrentSetting("vector_join_clustering", setting) && !setting.IsNull() &&
         !setting.ToString().empty()) {
       choice =
-        find_named_lists(ctx, setting.ToString(), catalog, schema, table, column, cosine, n_rows);
+        find_named_lists(_context, ctx, setting.ToString(), catalog, schema, table, column, cosine, n_rows);
       // An inner-product join searches FLOAT16 (re-scored) or FP32 rows only.
       if (choice && ip && !ip_searchable(ctx, *choice)) { choice.reset(); }
     }
     if (!choice) {
-      choice = find_exact_lists(ctx, catalog, schema, table, column, cosine, n_rows, 2, ip);
+      choice = find_exact_lists(_context, ctx, catalog, schema, table, column, cosine, n_rows, 2, ip);
     }
     if (!choice) {
       auto const* build_env = std::getenv("SIRIUS_VSS_BUILD_IN_QUERY");
@@ -1061,7 +1061,8 @@ class rewriter {
     }
     bool const cosine = req.metric == "cosine";
     bool const ip     = req.metric == "ip";
-    auto choice       = find_exact_lists(*sirius_ctx,
+    auto choice       = find_exact_lists(_context,
+                                   *sirius_ctx,
                                    catalog,
                                    schema,
                                    table_name,
@@ -1238,7 +1239,7 @@ class rewriter {
       n_clusters,
       table);
     return find_named_lists(
-      ctx, name, catalog, schema, table, column, cosine, static_cast<std::int64_t>(rows));
+      _context, ctx, name, catalog, schema, table, column, cosine, static_cast<std::int64_t>(rows));
   }
 
   /// DuckDB's join order can push an inner join or a filter from above a LATERAL into its subquery
@@ -1806,7 +1807,7 @@ class rewriter {
                                     corpus_table->ParentCatalog().GetName().GetIdentifierName(),
                                     corpus_table->ParentSchema().name.GetIdentifierName(),
                                     corpus_table->name.GetIdentifierName(),
-                                    sirius::vss::table_identity_of(*corpus_table.get()))
+                                    sirius::vss::table_identity_of(*corpus_get.GetTable()))
                                 : nullptr;
     if (!pin) { return 37; }
     auto const pinned_names = pin->cache_info.column_names();

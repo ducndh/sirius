@@ -43,6 +43,7 @@
 #include "transparent/physical_sirius_execution.hpp"
 #include "transparent/plan_source_policy.hpp"
 #include "transparent/read_view_registry.hpp"
+#include "transparent/read_view_registry.hpp"
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "util/duckdb_error_message.hpp"
 #include "vss/cuvs_index_cache.hpp"
@@ -179,14 +180,14 @@ void reject_update_to_pinned_table(SiriusContext& sirius_context,
   if (update_guard) { connection_state->set_pinned_update_guard(std::move(update_guard)); }
 }
 
-optional_ptr<TableCatalogEntry const> find_write_target(PhysicalOperator const& op)
+optional_ptr<TableCatalogEntry> find_write_target(PhysicalOperator const& op)
 {
   switch (op.type) {
     case PhysicalOperatorType::UPDATE: return &op.Cast<PhysicalUpdate>().tableref;
     case PhysicalOperatorType::DELETE_OPERATOR: return &op.Cast<PhysicalDelete>().tableref;
     case PhysicalOperatorType::INSERT: {
       auto const& insert = op.Cast<PhysicalInsert>();
-      if (insert.insert_table) { return &*insert.insert_table; }
+      if (insert.insert_table) { return insert.insert_table.get_mutable(); }
       break;
     }
     default: break;
@@ -1850,7 +1851,7 @@ namespace {
 bool subtree_has_vector_join(const LogicalOperator& op)
 {
   if (op.type == LogicalOperatorType::LOGICAL_GET) {
-    auto const& name = op.Cast<LogicalGet>().function.name;
+    auto const& name = op.Cast<LogicalGet>().function.GetName();
     if (name == "sirius_knn_join" || name == "sirius_knn_join_rel") { return true; }
   }
   for (auto const& child : op.children) {

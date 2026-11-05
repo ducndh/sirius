@@ -67,7 +67,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::get_nex
   }
   auto const partition_idx = _current_partition_index++;
   if (all_batches.empty()) { return nullptr; }
-  return std::make_unique<partitioned_operator_data>(std::move(all_batches), partition_idx);
+  return std::make_unique<partitioned_operator_data>(
+    std::move(all_batches), partition_idx, partition_placement::unpinned(partition_idx + 1));
 }
 
 std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute(
@@ -86,7 +87,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
   }
   if (input_batches.empty() || space == nullptr) {
     return std::make_unique<partitioned_operator_data>(
-      std::vector<std::shared_ptr<cucascade::data_batch>>{}, partition_idx);
+      std::vector<std::shared_ptr<cucascade::data_batch>>{},
+      partition_idx,
+      partition_placement::unpinned(partition_idx + 1));
   }
 
   // Each partial is [neighbor_id INT64 (col 0), distance FLOAT32 (col 1)],
@@ -141,7 +144,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_reduce_local::execute
   auto batch = sirius::make_data_batch(std::move(out_table), *space, stream, batch_telemetry());
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
   batches.push_back(std::move(batch));
-  return std::make_unique<partitioned_operator_data>(std::move(batches), partition_idx);
+  return std::make_unique<partitioned_operator_data>(
+    std::move(batches), partition_idx, partition_placement::unpinned(partition_idx + 1));
 }
 
 void sirius_physical_vector_join_reduce_local::sink(const operator_data& output_data,
