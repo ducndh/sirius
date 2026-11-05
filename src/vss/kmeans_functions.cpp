@@ -677,7 +677,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     // labels are already zero.
     std::optional<centroid_labeler> labeler;
     if (n_clusters > 1) { labeler.emplace(res, centroids->view(), dim, entry->meta.metric, mr); }
-    bool check_pass_1 = check_uint8 && !check_in_pass_2;
+    bool check_pass_1  = check_uint8 && !check_in_pass_2;
+    bool settled_early = false;
     pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0; i < n_chunks; ++i) {
@@ -740,8 +741,14 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         check_pass_1 = seen == 0;
       }
       base += rows;
+      // With no labels and no range to take, nothing else in this pass needs the rows, and staging
+      // those of a host pin is a copy across PCIe.
+      if (!labeler && !want_int8 && !check_pass_1) {
+        settled_early = true;
+        break;
+      }
     }
-    if (base != n_rows) {
+    if (base != n_rows && !settled_early) {
       throw std::runtime_error(fn + ": pinned column holds " + std::to_string(base) +
                                " rows but the pin reports " + std::to_string(n_rows));
     }
