@@ -3743,6 +3743,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     bool const budget_flush_refused = pairs_to_host_setting == "force_no_flush";
     bool const pairs_to_host_forced =
       pairs_to_host && (pairs_to_host_setting == "force" || budget_flush_refused);
+    // A scanned chunk stays staged until its group has been checked, and its candidates are
+    // re-scored from those rows, so its pairs cannot wait on the host. A slice of it can still be
+    // cut, each part flushed before the next: a large group of near duplicates passes hundreds of
+    // millions of pairs in one slice, more than the device holds beside a large block.
+    bool const cut_large_slices =
+      pairs_to_host || (scan_f16 && gap_rescore && !keyed && !best_only &&
+                        earlier_cut == nullptr && pairs_to_host_setting != "0");
+    bool const slice_cuts_forced =
+      cut_large_slices && (pairs_to_host_setting == "force" || budget_flush_refused);
     std::size_t const pair_budget = pairs_to_host ? host_pair_budget() : 0;
     if (dbg) {
       std::fprintf(stderr,
@@ -3922,8 +3931,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           continue;
         }
         auto const want = slice_pairs + slice_pairs / 4;
-        if (pairs_to_host && sl.n > 1 &&
-            (pairs_to_host_forced ||
+        if (cut_large_slices && sl.n > 1 &&
+            (slice_cuts_forced ||
              static_cast<std::size_t>(want) * kFlushBytesPerPair >
                device_room() + static_cast<std::size_t>(candidates->capacity()) * 16)) {
           ++slice_cuts;

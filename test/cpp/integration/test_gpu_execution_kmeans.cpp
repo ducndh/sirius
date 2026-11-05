@@ -4221,6 +4221,58 @@ TEST_CASE_METHOD(KMeansFixture,
   CHECK(distance_multiset(*con, join(16)).size() == 600u * 1000u);
 }
 
+TEST_CASE_METHOD(KMeansFixture,
+                 "a scanned corpus cuts a slice of duplicates that overflows the pair buffer",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][scan_bounded]")
+{
+  // Every row of one cluster and every probe row are the same vector, so all their pairs tie at
+  // distance 0 and pass the filter. The cut slice must give the answer the grown buffer gives.
+  create_wide_clustered_join(*this, "sdu", false, false, 16, 250000, 200);
+  run_ok("CREATE TABLE sdu_one AS SELECT vec FROM sdu_corpus WHERE cluster_id = 0 LIMIT 1;");
+  run_ok(
+    "CREATE TABLE sdu_same AS SELECT * FROM (SELECT c.id, d.vec, c.cluster_id FROM sdu_corpus c, "
+    "sdu_one d WHERE c.cluster_id = 0 UNION ALL SELECT id, vec, cluster_id FROM sdu_corpus WHERE "
+    "cluster_id <> 0) ORDER BY cluster_id, id;");
+  run_ok("CREATE TABLE sdu_big AS SELECT i::INTEGER AS id, d.vec FROM range(2000) t(i), sdu_one d;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sdu_big', tier => 'gpu', format => 'duckdb');");
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_PAIRS_TO_HOST");
+      ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    }
+  } unset_env;
+  std::string const join =
+    "SELECT left_id, distance FROM sirius_knn_join('sdu_big','vec','sdu_same','vec', search_mode "
+    "=> 'approx', metric => 'l2', k => 10, clustering => 'sdu_c', cluster_column => 'cluster_id', "
+    "n_probes => 4, build_source => 'scan');";
+  ::setenv("SIRIUS_VSS_PAIRS_TO_HOST", "0", 1);
+  auto const grown = distance_multiset(*con, join);
+  REQUIRE(grown.size() == 2000u * 10u);
+  ::setenv("SIRIUS_VSS_PAIRS_TO_HOST", "force", 1);
+  ::setenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG", "1", 1);
+  std::string log;
+  std::vector<std::pair<std::string, long long>> cut;
+  {
+    stderr_to_string capture{log};
+    cut = distance_multiset(*con, join);
+  }
+  CHECK(distance_mismatches(cut, grown) == 0);
+  INFO(log);
+  auto const at = log.find("pairs to host:");
+  REQUIRE(at != std::string::npos);
+  long long moves = -1, pairs = -1, cuts = -1, flushes = -1;
+  REQUIRE(std::sscanf(log.c_str() + at,
+                      "pairs to host: %lld moves, %lld pairs, %lld slice cuts, %lld flushes",
+                      &moves,
+                      &pairs,
+                      &cuts,
+                      &flushes) == 4);
+  CHECK(cuts > 0);
+  CHECK(moves == 0);
+}
+
 TEST_CASE_METHOD(
   KMeansFixture,
   "a scanned self-join answers the same whatever its probe blocks",
