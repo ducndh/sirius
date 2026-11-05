@@ -468,7 +468,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_side_scan(
   auto const projected_output_count = projected_types.size();
   auto scan                         = duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(
     sirius::from_duckdb_vec(projected_types),
-    scan_function,
+    duckdb::BoundTableFunction(scan_function),
     std::move(bind_data),
     sirius::from_duckdb_vec(types),
     std::move(column_ids),
