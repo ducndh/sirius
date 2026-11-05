@@ -1210,9 +1210,7 @@ bound_candidates::bound_candidates(int64_t capacity,
     ids(static_cast<std::size_t>(capacity), stream, mr),
     distances(static_cast<std::size_t>(capacity), stream, mr),
     count(1, stream, mr)
-{
-  CUDF_CUDA_TRY(cudaMemsetAsync(count.data(), 0, sizeof(unsigned long long), stream.get()));
-}
+{ CUDF_CUDA_TRY(cudaMemsetAsync(count.data(), 0, sizeof(unsigned long long), stream.get())); }
 
 bool bound_filter_int8_supports(int64_t dim)
 {
@@ -1593,9 +1591,8 @@ void exact_distances(float const* probe,
   auto const warps_per_block = 8;
   auto const grid            = static_cast<int>(
     std::clamp<int64_t>((n_pairs + warps_per_block - 1) / warps_per_block, 1, 65535));
-  (inner_product
-     ? exact_distances_kernel<true>
-     : exact_distances_kernel<false>)<<<grid, warps_per_block * 32, 0, stream.get()>>>(
+  (inner_product ? exact_distances_kernel<true>
+                 : exact_distances_kernel<false>)<<<grid, warps_per_block * 32, 0, stream.get()>>>(
     probe,
     rows,
     k,
@@ -1665,17 +1662,16 @@ void merge_bound_candidates(float* acc_distances,
   rmm::device_uvector<uint64_t> keys(total, stream, mr), keys_sorted(total, stream, mr);
   rmm::device_uvector<int64_t> order(total, stream, mr), order_sorted(total, stream, mr);
   rmm::device_uvector<int32_t> per_row(n_rows + 1, stream, mr);
-  CUDF_CUDA_TRY(
-    cudaMemsetAsync(per_row.data(), 0, per_row.size() * sizeof(int32_t), stream.get()));
+  CUDF_CUDA_TRY(cudaMemsetAsync(per_row.data(), 0, per_row.size() * sizeof(int32_t), stream.get()));
   merge_keys_kernel<<<grid_for(total), 256, 0, stream.get()>>>(acc_distances,
-                                                                 acc_n,
-                                                                 k,
-                                                                 candidates.rows.data(),
-                                                                 candidates.distances.data(),
-                                                                 n_candidates,
-                                                                 keys.data(),
-                                                                 order.data(),
-                                                                 per_row.data());
+                                                               acc_n,
+                                                               k,
+                                                               candidates.rows.data(),
+                                                               candidates.distances.data(),
+                                                               n_candidates,
+                                                               keys.data(),
+                                                               order.data(),
+                                                               per_row.data());
   CUDF_CUDA_TRY(cudaGetLastError());
 
   // Radix sort is stable and the accumulator entries come first, so they win ties.
@@ -1715,22 +1711,19 @@ void merge_bound_candidates(float* acc_distances,
   rmm::device_uvector<int64_t> old_n(acc_n, stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(
     old_d.data(), acc_distances, acc_n * sizeof(float), cudaMemcpyDeviceToDevice, stream.get()));
-  CUDF_CUDA_TRY(cudaMemcpyAsync(old_n.data(),
-                                acc_neighbors,
-                                acc_n * sizeof(int64_t),
-                                cudaMemcpyDeviceToDevice,
-                                stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    old_n.data(), acc_neighbors, acc_n * sizeof(int64_t), cudaMemcpyDeviceToDevice, stream.get()));
   merge_take_kernel<<<grid_for(acc_n), 256, 0, stream.get()>>>(order_sorted.data(),
-                                                                 cand_before.data(),
-                                                                 n_rows,
-                                                                 k,
-                                                                 old_d.data(),
-                                                                 old_n.data(),
-                                                                 candidates.distances.data(),
-                                                                 candidates.ids.data(),
-                                                                 acc_distances,
-                                                                 acc_neighbors,
-                                                                 bound);
+                                                               cand_before.data(),
+                                                               n_rows,
+                                                               k,
+                                                               old_d.data(),
+                                                               old_n.data(),
+                                                               candidates.distances.data(),
+                                                               candidates.ids.data(),
+                                                               acc_distances,
+                                                               acc_neighbors,
+                                                               bound);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
@@ -2079,20 +2072,19 @@ void seed_bound_sorted(void const* x,
     launch_seed_width(seed_width(words), [&](auto w) {
       seed_distances_kernel<decltype(w)::value, F16>
         <<<grid, kSeedWarps * 32, 0, stream.get()>>>(x,
-                                                       x_sq,
-                                                       probe,
-                                                       probe_sq,
-                                                       first,
-                                                       count,
-                                                       order,
-                                                       b0,
-                                                       nb,
-                                                       static_cast<int>(dim),
-                                                       stride,
-                                                       dist.data());
+                                                     x_sq,
+                                                     probe,
+                                                     probe_sq,
+                                                     first,
+                                                     count,
+                                                     order,
+                                                     b0,
+                                                     nb,
+                                                     static_cast<int>(dim),
+                                                     stride,
+                                                     dist.data());
     });
-    segment_offsets_kernel<<<grid_for(nb + 1), 256, 0, stream.get()>>>(
-      offsets.data(), nb, stride);
+    segment_offsets_kernel<<<grid_for(nb + 1), 256, 0, stream.get()>>>(offsets.data(), nb, stride);
     cub::DeviceSegmentedRadixSort::SortKeys(temp.data(),
                                             temp_bytes,
                                             dist.data(),
@@ -2239,15 +2231,15 @@ radius_pairs take_within(bound_candidates const& candidates,
   out.ids.resize(n, stream);
   out.distances.resize(n, stream);
   take_kernel<<<grid_for(n), 256, 0, stream.get()>>>(picked.data(),
-                                                       n,
-                                                       candidates.rows.data(),
-                                                       candidates.ids.data(),
-                                                       candidates.distances.data(),
-                                                       id_map,
-                                                       take_sqrt,
-                                                       out.rows.data(),
-                                                       out.ids.data(),
-                                                       out.distances.data());
+                                                     n,
+                                                     candidates.rows.data(),
+                                                     candidates.ids.data(),
+                                                     candidates.distances.data(),
+                                                     id_map,
+                                                     take_sqrt,
+                                                     out.rows.data(),
+                                                     out.ids.data(),
+                                                     out.distances.data());
   CUDF_CUDA_TRY(cudaGetLastError());
   return out;
 }

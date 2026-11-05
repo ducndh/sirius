@@ -81,7 +81,7 @@ std::optional<threshold_match> match_threshold_join(duckdb::LogicalAnyJoin& op)
   }
   if (!op.condition || op.children.size() != 2) { return std::nullopt; }
   if (!duckdb::BoundComparisonExpression::IsComparison(*op.condition)) { return std::nullopt; }
-  auto const& cmp = op.condition->Cast<duckdb::BoundFunctionExpression>();
+  auto const& cmp       = op.condition->Cast<duckdb::BoundFunctionExpression>();
   auto const& cmp_left  = duckdb::BoundComparisonExpression::Left(cmp);
   auto const& cmp_right = duckdb::BoundComparisonExpression::Right(cmp);
 

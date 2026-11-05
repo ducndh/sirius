@@ -121,7 +121,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_merge::execute(
   std::vector<std::shared_ptr<cucascade::data_batch>> out_batches;
   auto finish = [&]() {
     return std::make_unique<partitioned_operator_data>(
-    std::move(out_batches), partition_idx, partition_placement::unpinned(partition_idx + 1));
+      std::move(out_batches), partition_idx, partition_placement::unpinned(partition_idx + 1));
   };
   auto emit_table = [&](std::unique_ptr<cudf::table> table) {
     out_batches.push_back(make_data_batch(std::move(table), *space, stream, batch_telemetry()));

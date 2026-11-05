@@ -89,9 +89,9 @@ extern "C" int cudaProfilerStop();
 #include "duckdb/main/connection_manager.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
-#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "exec/stream_plan_bindings.hpp"
 #include "helper/type_conversions.hpp"
@@ -1688,7 +1688,7 @@ static unique_ptr<FunctionData> SiriusCreateAnnIndexBind(ClientContext& context,
   for (auto& kv : input.named_parameters) {
     auto const key = StringUtil::Lower(kv.first.GetIdentifierName());
     if (kv.second.IsNull()) {
-      throw BinderException("sirius_create_ann_index: named parameter '" + kv.first.GetIdentifierName() +
+      throw BinderException("sirius_create_ann_index: named parameter '" + kv.first +
                             "' cannot be NULL");
     }
     if (key == "metric") {
@@ -2028,7 +2028,7 @@ static unique_ptr<FunctionData> SiriusDropAnnIndexBind(ClientContext& context,
   for (auto& kv : input.named_parameters) {
     auto const key = StringUtil::Lower(kv.first.GetIdentifierName());
     if (kv.second.IsNull()) {
-      throw BinderException("sirius_drop_ann_index: named parameter '" + kv.first.GetIdentifierName() +
+      throw BinderException("sirius_drop_ann_index: named parameter '" + kv.first +
                             "' cannot be NULL");
     }
     if (key == "metric") {
@@ -2155,7 +2155,7 @@ static unique_ptr<FunctionData> SiriusVectorSearchBind(ClientContext& context,
   for (auto& kv : input.named_parameters) {
     auto const key = StringUtil::Lower(kv.first.GetIdentifierName());
     if (kv.second.IsNull()) {
-      throw BinderException("sirius_knn_search: named parameter '" + kv.first.GetIdentifierName() + "' cannot be NULL");
+      throw BinderException("sirius_knn_search: named parameter '" + kv.first + "' cannot be NULL");
     }
     if (key == "k") {
       req.k = kv.second.GetValue<int64_t>();
@@ -2391,10 +2391,8 @@ static int64_t ResolveVectorColumn(ClientContext& context,
 {
   auto const qname          = QualifiedName::Parse(table_arg);
   auto const schema_name    = !qname.Schema().empty() ? qname.Schema() : Identifier(schema_arg);
-  auto& entry_base =
-    Catalog::GetEntry(context,
-                      CatalogType::TABLE_ENTRY,
-                      QualifiedName(qname.Catalog(), schema_name, qname.Name()));
+  auto& entry_base          = Catalog::GetEntry(
+    context, CatalogType::TABLE_ENTRY, QualifiedName(qname.Catalog(), schema_name, qname.Name()));
   auto& entry = entry_base.Cast<DuckTableEntry>();
   out_catalog = entry.ParentCatalog().GetName().GetIdentifierName();
   out_schema  = entry.ParentSchema().name.GetIdentifierName();
@@ -2440,7 +2438,7 @@ static unique_ptr<FunctionData> SiriusKMeansFitBind(ClientContext& context,
   for (auto& kv : input.named_parameters) {
     auto const key = StringUtil::Lower(kv.first.GetIdentifierName());
     if (kv.second.IsNull()) {
-      throw BinderException("sirius_kmeans_fit: named parameter '" + kv.first.GetIdentifierName() + "' cannot be NULL");
+      throw BinderException("sirius_kmeans_fit: named parameter '" + kv.first + "' cannot be NULL");
     }
     if (key == "name") {
       req.name = kv.second.ToString();
@@ -2671,7 +2669,7 @@ static unique_ptr<FunctionData> SiriusKMeansAssignBind(ClientContext& context,
   for (auto& kv : input.named_parameters) {
     auto const key = StringUtil::Lower(kv.first.GetIdentifierName());
     if (kv.second.IsNull()) {
-      throw BinderException("sirius_kmeans_assign: named parameter '" + kv.first.GetIdentifierName() +
+      throw BinderException("sirius_kmeans_assign: named parameter '" + kv.first +
                             "' cannot be NULL");
     }
     if (key == "n_probes") {
@@ -2727,11 +2725,10 @@ static unique_ptr<GlobalTableFunctionState> SiriusKMeansAssignInit(ClientContext
     sirius::vss::pinned_table_identity(context, req.catalog, req.schema, req.table);
   if (auto const pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
         req.catalog, req.schema, req.table, req.table_identity)) {
-    auto& entry = Catalog::GetEntry(context,
-                                    CatalogType::TABLE_ENTRY,
-                                    QualifiedName(Identifier(req.catalog),
-                                                  Identifier(req.schema),
-                                                  Identifier(req.table)));
+    auto& entry = Catalog::GetEntry(
+      context,
+      CatalogType::TABLE_ENTRY,
+      QualifiedName(Identifier(req.catalog), Identifier(req.schema), Identifier(req.table)));
     if (auto const why =
           sirius::vss::pinned_rows_mismatch(context, *pin, entry.Cast<DuckTableEntry>())) {
       throw InvalidInputException("sirius_kmeans_assign: the pin of table '" + req.table +
@@ -2855,7 +2852,7 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   for (auto& kv : input.named_parameters) {
     auto const key = StringUtil::Lower(kv.first.GetIdentifierName());
     if (kv.second.IsNull()) {
-      throw BinderException("sirius_knn_join: named parameter '" + kv.first.GetIdentifierName() + "' cannot be NULL");
+      throw BinderException("sirius_knn_join: named parameter '" + kv.first + "' cannot be NULL");
     }
     if (key == "k") {
       req.k = kv.second.GetValue<int64_t>();
@@ -3059,27 +3056,26 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   }
 
   vector<string> side_names;
-  auto const left_dim  = relational
-                           ? sirius::vss::resolve_relational_probe_side(
-                               input.input_table_types,
-                               IdentifiersToStrings(input.input_table_names),
-                               left_column,
-                               left_out_cols,
-                               req.left,
-                               return_types,
-                               side_names)
-                           : resolve_vector_join_side(context,
-                                                     *sirius_ctx,
-                                                     "left",
-                                                     left_table,
-                                                     left_column,
-                                                     left_schema,
-                                                     left_out_cols,
-                                                     /*require_pin=*/!req.probe_from_scan,
-                                                     req.left,
-                                                     return_types,
-                                                     side_names,
-                                                     result->left_rows);
+  auto const left_dim  = relational ? sirius::vss::resolve_relational_probe_side(
+                                        input.input_table_types,
+                                        IdentifiersToStrings(input.input_table_names),
+                                        left_column,
+                                        left_out_cols,
+                                        req.left,
+                                        return_types,
+                                        side_names)
+                                    : resolve_vector_join_side(context,
+                                                               *sirius_ctx,
+                                                               "left",
+                                                               left_table,
+                                                               left_column,
+                                                               left_schema,
+                                                               left_out_cols,
+                                                               /*require_pin=*/!req.probe_from_scan,
+                                                               req.left,
+                                                               return_types,
+                                                               side_names,
+                                                               result->left_rows);
   auto const right_dim = resolve_vector_join_side(context,
                                                   *sirius_ctx,
                                                   "right",
@@ -3092,7 +3088,7 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
                                                   return_types,
                                                   side_names,
                                                   result->right_rows);
-  names = StringsToIdentifiers(side_names);
+  names                = StringsToIdentifiers(side_names);
   if (left_dim != right_dim) {
     throw BinderException("sirius_knn_join: left is FLOAT[" + std::to_string(left_dim) +
                           "] but right is FLOAT[" + std::to_string(right_dim) +
@@ -3148,7 +3144,8 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
     // entry to a table entry is undefined behaviour, which is why the two are kept apart.
     vector<string> corpus_columns;
     if (req.right.is_view) {
-      corpus_columns = IdentifiersToStrings(sirius::vss::bind_view_select(context, req.right).names);
+      corpus_columns =
+        IdentifiersToStrings(sirius::vss::bind_view_select(context, req.right).names);
     } else {
       auto& corpus_entry = Catalog::GetEntry(context,
                                              CatalogType::TABLE_ENTRY,
@@ -3255,10 +3252,10 @@ static void SiriusVectorJoinPushdownFilter(ClientContext&,
       ++it;
       continue;
     }
-    auto& comparison   = expr.Cast<BoundFunctionExpression>();
-    auto const& left   = BoundComparisonExpression::Left(comparison);
-    auto const& right  = BoundComparisonExpression::Right(comparison);
-    bool const flipped = left.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT;
+    auto& comparison       = expr.Cast<BoundFunctionExpression>();
+    auto const& left       = BoundComparisonExpression::Left(comparison);
+    auto const& right      = BoundComparisonExpression::Right(comparison);
+    bool const flipped     = left.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT;
     auto const& col_side   = flipped ? right : left;
     auto const& const_side = flipped ? left : right;
     auto const op          = op_of(comparison.GetExpressionType(), flipped);

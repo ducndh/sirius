@@ -198,10 +198,9 @@ batch_list run_batches(topk_ops& ops, batch_list const& lefts, batch_list const&
     REQUIRE(inputs.size() == 1);
     auto const& partials = by_partition[topk_partials_partition(i)];
     inputs.insert(inputs.end(), partials.begin(), partials.end());
-    auto out =
-      ops.merge->execute(
-        partitioned_operator_data(std::move(inputs), i, partition_placement::unpinned(i + 1)),
-        default_stream());
+    auto out = ops.merge->execute(
+      partitioned_operator_data(std::move(inputs), i, partition_placement::unpinned(i + 1)),
+      default_stream());
     auto const& batches = dynamic_cast<const pipelineable_operator_data&>(*out).get_data_batches();
     REQUIRE(!batches.empty());
     merged.insert(merged.end(), batches.begin(), batches.end());

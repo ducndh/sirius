@@ -34,7 +34,6 @@
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
-#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -44,6 +43,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/logical_operator_deep_copy.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -159,7 +159,8 @@ std::optional<distance_call> as_distance_call(const Expression& e)
     kind = distance_kind::cosine_similarity;
   } else if (f.Function().GetName().GetIdentifierName() == "array_cosine_distance") {
     kind = distance_kind::cosine_distance;
-  } else if (f.Function().GetName().GetIdentifierName() == "array_inner_product" || f.Function().GetName().GetIdentifierName() == "array_dot_product") {
+  } else if (f.Function().GetName().GetIdentifierName() == "array_inner_product" ||
+             f.Function().GetName().GetIdentifierName() == "array_dot_product") {
     kind = distance_kind::inner_product;
   } else if (f.Function().GetName().GetIdentifierName() == "array_negative_inner_product" ||
              f.Function().GetName().GetIdentifierName() == "array_negative_dot_product") {
@@ -395,8 +396,8 @@ bool replace_distance_calls(duckdb::ClientContext& context,
     auto replacement = score_expression(context, call->kind, joined, score);
     if (!replacement) { return false; }
     if (replacement->GetReturnType() != e->GetReturnType()) {
-      replacement =
-        duckdb::BoundCastExpression::AddCastToType(context, std::move(replacement), e->GetReturnType());
+      replacement = duckdb::BoundCastExpression::AddCastToType(
+        context, std::move(replacement), e->GetReturnType());
     }
     e = std::move(replacement);
     return true;
@@ -588,7 +589,8 @@ bool rewrite_enabled(duckdb::ClientContext& context)
 bool expression_has_vector_distance(Expression const& e)
 {
   if (e.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION) {
-    auto const& name = e.Cast<duckdb::BoundFunctionExpression>().Function().GetName().GetIdentifierName();
+    auto const& name =
+      e.Cast<duckdb::BoundFunctionExpression>().Function().GetName().GetIdentifierName();
     if (name == "array_distance" || name == "array_cosine_similarity" ||
         name == "array_cosine_distance" || name == "array_inner_product" ||
         name == "array_dot_product" || name == "array_negative_inner_product" ||
@@ -965,7 +967,8 @@ class rewriter {
     }
     if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
       auto const& fn = e.Cast<duckdb::BoundFunctionExpression>();
-      if ((fn.Function().GetName().GetIdentifierName() == "struct_extract" || fn.Function().GetName().GetIdentifierName() == "struct_extract_at") &&
+      if ((fn.Function().GetName().GetIdentifierName() == "struct_extract" ||
+           fn.Function().GetName().GetIdentifierName() == "struct_extract_at") &&
           fn.BindInfo() && !fn.GetChildren().empty() &&
           fn.GetChildren()[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
           fn.GetChildren()[0]->Cast<duckdb::BoundColumnRefExpression>().Binding() == value) {
@@ -1046,13 +1049,14 @@ class rewriter {
     std::optional<exact_lists_choice> choice;
     if (_context.TryGetCurrentSetting("vector_join_clustering", setting) && !setting.IsNull() &&
         !setting.ToString().empty()) {
-      choice =
-        find_named_lists(_context, ctx, setting.ToString(), catalog, schema, table, column, cosine, n_rows);
+      choice = find_named_lists(
+        _context, ctx, setting.ToString(), catalog, schema, table, column, cosine, n_rows);
       // An inner-product join searches FLOAT16 (re-scored) or FP32 rows only.
       if (choice && ip && !ip_searchable(ctx, *choice)) { choice.reset(); }
     }
     if (!choice) {
-      choice = find_exact_lists(_context, ctx, catalog, schema, table, column, cosine, n_rows, 2, ip);
+      choice =
+        find_exact_lists(_context, ctx, catalog, schema, table, column, cosine, n_rows, 2, ip);
     }
     if (!choice) {
       auto const* build_env = std::getenv("SIRIUS_VSS_BUILD_IN_QUERY");
@@ -1127,15 +1131,15 @@ class rewriter {
     bool const cosine = req.metric == "cosine";
     bool const ip     = req.metric == "ip";
     auto choice       = find_exact_lists(_context,
-                                   *sirius_ctx,
-                                   catalog,
-                                   schema,
-                                   table_name,
-                                   column,
-                                   cosine,
-                                   static_cast<std::int64_t>(rows),
-                                   1,
-                                   ip);
+                                         *sirius_ctx,
+                                         catalog,
+                                         schema,
+                                         table_name,
+                                         column,
+                                         cosine,
+                                         static_cast<std::int64_t>(rows),
+                                         1,
+                                         ip);
     auto pin          = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
       catalog, schema, table_name, sirius::vss::table_identity_of(table));
     access_path_shape shape;
@@ -1494,13 +1498,14 @@ class rewriter {
       aname == "arg_max" || aname == "arg_max_nulls_last" || aname == "max_by" || aname == "max";
     auto const arity = unnest ? std::size_t{3} : by_key ? std::size_t{1} : std::size_t{2};
     if ((!ascending && !descending) || (unnest && by_key) || aggr.GetChildren().size() != arity ||
-        aggr.GetFilter() || aggr.GetAggregateType() != duckdb::AggregateType::NON_DISTINCT || aggr.GetOrderBys()) {
+        aggr.GetFilter() || aggr.GetAggregateType() != duckdb::AggregateType::NON_DISTINCT ||
+        aggr.GetOrderBys()) {
       return decline(7);
     }
     // The column the subquery's values are read from: the unnested row, or the aggregate itself.
-    auto const value_binding =
-      unnest ? ColumnBinding(unnest->unnest_index, duckdb::ProjectionIndex(0))
-             : ColumnBinding(agg.aggregate_index, duckdb::ProjectionIndex(0));
+    auto const value_binding = unnest
+                                 ? ColumnBinding(unnest->unnest_index, duckdb::ProjectionIndex(0))
+                                 : ColumnBinding(agg.aggregate_index, duckdb::ProjectionIndex(0));
     if (unnest) {
       // The unnest must read the aggregate's list.
       auto const& un = unnest->expressions[0]->Cast<duckdb::BoundUnnestExpression>();
@@ -1587,7 +1592,8 @@ class rewriter {
     // One selected column is aggregated as itself; several are packed into a struct.
     bool const single =
       !(value->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
-        value->Cast<duckdb::BoundFunctionExpression>().Function().GetName().GetIdentifierName() == "struct_pack");
+        value->Cast<duckdb::BoundFunctionExpression>().Function().GetName().GetIdentifierName() ==
+          "struct_pack");
     if (single) {
       fields.push_back(value->Copy());
     } else {
@@ -1644,10 +1650,12 @@ class rewriter {
         continue;
       }
       auto& fn = e->Cast<duckdb::BoundFunctionExpression>();
-      if ((fn.Function().GetName().GetIdentifierName() != "struct_extract" && fn.Function().GetName().GetIdentifierName() != "struct_extract_at") ||
+      if ((fn.Function().GetName().GetIdentifierName() != "struct_extract" &&
+           fn.Function().GetName().GetIdentifierName() != "struct_extract_at") ||
           !fn.BindInfo() || fn.GetChildren().empty() ||
           fn.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
-          fn.GetChildren()[0]->Cast<duckdb::BoundColumnRefExpression>().Binding() != value_binding) {
+          fn.GetChildren()[0]->Cast<duckdb::BoundColumnRefExpression>().Binding() !=
+            value_binding) {
         return decline(19);
       }
       auto const idx = fn.BindInfo()->Cast<duckdb::StructExtractBindData>().index;
@@ -1656,7 +1664,8 @@ class rewriter {
       if (auto const fc = as_distance_call(f)) {
         sub_cols.push_back({true, ColumnBinding{}, fc->kind});
       } else {
-        sub_cols.push_back({false, f.Cast<duckdb::BoundColumnRefExpression>().Binding(), call->kind});
+        sub_cols.push_back(
+          {false, f.Cast<duckdb::BoundColumnRefExpression>().Binding(), call->kind});
       }
     }
 
@@ -1778,9 +1787,8 @@ class rewriter {
     bool const corpus_left = dgi == 1;
     auto const& corpus_e   = corpus_left ? cond.GetLHS() : cond.GetRHS();
     auto const& delim_e    = corpus_left ? cond.GetRHS() : cond.GetLHS();
-    auto const cmp =
-      corpus_left ? cond.GetComparisonType()
-                  : duckdb::FlipComparisonExpression(cond.GetComparisonType());
+    auto const cmp = corpus_left ? cond.GetComparisonType()
+                                 : duckdb::FlipComparisonExpression(cond.GetComparisonType());
     if (corpus_e.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
         delim_e.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
       return 34;
@@ -1858,9 +1866,7 @@ class rewriter {
     for (std::size_t j = 0; j < sub_bindings.size(); ++j) {
       if (!used.count(sub_bindings[j])) { continue; }
       vector_out = vector_out || sub_cols[j].probe_col == probe_vec;
-      if (sub_cols[j].probe_col.table_index.IsValid()) {
-        emit.insert(sub_cols[j].probe_col);
-      }
+      if (sub_cols[j].probe_col.table_index.IsValid()) { emit.insert(sub_cols[j].probe_col); }
     }
     if (vector_out) { return 37; }
     vector_join_side side;
@@ -1884,7 +1890,9 @@ class rewriter {
       return std::find(pinned_names.begin(), pinned_names.end(), n) != pinned_names.end();
     };
     auto const cv = column_of(corpus_get, corpus_vec);
-    if (!cv || !is_pinned(corpus_get.names[*cv].GetIdentifierName()) || !is_pinned(pair.column)) { return 37; }
+    if (!cv || !is_pinned(corpus_get.names[*cv].GetIdentifierName()) || !is_pinned(pair.column)) {
+      return 37;
+    }
     for (std::size_t j = 0; j < sub_bindings.size(); ++j) {
       if (!used.count(sub_bindings[j]) || sub_cols[j].is_score ||
           sub_cols[j].probe_col.table_index.IsValid()) {
@@ -1926,7 +1934,8 @@ class rewriter {
     }
     auto const& first =
       agg.expressions[first_ref.column_index]->Cast<duckdb::BoundAggregateExpression>();
-    if (first.Function().GetName().GetIdentifierName() != "first" || first.GetChildren().size() != 1 ||
+    if (first.Function().GetName().GetIdentifierName() != "first" ||
+        first.GetChildren().size() != 1 ||
         first.GetChildren()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
       return false;
     }
@@ -2074,8 +2083,7 @@ class rewriter {
     // Probe columns read above, directly or as the subquery's copy of a correlated column.
     auto emit = used;
     for (std::size_t j = 0; j < sub_bindings.size(); ++j) {
-      if (used.count(sub_bindings[j]) &&
-          sub_cols[j].probe_col.table_index.IsValid()) {
+      if (used.count(sub_bindings[j]) && sub_cols[j].probe_col.table_index.IsValid()) {
         emit.insert(sub_cols[j].probe_col);
       }
     }
@@ -2164,9 +2172,12 @@ class rewriter {
           vector_join_side side;
           try {
             auto const qualified =
-              duckdb::KeywordHelper::WriteQuoted(table->ParentCatalog().GetName().GetIdentifierName(), '"') + "." +
-              duckdb::KeywordHelper::WriteQuoted(table->ParentSchema().name.GetIdentifierName(), '"') + "." +
-              duckdb::KeywordHelper::WriteQuoted(table->name.GetIdentifierName(), '"');
+              duckdb::KeywordHelper::WriteQuoted(
+                table->ParentCatalog().GetName().GetIdentifierName(), '"') +
+              "." +
+              duckdb::KeywordHelper::WriteQuoted(table->ParentSchema().name.GetIdentifierName(),
+                                                 '"') +
+              "." + duckdb::KeywordHelper::WriteQuoted(table->name.GetIdentifierName(), '"');
             resolve_vector_join_side(_context,
                                      *sirius_ctx,
                                      "right",
@@ -2279,7 +2290,8 @@ class rewriter {
         if (!score_at) { score_at = exprs.size(); }
       } else if (in_probe != probe_pos.end()) {
         e = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-          returned_types[in_probe->second], ColumnBinding{table_index, duckdb::ProjectionIndex(in_probe->second)});
+          returned_types[in_probe->second],
+          ColumnBinding{table_index, duckdb::ProjectionIndex(in_probe->second)});
       } else if (j < sub_bindings.size() && used.count(b)) {
         auto const as_probe = std::find_if(probe_pos.begin(), probe_pos.end(), [&](auto const& bp) {
           return bp.first == sub_cols[j].probe_col;
@@ -2290,7 +2302,8 @@ class rewriter {
               "sirius vector-join rewrite: a correlated probe column is not an output of the join");
           }
           e = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-            returned_types[as_probe->second], ColumnBinding{table_index, duckdb::ProjectionIndex(as_probe->second)});
+            returned_types[as_probe->second],
+            ColumnBinding{table_index, duckdb::ProjectionIndex(as_probe->second)});
         } else if (sub_cols[j].is_score) {
           e = score_expression(_context, sub_cols[j].kind, call.kind, score);
           if (!e) { return false; }
@@ -2299,8 +2312,8 @@ class rewriter {
             std::find(corpus_cols.begin(), corpus_cols.end(), sub_cols[j].corpus_col) -
             corpus_cols.begin());
           auto const pos = right_base + c;
-          e              = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(returned_types[pos],
-                                                                  ColumnBinding{table_index, duckdb::ProjectionIndex(pos)});
+          e              = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
+            returned_types[pos], ColumnBinding{table_index, duckdb::ProjectionIndex(pos)});
         }
       } else if (used.count(b)) {
         throw duckdb::InternalException(
@@ -2312,8 +2325,13 @@ class rewriter {
     if (score_at) {
       bool ok = true;
       for_each_expression_outside(*_root, p.op, [&](unique_ptr<Expression>& e) {
-        ok = ok && replace_distance_calls(
-                     _context, e, call.a, call.b, call.kind, ColumnBinding{p.index, duckdb::ProjectionIndex(*score_at)});
+        ok =
+          ok && replace_distance_calls(_context,
+                                       e,
+                                       call.a,
+                                       call.b,
+                                       call.kind,
+                                       ColumnBinding{p.index, duckdb::ProjectionIndex(*score_at)});
       });
       if (!ok) {
         throw duckdb::InternalException("sirius vector-join rewrite: distance call left unmapped");
@@ -2517,7 +2535,8 @@ class rewriter {
     duckdb::ColumnBindingReplacer inner;
     inner.stop_operator = get;
     for (auto const& [old_binding, pos] : remap) {
-      inner.replacement_bindings.emplace_back(old_binding, ColumnBinding{score.table_index, duckdb::ProjectionIndex(pos)});
+      inner.replacement_bindings.emplace_back(
+        old_binding, ColumnBinding{score.table_index, duckdb::ProjectionIndex(pos)});
     }
     inner.VisitOperator(*replacement);
 
@@ -2533,7 +2552,8 @@ class rewriter {
         if (!score_at) { score_at = i; }
       } else if (it != remap.end()) {
         e = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-          get_types[it->second], ColumnBinding{score.table_index, duckdb::ProjectionIndex(it->second)});
+          get_types[it->second],
+          ColumnBinding{score.table_index, duckdb::ProjectionIndex(it->second)});
       } else if (used.count(b)) {
         e = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(_slot_types[i], b);
       }
@@ -2542,8 +2562,13 @@ class rewriter {
     auto const p = install(slot, std::move(replacement), std::move(exprs));
     if (score_at) {
       for_each_expression_outside(*_root, p.op, [&](unique_ptr<Expression>& e) {
-        ok = ok && replace_distance_calls(
-                     _context, e, call.a, call.b, call.kind, ColumnBinding{p.index, duckdb::ProjectionIndex(*score_at)});
+        ok =
+          ok && replace_distance_calls(_context,
+                                       e,
+                                       call.a,
+                                       call.b,
+                                       call.kind,
+                                       ColumnBinding{p.index, duckdb::ProjectionIndex(*score_at)});
       });
     }
     if (!ok) {
@@ -2748,8 +2773,7 @@ class rewriter {
     if (!sirius_ctx || probe->type != LogicalOperatorType::LOGICAL_GET) { return false; }
     auto& scan = probe->Cast<duckdb::LogicalGet>();
     auto table = scan.GetTable();
-    if (!table || scan.table_filters.HasFilters() ||
-        probe_vec.table_index != scan.table_index) {
+    if (!table || scan.table_filters.HasFilters() || probe_vec.table_index != scan.table_index) {
       return false;
     }
     auto const& column_ids = scan.GetColumnIds();
@@ -2780,9 +2804,11 @@ class rewriter {
     duckdb::vector<std::string> names;
     try {
       auto const qualified =
-        duckdb::KeywordHelper::WriteQuoted(table->ParentCatalog().GetName().GetIdentifierName(), '"') + "." +
-        duckdb::KeywordHelper::WriteQuoted(table->ParentSchema().name.GetIdentifierName(), '"') + "." +
-        duckdb::KeywordHelper::WriteQuoted(table->name.GetIdentifierName(), '"');
+        duckdb::KeywordHelper::WriteQuoted(table->ParentCatalog().GetName().GetIdentifierName(),
+                                           '"') +
+        "." +
+        duckdb::KeywordHelper::WriteQuoted(table->ParentSchema().name.GetIdentifierName(), '"') +
+        "." + duckdb::KeywordHelper::WriteQuoted(table->name.GetIdentifierName(), '"');
       resolve_vector_join_side(_context,
                                *sirius_ctx,
                                "left",
@@ -2918,9 +2944,11 @@ class rewriter {
     std::uint64_t right_rows = 0;
     try {
       auto const qualified =
-        duckdb::KeywordHelper::WriteQuoted(table->ParentCatalog().GetName().GetIdentifierName(), '"') + "." +
-        duckdb::KeywordHelper::WriteQuoted(table->ParentSchema().name.GetIdentifierName(), '"') + "." +
-        duckdb::KeywordHelper::WriteQuoted(table->name.GetIdentifierName(), '"');
+        duckdb::KeywordHelper::WriteQuoted(table->ParentCatalog().GetName().GetIdentifierName(),
+                                           '"') +
+        "." +
+        duckdb::KeywordHelper::WriteQuoted(table->ParentSchema().name.GetIdentifierName(), '"') +
+        "." + duckdb::KeywordHelper::WriteQuoted(table->name.GetIdentifierName(), '"');
       resolve_vector_join_side(_context,
                                *sirius_ctx,
                                "right",
@@ -2984,9 +3012,7 @@ class rewriter {
     }
     auto const right_base = returned_types.size();
     for (std::size_t j = 0; j < right_out.size(); ++j) {
-      if (right_old[j].table_index.IsValid()) {
-        remap.emplace_back(right_old[j], right_base + j);
-      }
+      if (right_old[j].table_index.IsValid()) { remap.emplace_back(right_old[j], right_base + j); }
       returned_types.push_back(right_types[j]);
       returned_names.push_back(right_names[j]);
     }
@@ -3042,7 +3068,8 @@ class rewriter {
       };
       if (!comparable(column)) { return false; }
       auto const comparisons = constant_comparisons_of(f);
-      return comparisons && std::all_of(comparisons->begin(), comparisons->end(), [&](auto const& c) {
+      return comparisons &&
+             std::all_of(comparisons->begin(), comparisons->end(), [&](auto const& c) {
                return !c.constant.IsNull() && comparable(c.constant.type());
              });
     };
@@ -3056,8 +3083,8 @@ class rewriter {
           duckdb::ExpressionFilter::GetExpressionFilter(*table_filter, "vector join").Copy());
         continue;
       }
-      duckdb::BoundColumnRefExpression column(right_types[j],
-                                              ColumnBinding{table_index, duckdb::ProjectionIndex(right_base + j)});
+      duckdb::BoundColumnRefExpression column(
+        right_types[j], ColumnBinding{table_index, duckdb::ProjectionIndex(right_base + j)});
       filter->expressions.push_back(table_filter->ToExpression(column));
     }
     if (!filter->expressions.empty()) {
@@ -3125,7 +3152,6 @@ class rewriter {
 
 namespace {
 
-
 }  // namespace
 
 namespace {
@@ -3146,7 +3172,8 @@ std::optional<std::string> stale_pinned_table(duckdb::ClientContext& context,
       if (pin != nullptr) {
         if (auto const why =
               pinned_rows_mismatch(context, *pin, table->Cast<duckdb::DuckTableEntry>())) {
-          return "'" + table->name.GetIdentifierName() + "' no longer holds its rows (" + *why + ")";
+          return "'" + table->name.GetIdentifierName() + "' no longer holds its rows (" + *why +
+                 ")";
         }
       }
     }
@@ -3212,8 +3239,9 @@ bool is_bare_count_star(duckdb::LogicalAggregate const& agg)
   auto const& e = *agg.expressions[0];
   if (e.GetExpressionClass() != duckdb::ExpressionClass::BOUND_AGGREGATE) { return false; }
   auto const& bound = e.Cast<duckdb::BoundAggregateExpression>();
-  return bound.Function().GetName().GetIdentifierName() == "count_star" && bound.GetChildren().empty() && !bound.GetFilter() &&
-         !bound.GetOrderBys() && bound.GetAggregateType() == duckdb::AggregateType::NON_DISTINCT;
+  return bound.Function().GetName().GetIdentifierName() == "count_star" &&
+         bound.GetChildren().empty() && !bound.GetFilter() && !bound.GetOrderBys() &&
+         bound.GetAggregateType() == duckdb::AggregateType::NON_DISTINCT;
 }
 
 // The aggregate that sums the per-batch counts. Sirius plans aggregates by name, and this one sums
@@ -3244,8 +3272,11 @@ void count_sum_combine(duckdb::Vector&, duckdb::Vector&, duckdb::AggregateInputD
 {
   count_sum_cpu();
 }
-void count_sum_finalize(
-  duckdb::Vector&, duckdb::AggregateFinalizeInputData&, duckdb::Vector&, duckdb::idx_t, duckdb::idx_t)
+void count_sum_finalize(duckdb::Vector&,
+                        duckdb::AggregateFinalizeInputData&,
+                        duckdb::Vector&,
+                        duckdb::idx_t,
+                        duckdb::idx_t)
 {
   count_sum_cpu();
 }
@@ -3286,7 +3317,8 @@ std::size_t push_count_into_vector_joins(LogicalOperator& plan)
   }
   if ((*slot)->type != duckdb::LogicalOperatorType::LOGICAL_GET) { return n; }
   auto& get = (*slot)->Cast<duckdb::LogicalGet>();
-  if (get.function.GetName() != "sirius_knn_join" && get.function.GetName() != "sirius_knn_join_rel") {
+  if (get.function.GetName() != "sirius_knn_join" &&
+      get.function.GetName() != "sirius_knn_join_rel") {
     return n;
   }
   auto* bind = dynamic_cast<SiriusVectorJoinBindData*>(get.bind_data.get());
@@ -3309,13 +3341,14 @@ std::size_t push_count_into_vector_joins(LogicalOperator& plan)
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
   children.push_back(duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
-    duckdb::LogicalType::BIGINT, duckdb::ColumnBinding(get.table_index, duckdb::ProjectionIndex(0))));
-  auto summed =
-    duckdb::make_uniq<duckdb::BoundAggregateExpression>(duckdb::BoundAggregateFunction(vector_join_count_sum_function()),
-                                                        std::move(children),
-                                                        nullptr,
-                                                        nullptr,
-                                                        duckdb::AggregateType::NON_DISTINCT);
+    duckdb::LogicalType::BIGINT,
+    duckdb::ColumnBinding(get.table_index, duckdb::ProjectionIndex(0))));
+  auto summed = duckdb::make_uniq<duckdb::BoundAggregateExpression>(
+    duckdb::BoundAggregateFunction(vector_join_count_sum_function()),
+    std::move(children),
+    nullptr,
+    nullptr,
+    duckdb::AggregateType::NON_DISTINCT);
   summed->SetAlias(agg.expressions[0]->GetAlias());
   agg.expressions[0] = std::move(summed);
   // The operators above cache their types; the join's and the aggregate's just changed.

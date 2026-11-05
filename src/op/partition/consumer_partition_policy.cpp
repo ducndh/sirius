@@ -174,16 +174,12 @@ void bind_vector_pair_join(VectorJoin& join,
 void bind_partition_inputs(sirius_physical_vector_threshold_join& join,
                            sirius_physical_partition& build,
                            sirius_physical_partition& probe)
-{
-  bind_vector_pair_join(join, build, probe);
-}
+{ bind_vector_pair_join(join, build, probe); }
 
 void bind_partition_inputs(sirius_physical_vector_topk_join& join,
                            sirius_physical_partition& build,
                            sirius_physical_partition& probe)
-{
-  bind_vector_pair_join(join, build, probe);
-}
+{ bind_vector_pair_join(join, build, probe); }
 
 void bind_partition_input(sirius_physical_vector_join_stream& join,
                           sirius_physical_partition& input,
@@ -191,8 +187,7 @@ void bind_partition_input(sirius_physical_vector_join_stream& join,
 {
   input.set_input_barrier(is_build ? MemoryBarrierType::FULL : MemoryBarrierType::PARTIAL);
   partition_exchange::bind({&input}, 0, false, [&join](auto const&, bool) {
-    install_placement(
-      join, partition_strategy{1, false, false, partition_placement::unpinned(1)});
+    install_placement(join, partition_strategy{1, false, false, partition_placement::unpinned(1)});
     return std::vector<partition_layout>{{partition_mode::single, join.placement()}};
   });
 }

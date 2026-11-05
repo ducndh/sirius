@@ -72,8 +72,7 @@ using KMeansFixture = sirius::test::GpuExecutionFixture;
 
 namespace {
 
-std::unique_ptr<duckdb::QueryResult> query_ok(duckdb::Connection& con,
-                                                          const std::string& sql)
+std::unique_ptr<duckdb::QueryResult> query_ok(duckdb::Connection& con, const std::string& sql)
 {
   auto r = con.Query(sql);
   REQUIRE(r);

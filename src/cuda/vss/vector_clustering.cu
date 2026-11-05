@@ -231,11 +231,8 @@ std::unique_ptr<cudf::column> mean_centroid(std::vector<cudf::column_view> const
   if (n_rows == 0) { throw std::invalid_argument("mean_centroid: no rows"); }
 
   std::vector<double> total(static_cast<std::size_t>(dim));
-  CUDF_CUDA_TRY(cudaMemcpyAsync(total.data(),
-                                sum.data(),
-                                total.size() * sizeof(double),
-                                cudaMemcpyDeviceToHost,
-                                stream.get()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    total.data(), sum.data(), total.size() * sizeof(double), cudaMemcpyDeviceToHost, stream.get()));
   stream.sync();
   std::vector<float> mean(total.size());
   for (std::size_t j = 0; j < total.size(); ++j) {
@@ -706,24 +703,24 @@ void centroid_labeler::label(cudf::column_view const& vectors, std::int32_t* lab
                      stream);
     auto const grid = label_grid(static_cast<std::int64_t>(capacity));
     nearest_filtered_kernel<<<grid, kLabelBlock, 0, stream.get()>>>(candidates.rows.data(),
-                                                                      candidates.distances.data(),
-                                                                      candidates.count.data(),
-                                                                      capacity,
-                                                                      nearest_bits.data(),
-                                                                      unusable.data());
+                                                                    candidates.distances.data(),
+                                                                    candidates.count.data(),
+                                                                    capacity,
+                                                                    nearest_bits.data(),
+                                                                    unusable.data());
     rescore_kernel<<<grid, kLabelBlock, 0, stream.get()>>>(x,
-                                                             dim,
-                                                             s.centers,
-                                                             candidates.rows.data(),
-                                                             candidates.ids.data(),
-                                                             candidates.distances.data(),
-                                                             candidates.count.data(),
-                                                             capacity,
-                                                             nearest_bits.data(),
-                                                             bound.data(),
-                                                             limit.data(),
-                                                             1.f + 4.f * gamma + 1e-6f,
-                                                             best.data());
+                                                           dim,
+                                                           s.centers,
+                                                           candidates.rows.data(),
+                                                           candidates.ids.data(),
+                                                           candidates.distances.data(),
+                                                           candidates.count.data(),
+                                                           capacity,
+                                                           nearest_bits.data(),
+                                                           bound.data(),
+                                                           limit.data(),
+                                                           1.f + 4.f * gamma + 1e-6f,
+                                                           best.data());
     take_labels_kernel<<<label_grid(m), kLabelBlock, 0, stream.get()>>>(
       best.data(), m, labels + at, unusable.data());
     CUDF_CHECK_CUDA(stream.get());

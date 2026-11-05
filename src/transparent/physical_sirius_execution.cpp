@@ -40,7 +40,6 @@
 #include <duckdb/planner/planner.hpp>
 
 #include <atomic>
-
 #include <chrono>
 #include <thread>
 

@@ -82,7 +82,8 @@ struct constant_comparison {
   duckdb::Value constant;
 };
 
-/// @p filter as conjuncts of constant comparisons, or nullopt when any part of it is something else.
+/// @p filter as conjuncts of constant comparisons, or nullopt when any part of it is something
+/// else.
 [[nodiscard]] std::optional<std::vector<constant_comparison>> constant_comparisons_of(
   duckdb::TableFilter const& filter);
 

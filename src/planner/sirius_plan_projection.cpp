@@ -110,7 +110,7 @@ void rewrite_distance_calls(duckdb::unique_ptr<duckdb::Expression>& expr,
     if (!target_as_similarity) { target_as_similarity = *as_sim; }
     if (*target_as_similarity == *as_sim) {
       expr        = duckdb::make_uniq<duckdb::BoundReferenceExpression>(expr->GetReturnType(),
-                                                                 info.distance_col_index);
+                                                                        info.distance_col_index);
       rewrote_any = true;
     }
     return;

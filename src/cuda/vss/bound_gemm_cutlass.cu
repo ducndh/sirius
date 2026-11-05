@@ -307,8 +307,7 @@ void bound_filter_f16_cutlass(bound_slice const& s,
       static_cast<int>(s.m), static_cast<int>(p.single.n), a.dim);
     p.grid_tiled       = sw.get_tiled_shape(problem, {kCutlassTileM, kCutlassTileN, 32}, 1);
     p.swizzle_log_tile = sw.get_log_tile(p.grid_tiled);
-    tile_filter_kernel<K>
-      <<<sw.get_grid_shape(p.grid_tiled), K::kThreads, smem, stream.get()>>>(p);
+    tile_filter_kernel<K><<<sw.get_grid_shape(p.grid_tiled), K::kThreads, smem, stream.get()>>>(p);
     CUDF_CUDA_TRY(cudaGetLastError());
   }
 }

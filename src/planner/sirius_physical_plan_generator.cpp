@@ -62,8 +62,6 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_nested_loop_join.hpp"
-#include "op/sirius_physical_vector_threshold_join.hpp"
-#include "op/sirius_physical_vector_topk_join.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_passthrough_sink.hpp"
@@ -77,6 +75,8 @@
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "op/sirius_physical_union.hpp"
+#include "op/sirius_physical_vector_threshold_join.hpp"
+#include "op/sirius_physical_vector_topk_join.hpp"
 #include "op/sirius_physical_window.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/sirius_plan_compressed_schema.hpp"
@@ -86,8 +86,8 @@
 #include "scan_manager/preparation_ledger.hpp"
 #include "sirius_config.hpp"
 #include "sirius_context.hpp"
-#include "vss/sirius_physical_vector_join_stream.hpp"
 #include "transparent/read_view_registry.hpp"
+#include "vss/sirius_physical_vector_join_stream.hpp"
 
 #include <cudf/cudf_utils.hpp>
 

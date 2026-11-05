@@ -109,7 +109,7 @@ std::optional<std::vector<constant_comparison>> constant_comparisons_of(
       return true;
     }
     if (!duckdb::BoundComparisonExpression::IsComparison(expr)) { return false; }
-    auto comparison = expr.GetExpressionType();
+    auto comparison     = expr.GetExpressionType();
     auto const constant = duckdb::ExpressionFilter::TryGetColumnConstantComparison(
       expr.Cast<duckdb::BoundFunctionExpression>(), comparison);
     if (!constant) { return false; }
@@ -249,7 +249,7 @@ std::int64_t resolve_vector_join_side(duckdb::ClientContext& context,
   side.catalog = entry_base.ParentCatalog().GetName().GetIdentifierName();
   side.schema  = entry_base.ParentSchema().name.GetIdentifierName();
   // Catalog-resolved name (matches query-side derivation).
-  side.table = entry_base.name.GetIdentifierName();
+  side.table   = entry_base.name.GetIdentifierName();
   side.is_view = is_view;
 
   duckdb::vector<duckdb::string> schema_names;

@@ -104,7 +104,9 @@ std::optional<topk_delim_match> match_topk_delim_join(duckdb::LogicalComparisonJ
   }
 
   auto const& cond = op.conditions[0];
-  if (cond.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) { return std::nullopt; }
+  if (cond.GetComparisonType() != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+    return std::nullopt;
+  }
   auto const lhs = as_float_array_ref(cond.GetLHS());
   auto const rhs = as_float_array_ref(cond.GetRHS());
   if (!lhs || !rhs || lhs->second != rhs->second) { return std::nullopt; }
@@ -298,7 +300,8 @@ std::optional<std::size_t> struct_field_of(const duckdb::Expression& expr)
 {
   if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_FUNCTION) { return std::nullopt; }
   auto const& func = expr.Cast<duckdb::BoundFunctionExpression>();
-  if ((func.Function().GetName().GetIdentifierName() != "struct_extract" && func.Function().GetName().GetIdentifierName() != "struct_extract_at") ||
+  if ((func.Function().GetName().GetIdentifierName() != "struct_extract" &&
+       func.Function().GetName().GetIdentifierName() != "struct_extract_at") ||
       !func.BindInfo() || func.GetChildren().empty()) {
     return std::nullopt;
   }
@@ -696,8 +699,8 @@ sirius_physical_plan_generator::try_plan_vector_global_topk_join(duckdb::Logical
   std::function<void(duckdb::unique_ptr<duckdb::Expression>&)> use_ranking_column =
     [&](duckdb::unique_ptr<duckdb::Expression>& expr) {
       if (expr->Equals(distance)) {
-        expr =
-          duckdb::make_uniq<duckdb::BoundReferenceExpression>(expr->GetReturnType(), n_left + n_right);
+        expr = duckdb::make_uniq<duckdb::BoundReferenceExpression>(expr->GetReturnType(),
+                                                                   n_left + n_right);
         return;
       }
       duckdb::ExpressionIterator::EnumerateChildren(*expr, use_ranking_column);

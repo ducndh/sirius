@@ -50,8 +50,7 @@ std::vector<std::vector<std::string>> sorted_rows(duckdb::Connection& con, const
   REQUIRE(r);
   if (r->HasError()) { UNSCOPED_INFO("query error: " << r->GetError()); }
   REQUIRE_FALSE(r->HasError());
-  auto rows = sirius::test::GpuExecutionFixture::collect_rows(
-    (*r), /*sort=*/true);
+  auto rows = sirius::test::GpuExecutionFixture::collect_rows((*r), /*sort=*/true);
   return rows;
 }
 

@@ -406,11 +406,12 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> make_side_scan(
   const std::string& extra_column                  = {},
   const std::vector<std::string>& trailing_columns = {})
 {
-  auto& entry_base = duckdb::Catalog::GetEntry(context,
-                                               duckdb::CatalogType::TABLE_ENTRY,
-                                               duckdb::QualifiedName(duckdb::Identifier(side.catalog),
-                                                                     duckdb::Identifier(side.schema),
-                                                                     duckdb::Identifier(side.table)));
+  auto& entry_base =
+    duckdb::Catalog::GetEntry(context,
+                              duckdb::CatalogType::TABLE_ENTRY,
+                              duckdb::QualifiedName(duckdb::Identifier(side.catalog),
+                                                    duckdb::Identifier(side.schema),
+                                                    duckdb::Identifier(side.table)));
   auto& table_entry = entry_base.Cast<duckdb::DuckTableEntry>();
 
   auto const& columns = table_entry.GetColumns();
@@ -1606,10 +1607,9 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       // a different row order than the one the build side's snapshot fixed.
       stream_op->children.push_back(
         corpus_child.has_value() ? std::move(*corpus_child)
-        : req.right.is_view
-          ? make_view_side(req.right, req.build_cluster_column)
-          : wired_side_scan(
-              make_side_scan(context, req.right, req.build_cluster_column, probe_only_columns)));
+        : req.right.is_view ? make_view_side(req.right, req.build_cluster_column)
+                            : wired_side_scan(make_side_scan(
+                                context, req.right, req.build_cluster_column, probe_only_columns)));
     }
     join_stage = std::move(stream_op);
   } else {

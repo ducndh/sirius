@@ -741,8 +741,9 @@ std::optional<expr_ref> gpu_expression_translator::add_unary_function_expression
   if (alt.arguments().size() != 1) { return std::nullopt; }
   auto arg = add_expression(*alt.arguments()[0], table_src);
   if (!arg) { return std::nullopt; }
-  auto const wants_double = sirius::require_cudf_type(alt.return_type()).id() == cudf::type_id::FLOAT64;
-  auto const arg_type     = alt.arguments()[0]->return_type().id();
+  auto const wants_double =
+    sirius::require_cudf_type(alt.return_type()).id() == cudf::type_id::FLOAT64;
+  auto const arg_type = alt.arguments()[0]->return_type().id();
   if (arg_type != sirius::type_id::FLOAT && arg_type != sirius::type_id::DOUBLE) {
     return std::nullopt;
   }

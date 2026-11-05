@@ -1229,7 +1229,8 @@ void sirius_physical_vector_join_stream::initialize_locked()
     _lists =
       _sirius_ctx != nullptr ? vss::find_cluster_lists(*_sirius_ctx, _request.clustering) : nullptr;
     if (_lists == nullptr || _lists->pin != right_pin.get() ||
-        _lists->pin_snapshot.lock() != right_pin->snapshot_identity || _lists->column != right.column ||
+        _lists->pin_snapshot.lock() != right_pin->snapshot_identity ||
+        _lists->column != right.column ||
         _lists->n_rows != static_cast<std::int64_t>(right_pin->num_rows)) {
       throw std::runtime_error("[sirius_physical_vector_join_stream] clustering '" +
                                _request.clustering + "' has no lists over the current pin of '" +
@@ -1687,9 +1688,9 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
                                      _sirius_ctx);
   } else {
     pin = _scan_manager->find_pinned_entry_for_duckdb_table(_request.right.catalog,
-                                                       _request.right.schema,
-                                                       _request.right.table,
-                                                       _request.right.table_identity);
+                                                            _request.right.schema,
+                                                            _request.right.table,
+                                                            _request.right.table_identity);
     if (pin == nullptr) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_stream] clustering needs the corpus table '" +
@@ -1974,7 +1975,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         std::move(batches), left_idx, join_in->ticket());
     }
     return std::make_unique<partitioned_operator_data>(
-    std::move(batches), left_idx, partition_placement::unpinned(left_idx + 1));
+      std::move(batches), left_idx, partition_placement::unpinned(left_idx + 1));
   };
   if (_request.probe_scalar && _scalar_probe_rows != 1) {
     throw std::runtime_error(
@@ -2497,18 +2498,18 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           mr);
         auto const first = at * n_probes;
         auto const count = static_cast<std::size_t>(n * n_probes);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(
-          assignment.row_ids->mutable_view().data<std::int64_t>() + first,
-          part.row_ids->view().data<std::int64_t>(),
-          count * sizeof(std::int64_t),
-          cudaMemcpyDeviceToDevice,
-          stream.get()));
-        CUDF_CUDA_TRY(cudaMemcpyAsync(
-          assignment.cluster_ids->mutable_view().data<std::int32_t>() + first,
-          part.cluster_ids->view().data<std::int32_t>(),
-          count * sizeof(std::int32_t),
-          cudaMemcpyDeviceToDevice,
-          stream.get()));
+        CUDF_CUDA_TRY(
+          cudaMemcpyAsync(assignment.row_ids->mutable_view().data<std::int64_t>() + first,
+                          part.row_ids->view().data<std::int64_t>(),
+                          count * sizeof(std::int64_t),
+                          cudaMemcpyDeviceToDevice,
+                          stream.get()));
+        CUDF_CUDA_TRY(
+          cudaMemcpyAsync(assignment.cluster_ids->mutable_view().data<std::int32_t>() + first,
+                          part.cluster_ids->view().data<std::int32_t>(),
+                          count * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToDevice,
+                          stream.get()));
         stream.sync();
       });
     } else {
@@ -2702,8 +2703,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     std::optional<rmm::device_uvector<float>> probe_code_error, rotated_probe;
     if (int8_search && !codes_int8) {
       rmm::device_uvector<unsigned long long> non_bytes(1, stream, mr);
-      CUDF_CUDA_TRY(
-        cudaMemsetAsync(non_bytes.data(), 0, sizeof(unsigned long long), stream.get()));
+      CUDF_CUDA_TRY(cudaMemsetAsync(non_bytes.data(), 0, sizeof(unsigned long long), stream.get()));
       vss::count_non_uint8(search_queries.data_handle(), n_left * dim, non_bytes.data(), stream);
       unsigned long long non_bytes_host = 0;
       CUDF_CUDA_TRY(cudaMemcpyAsync(&non_bytes_host,

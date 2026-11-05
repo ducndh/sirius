@@ -374,7 +374,7 @@ void sirius_physical_vector_join_materialize::ensure_initialized(
 
   auto left_pin  = _probe_side ? nullptr
                                : _scan_manager->find_pinned_entry_for_duckdb_table(
-                                  left.catalog, left.schema, left.table, left.table_identity);
+                                   left.catalog, left.schema, left.table, left.table_identity);
   auto right_pin = _build_side ? nullptr
                                : _scan_manager->find_pinned_entry_for_duckdb_table(
                                    right.catalog, right.schema, right.table, right.table_identity);
