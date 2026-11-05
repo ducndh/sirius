@@ -4273,6 +4273,85 @@ TEST_CASE_METHOD(KMeansFixture,
   CHECK(moves == 0);
 }
 
+TEST_CASE_METHOD(KMeansFixture,
+                 "lists cut a slice of duplicates that overflows the pair buffer",
+                 "[integration][gpu_execution][array][vss][kmeans][approx][vector_join]")
+{
+  // Over lists no path but the unseeded FP16 sweep can move pairs to the host, so the cut is all
+  // these have. Every pair of the one vector passes the filter; a cut slice must answer as the
+  // grown buffer does, for each list encoding and for a threshold join as for a top-k.
+  create_wide_clustered_join(*this, "ldu", false, false, 16, 200000, 200);
+  run_ok("CREATE TABLE ldu_one AS SELECT vec FROM ldu_corpus WHERE cluster_id = 0 LIMIT 1;");
+  run_ok(
+    "CREATE TABLE ldu_same AS SELECT * FROM (SELECT c.id, d.vec, c.cluster_id FROM ldu_corpus c, "
+    "ldu_one d WHERE c.cluster_id = 0 UNION ALL SELECT id, vec, cluster_id FROM ldu_corpus WHERE "
+    "cluster_id <> 0) ORDER BY cluster_id, id;");
+  run_ok(
+    "CREATE TABLE ldu_big AS SELECT i::INTEGER AS id, d.vec FROM range(2000) t(i), ldu_one d;");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'ldu_big', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => 'ldu_same', tier => 'gpu', format => 'duckdb');");
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_PAIRS_TO_HOST");
+      ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    }
+  } unset_env;
+  auto const slice_cuts = [](std::string const& log) {
+    auto const at = log.find("pairs to host:");
+    if (at == std::string::npos) { return -1LL; }
+    long long moves = -1, pairs = -1, cuts = -1;
+    return std::sscanf(log.c_str() + at,
+                       "pairs to host: %lld moves, %lld pairs, %lld slice cuts",
+                       &moves,
+                       &pairs,
+                       &cuts) == 3
+             ? cuts
+             : -1LL;
+  };
+  for (std::string const storage : {"int8", "float16"}) {
+    INFO(storage);
+    auto const name = "ldu_" + storage;
+    run_ok("SELECT * FROM sirius_kmeans_fit('ldu_same','vec', name => '" + name +
+           "', n_clusters => 16);");
+    run_ok("SELECT * FROM sirius_kmeans_build_lists('ldu_same','vec','" + name + "', storage => '" +
+           storage + "');");
+    auto const args =
+      "'ldu_big','vec','ldu_same','vec', search_mode => 'approx', metric => 'l2', "
+      "clustering => '" +
+      name + "', n_probes => 4";
+    std::string const top_k =
+      "SELECT left_id, distance FROM sirius_knn_join(" + args + ", k => 10);";
+    std::string const threshold =
+      "SELECT left_id, right_id, distance FROM sirius_knn_join(" + args +
+      ", join_mode => 'threshold', k => 1, eps => 0.001) WHERE left_id < 3;";
+    ::setenv("SIRIUS_VSS_PAIRS_TO_HOST", "0", 1);
+    ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    auto const grown_top_k     = distance_multiset(*con, top_k);
+    auto const grown_threshold = distance_multiset(*con, threshold);
+    REQUIRE(grown_top_k.size() == 2000u * 10u);
+    REQUIRE_FALSE(grown_threshold.empty());
+    ::setenv("SIRIUS_VSS_PAIRS_TO_HOST", "force", 1);
+    ::setenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG", "1", 1);
+    std::string log;
+    std::vector<std::pair<std::string, long long>> cut;
+    {
+      stderr_to_string capture{log};
+      cut = distance_multiset(*con, top_k);
+    }
+    CHECK(distance_mismatches(cut, grown_top_k) == 0);
+    CHECK(slice_cuts(log) > 0);
+    log.clear();
+    {
+      stderr_to_string capture{log};
+      cut = distance_multiset(*con, threshold);
+    }
+    CHECK(distance_mismatches(cut, grown_threshold) == 0);
+    CHECK(slice_cuts(log) > 0);
+  }
+}
+
 TEST_CASE_METHOD(
   KMeansFixture,
   "a scanned self-join answers the same whatever its probe blocks",

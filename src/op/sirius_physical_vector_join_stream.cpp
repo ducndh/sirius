@@ -3745,13 +3745,13 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     bool const budget_flush_refused = pairs_to_host_setting == "force_no_flush";
     bool const pairs_to_host_forced =
       pairs_to_host && (pairs_to_host_setting == "force" || budget_flush_refused);
-    // A scanned chunk stays staged until its group has been checked, and its candidates are
-    // re-scored from those rows, so its pairs cannot wait on the host. A slice of it can still be
-    // cut, each part flushed before the next: a large group of near duplicates passes hundreds of
-    // millions of pairs in one slice, more than the device holds beside a large block.
-    bool const cut_large_slices =
-      pairs_to_host || (scan_f16 && gap_rescore && !keyed && !best_only &&
-                        earlier_cut == nullptr && pairs_to_host_setting != "0");
+    // Pairs can wait on the host only on that one path. A scanned chunk, for one, stays staged
+    // until its group has been checked, and its candidates are re-scored from those rows. But any
+    // slice can be cut, each part flushed before the next: a large group of near duplicates passes
+    // hundreds of millions of pairs in one slice, more than the device holds beside a large block.
+    // The parts are pieces like the running bound's, disjoint rows with a flush between them, which
+    // every bounded search already takes.
+    bool const cut_large_slices = any_bounded && pairs_to_host_setting != "0";
     bool const slice_cuts_forced =
       cut_large_slices && (pairs_to_host_setting == "force" || budget_flush_refused);
     std::size_t const pair_budget = pairs_to_host ? host_pair_budget() : 0;
@@ -3941,8 +3941,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           auto lo = sl;
           lo.n    = sl.n / 2;
           auto hi = sl;
-          hi.x    = static_cast<std::byte const*>(sl.x) +
-                 static_cast<std::size_t>(lo.n) * static_cast<std::size_t>(dim) * 2;
+          hi.x    = static_cast<std::byte const*>(sl.x) + static_cast<std::size_t>(lo.n) *
+                                                            static_cast<std::size_t>(dim) *
+                                                            (f16_bounded ? 2 : 1);
           hi.x_sq = static_cast<std::byte const*>(sl.x_sq) + static_cast<std::size_t>(lo.n) * 4;
           hi.n    = sl.n - lo.n;
           hi.id_base += lo.n;
