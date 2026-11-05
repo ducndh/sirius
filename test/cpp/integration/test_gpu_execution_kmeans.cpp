@@ -3403,6 +3403,7 @@ TEST_CASE_METHOD(KMeansFixture,
   request.left.catalog        = attach_alias;
   request.left.schema         = "main";
   request.left.table          = "mst";
+  request.left.table_identity = pin->cache_info.table_identity;
   request.left.output_columns = {"id", "payload"};
   request.right               = request.left;
   request.right.output_columns.clear();

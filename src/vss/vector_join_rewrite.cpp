@@ -1204,12 +1204,14 @@ class rewriter {
   {
     bool const cosine = req.metric == "cosine";
     try {
+      auto const table_identity = pinned_table_identity(_context, catalog, schema, table);
       kmeans_fit_request fit;
-      fit.name    = name;
-      fit.catalog = catalog;
-      fit.schema  = schema;
-      fit.table   = table;
-      fit.column  = column;
+      fit.name           = name;
+      fit.catalog        = catalog;
+      fit.schema         = schema;
+      fit.table          = table;
+      fit.table_identity = table_identity;
+      fit.column         = column;
       fit.dim     = req.dim;
       fit.spec.n_clusters =
         std::clamp<std::int64_t>(n_clusters, 1, static_cast<std::int64_t>(rows));
@@ -1219,6 +1221,7 @@ class rewriter {
       lists.catalog    = catalog;
       lists.schema     = schema;
       lists.table      = table;
+      lists.table_identity = table_identity;
       lists.column     = column;
       lists.dim        = req.dim;
       // Inner-product lists are FLOAT16 like cosine's, but of the rows as they are.

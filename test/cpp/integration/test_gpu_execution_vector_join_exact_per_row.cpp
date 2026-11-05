@@ -754,12 +754,12 @@ TEST_CASE_METHOD(VectorJoinFixture,
   // with the build phase.
   run_ok(
     "INSERT INTO bp_corpus SELECT i, "
-    "list_transform(range(0, 64), j -> ((hash(i * 64 + j) % 100000) / 100000.0)::FLOAT)"
+    "list_transform(range(0, 64), lambda j: ((hash(i * 64 + j) % 100000) / 100000.0)::FLOAT)"
     "::FLOAT[64] FROM range(600000) t(i);");
   run_ok("CREATE TABLE bp_probe (id INTEGER, vec FLOAT[64]);");
   run_ok(
     "INSERT INTO bp_probe SELECT i, "
-    "list_transform(range(0, 64), j -> ((hash(i * 977 + j * 13 + 7) % 100000) / 100000.0)::FLOAT)"
+    "list_transform(range(0, 64), lambda j: ((hash(i * 977 + j * 13 + 7) % 100000) / 100000.0)::FLOAT)"
     "::FLOAT[64] FROM range(200) t(i);");
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'bp_corpus', tier => 'gpu', format => 'duckdb');");
@@ -818,12 +818,12 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("CREATE TABLE up_corpus (id INTEGER, vec FLOAT[8], category INTEGER);");
   run_ok(
     "INSERT INTO up_corpus SELECT i, "
-    "list_transform(range(0, 8), j -> ((hash(i * 8 + j) % 100000) / 100000.0)::FLOAT)::FLOAT[8], "
+    "list_transform(range(0, 8), lambda j: ((hash(i * 8 + j) % 100000) / 100000.0)::FLOAT)::FLOAT[8], "
     "(i % 7) FROM range(20000) t(i);");
   run_ok("CREATE TABLE up_probe (id INTEGER, vec FLOAT[8]);");
   run_ok(
     "INSERT INTO up_probe SELECT i, "
-    "list_transform(range(0, 8), j -> ((hash(i * 31 + j * 7 + 3) % 100000) / 100000.0)::FLOAT)"
+    "list_transform(range(0, 8), lambda j: ((hash(i * 31 + j * 7 + 3) % 100000) / 100000.0)::FLOAT)"
     "::FLOAT[8] FROM range(100) t(i);");
   run_ok("CHECKPOINT;");
 
@@ -869,12 +869,12 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("CREATE TABLE ps_corpus (id INTEGER, vec FLOAT[8]);");
   run_ok(
     "INSERT INTO ps_corpus SELECT i, "
-    "list_transform(range(0, 8), j -> ((hash(i * 8 + j) % 100000) / 100000.0)::FLOAT)::FLOAT[8] "
+    "list_transform(range(0, 8), lambda j: ((hash(i * 8 + j) % 100000) / 100000.0)::FLOAT)::FLOAT[8] "
     "FROM range(30000) t(i);");
   run_ok("CREATE TABLE ps_probe (id INTEGER, vec FLOAT[8], region INTEGER);");
   run_ok(
     "INSERT INTO ps_probe SELECT i, "
-    "list_transform(range(0, 8), j -> ((hash(i * 41 + j * 3 + 11) % 100000) / 100000.0)::FLOAT)"
+    "list_transform(range(0, 8), lambda j: ((hash(i * 41 + j * 3 + 11) % 100000) / 100000.0)::FLOAT)"
     "::FLOAT[8], (i % 5) FROM range(300) t(i);");
   run_ok("CHECKPOINT;");
 
@@ -928,12 +928,12 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("CREATE TABLE rl_corpus (id INTEGER, vec FLOAT[8]);");
   run_ok(
     "INSERT INTO rl_corpus SELECT i, "
-    "list_transform(range(0, 8), j -> ((hash(i * 8 + j) % 100000) / 100000.0)::FLOAT)::FLOAT[8] "
+    "list_transform(range(0, 8), lambda j: ((hash(i * 8 + j) % 100000) / 100000.0)::FLOAT)::FLOAT[8] "
     "FROM range(20000) t(i);");
   run_ok("CREATE TABLE rl_probe (id INTEGER, vec FLOAT[8], region INTEGER);");
   run_ok(
     "INSERT INTO rl_probe SELECT i, "
-    "list_transform(range(0, 8), j -> ((hash(i * 53 + j * 5 + 2) % 100000) / 100000.0)::FLOAT)"
+    "list_transform(range(0, 8), lambda j: ((hash(i * 53 + j * 5 + 2) % 100000) / 100000.0)::FLOAT)"
     "::FLOAT[8], (i % 10) FROM range(1000) t(i);");
   // The workaround the relational form removes: the filtered probe as its own table.
   run_ok("CREATE TABLE rl_probe_r3 AS SELECT id, vec FROM rl_probe WHERE region = 3;");
@@ -999,12 +999,12 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("CREATE TABLE pp_corpus (id INTEGER, vec FLOAT[8], category INTEGER);");
   run_ok(
     "INSERT INTO pp_corpus SELECT i, "
-    "list_transform(range(0, 8), j -> ((hash(i * 8 + j) % 100000) / 100000.0)::FLOAT)::FLOAT[8], "
+    "list_transform(range(0, 8), lambda j: ((hash(i * 8 + j) % 100000) / 100000.0)::FLOAT)::FLOAT[8], "
     "(i % 7) FROM range(20000) t(i);");
   run_ok("CREATE TABLE pp_probe (id INTEGER, vec FLOAT[8], region INTEGER);");
   run_ok(
     "INSERT INTO pp_probe SELECT i, "
-    "list_transform(range(0, 8), j -> ((hash(i * 61 + j * 9 + 4) % 100000) / 100000.0)::FLOAT)"
+    "list_transform(range(0, 8), lambda j: ((hash(i * 61 + j * 9 + 4) % 100000) / 100000.0)::FLOAT)"
     "::FLOAT[8], (i % 5) FROM range(200) t(i);");
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'pp_corpus', tier => 'gpu', format => 'duckdb');");
@@ -1065,12 +1065,12 @@ TEST_CASE_METHOD(VectorJoinFixture,
   run_ok("CREATE TABLE vw_corpus (id INTEGER, vec FLOAT[3]);");
   run_ok(
     "INSERT INTO vw_corpus SELECT i, "
-    "list_transform(range(0, 3), j -> ((hash(i * 3 + j) % 1000) / 1000.0)::FLOAT)::FLOAT[3] "
+    "list_transform(range(0, 3), lambda j: ((hash(i * 3 + j) % 1000) / 1000.0)::FLOAT)::FLOAT[3] "
     "FROM range(500) t(i);");
   run_ok("CREATE TABLE vw_probe (id INTEGER, vec FLOAT[3]);");
   run_ok(
     "INSERT INTO vw_probe SELECT i, "
-    "list_transform(range(0, 3), j -> ((hash(i * 7 + j) % 1000) / 1000.0)::FLOAT)::FLOAT[3] "
+    "list_transform(range(0, 3), lambda j: ((hash(i * 7 + j) % 1000) / 1000.0)::FLOAT)::FLOAT[3] "
     "FROM range(20) t(i);");
   run_ok("CHECKPOINT;");
   run_ok("SELECT * FROM pin_table(name => 'vw_probe', tier => 'gpu', format => 'duckdb');");
