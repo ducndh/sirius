@@ -257,6 +257,14 @@ class vector_join_stream_input : public operator_data {
     return _estimated_bytes;
   }
 
+  /// Pair counts differ by block, so a light task's peak must not size a heavy one below what its
+  /// own rows are known to hold.
+  [[nodiscard]] std::size_t get_estimated_working_set_size_in_bytes() const override
+  {
+    return _estimated_bytes;
+  }
+  [[nodiscard]] bool working_set_floors_reservation() const override { return true; }
+
   [[nodiscard]] ::cucascade::memory::memory_space* get_gpu_memory_space() const
   {
     return _gpu_memory_space;
