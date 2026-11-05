@@ -618,19 +618,13 @@ TEST_CASE("Sirius configuration loading from file with configurator",
 TEST_CASE("Sirius host pools come from registered pages by default",
           "[sirius][context][isolated_context]")
 {
-  finally cleanup_env{[]() {
-    unsetenv("SIRIUS_CONFIG_FILE");
-    setenv("SIRIUS_DISABLE", "1", 1);
-  }};
+  finally cleanup_env{[]() { setenv("SIRIUS_DISABLE", "1", 1); }};
 
   std::source_location loc = std::source_location::current();
   fs::path cfg = fs::path(loc.file_name()).parent_path() / "data" / "register_pools.yaml";
 
-  unsetenv("SIRIUS_DISABLE");
-  setenv("SIRIUS_CONFIG_FILE", cfg.string().c_str(), 1);
-
-  duckdb::DuckDB db(nullptr);
-  duckdb::Connection con(db);
+  auto db = sirius::test::open_sirius_db(nullptr, cfg);
+  duckdb::Connection con(*db);
   auto sirius_ctx = con.context->registered_state->Get<duckdb::SiriusContext>("sirius_state");
   REQUIRE(sirius_ctx != nullptr);
 

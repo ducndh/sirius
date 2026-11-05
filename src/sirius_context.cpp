@@ -208,7 +208,8 @@ void note_write_to_pinned_table(SiriusContext& sirius_context, PreparedStatement
     case StatementType::INSERT_STATEMENT:
     case StatementType::DELETE_STATEMENT:
     case StatementType::MERGE_INTO_STATEMENT:
-    case StatementType::COPY_STATEMENT: break;
+    case StatementType::COPY_STATEMENT:
+    case StatementType::EXECUTE_STATEMENT: break;
     default: return;
   }
   if (!prepared.physical_plan) { return; }
