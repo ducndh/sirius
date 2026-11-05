@@ -416,7 +416,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_join::execute(
            : vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/true);
 
   auto const k_eff = std::min(k, n_right);
-  auto knn         = vss::brute_force_knn(res, dataset, queries, k_eff, metric_type, mr);
+  auto knn         = vss::exact_topk(res, dataset, queries, k_eff, metric_type, mr);
   if (cosine) { halve_distances(*knn.distances, stream); }
   auto neighbors = std::move(knn.neighbors);
   auto distances = std::move(knn.distances);
@@ -494,7 +494,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_topk_join::execute_global(
   auto const metric_type =
     cosine ? cuvs::distance::DistanceType::L2Unexpanded
            : vss::join_selection_distance_type_from_metric(metric, /*exact_unexpanded=*/true);
-  auto knn = vss::brute_force_knn(res, dataset, queries, k_eff, metric_type, mr);
+  auto knn = vss::exact_topk(res, dataset, queries, k_eff, metric_type, mr);
   if (cosine) { halve_distances(*knn.distances, stream); }
 
   // Candidates are k_eff per left row: left row i repeated k_eff times.

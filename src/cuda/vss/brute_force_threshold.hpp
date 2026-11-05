@@ -108,4 +108,39 @@ threshold_join_result gemm_threshold(
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref(),
   bool count_only                   = false);
 
+/**
+ * @brief The same edge list as @ref brute_force_threshold for an L2 radius computed from the
+ * differences (@p metric L2Unexpanded or L2SqrtUnexpanded), from one GEMM and differences on what
+ * it leaves.
+ *
+ * The GEMM is a screen, widened by its a-priori rounding bound (gemm_topk.cu has the argument), so
+ * every pair within @p eps by the differences passes it; each pass is re-computed from the
+ * differences, which decide membership and report the distance. A chunk the screen cannot read
+ * (a non-finite norm), or a tile where it passes too many pairs to pay, goes to
+ * @ref brute_force_threshold, and @p screen_worthwhile, when given, is set to false so the caller
+ * can skip the screen for its next chunks. Edge order is unspecified. With @p count_only the
+ * columns come back null when the screen answered, and only n_edges is to be read.
+ */
+threshold_join_result screened_threshold(
+  raft::device_resources const& res,
+  dataset_matrix_view dataset,
+  dataset_matrix_view queries,
+  float eps,
+  cuvs::distance::DistanceType metric,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref(),
+  bool count_only                   = false,
+  bool* screen_worthwhile           = nullptr);
+
+/// An exact radius search: @ref screened_threshold where the screen applies
+/// (@ref exact_screen_applies), else @ref brute_force_threshold.
+threshold_join_result exact_threshold(
+  raft::device_resources const& res,
+  dataset_matrix_view dataset,
+  dataset_matrix_view queries,
+  float eps,
+  cuvs::distance::DistanceType metric,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref(),
+  bool count_only                   = false,
+  bool* screen_worthwhile           = nullptr);
+
 }  // namespace sirius::vss

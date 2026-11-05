@@ -888,6 +888,18 @@ bool scan_bounded_enabled()
 /// 10-30 ms slower through it, and on SIFT1M it wins from ~1k probes.
 constexpr std::int64_t kGemmMinProbeRows = 512;
 
+/// Whether an exact search still takes the GEMM screen. Chunks differ, so one it could not decide
+/// says little (a dense cluster's slice beside sparse ones), but rows far from the origin defeat it
+/// everywhere, and a few in a row stop it costing a GEMM a chunk.
+class screen_gate {
+ public:
+  [[nodiscard]] bool open() const { return _misses_in_a_row < 4; }
+  void note(bool worthwhile) { _misses_in_a_row = worthwhile ? 0 : _misses_in_a_row + 1; }
+
+ private:
+  int _misses_in_a_row{0};
+};
+
 vss::threshold_join_result threshold_search(raft::device_resources const& res,
                                             vss::dataset_matrix_view dataset,
                                             vss::dataset_matrix_view queries,
@@ -895,12 +907,25 @@ vss::threshold_join_result threshold_search(raft::device_resources const& res,
                                             cuvs::distance::DistanceType metric,
                                             rmm::device_async_resource_ref mr,
                                             std::int64_t min_gemm_rows = 0,
-                                            bool count_only            = false)
+                                            bool count_only            = false,
+                                            screen_gate* gate          = nullptr)
 {
-  return gemm_search_enabled() && vss::gemm_search_supports(metric) &&
-             queries.extent(0) >= min_gemm_rows
-           ? vss::gemm_threshold(res, dataset, queries, eps, metric, mr, count_only)
-           : vss::brute_force_threshold(res, dataset, queries, eps, metric, mr);
+  if (!gemm_search_enabled()) {
+    return vss::brute_force_threshold(res, dataset, queries, eps, metric, mr);
+  }
+  if (vss::gemm_search_supports(metric)) {
+    return queries.extent(0) >= min_gemm_rows
+             ? vss::gemm_threshold(res, dataset, queries, eps, metric, mr, count_only)
+             : vss::brute_force_threshold(res, dataset, queries, eps, metric, mr);
+  }
+  if (gate != nullptr && !gate->open()) {
+    return vss::brute_force_threshold(res, dataset, queries, eps, metric, mr);
+  }
+  bool worthwhile = true;
+  auto edges =
+    vss::exact_threshold(res, dataset, queries, eps, metric, mr, count_only, &worthwhile);
+  if (gate != nullptr) { gate->note(worthwhile); }
+  return edges;
 }
 
 /// Ask the downgrade executor to spill until @p bytes of the device are free. A streamed corpus
@@ -4195,6 +4220,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       }
     };
     std::vector<std::int64_t> stretch_pairs;  // debug only: pairs each stretch passed
+    screen_gate slices_screen;
     for (int sweep = radius_join && any_bounded ? 1 : 0; sweep < (any_bounded ? 2 : 1); ++sweep) {
       if (sweep == 1 && !kept.empty()) {
         for (auto const& entry : kept) {
@@ -4659,7 +4685,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                           ranked_metric,
                                           mr,
                                           0,
-                                          count_only && !keyed);
+                                          count_only && !keyed,
+                                          &slices_screen);
             if (count_only && !keyed) {
               note_radius_part(edges.n_edges);
             } else if (edges.n_edges > 0) {
@@ -4699,6 +4726,28 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
               radius_distances.push_back(std::move(edges.distances));
               note_radius_part(edges.n_edges);
             }
+            continue;
+          }
+
+          // Plain FP32 slices of an every-cluster search rank from the differences.
+          if (!rescore && !int8_search && gemm_search_enabled() && slices_screen.open() &&
+              vss::exact_screen_applies(ranked_metric, m, slice_rows)) {
+            bool worthwhile = true;
+            vss::screened_topk_fold(res,
+                                    slice_view,
+                                    queries_view,
+                                    k_eff,
+                                    ranked_metric,
+                                    {acc_distances->mutable_view().data<float>(),
+                                     acc_neighbors->mutable_view().data<std::int64_t>(),
+                                     n_left,
+                                     k_join,
+                                     rows_c,
+                                     id_base,
+                                     id_map},
+                                    mr,
+                                    &worthwhile);
+            slices_screen.note(worthwhile);
             continue;
           }
 
@@ -5043,6 +5092,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       all_rows = cudf::sequence(static_cast<cudf::size_type>(n_left), zero, one, stream, mr);
     }
     std::size_t last_edge_bytes = 0;
+    screen_gate screen;
     for (std::size_t j = 0; j < n_chunks; ++j) {
       // Held for this iteration only; released at the bottom once its compute is ordered,
       // which is what keeps device memory bounded by the chunks in flight, not the corpus.
@@ -5092,7 +5142,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                           exhaustive_metric,
                                           mr,
                                           kGemmMinProbeRows,
-                                          count_only && !keyed);
+                                          count_only && !keyed,
+                                          &screen);
         last_edge_bytes =
           static_cast<std::size_t>(edges.n_edges) * (2 * sizeof(std::int64_t) + sizeof(float));
         advance(j + 1);
@@ -5163,10 +5214,34 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                             static_cast<std::size_t>(dim + 4) * sizeof(float));
       }
       auto const rows = searched_rows(dataset);
-      auto knn        = gemm_search_enabled() && vss::gemm_search_supports(exhaustive_metric) &&
+      if (gemm_search_enabled() && screen.open() &&
+          vss::exact_screen_applies(exhaustive_metric, n_left, batch_rows)) {
+        bool worthwhile = true;
+        vss::screened_topk_fold(res,
+                                rows,
+                                fold_queries,
+                                k_eff,
+                                exhaustive_metric,
+                                {acc_distances->mutable_view().data<float>(),
+                                 acc_neighbors->mutable_view().data<std::int64_t>(),
+                                 n_left,
+                                 k_join,
+                                 nullptr,
+                                 offset,
+                                 nullptr},
+                                mr,
+                                &worthwhile);
+        screen.note(worthwhile);
+        advance(j + 1);
+        release_staged(staged);
+        offset += batch_rows;
+        exhaustive_rows_seen += batch_rows;
+        continue;
+      }
+      auto knn = gemm_search_enabled() && vss::gemm_search_supports(exhaustive_metric) &&
                      n_left >= kGemmMinProbeRows
-                          ? vss::gemm_topk(res, rows, fold_queries, k_eff, exhaustive_metric, mr)
-                          : vss::brute_force_knn(res, rows, fold_queries, k_eff, exhaustive_metric, mr);
+                   ? vss::gemm_topk(res, rows, fold_queries, k_eff, exhaustive_metric, mr)
+                   : vss::brute_force_knn(res, rows, fold_queries, k_eff, exhaustive_metric, mr);
 
       // The search above is issued, not finished. Staging the next chunk now runs its H2D
       // while the GPU works on this one; the host blocks inside the converter, the device

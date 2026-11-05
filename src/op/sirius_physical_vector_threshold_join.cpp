@@ -469,7 +469,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_threshold_join::execute(
       auto const qs      = std::min(query_tile, n_queries - s);
       auto const queries = raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
         queries_full.data_handle() + static_cast<int64_t>(s) * dim, static_cast<int64_t>(qs), dim);
-      auto tj = vss::brute_force_threshold(res, dataset, queries, search_cutoff, metric_type, mr);
+      auto tj = vss::exact_threshold(res, dataset, queries, search_cutoff, metric_type, mr);
       if (tj.query_rows->size() == 0) { continue; }
       if (cosine) { halve_distances(*tj.distances, stream); }
 

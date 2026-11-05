@@ -251,4 +251,51 @@ knn_result brute_force_knn_faiss(
   rmm::device_async_resource_ref mr   = cudf::get_current_device_resource_ref());
 #endif
 
+/// Whether an exact search of @p metric over @p probe_rows x @p corpus_rows takes the GEMM screen:
+/// L2 from the differences (cosine is that over rows normalized in FP32), and enough pairs to pay
+/// for it. SIRIUS_VSS_EXACT_SCREEN=0 keeps the differences throughout.
+bool exact_screen_applies(cuvs::distance::DistanceType metric,
+                          int64_t probe_rows,
+                          int64_t corpus_rows);
+
+/// The running top-k a screened search folds into, [n_rows x k], nearest first.
+struct screened_fold_target {
+  float* distances;
+  int64_t* neighbors;
+  int64_t n_rows;
+  int64_t k;
+  int64_t const* rows{nullptr};    ///< query row i's accumulator row; null for the identity
+  int64_t id_base{0};              ///< added to a dataset row to make its id, without @ref id_map
+  int64_t const* id_map{nullptr};  ///< a dataset row's id, in place of @ref id_base
+};
+
+/**
+ * @brief Fold one chunk's exact top-k into a running accumulator, from one GEMM and differences on
+ * what it leaves.
+ *
+ * The GEMM is a screen, widened by its a-priori rounding bound (gemm_topk.cu has the argument):
+ * under each row's running k-th, or until it has one under the chunk's own k-th, every pair that
+ * could enter the answer passes it. Each pass is re-computed from the differences, which rank it
+ * and report its distance. Rows the screen cannot decide go to @ref brute_force_knn, and
+ * @p screen_worthwhile, when given, is set to false when most of them could not. @p k is at most
+ * the chunk's rows. @p metric as for @ref exact_screen_applies.
+ */
+void screened_topk_fold(raft::device_resources const& res,
+                        dataset_matrix_view dataset,
+                        dataset_matrix_view queries,
+                        int64_t k,
+                        cuvs::distance::DistanceType metric,
+                        screened_fold_target const& target,
+                        rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref(),
+                        bool* screen_worthwhile           = nullptr);
+
+/// An exact top-k over one matrix: @ref screened_topk_fold where the screen applies, else
+/// @ref brute_force_knn.
+knn_result exact_topk(raft::device_resources const& res,
+                      dataset_matrix_view dataset,
+                      dataset_matrix_view queries,
+                      int64_t k,
+                      cuvs::distance::DistanceType metric,
+                      rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
 }  // namespace sirius::vss
