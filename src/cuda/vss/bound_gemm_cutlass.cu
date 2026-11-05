@@ -308,7 +308,7 @@ void bound_filter_f16_cutlass(bound_slice const& s,
     p.grid_tiled       = sw.get_tiled_shape(problem, {kCutlassTileM, kCutlassTileN, 32}, 1);
     p.swizzle_log_tile = sw.get_log_tile(p.grid_tiled);
     tile_filter_kernel<K>
-      <<<sw.get_grid_shape(p.grid_tiled), K::kThreads, smem, stream.value()>>>(p);
+      <<<sw.get_grid_shape(p.grid_tiled), K::kThreads, smem, stream.get()>>>(p);
     CUDF_CUDA_TRY(cudaGetLastError());
   }
 }
@@ -328,7 +328,7 @@ void bound_filter_f16_cutlass_group(bound_slice const* slices,
   p.prefix        = prefix;
   p.n_slices      = n_slices;
   p.walk          = walk;
-  tile_filter_kernel<K><<<blocks, K::kThreads, smem, stream.value()>>>(p);
+  tile_filter_kernel<K><<<blocks, K::kThreads, smem, stream.get()>>>(p);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

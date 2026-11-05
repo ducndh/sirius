@@ -51,13 +51,13 @@ TEST_CASE("rotate_rows is an in-order fmaf chain per output whatever the batch",
     // The whole batch, and the same rows as a 37-row batch from an odd offset.
     sirius::vss::rotate_rows(dx.data(), rows, d, dr.data(), doubt.data(), stream);
     std::vector<float> got(x.size());
-    stream.synchronize();
+    stream.sync();
     REQUIRE(cudaMemcpy(got.data(), doubt.data(), got.size() * 4, cudaMemcpyDeviceToHost) ==
             cudaSuccess);
     std::int64_t const off = 101, part = 37;
     sirius::vss::rotate_rows(dx.data() + off * d, part, d, dr.data(), doubt.data(), stream);
     std::vector<float> got_part(static_cast<std::size_t>(part * d));
-    stream.synchronize();
+    stream.sync();
     REQUIRE(
       cudaMemcpy(got_part.data(), doubt.data(), got_part.size() * 4, cudaMemcpyDeviceToHost) ==
       cudaSuccess);
@@ -79,17 +79,17 @@ TEST_CASE("rotate_rows is an in-order fmaf chain per output whatever the batch",
     // The range taken while rotating, never writing the rows, is column_min_max's over them.
     rmm::device_uvector<unsigned int> lo(d, stream), hi(d, stream), lo2(d, stream), hi2(d, stream);
     for (auto* v : {&lo, &lo2}) {
-      REQUIRE(cudaMemsetAsync(v->data(), 0xff, d * 4, stream.value()) == cudaSuccess);
+      REQUIRE(cudaMemsetAsync(v->data(), 0xff, d * 4, stream.get()) == cudaSuccess);
     }
     for (auto* v : {&hi, &hi2}) {
-      REQUIRE(cudaMemsetAsync(v->data(), 0, d * 4, stream.value()) == cudaSuccess);
+      REQUIRE(cudaMemsetAsync(v->data(), 0, d * 4, stream.get()) == cudaSuccess);
     }
     sirius::vss::rotate_rows(dx.data(), rows, d, dr.data(), doubt.data(), stream);
     sirius::vss::column_min_max(doubt.data(), rows, d, lo.data(), hi.data(), stream);
     if (sirius::vss::rotate_rows_min_max(
           dx.data(), rows, d, dr.data(), lo2.data(), hi2.data(), stream)) {
       std::vector<unsigned int> a(d), b(d), c(d), e(d);
-      stream.synchronize();
+      stream.sync();
       REQUIRE(cudaMemcpy(a.data(), lo.data(), d * 4, cudaMemcpyDeviceToHost) == cudaSuccess);
       REQUIRE(cudaMemcpy(b.data(), lo2.data(), d * 4, cudaMemcpyDeviceToHost) == cudaSuccess);
       REQUIRE(cudaMemcpy(c.data(), hi.data(), d * 4, cudaMemcpyDeviceToHost) == cudaSuccess);
@@ -99,12 +99,12 @@ TEST_CASE("rotate_rows is an in-order fmaf chain per output whatever the batch",
 
       // Asked to keep the rows as well, it writes exactly what rotate_rows writes, and the range.
       rmm::device_uvector<float> kept(x.size(), stream);
-      REQUIRE(cudaMemsetAsync(lo2.data(), 0xff, d * 4, stream.value()) == cudaSuccess);
-      REQUIRE(cudaMemsetAsync(hi2.data(), 0, d * 4, stream.value()) == cudaSuccess);
+      REQUIRE(cudaMemsetAsync(lo2.data(), 0xff, d * 4, stream.get()) == cudaSuccess);
+      REQUIRE(cudaMemsetAsync(hi2.data(), 0, d * 4, stream.get()) == cudaSuccess);
       REQUIRE(sirius::vss::rotate_rows_min_max(
         dx.data(), rows, d, dr.data(), lo2.data(), hi2.data(), stream, kept.data()));
       std::vector<float> got_kept(x.size());
-      stream.synchronize();
+      stream.sync();
       REQUIRE(
         cudaMemcpy(got_kept.data(), kept.data(), got_kept.size() * 4, cudaMemcpyDeviceToHost) ==
         cudaSuccess);

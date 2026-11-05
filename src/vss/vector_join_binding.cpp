@@ -26,6 +26,11 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
@@ -38,24 +43,56 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <set>
 #include <span>
-#include <unordered_map>
-#include <unordered_set>
 
 namespace sirius::vss {
 
 namespace {
 
 std::mutex written_mutex;
-std::unordered_set<std::uint64_t> written_pins;
+std::set<std::weak_ptr<const pin_snapshot_identity>, std::owner_less<>> written_pins;
 
 }  // namespace
 
-void note_pinned_table_written(std::uint64_t pin_generation)
+void note_pinned_table_written(sirius::scan_manager::pinned_entry const& pin)
 {
   std::lock_guard lock{written_mutex};
-  written_pins.insert(pin_generation);
+  std::erase_if(written_pins, [](auto const& note) { return note.expired(); });
+  written_pins.insert(pin.snapshot_identity);
+}
+
+sirius::duckdb_table_identity table_identity_of(duckdb::TableCatalogEntry& table)
+{
+  if (!table.IsDuckTable()) { return {}; }
+  return {table.oid, table.GetStorage().GetRowGroupCollection()};
+}
+
+std::optional<std::vector<constant_comparison>> constant_comparisons_of(
+  duckdb::TableFilter const& filter)
+{
+  std::vector<constant_comparison> out;
+  auto walk = [&](auto&& self, duckdb::Expression const& expr) -> bool {
+    if (expr.GetExpressionType() == duckdb::ExpressionType::CONJUNCTION_AND) {
+      for (auto const& child : expr.Cast<duckdb::BoundConjunctionExpression>().GetChildren()) {
+        if (!self(self, *child)) { return false; }
+      }
+      return true;
+    }
+    if (!duckdb::BoundComparisonExpression::IsComparison(expr)) { return false; }
+    auto comparison = expr.GetExpressionType();
+    auto const constant = duckdb::ExpressionFilter::TryGetColumnConstantComparison(
+      expr.Cast<duckdb::BoundFunctionExpression>(), comparison);
+    if (!constant) { return false; }
+    out.push_back({comparison, constant->GetValue()});
+    return true;
+  };
+  auto const& expression = duckdb::ExpressionFilter::GetExpressionFilter(filter, "vector join");
+  if (!walk(walk, *expression.expr)) { return std::nullopt; }
+  return out;
 }
 
 std::optional<std::string> pinned_rows_mismatch(duckdb::ClientContext& context,
@@ -65,7 +102,9 @@ std::optional<std::string> pinned_rows_mismatch(duckdb::ClientContext& context,
   if (pin.mvcc == nullptr) { return std::nullopt; }
   {
     std::lock_guard lock{written_mutex};
-    if (written_pins.contains(pin.generation)) { return "a statement wrote to it after pin_table"; }
+    if (written_pins.contains(std::weak_ptr<const pin_snapshot_identity>(pin.snapshot_identity))) {
+      return "a statement wrote to it after pin_table";
+    }
   }
   auto const& meta = *pin.mvcc;
   auto& storage    = table.GetStorage();
@@ -88,10 +127,13 @@ std::optional<std::string> pinned_rows_mismatch(duckdb::ClientContext& context,
   scan_manager::mvcc_mask_snapshot_key const key{
     manager.GetLastCommit(), txn.start_time, txn.ChangesMade()};
   static std::mutex clean_mutex;
-  static std::unordered_map<std::uint64_t, scan_manager::mvcc_mask_snapshot_key> clean;
+  static std::map<std::weak_ptr<const pin_snapshot_identity>,
+                  scan_manager::mvcc_mask_snapshot_key,
+                  std::owner_less<>>
+    clean;
   {
     std::lock_guard lock{clean_mutex};
-    auto const it = clean.find(pin.generation);
+    auto const it = clean.find(std::weak_ptr<const pin_snapshot_identity>(pin.snapshot_identity));
     if (it != clean.end() && scan_manager::mvcc_mask_cache_reusable(it->second, key)) {
       return std::nullopt;
     }
@@ -110,7 +152,8 @@ std::optional<std::string> pinned_rows_mismatch(duckdb::ClientContext& context,
   if (dropped) { return "rows were deleted from it, and the pin still holds them"; }
   if (scan_manager::mvcc_mask_cache_publishable(key)) {
     std::lock_guard lock{clean_mutex};
-    clean[pin.generation] = key;
+    std::erase_if(clean, [](auto const& entry) { return entry.first.expired(); });
+    clean.insert_or_assign(std::weak_ptr<const pin_snapshot_identity>(pin.snapshot_identity), key);
   }
   return std::nullopt;
 }

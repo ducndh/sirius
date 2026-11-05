@@ -218,14 +218,14 @@ std::unique_ptr<cudf::column> mean_centroid(std::vector<cudf::column_view> const
 {
   if (dim <= 0) { throw std::invalid_argument("mean_centroid: dim must be >= 1"); }
   rmm::device_uvector<double> sum(static_cast<std::size_t>(dim), stream, mr);
-  CUDF_CUDA_TRY(cudaMemsetAsync(sum.data(), 0, sum.size() * sizeof(double), stream.value()));
+  CUDF_CUDA_TRY(cudaMemsetAsync(sum.data(), 0, sum.size() * sizeof(double), stream.get()));
   std::int64_t n_rows = 0;
   for (auto const& chunk : chunks) {
     auto const rows = chunk_row_count(chunk);
     if (rows == 0) { continue; }
-    add_column_sums_kernel<<<static_cast<unsigned>((dim + 127) / 128), 128, 0, stream.value()>>>(
+    add_column_sums_kernel<<<static_cast<unsigned>((dim + 127) / 128), 128, 0, stream.get()>>>(
       list_column_as_dataset_view(chunk, dim).data_handle(), rows, dim, sum.data());
-    CUDF_CHECK_CUDA(stream.value());
+    CUDF_CHECK_CUDA(stream.get());
     n_rows += rows;
   }
   if (n_rows == 0) { throw std::invalid_argument("mean_centroid: no rows"); }
@@ -235,8 +235,8 @@ std::unique_ptr<cudf::column> mean_centroid(std::vector<cudf::column_view> const
                                 sum.data(),
                                 total.size() * sizeof(double),
                                 cudaMemcpyDeviceToHost,
-                                stream.value()));
-  stream.synchronize();
+                                stream.get()));
+  stream.sync();
   std::vector<float> mean(total.size());
   for (std::size_t j = 0; j < total.size(); ++j) {
     mean[j] = static_cast<float>(total[j] / static_cast<double>(n_rows));
@@ -250,13 +250,13 @@ std::unique_ptr<cudf::column> mean_centroid(std::vector<cudf::column_view> const
                                 mean.data(),
                                 mean.size() * sizeof(float),
                                 cudaMemcpyHostToDevice,
-                                stream.value()));
+                                stream.get()));
   cudf::numeric_scalar<std::int32_t> const zero(0, true, stream);
   cudf::numeric_scalar<std::int32_t> const width(static_cast<std::int32_t>(dim), true, stream);
   auto offsets = cudf::sequence(2, zero, width, stream, mr);
   auto out =
     cudf::make_lists_column(1, std::move(offsets), std::move(values), 0, rmm::device_buffer{});
-  stream.synchronize();  // `mean` is read by the copy above
+  stream.sync();  // `mean` is read by the copy above
   return out;
 }
 
@@ -585,7 +585,7 @@ centroid_labeler::centroid_labeler(raft::device_resources const& res,
   rmm::device_uvector<std::uint16_t> half(static_cast<std::size_t>(n * dim), stream, mr);
   rmm::device_uvector<float> half_sq(static_cast<std::size_t>(n), stream, mr);
   rmm::device_uvector<unsigned int> extremes(2, stream, mr);
-  CUDF_CUDA_TRY(cudaMemsetAsync(extremes.data(), 0, 2 * sizeof(unsigned int), stream.value()));
+  CUDF_CUDA_TRY(cudaMemsetAsync(extremes.data(), 0, 2 * sizeof(unsigned int), stream.get()));
   narrow_to_float16(s.centers, n * dim, half.data(), stream);
   half_rows_norms(s.centers,
                   half.data(),
@@ -606,13 +606,13 @@ centroid_labeler::centroid_labeler(raft::device_resources const& res,
                                 picked.data(),
                                 picked.size() * sizeof(std::int64_t),
                                 cudaMemcpyHostToDevice,
-                                stream.value()));
+                                stream.get()));
   rmm::device_uvector<float> seeds(static_cast<std::size_t>(s.n_seeds * dim), stream, mr);
   gather_rows(s.centers, dim, picked_d.data(), s.n_seeds, seeds.data(), stream);
   unsigned int bits[2] = {0, 0};
   CUDF_CUDA_TRY(
-    cudaMemcpyAsync(bits, extremes.data(), sizeof(bits), cudaMemcpyDeviceToHost, stream.value()));
-  stream.synchronize();
+    cudaMemcpyAsync(bits, extremes.data(), sizeof(bits), cudaMemcpyDeviceToHost, stream.get()));
+  stream.sync();
   float max_sq = 0.f;
   std::memcpy(&s.half_error, &bits[0], sizeof(float));
   std::memcpy(&max_sq, &bits[1], sizeof(float));
@@ -636,7 +636,7 @@ void centroid_labeler::label(cudf::column_view const& vectors, std::int32_t* lab
   auto const dim    = s.dim;
   if (!s.seeds) {
     s.predict(queries.data_handle(), total, s.centers, s.n_centers, labels);
-    stream.synchronize();
+    stream.sync();
     return;
   }
   auto const mr    = s.mr;
@@ -651,8 +651,8 @@ void centroid_labeler::label(cudf::column_view const& vectors, std::int32_t* lab
                                   rows.data(),
                                   rows.size() * sizeof(std::int64_t),
                                   cudaMemcpyHostToDevice,
-                                  stream.value()));
-    stream.synchronize();
+                                  stream.get()));
+    stream.sync();
   }
   auto const rows_sz = static_cast<std::size_t>(batch);
   rmm::device_uvector<int> seed(rows_sz, stream, mr);
@@ -671,9 +671,9 @@ void centroid_labeler::label(cudf::column_view const& vectors, std::int32_t* lab
     auto const m  = std::min(batch, total - at);
     auto const* x = queries.data_handle() + at * dim;
     s.predict(x, m, s.seeds->data(), s.n_seeds, seed.data());
-    seed_bound_kernel<<<label_grid(m), kLabelBlock, 0, stream.value()>>>(
+    seed_bound_kernel<<<label_grid(m), kLabelBlock, 0, stream.get()>>>(
       x, m, dim, s.seeds->data(), seed.data(), 1.f + 2.f * gamma, bound.data());
-    CUDF_CHECK_CUDA(stream.value());
+    CUDF_CHECK_CUDA(stream.get());
     narrow_to_float16(x, m * dim, x_half.data(), stream);
     half_rows_norms(
       x, x_half.data(), m, dim, x_sq.data(), x_error.data(), nullptr, nullptr, stream);
@@ -687,9 +687,9 @@ void centroid_labeler::label(cudf::column_view const& vectors, std::int32_t* lab
                         limit.data(),
                         stream);
     CUDF_CUDA_TRY(
-      cudaMemsetAsync(candidates.count.data(), 0, sizeof(unsigned long long), stream.value()));
-    CUDF_CUDA_TRY(cudaMemsetAsync(unusable.data(), 0, sizeof(unsigned long long), stream.value()));
-    reset_rows_kernel<<<label_grid(m), kLabelBlock, 0, stream.value()>>>(
+      cudaMemsetAsync(candidates.count.data(), 0, sizeof(unsigned long long), stream.get()));
+    CUDF_CUDA_TRY(cudaMemsetAsync(unusable.data(), 0, sizeof(unsigned long long), stream.get()));
+    reset_rows_kernel<<<label_grid(m), kLabelBlock, 0, stream.get()>>>(
       nearest_bits.data(), best.data(), m);
     bound_filter_f16(s.half->data(),
                      s.half_sq->data(),
@@ -705,13 +705,13 @@ void centroid_labeler::label(cudf::column_view const& vectors, std::int32_t* lab
                      candidates,
                      stream);
     auto const grid = label_grid(static_cast<std::int64_t>(capacity));
-    nearest_filtered_kernel<<<grid, kLabelBlock, 0, stream.value()>>>(candidates.rows.data(),
+    nearest_filtered_kernel<<<grid, kLabelBlock, 0, stream.get()>>>(candidates.rows.data(),
                                                                       candidates.distances.data(),
                                                                       candidates.count.data(),
                                                                       capacity,
                                                                       nearest_bits.data(),
                                                                       unusable.data());
-    rescore_kernel<<<grid, kLabelBlock, 0, stream.value()>>>(x,
+    rescore_kernel<<<grid, kLabelBlock, 0, stream.get()>>>(x,
                                                              dim,
                                                              s.centers,
                                                              candidates.rows.data(),
@@ -724,20 +724,20 @@ void centroid_labeler::label(cudf::column_view const& vectors, std::int32_t* lab
                                                              limit.data(),
                                                              1.f + 4.f * gamma + 1e-6f,
                                                              best.data());
-    take_labels_kernel<<<label_grid(m), kLabelBlock, 0, stream.value()>>>(
+    take_labels_kernel<<<label_grid(m), kLabelBlock, 0, stream.get()>>>(
       best.data(), m, labels + at, unusable.data());
-    CUDF_CHECK_CUDA(stream.value());
+    CUDF_CHECK_CUDA(stream.get());
     unsigned long long passed = 0, bad = 0;
     CUDF_CUDA_TRY(cudaMemcpyAsync(
-      &passed, candidates.count.data(), sizeof(passed), cudaMemcpyDeviceToHost, stream.value()));
+      &passed, candidates.count.data(), sizeof(passed), cudaMemcpyDeviceToHost, stream.get()));
     CUDF_CUDA_TRY(
-      cudaMemcpyAsync(&bad, unusable.data(), sizeof(bad), cudaMemcpyDeviceToHost, stream.value()));
-    stream.synchronize();
+      cudaMemcpyAsync(&bad, unusable.data(), sizeof(bad), cudaMemcpyDeviceToHost, stream.get()));
+    stream.sync();
     // More candidates than the buffer holds, a value past half's range, or a device without
     // the tensor-core kernel: this batch is ranked in FP32.
     if (passed > capacity || bad != 0) {
       s.predict(x, m, s.centers, s.n_centers, labels + at);
-      stream.synchronize();
+      stream.sync();
     }
   }
 }

@@ -231,14 +231,14 @@ sirius_physical_vector_join_materialize::build_side_output_columns(
       }
     }
     ro = host_or_device_resident(
-      batch, std::move(ro), _sirius_ctx, ::cuda::stream_ref{stream.value()}, "a build-side batch");
+      batch, std::move(ro), _sirius_ctx, ::cuda::stream_ref{stream.get()}, "a build-side batch");
     if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
       auto const table = sirius::get_cudf_table_view(ro);
       for (std::size_t c = 0; c < num_output_columns; ++c) {
         parts[c].push_back(std::make_unique<cudf::column>(
           table.column(static_cast<cudf::size_type>(c + 1)), stream, mr));
       }
-      stream.synchronize();
+      stream.sync();
       continue;
     }
 
@@ -266,7 +266,7 @@ sirius_physical_vector_join_materialize::build_side_output_columns(
       parts[c].push_back(
         std::make_unique<cudf::column>(table.column(static_cast<cudf::size_type>(c)), stream, mr));
     }
-    stream.synchronize();
+    stream.sync();
   }
 
   std::vector<std::unique_ptr<cudf::column>> cols;
@@ -327,7 +327,7 @@ sirius_physical_vector_join_materialize::probe_chunk_output_columns(
     }
   }
   ro = host_or_device_resident(
-    batch, std::move(ro), _sirius_ctx, ::cuda::stream_ref{stream.value()}, "a probe-side batch");
+    batch, std::move(ro), _sirius_ctx, ::cuda::stream_ref{stream.get()}, "a probe-side batch");
   if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
     auto const table = sirius::get_cudf_table_view(ro);
     for (auto const c : out_cols) {
@@ -482,8 +482,8 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::gather_rig
                                   neighbors.data<std::int64_t>(),
                                   n * sizeof(std::int64_t),
                                   cudaMemcpyDeviceToHost,
-                                  stream.value()));
-    stream.synchronize();
+                                  stream.get()));
+    stream.sync();
   }
   // Each row's chunk and its row within it.
   std::vector<std::pair<std::size_t, std::int64_t>> where(n);
@@ -519,9 +519,9 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::gather_rig
                                     values.data(),
                                     values.size(),
                                     cudaMemcpyHostToDevice,
-                                    stream.value()));
+                                    stream.get()));
       // The next column reuses the host buffer.
-      stream.synchronize();
+      stream.sync();
     }
     out.push_back(std::move(column));
   }
@@ -544,7 +544,7 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::gather_rig
                                 _right_chunk_ends.data(),
                                 _right_chunk_ends.size() * sizeof(std::int64_t),
                                 cudaMemcpyHostToDevice,
-                                stream.value()));
+                                stream.get()));
   auto const chunk_of   = cudf::upper_bound(cudf::table_view{{ends->view()}},
                                           cudf::table_view{{neighbors}},
                                             {cudf::order::ASCENDING},
@@ -565,8 +565,8 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::gather_rig
                                   needed_col->view().column(0).data<cudf::size_type>(),
                                   needed.size() * sizeof(cudf::size_type),
                                   cudaMemcpyDeviceToHost,
-                                  stream.value()));
-    stream.synchronize();
+                                  stream.get()));
+    stream.sync();
   }
   std::sort(needed.begin(), needed.end());
   // No neighbours still needs typed columns to gather nothing from.
@@ -587,7 +587,7 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::gather_rig
                                 shift.data(),
                                 shift.size() * sizeof(std::int64_t),
                                 cudaMemcpyHostToDevice,
-                                stream.value()));
+                                stream.get()));
   auto const shift_of = cudf::gather(cudf::table_view{{shifts->view()}},
                                      chunk_of->view(),
                                      cudf::out_of_bounds_policy::DONT_CHECK,
@@ -762,7 +762,7 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::materializ
   // The chunk goes back to the engine as soon as its columns are copied: in a self-join it is a
   // corpus batch, which has to stay spillable for the blocks after this one.
   if (probe_chunk) {
-    stream.synchronize();
+    stream.sync();
     probe_chunk.reset();
   }
 

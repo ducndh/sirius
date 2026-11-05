@@ -3573,14 +3573,16 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                            {LogicalType::VARCHAR, LogicalType::VARCHAR},
                            SiriusKMeansFitFunction,
                            SiriusKMeansFitBind);
-  kmeans_fit.named_parameters["name"]               = LogicalType::VARCHAR;
-  kmeans_fit.named_parameters["n_clusters"]         = LogicalType::BIGINT;
-  kmeans_fit.named_parameters["train_rows"]         = LogicalType::BIGINT;
-  kmeans_fit.named_parameters["n_iters"]            = LogicalType::INTEGER;
-  kmeans_fit.named_parameters["seed"]               = LogicalType::BIGINT;
-  kmeans_fit.named_parameters["metric"]             = LogicalType::VARCHAR;
-  kmeans_fit.named_parameters["schema_name"]        = LogicalType::VARCHAR;
-  kmeans_fit.named_parameters["rows_are_centroids"] = LogicalType::BOOLEAN;
+  kmeans_fit.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
+    options.Add("name", LogicalType::VARCHAR);
+    options.Add("n_clusters", LogicalType::BIGINT);
+    options.Add("train_rows", LogicalType::BIGINT);
+    options.Add("n_iters", LogicalType::INTEGER);
+    options.Add("seed", LogicalType::BIGINT);
+    options.Add("metric", LogicalType::VARCHAR);
+    options.Add("schema_name", LogicalType::VARCHAR);
+    options.Add("rows_are_centroids", LogicalType::BOOLEAN);
+  });
   CreateTableFunctionInfo kmeans_fit_info(kmeans_fit);
   catalog.CreateTableFunction(transaction, kmeans_fit_info);
 
@@ -3590,10 +3592,12 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
     SiriusKMeansBuildListsFunction,
     SiriusKMeansBuildListsBind);
-  kmeans_build_lists.named_parameters["schema_name"] = LogicalType::VARCHAR;
-  kmeans_build_lists.named_parameters["storage"]     = LogicalType::VARCHAR;
-  kmeans_build_lists.named_parameters["metric"]      = LogicalType::VARCHAR;
-  kmeans_build_lists.named_parameters["tier"]        = LogicalType::VARCHAR;
+  kmeans_build_lists.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
+    options.Add("schema_name", LogicalType::VARCHAR);
+    options.Add("storage", LogicalType::VARCHAR);
+    options.Add("metric", LogicalType::VARCHAR);
+    options.Add("tier", LogicalType::VARCHAR);
+  });
   CreateTableFunctionInfo kmeans_build_lists_info(kmeans_build_lists);
   catalog.CreateTableFunction(transaction, kmeans_build_lists_info);
 
@@ -3604,10 +3608,12 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                               SiriusKMeansAssignFunction,
                               SiriusKMeansAssignBind,
                               SiriusKMeansAssignInit);
-  kmeans_assign.named_parameters["n_probes"]      = LogicalType::BIGINT;
-  kmeans_assign.named_parameters["radius_factor"] = LogicalType::DOUBLE;
-  kmeans_assign.named_parameters["max_probes"]    = LogicalType::BIGINT;
-  kmeans_assign.named_parameters["schema_name"]   = LogicalType::VARCHAR;
+  kmeans_assign.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
+    options.Add("n_probes", LogicalType::BIGINT);
+    options.Add("radius_factor", LogicalType::DOUBLE);
+    options.Add("max_probes", LogicalType::BIGINT);
+    options.Add("schema_name", LogicalType::VARCHAR);
+  });
   CreateTableFunctionInfo kmeans_assign_info(kmeans_assign);
   catalog.CreateTableFunction(transaction, kmeans_assign_info);
 
@@ -3629,25 +3635,28 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
     SiriusVectorJoinFunction,
     SiriusVectorJoinBind);
-  vector_join.named_parameters["clustering"]           = LogicalType::VARCHAR;
-  vector_join.named_parameters["cluster_column"]       = LogicalType::VARCHAR;
-  vector_join.named_parameters["k"]                    = LogicalType::BIGINT;
-  vector_join.named_parameters["metric"]               = LogicalType::VARCHAR;
-  vector_join.named_parameters["search_mode"]          = LogicalType::VARCHAR;
-  vector_join.named_parameters["join_mode"]            = LogicalType::VARCHAR;
-  vector_join.named_parameters["n_clusters"]           = LogicalType::BIGINT;
-  vector_join.named_parameters["n_probes"]             = LogicalType::BIGINT;
-  vector_join.named_parameters["eps"]                  = LogicalType::DOUBLE;
-  vector_join.named_parameters["output_type"]          = LogicalType::VARCHAR;
-  vector_join.named_parameters["left_schema_name"]     = LogicalType::VARCHAR;
-  vector_join.named_parameters["right_schema_name"]    = LogicalType::VARCHAR;
-  vector_join.named_parameters["left_output_columns"]  = LogicalType::LIST(LogicalType::VARCHAR);
-  vector_join.named_parameters["right_output_columns"] = LogicalType::LIST(LogicalType::VARCHAR);
-  vector_join.named_parameters["build_source"]         = LogicalType::VARCHAR;
-  vector_join.named_parameters["probe_source"]         = LogicalType::VARCHAR;
-  vector_join.named_parameters["keep"]                 = LogicalType::VARCHAR;
-  vector_join.named_parameters["earlier_by"]           = LogicalType::VARCHAR;
-  vector_join.named_parameters["other_by"]             = LogicalType::VARCHAR;
+  auto const vector_join_options = [](TypedKwargs& options) {
+    options.Add("clustering", LogicalType::VARCHAR);
+    options.Add("cluster_column", LogicalType::VARCHAR);
+    options.Add("k", LogicalType::BIGINT);
+    options.Add("metric", LogicalType::VARCHAR);
+    options.Add("search_mode", LogicalType::VARCHAR);
+    options.Add("join_mode", LogicalType::VARCHAR);
+    options.Add("n_clusters", LogicalType::BIGINT);
+    options.Add("n_probes", LogicalType::BIGINT);
+    options.Add("eps", LogicalType::DOUBLE);
+    options.Add("output_type", LogicalType::VARCHAR);
+    options.Add("left_schema_name", LogicalType::VARCHAR);
+    options.Add("right_schema_name", LogicalType::VARCHAR);
+    options.Add("left_output_columns", LogicalType::LIST(LogicalType::VARCHAR));
+    options.Add("right_output_columns", LogicalType::LIST(LogicalType::VARCHAR));
+    options.Add("build_source", LogicalType::VARCHAR);
+    options.Add("probe_source", LogicalType::VARCHAR);
+    options.Add("keep", LogicalType::VARCHAR);
+    options.Add("earlier_by", LogicalType::VARCHAR);
+    options.Add("other_by", LogicalType::VARCHAR);
+  };
+  vector_join.GetSignature().WithTypedKwargs("options", vector_join_options);
   vector_join.cardinality                              = SiriusVectorJoinCardinality;
   // Lets DuckDB narrow column_ids to what the query reads. create_plan_knn_join drops the rest
   // before the corpus's output columns are concatenated, which is where the cost is.
@@ -3671,7 +3680,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
     {LogicalType::TABLE, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
     SiriusVectorJoinFunction,
     SiriusVectorJoinRelBind);
-  vector_join_rel.named_parameters        = vector_join.named_parameters;
+  vector_join_rel.GetSignature().WithTypedKwargs("options", vector_join_options);
   vector_join_rel.cardinality             = SiriusVectorJoinCardinality;
   vector_join_rel.projection_pushdown     = true;
   vector_join_rel.pushdown_complex_filter = SiriusVectorJoinPushdownFilter;

@@ -18,6 +18,7 @@
 
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/bound_statement.hpp"
+#include "duckdb_table_identity.hpp"
 #include "vss/vector_join.hpp"
 
 #include <cstdint>
@@ -28,6 +29,8 @@
 namespace duckdb {
 class ClientContext;
 class DuckTableEntry;
+class TableCatalogEntry;
+class TableFilter;
 class SiriusContext;
 }  // namespace duckdb
 
@@ -54,10 +57,23 @@ duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
 ///                     also decides which columns can be emitted. False for a side fed by the
 ///                     build phase: its scan reads the table whether or not a pin happens to be
 ///                     caching it, so columns come from the catalog and no pin is required.
-/// Record that a statement writes to the table pinned as generation @p pin_generation (see
-/// SiriusContext's prepare hooks, which already refuse an UPDATE on a pinned table). Recorded
-/// when the statement is prepared, so a write that rolls back still counts.
-void note_pinned_table_written(std::uint64_t pin_generation);
+/// Record that a statement writes to the table pinned as @p pin (see SiriusContext's prepare hooks,
+/// which already refuse an UPDATE on a pinned table). Recorded when the statement is prepared, so
+/// a write that rolls back still counts.
+void note_pinned_table_written(sirius::scan_manager::pinned_entry const& pin);
+
+/// The identity a pin of @p table is matched against.
+[[nodiscard]] sirius::duckdb_table_identity table_identity_of(duckdb::TableCatalogEntry& table);
+
+/// One conjunct of a filter pushed onto a single column: `column <comparison> constant`.
+struct constant_comparison {
+  duckdb::ExpressionType comparison;
+  duckdb::Value constant;
+};
+
+/// @p filter as conjuncts of constant comparisons, or nullopt when any part of it is something else.
+[[nodiscard]] std::optional<std::vector<constant_comparison>> constant_comparisons_of(
+  duckdb::TableFilter const& filter);
 
 /// Why the vector join cannot read @p table's rows out of its pin @p pin for @p context's
 /// transaction, or nullopt when it can. A duckdb pin is the table's last-checkpointed image as

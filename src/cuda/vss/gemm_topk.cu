@@ -307,11 +307,11 @@ struct gemm_search {
     CUDF_EXPECTS(queries.extent(1) == d, "VSS dataset and query dimensionality must match");
     CUDF_EXPECTS(n <= std::numeric_limits<int>::max(), "GEMM search: corpus chunk too large");
     auto const stream = raft::resource::get_cuda_stream(res);
-    prepare_dataset_kernel<<<grid_for_warps(n), kBlock, 0, stream.value()>>>(
+    prepare_dataset_kernel<<<grid_for_warps(n), kBlock, 0, stream.get()>>>(
       dataset.data_handle(), n, d, dp, static_cast<int>(kind), xa.data(), x_root_norms.data());
-    prepare_queries_kernel<<<grid_for_warps(m), kBlock, 0, stream.value()>>>(
+    prepare_queries_kernel<<<grid_for_warps(m), kBlock, 0, stream.get()>>>(
       queries.data_handle(), m, d, dp, static_cast<int>(kind), qa.data(), qn.data());
-    CUDF_CHECK_CUDA(stream.value());
+    CUDF_CHECK_CUDA(stream.get());
     scores.resize(static_cast<std::size_t>(tile_rows * n), stream);
   }
 
@@ -321,7 +321,7 @@ struct gemm_search {
   {
     auto const stream = raft::resource::get_cuda_stream(res);
     auto handle       = raft::resource::get_cublas_handle(res);
-    CUDF_EXPECTS(cublasSetStream(handle, stream.value()) == CUBLAS_STATUS_SUCCESS,
+    CUDF_EXPECTS(cublasSetStream(handle, stream.get()) == CUBLAS_STATUS_SUCCESS,
                  "GEMM search: cublasSetStream failed");
     float const alpha = 1.f;
     float const beta  = 0.f;
@@ -459,9 +459,9 @@ knn_result gemm_topk(raft::device_resources const& res,
       /*select_min=*/true,
       /*sorted=*/true);
   });
-  finish_topk_kernel<<<grid_for(m * k), kBlock, 0, stream.value()>>>(
+  finish_topk_kernel<<<grid_for(m * k), kBlock, 0, stream.get()>>>(
     out_d, m, k, search.qn.data(), static_cast<int>(*kind));
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
   return knn_result{std::move(neighbors), std::move(distances), m, k};
 }
 
@@ -498,7 +498,7 @@ threshold_join_result gemm_threshold(raft::device_resources const& res,
   auto const n = search.n;
 
   rmm::device_uvector<float> bounds(static_cast<std::size_t>(m), stream, mr);
-  threshold_bounds_kernel<<<grid_for(m), kBlock, 0, stream.value()>>>(
+  threshold_bounds_kernel<<<grid_for(m), kBlock, 0, stream.get()>>>(
     search.qn.data(), m, eps, static_cast<int>(*kind), bounds.data());
 
   // Edges accumulate in one buffer that doubles when a tile overflows it. The overflowing tile's
@@ -514,10 +514,10 @@ threshold_join_result gemm_threshold(raft::device_resources const& res,
   auto const per_block = static_cast<int64_t>(kBlock) * kPerThread;
   search.for_each_tile(res, [&](int64_t q0, int64_t t) {
     for (;;) {
-      CUDF_CUDA_TRY(cudaMemsetAsync(counter.data(), 0, sizeof(unsigned long long), stream.value()));
+      CUDF_CUDA_TRY(cudaMemsetAsync(counter.data(), 0, sizeof(unsigned long long), stream.get()));
       dim3 const grid(static_cast<unsigned>((n + per_block - 1) / per_block),
                       static_cast<unsigned>(t));
-      threshold_emit_kernel<<<grid, kBlock, 0, stream.value()>>>(
+      threshold_emit_kernel<<<grid, kBlock, 0, stream.get()>>>(
         search.scores.data(),
         n,
         bounds.data() + q0,
@@ -531,11 +531,11 @@ threshold_join_result gemm_threshold(raft::device_resources const& res,
         count_only ? nullptr : dist.data() + size,
         counter.data(),
         count_only ? 0 : capacity - size);
-      CUDF_CHECK_CUDA(stream.value());
+      CUDF_CHECK_CUDA(stream.get());
       unsigned long long emitted = 0;
       CUDF_CUDA_TRY(cudaMemcpyAsync(
-        &emitted, counter.data(), sizeof(emitted), cudaMemcpyDeviceToHost, stream.value()));
-      stream.synchronize();
+        &emitted, counter.data(), sizeof(emitted), cudaMemcpyDeviceToHost, stream.get()));
+      stream.sync();
       if (count_only || size + emitted <= capacity) {
         size += emitted;
         return;
@@ -648,7 +648,7 @@ knn_result gemm_int8_topk(raft::device_resources const& res,
   auto* out_d = distances->mutable_view().data<float>();
 
   auto handle = raft::resource::get_cublas_handle(res);
-  CUDF_EXPECTS(cublasSetStream(handle, stream.value()) == CUBLAS_STATUS_SUCCESS,
+  CUDF_EXPECTS(cublasSetStream(handle, stream.get()) == CUBLAS_STATUS_SUCCESS,
                "gemm_int8_topk: cublasSetStream failed");
   for (int64_t q0 = 0; q0 < m; q0 += tile_rows) {
     auto const t = std::min(tile_rows, m - q0);
@@ -664,8 +664,8 @@ knn_result gemm_int8_topk(raft::device_resources const& res,
     dim3 const grid(
       static_cast<unsigned>(std::clamp<int64_t>((ldc + kBlock - 1) / kBlock, 1, 65535)),
       static_cast<unsigned>(t));
-    int8_scores_kernel<<<grid, kBlock, 0, stream.value()>>>(scores.data(), n, ldc, x_sq);
-    CUDF_CHECK_CUDA(stream.value());
+    int8_scores_kernel<<<grid, kBlock, 0, stream.get()>>>(scores.data(), n, ldc, x_sq);
+    CUDF_CHECK_CUDA(stream.get());
     cuvs::selection::select_k(
       res,
       raft::make_device_matrix_view<const float, int64_t, raft::row_major>(
@@ -676,9 +676,9 @@ knn_result gemm_int8_topk(raft::device_resources const& res,
       /*select_min=*/true,
       /*sorted=*/true);
   }
-  finish_int8_topk_kernel<<<grid_for(m * k), kBlock, 0, stream.value()>>>(
+  finish_int8_topk_kernel<<<grid_for(m * k), kBlock, 0, stream.get()>>>(
     out_d, m, k, q_sq, take_sqrt);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
   return knn_result{std::move(neighbors), std::move(distances), m, k};
 }
 
@@ -715,7 +715,7 @@ knn_result gemm_f16_topk(raft::device_resources const& res,
   auto* out_d = distances->mutable_view().data<float>();
 
   auto handle = raft::resource::get_cublas_handle(res);
-  CUDF_EXPECTS(cublasSetStream(handle, stream.value()) == CUBLAS_STATUS_SUCCESS,
+  CUDF_EXPECTS(cublasSetStream(handle, stream.get()) == CUBLAS_STATUS_SUCCESS,
                "gemm_f16_topk: cublasSetStream failed");
   float const alpha = 1.f;
   float const beta  = 0.f;
@@ -746,8 +746,8 @@ knn_result gemm_f16_topk(raft::device_resources const& res,
     dim3 const grid(
       static_cast<unsigned>(std::clamp<int64_t>((ldc + kBlock - 1) / kBlock, 1, 65535)),
       static_cast<unsigned>(t));
-    f16_scores_kernel<<<grid, kBlock, 0, stream.value()>>>(scores.data(), n, ldc, x_sq);
-    CUDF_CHECK_CUDA(stream.value());
+    f16_scores_kernel<<<grid, kBlock, 0, stream.get()>>>(scores.data(), n, ldc, x_sq);
+    CUDF_CHECK_CUDA(stream.get());
     cuvs::selection::select_k(
       res,
       raft::make_device_matrix_view<const float, int64_t, raft::row_major>(scores.data(), t, ldc),
@@ -757,9 +757,9 @@ knn_result gemm_f16_topk(raft::device_resources const& res,
       /*select_min=*/true,
       /*sorted=*/true);
   }
-  finish_f16_topk_kernel<<<grid_for(m * k), kBlock, 0, stream.value()>>>(
+  finish_f16_topk_kernel<<<grid_for(m * k), kBlock, 0, stream.get()>>>(
     out_d, m, k, q_sq, take_sqrt);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
   return knn_result{std::move(neighbors), std::move(distances), m, k};
 }
 

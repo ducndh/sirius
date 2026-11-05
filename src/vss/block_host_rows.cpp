@@ -163,12 +163,12 @@ bool block_host_rows::append(float const* device_rows, std::int64_t rows)
                                       reinterpret_cast<std::byte const*>(device_rows) + before,
                                       bytes,
                                       cudaMemcpyDeviceToHost,
-                                      _stream.value()));
+                                      _stream.get()));
       });
     device_rows += n * _dim;
     rows -= n;
     _open_rows += n;
-    _stream.synchronize();
+    _stream.sync();
     if (_open_rows == _open_capacity) { seal_open_part(); }
   }
   return true;
@@ -211,7 +211,7 @@ void block_host_rows::with_part(std::size_t part, Read&& read)
       if (lock.get_current_tier() != cucascade::memory::Tier::HOST) {
         try {
           lock.convert_to<cucascade::host_data_representation>(
-            sirius::converter_registry::get(), &_host_space, ::cuda::stream_ref{_stream.value()});
+            sirius::converter_registry::get(), &_host_space, ::cuda::stream_ref{_stream.get()});
           _ctx.record_vector_join_host_restore();
         } catch (std::bad_alloc const&) {
           bytes = lock.get_data()->get_size_in_bytes();
@@ -251,10 +251,10 @@ void block_host_rows::copy_to_device(std::int64_t row, std::int64_t rows, float*
                                         block,
                                         bytes,
                                         cudaMemcpyHostToDevice,
-                                        _stream.value()));
+                                        _stream.get()));
         });
       // The blocks are pinned, so the copies are still running and must end under the lock.
-      _stream.synchronize();
+      _stream.sync();
     });
     device_dst += n * _dim;
     row += n;

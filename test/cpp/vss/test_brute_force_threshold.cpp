@@ -140,7 +140,7 @@ TEST_CASE("brute_force_threshold keeps every L2 neighbor within the radius", "[v
   SECTION("L2 expanded (GEMM)") { metric = Metric::L2SqrtExpanded; }
 
   auto r = brute_force_threshold(res, dataset_view, query_view, /*eps=*/4.0f, metric, mr);
-  stream.synchronize();
+  stream.sync();
 
   auto const edges = collect_edges(r);
   REQUIRE(r.n_edges == 3);
@@ -176,7 +176,7 @@ TEST_CASE("brute_force_threshold cosine radius ignores magnitude", "[vss]")
 
   auto r =
     brute_force_threshold(res, dataset_view, query_view, /*eps=*/0.1f, Metric::CosineExpanded, mr);
-  stream.synchronize();
+  stream.sync();
 
   auto const edges = collect_edges(r);
   REQUIRE(r.n_edges == 2);
@@ -224,7 +224,7 @@ TEST_CASE("brute_force_threshold emits a ragged, per-query-variable edge list", 
                                  mr,
                                  tile_rows,
                                  tile_cols);
-  stream.synchronize();
+  stream.sync();
 
   auto const edges = collect_edges(r);
   REQUIRE(r.n_edges == 5);
@@ -255,7 +255,7 @@ TEST_CASE("brute_force_threshold returns no edges when nothing is within the rad
 
   auto r =
     brute_force_threshold(res, dataset_view, query_view, /*eps=*/1.0f, Metric::L2SqrtExpanded, mr);
-  stream.synchronize();
+  stream.sync();
 
   REQUIRE(r.n_edges == 0);
   REQUIRE(r.query_rows->size() == 0);

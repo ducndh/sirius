@@ -217,7 +217,7 @@ void note_write_to_pinned_table(SiriusContext& sirius_context, PreparedStatement
   auto const pinned_name = pinned_name_for_table(scan_manager, *target);
   if (!pinned_name) { return; }
   if (auto pin = scan_manager.find_pinned_entry(*pinned_name)) {
-    sirius::vss::note_pinned_table_written(pin);
+    sirius::vss::note_pinned_table_written(*pin);
   }
 }
 

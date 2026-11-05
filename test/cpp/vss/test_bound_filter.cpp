@@ -53,7 +53,7 @@ rmm::device_uvector<T> to_device(std::vector<T> const& h)
   rmm::device_uvector<T> d(h.size(), stream());
   if (!h.empty()) {
     REQUIRE(cudaMemcpyAsync(
-              d.data(), h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice, stream().value()) ==
+              d.data(), h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice, stream().get()) ==
             cudaSuccess);
   }
   return d;
@@ -65,10 +65,10 @@ std::vector<T> to_host(rmm::device_uvector<T> const& d, std::size_t n)
   std::vector<T> h(n);
   if (n > 0) {
     REQUIRE(cudaMemcpyAsync(
-              h.data(), d.data(), n * sizeof(T), cudaMemcpyDeviceToHost, stream().value()) ==
+              h.data(), d.data(), n * sizeof(T), cudaMemcpyDeviceToHost, stream().get()) ==
             cudaSuccess);
   }
-  stream().synchronize();
+  stream().sync();
   return h;
 }
 
@@ -217,7 +217,7 @@ void check_single(int64_t m, int64_t n, int64_t d, bool f16, bool with_map, uint
 
   auto const mr = cudf::get_current_device_resource_ref();
   bound_candidates out(m * n / 8 + 1024, stream(), mr);
-  REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().value()) ==
+  REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().get()) ==
           cudaSuccess);
   auto const d_rows  = to_device(rows);
   auto const d_bound = to_device(bound);
@@ -348,7 +348,7 @@ TEST_CASE("a half tile search keeps no pair of a padding row or column", "[vss]"
   bound_candidates out(150 * 300 + 1024, stream(), mr);
   bound_candidates poison(1024, stream(), mr);
   for (int round = 0; round < 32; ++round) {
-    REQUIRE(cudaMemsetAsync(poison.count.data(), 0, sizeof(unsigned long long), stream().value()) ==
+    REQUIRE(cudaMemsetAsync(poison.count.data(), 0, sizeof(unsigned long long), stream().get()) ==
             cudaSuccess);
     sirius::vss::bound_filter_f16(inf_rows.data(),
                                   zero_sq.data(),
@@ -363,7 +363,7 @@ TEST_CASE("a half tile search keeps no pair of a padding row or column", "[vss]"
                                   sirius::vss::float16_slack{},
                                   poison,
                                   stream());
-    REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().value()) ==
+    REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().get()) ==
             cudaSuccess);
     if (round % 2 == 0) {
       sirius::vss::bound_filter_f16(dx.data(),
@@ -421,7 +421,7 @@ TEST_CASE("a half search adds the slack to each row's bound", "[vss]")
     auto const d_rows  = to_device(rows);
     auto const d_bound = to_device(bound);
     bound_candidates out(p.rows * x.rows / 4 + 1024, stream(), mr);
-    REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().value()) ==
+    REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().get()) ==
             cudaSuccess);
     sirius::vss::bound_filter_f16(dx.data(),
                                   dxs.data(),
@@ -457,16 +457,16 @@ TEST_CASE("a half tile search reads rows past 2^31 values of either side", "[.][
   // every component, far past every live probe row's bound.
   rmm::device_uvector<uint16_t> dx(static_cast<std::size_t>(total * d), stream());
   rmm::device_uvector<uint16_t> dp(static_cast<std::size_t>(total * d), stream());
-  REQUIRE(cudaMemsetAsync(dx.data(), 0x40, dx.size() * 2, stream().value()) == cudaSuccess);
-  REQUIRE(cudaMemsetAsync(dp.data(), 0, dp.size() * 2, stream().value()) == cudaSuccess);
+  REQUIRE(cudaMemsetAsync(dx.data(), 0x40, dx.size() * 2, stream().get()) == cudaSuccess);
+  REQUIRE(cudaMemsetAsync(dp.data(), 0, dp.size() * 2, stream().get()) == cudaSuccess);
   auto const at = (total - live) * d;
   REQUIRE(
     cudaMemcpyAsync(
-      dx.data() + at, x.f16.data(), x.f16.size() * 2, cudaMemcpyHostToDevice, stream().value()) ==
+      dx.data() + at, x.f16.data(), x.f16.size() * 2, cudaMemcpyHostToDevice, stream().get()) ==
     cudaSuccess);
   REQUIRE(
     cudaMemcpyAsync(
-      dp.data() + at, p.f16.data(), p.f16.size() * 2, cudaMemcpyHostToDevice, stream().value()) ==
+      dp.data() + at, p.f16.data(), p.f16.size() * 2, cudaMemcpyHostToDevice, stream().get()) ==
     cudaSuccess);
   std::vector<float> xsq(total, 2.125f * 2.125f * d), psq(total, 0.f), lim(total, -1.f);
   std::vector<int64_t> rows(live);
@@ -479,7 +479,7 @@ TEST_CASE("a half tile search reads rows past 2^31 values of either side", "[.][
   for (bool const grouped : {false, true}) {
     INFO((grouped ? "grouped" : "single"));
     bound_candidates out(live * live + 1024, stream(), mr);
-    REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().value()) ==
+    REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().get()) ==
             cudaSuccess);
     if (grouped) {
       std::vector<bound_slice> slices{
@@ -584,7 +584,7 @@ TEST_CASE("a grouped bounded search answers each slice as a search of its own", 
                                    static_cast<int64_t>(c.rows.size())});
     }
     bound_candidates out(200000, stream(), mr);
-    REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().value()) ==
+    REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().get()) ==
             cudaSuccess);
     sirius::vss::bound_filter_group(
       slices,
@@ -670,7 +670,7 @@ TEST_CASE("bounded search throughput", "[.][vss_bench]")
       bound_candidates out(64 << 20, stream(), mr);
       auto run = [&] {
         REQUIRE(
-          cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().value()) ==
+          cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().get()) ==
           cudaSuccess);
         if (f16) {
           sirius::vss::bound_filter_f16(xh.data(),
@@ -707,11 +707,11 @@ TEST_CASE("bounded search throughput", "[.][vss_bench]")
       cudaEventCreate(&a);
       cudaEventCreate(&b);
       int const reps = 5;
-      cudaEventRecord(a, stream().value());
+      cudaEventRecord(a, stream().get());
       for (int r = 0; r < reps; ++r) {
         run();
       }
-      cudaEventRecord(b, stream().value());
+      cudaEventRecord(b, stream().get());
       cudaEventSynchronize(b);
       float ms = 0;
       cudaEventElapsedTime(&ms, a, b);
@@ -788,7 +788,7 @@ TEST_CASE("grouped bounded search throughput", "[.][vss_bench]")
       bound_candidates out(64 << 20, stream(), mr);
       auto run = [&] {
         REQUIRE(
-          cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().value()) ==
+          cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().get()) ==
           cudaSuccess);
         sirius::vss::bound_filter_group(
           slices,
@@ -806,11 +806,11 @@ TEST_CASE("grouped bounded search throughput", "[.][vss_bench]")
       cudaEventCreate(&a);
       cudaEventCreate(&b);
       int const reps = 5;
-      cudaEventRecord(a, stream().value());
+      cudaEventRecord(a, stream().get());
       for (int r = 0; r < reps; ++r) {
         run();
       }
-      cudaEventRecord(b, stream().value());
+      cudaEventRecord(b, stream().get());
       cudaEventSynchronize(b);
       float ms = 0;
       cudaEventElapsedTime(&ms, a, b);

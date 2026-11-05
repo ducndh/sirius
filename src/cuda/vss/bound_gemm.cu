@@ -871,7 +871,7 @@ bool launch_small(T const* x,
   auto const grid =
     static_cast<unsigned>(std::clamp<int64_t>((n + kSmallThreads - 1) / kSmallThreads, 1, 65535));
   auto go = [&](auto kernel) {
-    kernel<<<grid, kSmallThreads, 0, stream.value()>>>(
+    kernel<<<grid, kSmallThreads, 0, stream.get()>>>(
       x,
       x_sq,
       n,
@@ -1211,7 +1211,7 @@ bound_candidates::bound_candidates(int64_t capacity,
     distances(static_cast<std::size_t>(capacity), stream, mr),
     count(1, stream, mr)
 {
-  CUDF_CUDA_TRY(cudaMemsetAsync(count.data(), 0, sizeof(unsigned long long), stream.value()));
+  CUDF_CUDA_TRY(cudaMemsetAsync(count.data(), 0, sizeof(unsigned long long), stream.get()));
 }
 
 bool bound_filter_int8_supports(int64_t dim)
@@ -1258,7 +1258,7 @@ void bound_filter_int8(int8_t const* x,
   auto const kernel = accumulator_layout_is_m16n8<typename mma_traits<int8_t>::accumulator>()
                         ? bound_filter_kernel<int8_t, true>
                         : bound_filter_kernel<int8_t, false>;
-  kernel<<<plan.grid, kWarps * 32, 0, stream.value()>>>(
+  kernel<<<plan.grid, kWarps * 32, 0, stream.get()>>>(
     x,
     x_sq,
     n,
@@ -1323,12 +1323,12 @@ void bound_filter_group(std::vector<bound_slice> const& slices,
     auto* device_prefix =
       reinterpret_cast<int64_t*>(static_cast<std::byte*>(table.data()) + table_bytes);
     CUDF_CUDA_TRY(
-      cudaMemcpyAsync(table.data(), v.data(), table_bytes, cudaMemcpyHostToDevice, stream.value()));
+      cudaMemcpyAsync(table.data(), v.data(), table_bytes, cudaMemcpyHostToDevice, stream.get()));
     CUDF_CUDA_TRY(cudaMemcpyAsync(device_prefix,
                                   prefix.data(),
                                   prefix.size() * sizeof(int64_t),
                                   cudaMemcpyHostToDevice,
-                                  stream.value()));
+                                  stream.get()));
     if (tile && cutlass) { ++n_cutlass_group; }
     go(static_cast<unsigned>(prefix.back()),
        group_view{static_cast<bound_slice const*>(table.data()),
@@ -1344,7 +1344,7 @@ void bound_filter_group(std::vector<bound_slice> const& slices,
     auto const* psq = static_cast<N const*>(probe_sq);
     auto small      = [&](std::size_t c, auto kernel) {
       launch(classes[c], false, [&](unsigned blocks, group_view g) {
-        kernel<<<blocks, kSmallThreads, 0, stream.value()>>>(
+        kernel<<<blocks, kSmallThreads, 0, stream.get()>>>(
           nullptr,
           nullptr,
           0,
@@ -1396,7 +1396,7 @@ void bound_filter_group(std::vector<bound_slice> const& slices,
                           ? bound_filter_kernel<T, true, true>
                           : bound_filter_kernel<T, false, true>;
     launch(classes[5], true, [&](unsigned blocks, group_view g) {
-      kernel<<<blocks, kWarps * 32, 0, stream.value()>>>(
+      kernel<<<blocks, kWarps * 32, 0, stream.get()>>>(
         nullptr,
         nullptr,
         0,
@@ -1513,7 +1513,7 @@ void bound_filter_f16(std::uint16_t const* x,
   auto const kernel = accumulator_layout_is_m16n8<typename mma_traits<__half>::accumulator>()
                         ? bound_filter_kernel<__half, true>
                         : bound_filter_kernel<__half, false>;
-  kernel<<<plan.grid, kWarps * 32, 0, stream.value()>>>(
+  kernel<<<plan.grid, kWarps * 32, 0, stream.get()>>>(
     reinterpret_cast<__half const*>(x),
     x_sq,
     n,
@@ -1560,7 +1560,7 @@ void exact_distances(float const* probe,
     rmm::device_uvector<int64_t> keys(n_pairs, stream, mr), keys_sorted(n_pairs, stream, mr);
     rmm::device_uvector<int64_t> unsorted(n_pairs, stream, mr);
     order.emplace(n_pairs, stream, mr);
-    pin_row_keys_kernel<<<grid_for(n_pairs), 256, 0, stream.value()>>>(
+    pin_row_keys_kernel<<<grid_for(n_pairs), 256, 0, stream.get()>>>(
       ids, source.row_map, n_pairs, source.n_rows, keys.data(), unsorted.data());
     CUDF_CUDA_TRY(cudaGetLastError());
     int bits = 1;
@@ -1577,7 +1577,7 @@ void exact_distances(float const* probe,
                                                   n_pairs,
                                                   0,
                                                   bits,
-                                                  stream.value()));
+                                                  stream.get()));
     rmm::device_buffer temp(temp_bytes, stream, mr);
     CUDF_CUDA_TRY(cub::DeviceRadixSort::SortPairs(temp.data(),
                                                   temp_bytes,
@@ -1588,14 +1588,14 @@ void exact_distances(float const* probe,
                                                   n_pairs,
                                                   0,
                                                   bits,
-                                                  stream.value()));
+                                                  stream.get()));
   }
   auto const warps_per_block = 8;
   auto const grid            = static_cast<int>(
     std::clamp<int64_t>((n_pairs + warps_per_block - 1) / warps_per_block, 1, 65535));
   (inner_product
      ? exact_distances_kernel<true>
-     : exact_distances_kernel<false>)<<<grid, warps_per_block * 32, 0, stream.value()>>>(
+     : exact_distances_kernel<false>)<<<grid, warps_per_block * 32, 0, stream.get()>>>(
     probe,
     rows,
     k,
@@ -1622,7 +1622,7 @@ void gather_exact_rows(exact_rows const& source,
   auto const warps_per_block = 8;
   auto const grid            = static_cast<int>(
     std::clamp<int64_t>((count + warps_per_block - 1) / warps_per_block, 1, 65535));
-  gather_exact_rows_kernel<<<grid, warps_per_block * 32, 0, stream.value()>>>(
+  gather_exact_rows_kernel<<<grid, warps_per_block * 32, 0, stream.get()>>>(
     source, start, stride, count, static_cast<int>(dim), out);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
@@ -1631,21 +1631,21 @@ void row_max_bound(
   float const* acc_distances, int64_t n_rows, int64_t k, float* bound, rmm::cuda_stream_view stream)
 {
   if (n_rows == 0) { return; }
-  row_max_kernel<<<grid_for(n_rows), 256, 0, stream.value()>>>(acc_distances, n_rows, k, bound);
+  row_max_kernel<<<grid_for(n_rows), 256, 0, stream.get()>>>(acc_distances, n_rows, k, bound);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
 void fill_misses(float* distances, int64_t* ids, int64_t n, rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }
-  fill_misses_kernel<<<grid_for(n), 256, 0, stream.value()>>>(distances, ids, n);
+  fill_misses_kernel<<<grid_for(n), 256, 0, stream.get()>>>(distances, ids, n);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
 void map_ids(int64_t* ids, int64_t n, int64_t const* id_map, rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }
-  map_ids_kernel<<<grid_for(n), 256, 0, stream.value()>>>(ids, n, id_map);
+  map_ids_kernel<<<grid_for(n), 256, 0, stream.get()>>>(ids, n, id_map);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
@@ -1666,8 +1666,8 @@ void merge_bound_candidates(float* acc_distances,
   rmm::device_uvector<int64_t> order(total, stream, mr), order_sorted(total, stream, mr);
   rmm::device_uvector<int32_t> per_row(n_rows + 1, stream, mr);
   CUDF_CUDA_TRY(
-    cudaMemsetAsync(per_row.data(), 0, per_row.size() * sizeof(int32_t), stream.value()));
-  merge_keys_kernel<<<grid_for(total), 256, 0, stream.value()>>>(acc_distances,
+    cudaMemsetAsync(per_row.data(), 0, per_row.size() * sizeof(int32_t), stream.get()));
+  merge_keys_kernel<<<grid_for(total), 256, 0, stream.get()>>>(acc_distances,
                                                                  acc_n,
                                                                  k,
                                                                  candidates.rows.data(),
@@ -1693,10 +1693,10 @@ void merge_bound_candidates(float* acc_distances,
                                                 total,
                                                 0,
                                                 32 + row_bits,
-                                                stream.value()));
+                                                stream.get()));
   rmm::device_uvector<int32_t> cand_before(n_rows + 1, stream, mr);
   CUDF_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
-    nullptr, scan_bytes, per_row.data(), cand_before.data(), n_rows + 1, stream.value()));
+    nullptr, scan_bytes, per_row.data(), cand_before.data(), n_rows + 1, stream.get()));
   rmm::device_buffer temp(std::max(sort_bytes, scan_bytes), stream, mr);
   CUDF_CUDA_TRY(cub::DeviceRadixSort::SortPairs(temp.data(),
                                                 sort_bytes,
@@ -1707,20 +1707,20 @@ void merge_bound_candidates(float* acc_distances,
                                                 total,
                                                 0,
                                                 32 + row_bits,
-                                                stream.value()));
+                                                stream.get()));
   CUDF_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
-    temp.data(), scan_bytes, per_row.data(), cand_before.data(), n_rows + 1, stream.value()));
+    temp.data(), scan_bytes, per_row.data(), cand_before.data(), n_rows + 1, stream.get()));
 
   rmm::device_uvector<float> old_d(acc_n, stream, mr);
   rmm::device_uvector<int64_t> old_n(acc_n, stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    old_d.data(), acc_distances, acc_n * sizeof(float), cudaMemcpyDeviceToDevice, stream.value()));
+    old_d.data(), acc_distances, acc_n * sizeof(float), cudaMemcpyDeviceToDevice, stream.get()));
   CUDF_CUDA_TRY(cudaMemcpyAsync(old_n.data(),
                                 acc_neighbors,
                                 acc_n * sizeof(int64_t),
                                 cudaMemcpyDeviceToDevice,
-                                stream.value()));
-  merge_take_kernel<<<grid_for(acc_n), 256, 0, stream.value()>>>(order_sorted.data(),
+                                stream.get()));
+  merge_take_kernel<<<grid_for(acc_n), 256, 0, stream.get()>>>(order_sorted.data(),
                                                                  cand_before.data(),
                                                                  n_rows,
                                                                  k,
@@ -1738,7 +1738,7 @@ void kth_distance_bound(
   float const* acc_distances, int64_t n_rows, int64_t k, float* bound, rmm::cuda_stream_view stream)
 {
   if (n_rows == 0) { return; }
-  kth_bound_kernel<<<grid_for(n_rows), 256, 0, stream.value()>>>(acc_distances, n_rows, k, bound);
+  kth_bound_kernel<<<grid_for(n_rows), 256, 0, stream.get()>>>(acc_distances, n_rows, k, bound);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
@@ -2069,7 +2069,7 @@ void seed_bound_sorted(void const* x,
                                           offsets.data() + 1,
                                           0,
                                           sizeof(float) * 8,
-                                          stream.value());
+                                          stream.get());
   rmm::device_buffer temp(temp_bytes, stream, mr);
   auto const words = F16 ? dim / 2 : dim / 4;
   for (int64_t b0 = 0; b0 < n; b0 += batch) {
@@ -2078,7 +2078,7 @@ void seed_bound_sorted(void const* x,
       static_cast<int>(std::clamp<int64_t>((nb + kSeedWarps - 1) / kSeedWarps, 1, 65535));
     launch_seed_width(seed_width(words), [&](auto w) {
       seed_distances_kernel<decltype(w)::value, F16>
-        <<<grid, kSeedWarps * 32, 0, stream.value()>>>(x,
+        <<<grid, kSeedWarps * 32, 0, stream.get()>>>(x,
                                                        x_sq,
                                                        probe,
                                                        probe_sq,
@@ -2091,7 +2091,7 @@ void seed_bound_sorted(void const* x,
                                                        stride,
                                                        dist.data());
     });
-    segment_offsets_kernel<<<grid_for(nb + 1), 256, 0, stream.value()>>>(
+    segment_offsets_kernel<<<grid_for(nb + 1), 256, 0, stream.get()>>>(
       offsets.data(), nb, stride);
     cub::DeviceSegmentedRadixSort::SortKeys(temp.data(),
                                             temp_bytes,
@@ -2103,8 +2103,8 @@ void seed_bound_sorted(void const* x,
                                             offsets.data() + 1,
                                             0,
                                             sizeof(float) * 8,
-                                            stream.value());
-    seed_kth_from_sorted_kernel<<<grid_for(nb), 256, 0, stream.value()>>>(
+                                            stream.get());
+    seed_kth_from_sorted_kernel<<<grid_for(nb), 256, 0, stream.get()>>>(
       sorted.data(), count, order, b0, nb, stride, k, bound);
     CUDF_CUDA_TRY(cudaGetLastError());
   }
@@ -2136,7 +2136,7 @@ void seed_bound_int8(int8_t const* x,
   auto const grid =
     static_cast<int>(std::clamp<int64_t>((n + kSeedWarps - 1) / kSeedWarps, 1, 65535));
   launch_seed_width(seed_width(dim / 4), [&](auto w) {
-    seed_bound_int8_kernel<decltype(w)::value><<<grid, kSeedWarps * 32, 0, stream.value()>>>(
+    seed_bound_int8_kernel<decltype(w)::value><<<grid, kSeedWarps * 32, 0, stream.get()>>>(
       x, x_sq, probe, probe_sq, first, count, order, n, static_cast<int>(dim), k, bound);
   });
   CUDF_CUDA_TRY(cudaGetLastError());
@@ -2166,7 +2166,7 @@ void seed_bound_f16(uint16_t const* x,
   auto const grid =
     static_cast<int>(std::clamp<int64_t>((n + kSeedWarps - 1) / kSeedWarps, 1, 65535));
   launch_seed_width(seed_width(dim / 2), [&](auto w) {
-    seed_bound_f16_kernel<decltype(w)::value><<<grid, kSeedWarps * 32, 0, stream.value()>>>(
+    seed_bound_f16_kernel<decltype(w)::value><<<grid, kSeedWarps * 32, 0, stream.get()>>>(
       x, x_sq, probe, probe_sq, first, count, order, n, static_cast<int>(dim), k, bound);
   });
   CUDF_CUDA_TRY(cudaGetLastError());
@@ -2175,7 +2175,7 @@ void seed_bound_f16(uint16_t const* x,
 void scale_in_place(float* d, int64_t n, float factor, rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }
-  scale_kernel<<<grid_for(n), 256, 0, stream.value()>>>(d, n, factor);
+  scale_kernel<<<grid_for(n), 256, 0, stream.get()>>>(d, n, factor);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
@@ -2184,21 +2184,21 @@ void normalize_rows(
 {
   if (n == 0) { return; }
   auto const grid = static_cast<int>(std::clamp<int64_t>((n + 7) / 8, 1, 65535));
-  normalize_rows_kernel<<<grid, 256, 0, stream.value()>>>(x, n, dim, out);
+  normalize_rows_kernel<<<grid, 256, 0, stream.get()>>>(x, n, dim, out);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
 void sqrt_in_place(float* d, int64_t n, rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }
-  sqrt_kernel<<<grid_for(n), 256, 0, stream.value()>>>(d, n);
+  sqrt_kernel<<<grid_for(n), 256, 0, stream.get()>>>(d, n);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
 void fill_bound(float* bound, int64_t n, float value, rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }
-  fill_kernel<<<grid_for(n), 256, 0, stream.value()>>>(bound, n, value);
+  fill_kernel<<<grid_for(n), 256, 0, stream.get()>>>(bound, n, value);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
@@ -2220,7 +2220,7 @@ radius_pairs take_within(bound_candidates const& candidates,
   within_distance const keep{candidates.distances.data(), max_distance};
   std::size_t temp_bytes = 0;
   CUDF_CUDA_TRY(cub::DeviceSelect::If(
-    nullptr, temp_bytes, all, picked.data(), n_picked.data(), n_candidates, keep, stream.value()));
+    nullptr, temp_bytes, all, picked.data(), n_picked.data(), n_candidates, keep, stream.get()));
   rmm::device_buffer temp(temp_bytes, stream, mr);
   CUDF_CUDA_TRY(cub::DeviceSelect::If(temp.data(),
                                       temp_bytes,
@@ -2229,16 +2229,16 @@ radius_pairs take_within(bound_candidates const& candidates,
                                       n_picked.data(),
                                       n_candidates,
                                       keep,
-                                      stream.value()));
+                                      stream.get()));
   int64_t n = 0;
   CUDF_CUDA_TRY(
-    cudaMemcpyAsync(&n, n_picked.data(), sizeof(n), cudaMemcpyDeviceToHost, stream.value()));
-  stream.synchronize();
+    cudaMemcpyAsync(&n, n_picked.data(), sizeof(n), cudaMemcpyDeviceToHost, stream.get()));
+  stream.sync();
   if (n == 0) { return out; }
   out.rows.resize(n, stream);
   out.ids.resize(n, stream);
   out.distances.resize(n, stream);
-  take_kernel<<<grid_for(n), 256, 0, stream.value()>>>(picked.data(),
+  take_kernel<<<grid_for(n), 256, 0, stream.get()>>>(picked.data(),
                                                        n,
                                                        candidates.rows.data(),
                                                        candidates.ids.data(),

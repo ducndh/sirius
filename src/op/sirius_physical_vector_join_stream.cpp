@@ -580,7 +580,7 @@ class materialized_chunk_source : public vector_chunk_source {
     }
     std::ignore   = cucascade::data_batch::to_idle(std::move(ro));
     auto prepared = pipeline::lock_and_prepare_batch(
-      batch, _host_space, ::cuda::stream_ref{rmm::cuda_stream_per_thread.value()});
+      batch, _host_space, ::cuda::stream_ref{rmm::cuda_stream_per_thread.get()});
     if (!prepared) {
       throw std::runtime_error(
         "[sirius_physical_vector_join_stream] could not restore a disk-resident build batch");
@@ -738,7 +738,7 @@ filtered_chunk filter_corpus_chunk(const scan_manager::pinned_entry& pin,
                    stream);
   out.row_ids = std::move(kept->release()[1]);
   // The staged predicate columns are released on return; the mask read them.
-  stream.synchronize();
+  stream.sync();
   return out;
 }
 
@@ -769,9 +769,9 @@ void copy_earlier_keys(cudf::column_view const& keys,
                                 view.data<std::int64_t>(),
                                 static_cast<std::size_t>(view.size()) * sizeof(std::int64_t),
                                 cudaMemcpyDeviceToDevice,
-                                stream.value()));
+                                stream.get()));
   // The caller drops the staged chunk, and this drops the widened copy, once it returns.
-  stream.synchronize();
+  stream.sync();
 }
 
 /// Whether the GEMM-ranked kernels replace cuVS where they can; SIRIUS_VSS_GEMM_TOPK=0 is the
@@ -852,7 +852,7 @@ class borrow_window {
   {
     cudaEvent_t done = nullptr;
     CUDF_CUDA_TRY(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
-    CUDF_CUDA_TRY(cudaEventRecord(done, _stream.value()));
+    CUDF_CUDA_TRY(cudaEventRecord(done, _stream.get()));
     _held.push_back(held{done, std::move(reader)});
     while (_held.size() > kInFlight) {
       release_front();
@@ -951,7 +951,7 @@ class cluster_lists_chunk_source : public vector_chunk_source {
                              _lists.dim,
                              static_cast<float*>(buffer->data()),
                              stream);
-      stream.synchronize();
+      stream.sync();
       staged_vector_chunk staged{list_view(static_cast<const float*>(buffer->data()), rows),
                                  nullptr,
                                  std::move(reservation)};
@@ -995,7 +995,7 @@ class cluster_lists_chunk_source : public vector_chunk_source {
     // Synchronous like the pin converter: the caller overlaps "host waits on this copy" with
     // the compute it already issued, and the view must be complete before it is searched. It is
     // also what lets the byte staging buffer go at the end of this call.
-    stream.synchronize();
+    stream.sync();
     auto view = list_view(static_cast<const float*>(buffer->data()), rows);
     staged_vector_chunk staged{view, nullptr, std::move(reservation)};
     staged.buffer = std::move(buffer);
@@ -1229,7 +1229,7 @@ void sirius_physical_vector_join_stream::initialize_locked()
     _lists =
       _sirius_ctx != nullptr ? vss::find_cluster_lists(*_sirius_ctx, _request.clustering) : nullptr;
     if (_lists == nullptr || _lists->pin != right_pin.get() ||
-        _lists->pin_generation != right_pin->generation || _lists->column != right.column ||
+        _lists->pin_snapshot.lock() != right_pin->snapshot_identity || _lists->column != right.column ||
         _lists->n_rows != static_cast<std::int64_t>(right_pin->num_rows)) {
       throw std::runtime_error("[sirius_physical_vector_join_stream] clustering '" +
                                _request.clustering + "' has no lists over the current pin of '" +
@@ -1756,8 +1756,8 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
                                   labels_view.data<std::int32_t>(),
                                   rows * sizeof(std::int32_t),
                                   cudaMemcpyDeviceToHost,
-                                  stream.value()));
-    stream.synchronize();
+                                  stream.get()));
+    stream.sync();
     row_base += static_cast<std::int64_t>(rows);
 
     // A chunk is read as runs of one cluster each, and a cluster may come as several runs --
@@ -1831,8 +1831,8 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
                                     values.data<float>(),
                                     nvals * sizeof(float),
                                     cudaMemcpyDeviceToHost,
-                                    stream.value()));
-      stream.synchronize();
+                                    stream.get()));
+      stream.sync();
       for (auto const value : host_centroids) {
         std::uint32_t bits;
         std::memcpy(&bits, &value, sizeof(bits));
@@ -1924,8 +1924,8 @@ void sirius_physical_vector_join_stream::ensure_earlier_keys(
     // would drop pairs otherwise.
     std::vector<std::int64_t> host(static_cast<std::size_t>(_right_total_rows));
     CUDF_CUDA_TRY(
-      cudaMemcpyAsync(host.data(), layout_keys, bytes, cudaMemcpyDefault, stream.value()));
-    stream.synchronize();
+      cudaMemcpyAsync(host.data(), layout_keys, bytes, cudaMemcpyDefault, stream.get()));
+    stream.sync();
     bool ascending = true;
     for (std::size_t c = 0; ascending && c + 1 < _lists->offsets.size(); ++c) {
       auto const first = host.begin() + _lists->offsets[c];
@@ -2046,8 +2046,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                     rows.data_handle() + piece.begin * dim,
                                     values * sizeof(float),
                                     cudaMemcpyDeviceToDevice,
-                                    stream.value()));
-      stream.synchronize();
+                                    stream.get()));
+      stream.sync();
       at += values;
     }
   }
@@ -2304,8 +2304,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                       probe_keys->data(),
                                       host.size() * sizeof(std::int64_t),
                                       cudaMemcpyDeviceToHost,
-                                      stream.value()));
-        stream.synchronize();
+                                      stream.get()));
+        stream.sync();
         probe_key_max = *std::max_element(host.begin(), host.end());
       }
       earlier_cut = _layout_key_host.data();
@@ -2389,7 +2389,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto phase_t0  = std::chrono::steady_clock::now();
     auto phase     = [&](const char* name) {
       if (!dbg) { return; }
-      stream.synchronize();
+      stream.sync();
       auto const now = std::chrono::steady_clock::now();
       std::fprintf(
         stderr,
@@ -2441,7 +2441,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         rmm::device_uvector<float> piece(static_cast<std::size_t>(rows * dim), stream, mr);
         host_rows->copy_to_device(at, rows, piece.data());
         use(piece.data(), at, rows);
-        stream.synchronize();
+        stream.sync();
       }
     };
 
@@ -2499,14 +2499,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           part.row_ids->view().data<std::int64_t>(),
           count * sizeof(std::int64_t),
           cudaMemcpyDeviceToDevice,
-          stream.value()));
+          stream.get()));
         CUDF_CUDA_TRY(cudaMemcpyAsync(
           assignment.cluster_ids->mutable_view().data<std::int32_t>() + first,
           part.cluster_ids->view().data<std::int32_t>(),
           count * sizeof(std::int32_t),
           cudaMemcpyDeviceToDevice,
-          stream.value()));
-        stream.synchronize();
+          stream.get()));
+        stream.sync();
       });
     } else {
       assignment = vss::assign_to_centroids(
@@ -2522,8 +2522,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                   assignment.cluster_ids->view().data<std::int32_t>(),
                                   host_edges.size() * sizeof(std::int32_t),
                                   cudaMemcpyDeviceToHost,
-                                  stream.value()));
-    stream.synchronize();
+                                  stream.get()));
+    stream.sync();
     std::vector<bool> wanted(static_cast<std::size_t>(_n_clusters), false);
     std::vector<std::int64_t> edge_begin(static_cast<std::size_t>(_n_clusters) + 1, 0);
     for (std::int64_t r = 0; r < n_left; ++r) {
@@ -2601,7 +2601,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                        mr);
     }();
     // The sort's inputs are done with; an edge costs its sorted row from here on.
-    stream.synchronize();
+    stream.sync();
     assignment = vss::cluster_assignment{};
     auto const sorted_rows = sorted->get_column(0).view();  // INT64 probe row per edge
     phase("sort edges");
@@ -2700,15 +2700,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     if (int8_search && !codes_int8) {
       rmm::device_uvector<unsigned long long> non_bytes(1, stream, mr);
       CUDF_CUDA_TRY(
-        cudaMemsetAsync(non_bytes.data(), 0, sizeof(unsigned long long), stream.value()));
+        cudaMemsetAsync(non_bytes.data(), 0, sizeof(unsigned long long), stream.get()));
       vss::count_non_uint8(search_queries.data_handle(), n_left * dim, non_bytes.data(), stream);
       unsigned long long non_bytes_host = 0;
       CUDF_CUDA_TRY(cudaMemcpyAsync(&non_bytes_host,
                                     non_bytes.data(),
                                     sizeof(non_bytes_host),
                                     cudaMemcpyDeviceToHost,
-                                    stream.value()));
-      stream.synchronize();
+                                    stream.get()));
+      stream.sync();
       int8_search = non_bytes_host == 0;
     }
     if (int8_search) {
@@ -2868,7 +2868,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       probe_sqf.emplace(static_cast<std::size_t>(n_left), stream, mr);
       probe_half_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
       rmm::device_uvector<unsigned int> max_sq_bits(1, stream, mr);
-      CUDF_CUDA_TRY(cudaMemsetAsync(max_sq_bits.data(), 0, sizeof(unsigned int), stream.value()));
+      CUDF_CUDA_TRY(cudaMemsetAsync(max_sq_bits.data(), 0, sizeof(unsigned int), stream.get()));
       if (probe_rows_on_host) {
         for_each_host_piece([&](float const* rows, std::int64_t at, std::int64_t n) {
           vss::narrow_to_float16(rows, n * dim, probe_f16->data() + at * dim, stream);
@@ -2897,8 +2897,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       }
       unsigned int bits = 0;
       CUDF_CUDA_TRY(cudaMemcpyAsync(
-        &bits, max_sq_bits.data(), sizeof(bits), cudaMemcpyDeviceToHost, stream.value()));
-      stream.synchronize();
+        &bits, max_sq_bits.data(), sizeof(bits), cudaMemcpyDeviceToHost, stream.get()));
+      stream.sync();
       float max_sq = 0;
       std::memcpy(&max_sq, &bits, sizeof(max_sq));
       float const probe_norm_max = std::sqrt(max_sq);
@@ -3058,14 +3058,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         // zeros on both sides that is -2 q.x, the inner-product distance, exactly.
         ip_probe_zero_sq.emplace(static_cast<std::size_t>(n_left), stream, mr);
         CUDF_CUDA_TRY(cudaMemsetAsync(
-          ip_probe_zero_sq->data(), 0, ip_probe_zero_sq->size() * sizeof(float), stream.value()));
+          ip_probe_zero_sq->data(), 0, ip_probe_zero_sq->size() * sizeof(float), stream.get()));
         if (_lists != nullptr && !_lists->offsets.empty()) {
           ip_row_zero_sq.emplace(
             static_cast<std::size_t>(std::max<std::int64_t>(_lists->offsets.back(), 1)),
             stream,
             mr);
           CUDF_CUDA_TRY(cudaMemsetAsync(
-            ip_row_zero_sq->data(), 0, ip_row_zero_sq->size() * sizeof(float), stream.value()));
+            ip_row_zero_sq->data(), 0, ip_row_zero_sq->size() * sizeof(float), stream.get()));
         }
       }
     }
@@ -3152,7 +3152,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     // seeds alike.)
     auto debug_mark = [&] {
       if (!dbg) { return std::chrono::steady_clock::time_point{}; }
-      stream.synchronize();
+      stream.sync();
       return std::chrono::steady_clock::now();
     };
     auto gap_trim = [&] {
@@ -3198,8 +3198,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                     candidates->rows.data(),
                                     rows.size() * sizeof(std::int32_t),
                                     cudaMemcpyDeviceToHost,
-                                    stream.value()));
-      stream.synchronize();
+                                    stream.get()));
+      stream.sync();
       std::vector<std::int32_t> distinct;
       std::vector<float> staged;
       for (std::size_t from = 0; from < rows.size();) {
@@ -3226,12 +3226,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                       staged.data(),
                                       staged.size() * sizeof(float),
                                       cudaMemcpyHostToDevice,
-                                      stream.value()));
+                                      stream.get()));
         CUDF_CUDA_TRY(cudaMemcpyAsync(slots.data(),
                                       rows.data() + from,
                                       slots.size() * sizeof(std::int32_t),
                                       cudaMemcpyHostToDevice,
-                                      stream.value()));
+                                      stream.get()));
         vss::exact_distances(device_rows.data(),
                              slots.data(),
                              0,
@@ -3245,7 +3245,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                              nullptr,
                              0.f,
                              ip);
-        stream.synchronize();
+        stream.sync();
         from = to;
       }
     };
@@ -3259,7 +3259,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       auto const* c_dist = candidates->distances.data();
       auto const done    = [&] {
         CUDF_CUDA_TRY(
-          cudaMemsetAsync(candidates->count.data(), 0, sizeof(unsigned long long), stream.value()));
+          cudaMemsetAsync(candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
         pending = 0;
         if (dbg) { rescore_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
       };
@@ -3428,7 +3428,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           note_radius_part(pairs);
         }
         CUDF_CUDA_TRY(
-          cudaMemsetAsync(candidates->count.data(), 0, sizeof(unsigned long long), stream.value()));
+          cudaMemsetAsync(candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
         pending = 0;
         if (dbg) { take_seconds += std::chrono::duration<double>(debug_mark() - t1).count(); }
         return;
@@ -3444,7 +3444,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                   mr);
       refresh_code_limit(bound->data());
       CUDF_CUDA_TRY(
-        cudaMemsetAsync(candidates->count.data(), 0, sizeof(unsigned long long), stream.value()));
+        cudaMemsetAsync(candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
       pending = 0;
       if (dbg) { take_seconds += std::chrono::duration<double>(debug_mark() - t1).count(); }
     };
@@ -3525,14 +3525,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     auto read_count = [&] {
       unsigned long long total = 0;
       CUDF_CUDA_TRY(cudaMemcpyAsync(
-        &total, candidates->count.data(), sizeof(total), cudaMemcpyDeviceToHost, stream.value()));
-      stream.synchronize();
+        &total, candidates->count.data(), sizeof(total), cudaMemcpyDeviceToHost, stream.get()));
+      stream.sync();
       return static_cast<std::int64_t>(total);
     };
     auto rollback = [&] {
       auto const keep = static_cast<unsigned long long>(pending);
       CUDF_CUDA_TRY(cudaMemcpyAsync(
-        candidates->count.data(), &keep, sizeof(keep), cudaMemcpyHostToDevice, stream.value()));
+        candidates->count.data(), &keep, sizeof(keep), cudaMemcpyHostToDevice, stream.get()));
     };
     auto launch_deferred = [&] {
       if (!deferred.empty()) {
@@ -3713,19 +3713,19 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                     order.data(),
                                     order.size() * sizeof(std::int64_t),
                                     cudaMemcpyHostToDevice,
-                                    stream.value()));
+                                    stream.get()));
       rmm::device_uvector<std::int64_t> first_d(first.size(), stream, mr);
       rmm::device_uvector<std::int32_t> count_d(count.size(), stream, mr);
       CUDF_CUDA_TRY(cudaMemcpyAsync(first_d.data(),
                                     first.data(),
                                     first.size() * sizeof(std::int64_t),
                                     cudaMemcpyHostToDevice,
-                                    stream.value()));
+                                    stream.get()));
       CUDF_CUDA_TRY(cudaMemcpyAsync(count_d.data(),
                                     count.data(),
                                     count.size() * sizeof(std::int32_t),
                                     cudaMemcpyHostToDevice,
-                                    stream.value()));
+                                    stream.get()));
       if (f16_bounded) {
         vss::seed_bound_f16(static_cast<std::uint16_t const*>(_lists->device_vectors->data()),
                             ip_row_zero_sq ? ip_row_zero_sq->data()
@@ -3959,7 +3959,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                       tasks.data(),
                                       tasks.size() * sizeof(vss::nearest_task),
                                       cudaMemcpyHostToDevice,
-                                      stream.value()));
+                                      stream.get()));
         bool const f16 = !int8_search;
         vss::nearest_cluster_topk(
           device_tasks.data(),
@@ -4052,7 +4052,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                         bases.data(),
                                         bases.size() * sizeof(float const*),
                                         cudaMemcpyHostToDevice,
-                                        stream.value()));
+                                        stream.get()));
           if (sweep == 1) {
             // The chunk as the FLOAT16 lists would hold it: rounded rows, their norms, and the
             // largest rounding error and norm, which this chunk's filter limit allows for.
@@ -4060,7 +4060,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             scan_sqf.emplace(static_cast<std::size_t>(chunk_n), stream, mr);
             rmm::device_uvector<unsigned int> maxima(2, stream, mr);
             CUDF_CUDA_TRY(
-              cudaMemsetAsync(maxima.data(), 0, 2 * sizeof(unsigned int), stream.value()));
+              cudaMemsetAsync(maxima.data(), 0, 2 * sizeof(unsigned int), stream.get()));
             vss::narrow_to_float16(chunk_data, chunk_n * dim, scan_f16_rows->data(), stream);
             vss::half_rows_norms(chunk_data,
                                  scan_f16_rows->data(),
@@ -4073,8 +4073,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                  stream);
             unsigned int bits[2] = {0, 0};
             CUDF_CUDA_TRY(cudaMemcpyAsync(
-              bits, maxima.data(), sizeof(bits), cudaMemcpyDeviceToHost, stream.value()));
-            stream.synchronize();
+              bits, maxima.data(), sizeof(bits), cudaMemcpyDeviceToHost, stream.get()));
+            stream.sync();
             float max_sq = 0;
             std::memcpy(&row_half_error, &bits[0], sizeof(float));
             std::memcpy(&max_sq, &bits[1], sizeof(float));
@@ -4135,8 +4135,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                             rows_c,
                                             slice_rows_c.size() * sizeof(std::int64_t),
                                             cudaMemcpyDeviceToHost,
-                                            stream.value()));
-              stream.synchronize();
+                                            stream.get()));
+              stream.sync();
               std::vector<float> gathered(static_cast<std::size_t>(m * dim));
               host_rows->gather(slice_rows_c.data(), slice_rows_c.size(), gathered.data());
               // From a pageable vector, so the copy has completed when the call returns.
@@ -4144,7 +4144,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                             gathered.data(),
                                             gathered.size() * sizeof(float),
                                             cudaMemcpyHostToDevice,
-                                            stream.value()));
+                                            stream.get()));
             }
           } else if (!direct) {
             vss::gather_rows(

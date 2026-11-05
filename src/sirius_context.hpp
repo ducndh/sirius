@@ -68,6 +68,11 @@ namespace sirius::vss {
 class cuvs_index_cache;
 }  // namespace sirius::vss
 
+namespace sirius::transparent {
+enum class candidate_origin : uint8_t;
+struct plan_source_policy;
+}  // namespace sirius::transparent
+
 namespace sirius::memory {
 class numa_small_pinned_mr;
 class topology_index;

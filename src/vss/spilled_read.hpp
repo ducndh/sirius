@@ -143,7 +143,7 @@ inline void copy_file_to_device_impl(int fd,
       }
       if (r <= 0) {
         // The other piece's copy may still be queued; the next call must not refill it under it.
-        stream.synchronize();
+        stream.sync();
         throw std::runtime_error("reading spilled batch " + what + " failed");
       }
       got += static_cast<std::size_t>(r);
@@ -155,11 +155,11 @@ inline void copy_file_to_device_impl(int fd,
                                   host + (from - at),
                                   to - from,
                                   cudaMemcpyHostToDevice,
-                                  stream.value()));
-    CUDF_CUDA_TRY(cudaEventRecord(buffers.landed[slot], stream.value()));
+                                  stream.get()));
+    CUDF_CUDA_TRY(cudaEventRecord(buffers.landed[slot], stream.get()));
     pending[slot] = true;
   }
-  stream.synchronize();
+  stream.sync();
 }
 
 }  // namespace detail

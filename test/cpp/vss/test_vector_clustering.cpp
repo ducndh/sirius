@@ -209,7 +209,7 @@ TEST_CASE("assign_to_centroids emits one edge per row at n_probes 1", "[vss]")
   spec.n_probes         = 1;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   REQUIRE(assignment.row_ids->size() == 8);
   auto const rows     = to_host<std::int64_t>(assignment.row_ids->view());
@@ -234,7 +234,7 @@ TEST_CASE("assign_to_centroids offsets row ids by the chunk base", "[vss]")
   spec.n_probes         = 1;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, spec, 1000, Metric::L2SqrtExpanded, stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   auto const rows = to_host<std::int64_t>(assignment.row_ids->view());
   REQUIRE(rows.size() == 2);
@@ -256,7 +256,7 @@ TEST_CASE("assign_to_centroids repeats a row once per probe and orders by distan
   spec.n_probes         = 3;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   REQUIRE(assignment.row_ids->size() == 3);
   auto const rows      = to_host<std::int64_t>(assignment.row_ids->view());
@@ -282,7 +282,7 @@ TEST_CASE("assign_to_centroids caps probes at the centroid count", "[vss]")
   spec.n_probes         = 10;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   CHECK(assignment.row_ids->size() == 2);
 }
@@ -303,7 +303,7 @@ TEST_CASE("assign_to_centroids radius mode keeps only near-tied centroids", "[vs
   spec.max_probes       = 3;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   REQUIRE(assignment.row_ids->size() == 2);
   auto const clusters = to_host<std::int32_t>(assignment.cluster_ids->view());
@@ -327,7 +327,7 @@ TEST_CASE("assign_to_centroids radius mode always keeps the nearest centroid", "
   spec.max_probes       = 3;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, spec, 0, Metric::L2SqrtExpanded, stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   REQUIRE(assignment.row_ids->size() == 2);
   auto const rows     = to_host<std::int64_t>(assignment.row_ids->view());
@@ -354,7 +354,7 @@ TEST_CASE("assign_to_centroids round-trips centroids trained by train_centroids"
   assign.n_probes       = 1;
   auto const assignment = assign_to_centroids(
     res, vectors->view(), centroids->view(), dim, assign, 0, spec.metric, stream, mr);
-  stream.synchronize();
+  stream.sync();
 
   REQUIRE(assignment.cluster_ids->size() == 8);
   auto const clusters = to_host<std::int32_t>(assignment.cluster_ids->view());
@@ -380,12 +380,12 @@ TEST_CASE("half and FP32 row norms report the same largest squared norm", "[vss]
 
   rmm::device_uvector<float> x(host.size(), stream);
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    x.data(), host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice, stream.value()));
+    x.data(), host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice, stream.get()));
   rmm::device_uvector<std::uint16_t> h(host.size(), stream);
   sirius::vss::narrow_to_float16(x.data(), rows * dim, h.data(), stream);
   rmm::device_uvector<float> sq(rows, stream);
   rmm::device_uvector<unsigned int> bits(2, stream);
-  CUDF_CUDA_TRY(cudaMemsetAsync(bits.data(), 0, 2 * sizeof(unsigned int), stream.value()));
+  CUDF_CUDA_TRY(cudaMemsetAsync(bits.data(), 0, 2 * sizeof(unsigned int), stream.get()));
 
   sirius::vss::half_rows_norms(
     x.data(), h.data(), rows, dim, sq.data(), nullptr, nullptr, bits.data(), stream);
@@ -393,8 +393,8 @@ TEST_CASE("half and FP32 row norms report the same largest squared norm", "[vss]
 
   std::vector<unsigned int> out(2);
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    out.data(), bits.data(), 2 * sizeof(unsigned int), cudaMemcpyDeviceToHost, stream.value()));
-  stream.synchronize();
+    out.data(), bits.data(), 2 * sizeof(unsigned int), cudaMemcpyDeviceToHost, stream.get()));
+  stream.sync();
   float half_max = 0.f, fp32_max = 0.f;
   std::memcpy(&half_max, &out[0], sizeof(float));
   std::memcpy(&fp32_max, &out[1], sizeof(float));
@@ -448,8 +448,8 @@ std::vector<std::int32_t> labels_of(std::vector<float> const& rows,
                                 labels.data(),
                                 host.size() * sizeof(std::int32_t),
                                 cudaMemcpyDeviceToHost,
-                                stream.value()));
-  stream.synchronize();
+                                stream.get()));
+  stream.sync();
   return host;
 }
 
@@ -530,12 +530,12 @@ TEST_CASE("scatter_rows moves whole rows of any width", "[vss][kmeans]")
     rmm::device_uvector<std::uint8_t> src_d(src.size(), stream), out_d(src.size(), stream);
     rmm::device_uvector<std::int64_t> dest_d(dest.size(), stream);
     CUDF_CUDA_TRY(cudaMemcpyAsync(
-      src_d.data(), src.data(), src.size(), cudaMemcpyHostToDevice, stream.value()));
+      src_d.data(), src.data(), src.size(), cudaMemcpyHostToDevice, stream.get()));
     CUDF_CUDA_TRY(cudaMemcpyAsync(dest_d.data(),
                                   dest.data(),
                                   dest.size() * sizeof(std::int64_t),
                                   cudaMemcpyHostToDevice,
-                                  stream.value()));
+                                  stream.get()));
     sirius::vss::scatter_rows(reinterpret_cast<std::byte const*>(src_d.data()),
                               width,
                               dest_d.data(),
@@ -544,8 +544,8 @@ TEST_CASE("scatter_rows moves whole rows of any width", "[vss][kmeans]")
                               stream);
     std::vector<std::uint8_t> out(src.size());
     CUDF_CUDA_TRY(cudaMemcpyAsync(
-      out.data(), out_d.data(), out.size(), cudaMemcpyDeviceToHost, stream.value()));
-    stream.synchronize();
+      out.data(), out_d.data(), out.size(), cudaMemcpyDeviceToHost, stream.get()));
+    stream.sync();
     std::int64_t wrong = 0;
     for (std::int64_t i = 0; i < n; ++i) {
       wrong += std::memcmp(out.data() + dest[static_cast<std::size_t>(i)] * width,

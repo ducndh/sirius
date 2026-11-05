@@ -271,7 +271,7 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
       if (take <= 0) { break; }
       samples.push_back(sample_vector_rows(staged.view, take, req.spec.seed, stream, mr));
       // The sample borrows the staged chunk, which this iteration is about to release.
-      stream.synchronize();
+      stream.sync();
       sampled += take;
     }
     if (samples.empty()) {
@@ -367,7 +367,7 @@ std::unique_ptr<cucascade::host_data_representation> run_kmeans_assign(
     auto assignment = assign_to_centroids(
       res, staged.view, centroids->view(), req.dim, req.spec, base, entry->meta.metric, stream, mr);
     // The assignment reads the staged chunk, which is released at the end of this iteration.
-    stream.synchronize();
+    stream.sync();
     row_ids.push_back(std::move(assignment.row_ids));
     cluster_ids.push_back(std::move(assignment.cluster_ids));
     distances.push_back(std::move(assignment.distances));
@@ -409,7 +409,7 @@ namespace {
 
 /// Whether @p lists were built from the pin that stands for (@p catalog, @p schema, @p table) now.
 /// After an unpin and re-pin, or a pin_table that replaced the entry, they describe rows the table
-/// may no longer hold; the generation tells the new pin apart even at the old one's address.
+/// may no longer hold; its snapshot identity tells the new pin apart even at the old one's address.
 bool built_from_current_pin(duckdb::SiriusContext& ctx,
                             cluster_lists const& lists,
                             const std::string& catalog,
@@ -418,7 +418,7 @@ bool built_from_current_pin(duckdb::SiriusContext& ctx,
 {
   auto const pin =
     ctx.get_scan_manager().find_pinned_entry_for_duckdb_table(catalog, schema, table);
-  return pin != nullptr && pin->generation == lists.pin_generation;
+  return pin != nullptr && lists.pin_snapshot.lock() == pin->snapshot_identity;
 }
 
 }  // namespace
@@ -574,7 +574,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   auto phase_t0  = std::chrono::steady_clock::now();
   auto phase     = [&](const char* name) {
     if (!dbg) { return; }
-    stream.synchronize();
+    stream.sync();
     auto const now = std::chrono::steady_clock::now();
     std::fprintf(stderr,
                  "[vecjoin-lists] %-18s %8.3f s\n",
@@ -597,7 +597,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   bool const check_in_pass_2 = check_uint8 && one_list && storage == list_storage::uint8 &&
                                c.pin->tier != cucascade::memory::Tier::GPU;
   rmm::device_uvector<unsigned long long> non_uint8(1, stream, mr);
-  CUDF_CUDA_TRY(cudaMemsetAsync(non_uint8.data(), 0, sizeof(unsigned long long), stream.value()));
+  CUDF_CUDA_TRY(cudaMemsetAsync(non_uint8.data(), 0, sizeof(unsigned long long), stream.get()));
   auto const refuse_non_uint8 = [&](unsigned long long count) {
     throw duckdb::InvalidInputException(fn + ": storage => 'uint8' needs every value of '" +
                                         req.column + "' to be an integer in [0, 255]; " +
@@ -613,7 +613,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   auto const rotated_rows = [&](float const* x, std::int64_t rows) -> float const* {
     if (!rotation) { return x; }
     if (!rotated || rotated->size() < static_cast<std::size_t>(rows * dim)) {
-      if (rotated) { stream.synchronize(); }  // the old buffer may still be read by queued work
+      if (rotated) { stream.sync(); }  // the old buffer may still be read by queued work
       rotated.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
     }
     rotate_rows(x, rows, dim, static_cast<float const*>(rotation->data()), rotated->data(), stream);
@@ -623,9 +623,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     col_min.emplace(static_cast<std::size_t>(dim), stream, mr);
     col_max.emplace(static_cast<std::size_t>(dim), stream, mr);
     CUDF_CUDA_TRY(cudaMemsetAsync(
-      col_min->data(), 0xff, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.value()));
+      col_min->data(), 0xff, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.get()));
     CUDF_CUDA_TRY(cudaMemsetAsync(
-      col_max->data(), 0, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.value()));
+      col_max->data(), 0, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.get()));
     auto const* env = std::getenv("SIRIUS_VSS_INT8_ROTATE");
     if (env == nullptr || std::string_view{env} != "0") {
       auto const host =
@@ -635,8 +635,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                     host.data(),
                                     host.size() * sizeof(float),
                                     cudaMemcpyHostToDevice,
-                                    stream.value()));
-      stream.synchronize();  // `host` goes out of scope
+                                    stream.get()));
+      stream.sync();  // `host` goes out of scope
     }
   }
   // One list rotated before coding keeps the rows pass 1 rotates and codes them from there, rather
@@ -713,9 +713,9 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                       chunk_labels.data(),
                                       static_cast<std::size_t>(rows) * sizeof(std::int32_t),
                                       cudaMemcpyDeviceToHost,
-                                      stream.value()));
+                                      stream.get()));
       }
-      stream.synchronize();
+      stream.sync();
       base += rows;
     }
     if (base != n_rows) {
@@ -731,8 +731,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                 non_uint8.data(),
                                 sizeof(non_uint8_host),
                                 cudaMemcpyDeviceToHost,
-                                stream.value()));
-  stream.synchronize();
+                                stream.get()));
+  stream.sync();
   if (storage == list_storage::uint8 && non_uint8_host != 0) { refuse_non_uint8(non_uint8_host); }
   // 'auto' is the planner's choice, the one a statement that builds its own lists makes ('exact'):
   // bytes as UINT8, anything else as FLOAT16 that the bounded search re-scores in FP32 -- where the
@@ -770,13 +770,13 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                   col_min->data(),
                                   lo.size() * sizeof(unsigned int),
                                   cudaMemcpyDeviceToHost,
-                                  stream.value()));
+                                  stream.get()));
     CUDF_CUDA_TRY(cudaMemcpyAsync(hi.data(),
                                   col_max->data(),
                                   hi.size() * sizeof(unsigned int),
                                   cudaMemcpyDeviceToHost,
-                                  stream.value()));
-    stream.synchronize();
+                                  stream.get()));
+    stream.sync();
     code_offset_host.resize(static_cast<std::size_t>(dim));
     float half_range = 0.f;
     for (std::size_t j = 0; j < lo.size(); ++j) {
@@ -830,7 +830,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
 
   cluster_lists lists;
   lists.pin            = c.pin.get();
-  lists.pin_generation = c.pin->generation;
+  lists.pin_snapshot = c.pin->snapshot_identity;
   lists.table          = req.table;
   lists.column         = req.column;
   lists.n_rows         = n_rows;
@@ -1044,7 +1044,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   if (encoding == list_encoding::float16 && lists.has_exact_rows()) {
     half_error_bits.emplace(1, stream, mr);
     CUDF_CUDA_TRY(
-      cudaMemsetAsync(half_error_bits->data(), 0, sizeof(unsigned int), stream.value()));
+      cudaMemsetAsync(half_error_bits->data(), 0, sizeof(unsigned int), stream.get()));
   }
   if (encoding == list_encoding::int8) {
     lists.code_scale  = code_scale;
@@ -1061,7 +1061,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     }
     code_error_bits.emplace(1, stream, mr);
     CUDF_CUDA_TRY(
-      cudaMemsetAsync(code_error_bits->data(), 0, sizeof(unsigned int), stream.value()));
+      cudaMemsetAsync(code_error_bits->data(), 0, sizeof(unsigned int), stream.get()));
     persistent.synchronize();
   }
 
@@ -1101,7 +1101,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       while (bytes > 0) {
         auto const [out, room] = where(at);
         auto const now         = std::min(bytes, room);
-        CUDF_CUDA_TRY(cudaMemcpyAsync(out, from, now, cudaMemcpyDeviceToHost, stream.value()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(out, from, now, cudaMemcpyDeviceToHost, stream.get()));
         from += now;
         at += now;
         bytes -= now;
@@ -1139,7 +1139,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                       x,
                                       static_cast<std::size_t>(rows) * row_bytes_v,
                                       cudaMemcpyDeviceToDevice,
-                                      stream.value()));
+                                      stream.get()));
       }
       if (encoding == list_encoding::float16) {
         narrow_to_float16(x, rows * dim, reinterpret_cast<std::uint16_t*>(coded), stream);
@@ -1201,7 +1201,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       }
       walk.prefetch_after(i);
       // The staged chunk and the buffers above are released once this iteration ends.
-      stream.synchronize();
+      stream.sync();
       base += rows;
     }
     if (base != n_rows) {
@@ -1214,8 +1214,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                     non_uint8.data(),
                                     sizeof(non_uint8_host),
                                     cudaMemcpyDeviceToHost,
-                                    stream.value()));
-      stream.synchronize();
+                                    stream.get()));
+      stream.sync();
       if (non_uint8_host != 0) { refuse_non_uint8(non_uint8_host); }
     }
   }
@@ -1259,7 +1259,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                       src + at,
                                       std::min(block_bytes, bytes - at),
                                       cudaMemcpyDeviceToHost,
-                                      stream.value()));
+                                      stream.get()));
       }
     };
     auto const copy_threads =
@@ -1349,17 +1349,17 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                     order.data(),
                                     static_cast<std::size_t>(rows) * sizeof(std::int64_t),
                                     cudaMemcpyHostToDevice,
-                                    stream.value()));
+                                    stream.get()));
       CUDF_CUDA_TRY(cudaMemcpyAsync(chunk_dest.data(),
                                     dest.data() + base,
                                     static_cast<std::size_t>(rows) * sizeof(std::int64_t),
                                     cudaMemcpyHostToDevice,
-                                    stream.value()));
+                                    stream.get()));
       CUDF_CUDA_TRY(cudaMemcpyAsync(grouped_dest_d.data(),
                                     grouped_dest.data(),
                                     static_cast<std::size_t>(rows) * sizeof(std::int64_t),
                                     cudaMemcpyHostToDevice,
-                                    stream.value()));
+                                    stream.get()));
       // Per-row values of the grouped chunk into a device-resident part of the layout.
       auto const scatter = [&](void const* src, std::size_t width, void* out) {
         scatter_rows(static_cast<std::byte const*>(src),
@@ -1444,7 +1444,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       walk.prefetch_after(i);
       // The staged chunk, the grouped rows and the pageable sources of the copies above are
       // released or reused once this iteration ends.
-      stream.synchronize();
+      stream.sync();
       if (lists.exact_vectors) { copy_out(exact_stage, runs_owner, exact_row_bytes, exact_at); }
       if (!on_device) { copy_out(row_stage, runs_owner, row_bytes_v, chunk_at); }
       base += rows;
@@ -1557,7 +1557,7 @@ cucascade::read_only_data_batch lock_host_list_chunk(const cluster_lists& lists,
   }
   // The downgrade executor moved it on; the engine brings it back to the lists' host space.
   auto prepared =
-    pipeline::lock_and_prepare_batch(batch, lists.host_space, ::cuda::stream_ref{stream.value()});
+    pipeline::lock_and_prepare_batch(batch, lists.host_space, ::cuda::stream_ref{stream.get()});
   if (!prepared) {
     throw std::runtime_error("[vss] cluster list chunk " + std::to_string(chunk) +
                              " could not be brought back to host memory");
@@ -1584,7 +1584,7 @@ void copy_host_list_rows(const cluster_lists& lists,
     auto const in_block = offset % block_bytes;
     auto const bytes    = std::min(remaining, block_bytes - in_block);
     CUDF_CUDA_TRY(cudaMemcpyAsync(
-      dst, alloc.at(block).data() + in_block, bytes, cudaMemcpyHostToDevice, stream.value()));
+      dst, alloc.at(block).data() + in_block, bytes, cudaMemcpyHostToDevice, stream.get()));
     dst += bytes;
     offset += bytes;
     remaining -= bytes;

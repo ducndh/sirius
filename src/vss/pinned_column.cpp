@@ -216,7 +216,7 @@ std::unique_ptr<rmm::device_buffer> to_device(std::vector<T> const& host,
 {
   auto buf = std::make_unique<rmm::device_buffer>(host.size() * sizeof(T), stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    buf->data(), host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice, stream.value()));
+    buf->data(), host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice, stream.get()));
   return buf;
 }
 
@@ -305,7 +305,7 @@ std::optional<pinned_rows_map> map_pinned_rows(const scan_manager::pinned_entry&
   out.chunk_block  = to_device(chunk_block, stream, mr);
   out.chunk_offset = to_device(chunk_offset, stream, mr);
   out.blocks       = to_device(blocks, stream, mr);
-  stream.synchronize();
+  stream.sync();
   return out;
 }
 

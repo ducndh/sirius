@@ -70,7 +70,7 @@ knn_result knn_merge_parts_topk(raft::device_resources const& res,
   // Ids are already unique across parts, so every part's translation offset is zero.
   rmm::device_uvector<int64_t> translations(static_cast<std::size_t>(n_parts), stream, mr);
   CUDF_CUDA_TRY(
-    cudaMemsetAsync(translations.data(), 0, translations.size() * sizeof(int64_t), stream.value()));
+    cudaMemsetAsync(translations.data(), 0, translations.size() * sizeof(int64_t), stream.get()));
   auto const trans_view =
     raft::make_device_vector_view<int64_t, int64_t>(translations.data(), n_parts);
 

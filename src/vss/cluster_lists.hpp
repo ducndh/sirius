@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "pin_snapshot_identity.hpp"
 #include "vss/exact_rows.hpp"
 #include "vss/kmeans_functions.hpp"
 #include "vss/pinned_column.hpp"
@@ -102,9 +103,9 @@ struct cluster_lists {
   }
 
   const scan_manager::pinned_entry* pin{nullptr};  ///< The pin the lists were built from.
-  /// That pin's generation: lists serve only the pin they were built from, and an unpin and
+  /// That pin's identity: lists serve only the pin they were built from, and an unpin and
   /// re-pin (whose new entry may reuse the old address) is a different pin.
-  std::uint64_t pin_generation{0};
+  std::weak_ptr<const pin_snapshot_identity> pin_snapshot;
   std::string table;
   std::string column;
   std::int64_t n_rows{0};

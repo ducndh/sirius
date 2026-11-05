@@ -812,8 +812,8 @@ void scatter_row_ids(
 {
   if (n == 0) { return; }
   auto const grid = std::min(grid_for(n), 65535);
-  scatter_row_ids_kernel<<<grid, kBlock, 0, stream.value()>>>(dest, n, row_base, row_ids);
-  CUDF_CHECK_CUDA(stream.value());
+  scatter_row_ids_kernel<<<grid, kBlock, 0, stream.get()>>>(dest, n, row_base, row_ids);
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void scatter_rows(std::byte const* src,
@@ -830,14 +830,14 @@ void scatter_rows(std::byte const* src,
   if (words) {
     auto const width = row_bytes / 4;
     scatter_rows_kernel<uint32_t>
-      <<<std::min(grid_for(n * width), 65535), kBlock, 0, stream.value()>>>(
+      <<<std::min(grid_for(n * width), 65535), kBlock, 0, stream.get()>>>(
         reinterpret_cast<uint32_t const*>(src), width, dest, n, reinterpret_cast<uint32_t*>(out));
   } else {
     scatter_rows_kernel<uint8_t>
-      <<<std::min(grid_for(n * row_bytes), 65535), kBlock, 0, stream.value()>>>(
+      <<<std::min(grid_for(n * row_bytes), 65535), kBlock, 0, stream.get()>>>(
         reinterpret_cast<uint8_t const*>(src), row_bytes, dest, n, reinterpret_cast<uint8_t*>(out));
   }
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void count_non_uint8(float const* values,
@@ -846,17 +846,17 @@ void count_non_uint8(float const* values,
                      rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }
-  count_non_uint8_kernel<<<std::min(grid_for(n), 4096), kBlock, 0, stream.value()>>>(
+  count_non_uint8_kernel<<<std::min(grid_for(n), 4096), kBlock, 0, stream.get()>>>(
     values, n, out);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void narrow_to_shifted_int8(float const* in, int64_t n, int8_t* out, rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }
-  narrow_to_shifted_int8_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+  narrow_to_shifted_int8_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.get()>>>(
     in, n, out);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void widen_shifted_int8(int8_t const* in, int64_t n, float* out, rmm::cuda_stream_view stream)
@@ -867,9 +867,9 @@ void widen_shifted_int8(int8_t const* in, int64_t n, float* out, rmm::cuda_strea
   CUDF_EXPECTS(
     reinterpret_cast<uintptr_t>(in) % 4 == 0 && reinterpret_cast<uintptr_t>(out) % 16 == 0,
     "widen_shifted_int8: misaligned buffers");
-  widen_shifted_int8_kernel<<<std::min(grid_for(n / 4 + 1), 65535), kBlock, 0, stream.value()>>>(
+  widen_shifted_int8_kernel<<<std::min(grid_for(n / 4 + 1), 65535), kBlock, 0, stream.get()>>>(
     in, n, out);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void int8_row_sq_norms(
@@ -877,8 +877,8 @@ void int8_row_sq_norms(
 {
   if (rows == 0) { return; }
   auto const grid = static_cast<int>(std::min<int64_t>((rows + 7) / 8, 65535));
-  int8_row_sq_norms_kernel<<<grid, kBlock, 0, stream.value()>>>(x, rows, d, out);
-  CUDF_CHECK_CUDA(stream.value());
+  int8_row_sq_norms_kernel<<<grid, kBlock, 0, stream.get()>>>(x, rows, d, out);
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void float_row_sq_norms(float const* x,
@@ -890,8 +890,8 @@ void float_row_sq_norms(float const* x,
 {
   if (rows == 0) { return; }
   auto const grid = static_cast<int>(std::min<int64_t>((rows + 7) / 8, 65535));
-  float_row_sq_norms_kernel<<<grid, kBlock, 0, stream.value()>>>(x, rows, d, out, max_bits);
-  CUDF_CHECK_CUDA(stream.value());
+  float_row_sq_norms_kernel<<<grid, kBlock, 0, stream.get()>>>(x, rows, d, out, max_bits);
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void gather_bytes(void const* src,
@@ -902,32 +902,32 @@ void gather_bytes(void const* src,
                   rmm::cuda_stream_view stream)
 {
   if (m == 0) { return; }
-  gather_bytes_kernel<<<std::min(grid_for(m * row_bytes), 65535), kBlock, 0, stream.value()>>>(
+  gather_bytes_kernel<<<std::min(grid_for(m * row_bytes), 65535), kBlock, 0, stream.get()>>>(
     static_cast<uint8_t const*>(src), row_bytes, rows, m, static_cast<uint8_t*>(out));
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void gather_int32(
   int32_t const* src, int64_t const* rows, int64_t m, int32_t* out, rmm::cuda_stream_view stream)
 {
   if (m == 0) { return; }
-  gather_int32_kernel<<<std::min(grid_for(m), 65535), kBlock, 0, stream.value()>>>(
+  gather_int32_kernel<<<std::min(grid_for(m), 65535), kBlock, 0, stream.get()>>>(
     src, rows, m, out);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void narrow_to_float16(float const* in, int64_t n, uint16_t* out, rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }
-  narrow_to_float16_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(in, n, out);
-  CUDF_CHECK_CUDA(stream.value());
+  narrow_to_float16_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.get()>>>(in, n, out);
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void widen_float16(uint16_t const* in, int64_t n, float* out, rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }
-  widen_float16_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(in, n, out);
-  CUDF_CHECK_CUDA(stream.value());
+  widen_float16_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.get()>>>(in, n, out);
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void column_min_max(float const* x,
@@ -940,9 +940,9 @@ void column_min_max(float const* x,
   if (rows == 0) { return; }
   constexpr int64_t kRowsPerBlock = 4096;
   auto const blocks               = static_cast<int>((rows + kRowsPerBlock - 1) / kRowsPerBlock);
-  column_min_max_kernel<<<blocks, 128, 0, stream.value()>>>(
+  column_min_max_kernel<<<blocks, 128, 0, stream.get()>>>(
     x, rows, d, kRowsPerBlock, min_bits, max_bits);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 float decode_ordered_float(unsigned int bits)
@@ -1192,7 +1192,7 @@ void launch_wide_rotation(int q,
   dim3 const grid(static_cast<unsigned>((rows + 16 * R - 1) / (16 * R)),
                   static_cast<unsigned>((d + 16 * q - 1) / (16 * q)));
   auto go = [&](auto kernel) {
-    kernel<<<grid, 256, 0, stream.value()>>>(x, rows, d, rotation, out, min_b, max_b);
+    kernel<<<grid, 256, 0, stream.get()>>>(x, rows, d, rotation, out, min_b, max_b);
   };
   switch (q) {
     case 1: go(rotate_rows_wide_kernel<1, R, kMinMax>); break;
@@ -1204,7 +1204,7 @@ void launch_wide_rotation(int q,
     case 7: go(rotate_rows_wide_kernel<7, R, kMinMax>); break;
     default: go(rotate_rows_wide_kernel<8, R, kMinMax>); break;
   }
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 }  // namespace
@@ -1224,8 +1224,8 @@ void rotate_rows(float const* x,
     return;
   }
   dim3 const grid(row_blocks, static_cast<unsigned>((d + kRotTile - 1) / kRotTile));
-  rotate_rows_kernel<<<grid, 256, 0, stream.value()>>>(x, rows, d, rotation, out);
-  CUDF_CHECK_CUDA(stream.value());
+  rotate_rows_kernel<<<grid, 256, 0, stream.get()>>>(x, rows, d, rotation, out);
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 bool rotate_rows_min_max(float const* x,
@@ -1258,9 +1258,9 @@ void quantize_rows_int8(float const* x,
 {
   if (rows == 0) { return; }
   auto const grid = static_cast<int>(std::min<int64_t>((rows + 7) / 8, 65535));
-  quantize_rows_int8_kernel<<<grid, 256, 0, stream.value()>>>(
+  quantize_rows_int8_kernel<<<grid, 256, 0, stream.get()>>>(
     x, rows, d, offset, scale, out, row_error, max_error_bits, norm_slack);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void int8_code_limit(float const* bound,
@@ -1274,9 +1274,9 @@ void int8_code_limit(float const* bound,
 {
   if (n == 0) { return; }
   auto const grid = std::min(grid_for(n), 65535);
-  int8_code_limit_kernel<<<grid, kBlock, 0, stream.value()>>>(
+  int8_code_limit_kernel<<<grid, kBlock, 0, stream.get()>>>(
     bound, probe_error, code_error, scale, n, limit, lower);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void int8_seed_upper_bound(float* bound,
@@ -1287,7 +1287,7 @@ void int8_seed_upper_bound(float* bound,
                            rmm::cuda_stream_view stream)
 {
   if (n == 0) { return; }
-  int8_seed_upper_bound_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+  int8_seed_upper_bound_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.get()>>>(
     bound, probe_error, code_error, scale, n);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
@@ -1303,7 +1303,7 @@ void float16_seed_upper_bound(float* bound,
                               bool inner_product)
 {
   if (n == 0) { return; }
-  float16_seed_upper_bound_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+  float16_seed_upper_bound_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.get()>>>(
     bound, probe_sq, probe_error, row_error, row_norm, d, n, inner_product);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
@@ -1357,26 +1357,26 @@ void gap_rescore_bound(int32_t const* rows,
   rmm::device_uvector<int32_t> per_row(static_cast<std::size_t>(n_rows + 1), stream, mr);
   rmm::device_uvector<int64_t> before(static_cast<std::size_t>(n_rows + 1), stream, mr);
   CUDF_CUDA_TRY(
-    cudaMemsetAsync(per_row.data(), 0, per_row.size() * sizeof(int32_t), stream.value()));
+    cudaMemsetAsync(per_row.data(), 0, per_row.size() * sizeof(int32_t), stream.get()));
   if (n > 0) {
-    gap_count_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+    gap_count_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.get()>>>(
       rows, n, per_row.data());
     CUDF_CUDA_TRY(cudaGetLastError());
   }
   std::size_t scan_bytes = 0;
   CUDF_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
-    nullptr, scan_bytes, per_row.data(), before.data(), n_rows + 1, stream.value()));
+    nullptr, scan_bytes, per_row.data(), before.data(), n_rows + 1, stream.get()));
   rmm::device_buffer temp(std::max<std::size_t>(scan_bytes, 1), stream, mr);
   CUDF_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
-    temp.data(), scan_bytes, per_row.data(), before.data(), n_rows + 1, stream.value()));
+    temp.data(), scan_bytes, per_row.data(), before.data(), n_rows + 1, stream.get()));
   if (n > 0) {
-    gap_scatter_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+    gap_scatter_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.get()>>>(
       rows, codes, n, before.data(), per_row.data(), by_row.data());
     CUDF_CUDA_TRY(cudaGetLastError());
   }
   auto const warp_grid =
     static_cast<int>(std::clamp<int64_t>((n_rows + kBlock / 32 - 1) / (kBlock / 32), 1, 65535));
-  gap_rescore_bound_kernel<<<warp_grid, kBlock, 0, stream.value()>>>(
+  gap_rescore_bound_kernel<<<warp_grid, kBlock, 0, stream.get()>>>(
     by_row.data(), before.data(), acc_distances, n_rows, k, bound, terms, out);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
@@ -1397,18 +1397,18 @@ int64_t keep_within_row_limit(int32_t* rows,
     rmm::device_uvector<int32_t> counts(static_cast<std::size_t>(2 * n_rows), stream, mr);
     rmm::device_uvector<unsigned long long> slots(6, stream, mr);
     CUDF_CUDA_TRY(
-      cudaMemsetAsync(counts.data(), 0, counts.size() * sizeof(int32_t), stream.value()));
+      cudaMemsetAsync(counts.data(), 0, counts.size() * sizeof(int32_t), stream.get()));
     CUDF_CUDA_TRY(
-      cudaMemsetAsync(slots.data(), 0, slots.size() * sizeof(unsigned long long), stream.value()));
-    gap_row_counts_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.value()>>>(
+      cudaMemsetAsync(slots.data(), 0, slots.size() * sizeof(unsigned long long), stream.get()));
+    gap_row_counts_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.get()>>>(
       rows, codes, n, limit, counts.data(), counts.data() + n_rows);
-    gap_stats_kernel<<<std::min(grid_for(n_rows), 65535), kBlock, 0, stream.value()>>>(
+    gap_stats_kernel<<<std::min(grid_for(n_rows), 65535), kBlock, 0, stream.get()>>>(
       counts.data(), counts.data() + n_rows, n_rows, k, slots.data());
     CUDF_CUDA_TRY(cudaGetLastError());
     unsigned long long host[6] = {};
     CUDF_CUDA_TRY(
-      cudaMemcpyAsync(host, slots.data(), sizeof(host), cudaMemcpyDeviceToHost, stream.value()));
-    stream.synchronize();
+      cudaMemcpyAsync(host, slots.data(), sizeof(host), cudaMemcpyDeviceToHost, stream.get()));
+    stream.sync();
     stats->rows += host[0];
     stats->short_rows += host[1];
     stats->m2_rows += host[2];
@@ -1422,14 +1422,14 @@ int64_t keep_within_row_limit(int32_t* rows,
   within_row_limit const keep{rows, codes, limit};
   std::size_t temp_bytes = 0;
   CUDF_CUDA_TRY(cub::DeviceSelect::If(
-    nullptr, temp_bytes, all, picked.data(), n_picked.data(), n, keep, stream.value()));
+    nullptr, temp_bytes, all, picked.data(), n_picked.data(), n, keep, stream.get()));
   rmm::device_buffer temp(std::max<std::size_t>(temp_bytes, 1), stream, mr);
   CUDF_CUDA_TRY(cub::DeviceSelect::If(
-    temp.data(), temp_bytes, all, picked.data(), n_picked.data(), n, keep, stream.value()));
+    temp.data(), temp_bytes, all, picked.data(), n_picked.data(), n, keep, stream.get()));
   int64_t kept = 0;
   CUDF_CUDA_TRY(
-    cudaMemcpyAsync(&kept, n_picked.data(), sizeof(kept), cudaMemcpyDeviceToHost, stream.value()));
-  stream.synchronize();
+    cudaMemcpyAsync(&kept, n_picked.data(), sizeof(kept), cudaMemcpyDeviceToHost, stream.get()));
+  stream.sync();
   if (stats != nullptr) {
     stats->candidates += static_cast<unsigned long long>(n);
     stats->kept += static_cast<unsigned long long>(kept);
@@ -1439,15 +1439,15 @@ int64_t keep_within_row_limit(int32_t* rows,
   rmm::device_uvector<int32_t> out_rows(static_cast<std::size_t>(kept), stream, mr);
   rmm::device_uvector<int64_t> out_ids(static_cast<std::size_t>(kept), stream, mr);
   rmm::device_uvector<float> out_codes(static_cast<std::size_t>(kept), stream, mr);
-  gap_take_kernel<<<std::min(grid_for(kept), 65535), kBlock, 0, stream.value()>>>(
+  gap_take_kernel<<<std::min(grid_for(kept), 65535), kBlock, 0, stream.get()>>>(
     picked.data(), kept, rows, ids, codes, out_rows.data(), out_ids.data(), out_codes.data());
   CUDF_CUDA_TRY(cudaGetLastError());
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    rows, out_rows.data(), kept * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream.value()));
+    rows, out_rows.data(), kept * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream.get()));
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    ids, out_ids.data(), kept * sizeof(int64_t), cudaMemcpyDeviceToDevice, stream.value()));
+    ids, out_ids.data(), kept * sizeof(int64_t), cudaMemcpyDeviceToDevice, stream.get()));
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    codes, out_codes.data(), kept * sizeof(float), cudaMemcpyDeviceToDevice, stream.value()));
+    codes, out_codes.data(), kept * sizeof(float), cudaMemcpyDeviceToDevice, stream.get()));
   return kept;
 }
 
@@ -1463,9 +1463,9 @@ void half_rows_norms(float const* x,
 {
   if (rows == 0) { return; }
   auto const grid = static_cast<int>(std::min<int64_t>((rows + 7) / 8, 65535));
-  half_rows_norms_kernel<<<grid, 256, 0, stream.value()>>>(
+  half_rows_norms_kernel<<<grid, 256, 0, stream.get()>>>(
     x, h, rows, d, sq, row_error, max_error_bits, max_norm_bits);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void float16_bound_limit(float const* bound,
@@ -1482,16 +1482,16 @@ void float16_bound_limit(float const* bound,
 {
   if (n == 0) { return; }
   auto const grid = std::min(grid_for(n), 65535);
-  float16_bound_limit_kernel<<<grid, kBlock, 0, stream.value()>>>(
+  float16_bound_limit_kernel<<<grid, kBlock, 0, stream.get()>>>(
     bound, probe_sq, probe_error, row_error, row_norm, d, n, limit, lower, inner_product);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void fill_list_offsets(int32_t* out, int64_t n, int64_t dim, rmm::cuda_stream_view stream)
 {
   auto const grid = std::min(grid_for(n + 1), 65535);
-  fill_list_offsets_kernel<<<grid, kBlock, 0, stream.value()>>>(out, n, dim);
-  CUDF_CHECK_CUDA(stream.value());
+  fill_list_offsets_kernel<<<grid, kBlock, 0, stream.get()>>>(out, n, dim);
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void gather_rows(float const* src,
@@ -1503,8 +1503,8 @@ void gather_rows(float const* src,
 {
   if (m == 0) { return; }
   auto const grid = std::min(grid_for(m * dim), 65535);
-  gather_rows_kernel<<<grid, kBlock, 0, stream.value()>>>(src, dim, rows, m, out);
-  CUDF_CHECK_CUDA(stream.value());
+  gather_rows_kernel<<<grid, kBlock, 0, stream.get()>>>(src, dim, rows, m, out);
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void fold_topk_rows(float* acc_distances,
@@ -1522,7 +1522,7 @@ void fold_topk_rows(float* acc_distances,
 {
   if (m == 0 || k_eff == 0) { return; }
   CUDF_EXPECTS(k_eff <= part_width && k_eff <= k, "fold_topk_rows: k_eff exceeds its row");
-  fold_topk_rows_kernel<<<grid_for(m), kBlock, 0, stream.value()>>>(acc_distances,
+  fold_topk_rows_kernel<<<grid_for(m), kBlock, 0, stream.get()>>>(acc_distances,
                                                                     acc_neighbors,
                                                                     k,
                                                                     part_distances,
@@ -1533,7 +1533,7 @@ void fold_topk_rows(float* acc_distances,
                                                                     m,
                                                                     id_base,
                                                                     id_map);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void nearest_cluster_topk(nearest_task const* tasks,
@@ -1576,7 +1576,7 @@ void nearest_cluster_topk(nearest_task const* tasks,
   }
   if (f16) {
     nearest_cluster_topk_kernel<true>
-      <<<static_cast<unsigned>(n_tasks), threads, smem, stream.value()>>>(tasks,
+      <<<static_cast<unsigned>(n_tasks), threads, smem, stream.get()>>>(tasks,
                                                                           rows,
                                                                           row_words,
                                                                           tile_rows,
@@ -1589,7 +1589,7 @@ void nearest_cluster_topk(nearest_task const* tasks,
                                                                           acc_neighbors);
   } else {
     nearest_cluster_topk_kernel<false>
-      <<<static_cast<unsigned>(n_tasks), threads, smem, stream.value()>>>(tasks,
+      <<<static_cast<unsigned>(n_tasks), threads, smem, stream.get()>>>(tasks,
                                                                           rows,
                                                                           row_words,
                                                                           tile_rows,
@@ -1601,7 +1601,7 @@ void nearest_cluster_topk(nearest_task const* tasks,
                                                                           acc_distances,
                                                                           acc_neighbors);
   }
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void remap_radius_edges(int64_t const* query_rows,
@@ -1615,9 +1615,9 @@ void remap_radius_edges(int64_t const* query_rows,
 {
   if (n_edges == 0) { return; }
   auto const grid = std::min(grid_for(n_edges), 65535);
-  remap_radius_edges_kernel<<<grid, kBlock, 0, stream.value()>>>(
+  remap_radius_edges_kernel<<<grid, kBlock, 0, stream.get()>>>(
     query_rows, rows, left, neighbors, n_edges, id_base, id_map);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 namespace {
@@ -1796,14 +1796,14 @@ int64_t select_indices(int64_t n,
   thrust::counting_iterator<int64_t> const all(0);
   std::size_t temp_bytes = 0;
   CUDF_CUDA_TRY(cub::DeviceSelect::If(
-    nullptr, temp_bytes, all, picked.data(), n_picked.data(), n, keep, stream.value()));
+    nullptr, temp_bytes, all, picked.data(), n_picked.data(), n, keep, stream.get()));
   rmm::device_buffer temp(temp_bytes, stream, mr);
   CUDF_CUDA_TRY(cub::DeviceSelect::If(
-    temp.data(), temp_bytes, all, picked.data(), n_picked.data(), n, keep, stream.value()));
+    temp.data(), temp_bytes, all, picked.data(), n_picked.data(), n, keep, stream.get()));
   int64_t count = 0;
   CUDF_CUDA_TRY(cudaMemcpyAsync(
-    &count, n_picked.data(), sizeof(count), cudaMemcpyDeviceToHost, stream.value()));
-  stream.synchronize();
+    &count, n_picked.data(), sizeof(count), cudaMemcpyDeviceToHost, stream.get()));
+  stream.sync();
   return count;
 }
 
@@ -1815,9 +1815,9 @@ void best_match_reset(uint32_t* best_order,
                       rmm::cuda_stream_view stream)
 {
   if (n_rows == 0) { return; }
-  best_match_reset_kernel<<<grid_for(n_rows), kBlock, 0, stream.value()>>>(
+  best_match_reset_kernel<<<grid_for(n_rows), kBlock, 0, stream.get()>>>(
     best_order, best_ids, n_rows);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void best_match_fold(int32_t const* rows,
@@ -1839,12 +1839,12 @@ void best_match_fold(int32_t const* rows,
                                 best_order,
                                 static_cast<std::size_t>(n_rows) * sizeof(uint32_t),
                                 cudaMemcpyDeviceToDevice,
-                                stream.value()));
-  best_match_min_kernel<<<grid, kBlock, 0, stream.value()>>>(
+                                stream.get()));
+  best_match_min_kernel<<<grid, kBlock, 0, stream.get()>>>(
     rows, ids, distances, n, max_distance, nullptr, keys, best_order);
-  best_match_settle_kernel<<<grid_for(n_rows), kBlock, 0, stream.value()>>>(
+  best_match_settle_kernel<<<grid_for(n_rows), kBlock, 0, stream.get()>>>(
     best_order, scratch, best_ids, bound, n_rows);
-  best_match_pick_kernel<<<grid, kBlock, 0, stream.value()>>>(
+  best_match_pick_kernel<<<grid, kBlock, 0, stream.get()>>>(
     rows,
     ids,
     distances,
@@ -1855,7 +1855,7 @@ void best_match_fold(int32_t const* rows,
     best_order,
     reinterpret_cast<long long*>(best_ids),
     false);
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 void best_match_winners(int32_t const* rows,
@@ -1870,12 +1870,12 @@ void best_match_winners(int32_t const* rows,
                         rmm::cuda_stream_view stream)
 {
   if (n_rows == 0) { return; }
-  best_match_reset_kernel<<<grid_for(n_rows), kBlock, 0, stream.value()>>>(scratch, winner, n_rows);
+  best_match_reset_kernel<<<grid_for(n_rows), kBlock, 0, stream.get()>>>(scratch, winner, n_rows);
   if (n > 0) {
     auto const grid = std::min(grid_for(n), 65535);
-    best_match_min_kernel<<<grid, kBlock, 0, stream.value()>>>(
+    best_match_min_kernel<<<grid, kBlock, 0, stream.get()>>>(
       rows, ids, distances, n, INFINITY, limit, keys, scratch);
-    best_match_pick_kernel<<<grid, kBlock, 0, stream.value()>>>(
+    best_match_pick_kernel<<<grid, kBlock, 0, stream.get()>>>(
       rows,
       ids,
       distances,
@@ -1887,7 +1887,7 @@ void best_match_winners(int32_t const* rows,
       reinterpret_cast<long long*>(winner),
       true);
   }
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
 }
 
 kept_pairs best_match_take(int32_t const* rows,
@@ -1914,7 +1914,7 @@ kept_pairs best_match_take(int32_t const* rows,
   out.rows.resize(count, stream);
   out.ids.resize(count, stream);
   out.distances.resize(count, stream);
-  take_pairs_kernel<<<grid_for(count), kBlock, 0, stream.value()>>>(picked.data(),
+  take_pairs_kernel<<<grid_for(count), kBlock, 0, stream.get()>>>(picked.data(),
                                                                     count,
                                                                     rows,
                                                                     ids,
@@ -1924,7 +1924,7 @@ kept_pairs best_match_take(int32_t const* rows,
                                                                     out.rows.data(),
                                                                     out.ids.data(),
                                                                     out.distances.data());
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
   // `picked` is freed on return; the gather that reads it is ordered before that on this stream.
   return out;
 }
@@ -1951,7 +1951,7 @@ kept_pairs take_pairs(int32_t const* rows,
   out.rows.resize(count, stream);
   out.ids.resize(count, stream);
   out.distances.resize(count, stream);
-  take_pairs_kernel<<<grid_for(count), kBlock, 0, stream.value()>>>(picked.data(),
+  take_pairs_kernel<<<grid_for(count), kBlock, 0, stream.get()>>>(picked.data(),
                                                                     count,
                                                                     rows,
                                                                     ids,
@@ -1961,7 +1961,7 @@ kept_pairs take_pairs(int32_t const* rows,
                                                                     out.rows.data(),
                                                                     out.ids.data(),
                                                                     out.distances.data());
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
   return out;
 }
 
@@ -1983,7 +1983,7 @@ kept_pairs best_match_emit(uint32_t const* best_order,
   out.rows.resize(count, stream);
   out.ids.resize(count, stream);
   out.distances.resize(count, stream);
-  best_match_emit_kernel<<<grid_for(count), kBlock, 0, stream.value()>>>(picked.data(),
+  best_match_emit_kernel<<<grid_for(count), kBlock, 0, stream.get()>>>(picked.data(),
                                                                          count,
                                                                          best_order,
                                                                          best_ids,
@@ -1992,7 +1992,7 @@ kept_pairs best_match_emit(uint32_t const* best_order,
                                                                          out.rows.data(),
                                                                          out.ids.data(),
                                                                          out.distances.data());
-  CUDF_CHECK_CUDA(stream.value());
+  CUDF_CHECK_CUDA(stream.get());
   return out;
 }
 
