@@ -649,6 +649,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::get_next
 std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
   const operator_data& input_data, ::cuda::stream_ref stream_ref)
 {
+  vector_join_debug_wall_time const task_wall_time{"materialize task"};
   rmm::cuda_stream_view stream{stream_ref};
   nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_materialize::execute"};
 

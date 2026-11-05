@@ -32,7 +32,10 @@
 #include <cucascade/data/data_repository.hpp>
 #include <cuvs/distance/distance.hpp>
 
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -62,6 +65,36 @@ struct cluster_lists;
 }  // namespace sirius::vss
 
 namespace sirius::op {
+
+/// Under SIRIUS_VECTOR_JOIN_PHASE_DEBUG only: a phase line with a scope's wall time as it ends. One
+/// that ends in an exception says so, since the engine retries those and their time counts too.
+class vector_join_debug_wall_time {
+ public:
+  explicit vector_join_debug_wall_time(char const* name)
+    : _name(std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr ? name : nullptr)
+  {
+    if (_name != nullptr) {
+      _exceptions = std::uncaught_exceptions();
+      _start      = std::chrono::steady_clock::now();
+    }
+  }
+  ~vector_join_debug_wall_time()
+  {
+    if (_name == nullptr) { return; }
+    std::fprintf(stderr,
+                 "[vecjoin-phase] %-22s %8.3f s%s\n",
+                 _name,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - _start).count(),
+                 std::uncaught_exceptions() > _exceptions ? " (threw)" : "");
+  }
+  vector_join_debug_wall_time(vector_join_debug_wall_time const&)            = delete;
+  vector_join_debug_wall_time& operator=(vector_join_debug_wall_time const&) = delete;
+
+ private:
+  char const* _name;
+  int _exceptions{0};
+  std::chrono::steady_clock::time_point _start;
+};
 
 /// Pinned host blocks a join's waiting pairs move to when a flush would not fit the device, kept
 /// for its later tasks: the first use pays to pin them. They sit outside the host pool, beside it,

@@ -2071,6 +2071,8 @@ void sirius_physical_vector_join_stream::ensure_earlier_keys(
 std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
   const operator_data& input_data, ::cuda::stream_ref stream_ref)
 {
+  // First, so it also covers what this task's locals free on the way out.
+  vector_join_debug_wall_time const task_wall_time{"stream task"};
   rmm::cuda_stream_view stream{stream_ref};
   nvtx3::scoped_range nvtx_range{"sirius_physical_vector_join_stream::execute"};
   {
