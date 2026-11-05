@@ -146,7 +146,8 @@ std::int64_t pair_call_rows(std::int64_t dim)
 bool search_can_shrink(std::exception const& thrown)
 {
   return dynamic_cast<rmm::out_of_memory const*>(&thrown) != nullptr ||
-         dynamic_cast<vss::threshold_pairs_exceed_device const*>(&thrown) != nullptr;
+         dynamic_cast<vss::threshold_pairs_exceed_device const*>(&thrown) != nullptr ||
+         dynamic_cast<std::overflow_error const*>(&thrown) != nullptr;
 }
 
 /// Waits for the stream as a scope ends, before the buffers and locks declared ahead of it go.
