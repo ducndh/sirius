@@ -281,9 +281,14 @@ void scale_in_place(float* d, int64_t n, float factor, rmm::cuda_stream_view str
 
 /// Each of the @p n rows of @p x (@p dim components) divided by its L2 norm, into @p out (which
 /// may be @p x). A row whose squared norm leaves FP32's normal range is scaled by a power of two
-/// first. Throws std::invalid_argument for a zero row, which has no direction. Synchronizes.
-void normalize_rows(
-  float const* x, int64_t n, int64_t dim, float* out, rmm::cuda_stream_view stream);
+/// first. A zero row has no direction: it throws std::invalid_argument (and synchronizes), or with
+/// @p zero_rows_are_errors false stays a zero row.
+void normalize_rows(float const* x,
+                    int64_t n,
+                    int64_t dim,
+                    float* out,
+                    rmm::cuda_stream_view stream,
+                    bool zero_rows_are_errors = true);
 
 /// bound[i] = value for i in [0, n): the fixed radius a threshold join searches with.
 void fill_bound(float* bound, int64_t n, float value, rmm::cuda_stream_view stream);

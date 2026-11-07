@@ -3596,16 +3596,13 @@ TEST_CASE_METHOD(KMeansFixture,
     }
     run_ok("SELECT * FROM sirius_kmeans_fit('" + p + "_cent','vec', name => '" + p +
            "_c', rows_are_centroids => true);");
-    run_ok("SELECT * FROM sirius_kmeans_build_lists('" + p + "_corpus','vec','" + p +
-           "_c', storage => 'float16');");
+    // Every row lies within sqrt(d) 2^-14 of the origin, so FLOAT16 lists are refused (Condition D4 of the
+    // exactness proof); before that check this case joined exactly.
     INFO("k " << k);
-    CHECK(relative_mismatches(
-            exact_distances(*con,
-                            "SELECT left_id, distance FROM sirius_knn_join('" + p +
-                              "_probe','vec','" + p + "_corpus','vec', metric => 'l2', k => " + n +
-                              ", search_mode => 'approx', clustering => '" + p +
-                              "_c', n_probes => 2);"),
-            cpu_exact_top_k(*con, p, k, 1)) == 0);
+    expect_error(*con,
+                 "SELECT * FROM sirius_kmeans_build_lists('" + p + "_corpus','vec','" + p +
+                   "_c', storage => 'float16');",
+                 "too close to the origin");
     for (auto const* t : {"_corpus", "_probe", "_cent"}) {
       run_ok("SELECT * FROM unpin_table('" + p + t + "');");
     }

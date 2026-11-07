@@ -2209,11 +2209,20 @@ void scale_in_place(float* d, int64_t n, float factor, rmm::cuda_stream_view str
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
-void normalize_rows(
-  float const* x, int64_t n, int64_t dim, float* out, rmm::cuda_stream_view stream)
+void normalize_rows(float const* x,
+                    int64_t n,
+                    int64_t dim,
+                    float* out,
+                    rmm::cuda_stream_view stream,
+                    bool zero_rows_are_errors)
 {
   if (n == 0) { return; }
   auto const grid = static_cast<int>(std::clamp<int64_t>((n + 7) / 8, 1, 65535));
+  if (!zero_rows_are_errors) {
+    normalize_rows_kernel<<<grid, 256, 0, stream.get()>>>(x, n, dim, out, nullptr);
+    CUDF_CUDA_TRY(cudaGetLastError());
+    return;
+  }
   rmm::device_buffer zero_rows(sizeof(unsigned long long), stream);
   CUDF_CUDA_TRY(cudaMemsetAsync(zero_rows.data(), 0, sizeof(unsigned long long), stream.get()));
   normalize_rows_kernel<<<grid, 256, 0, stream.get()>>>(
