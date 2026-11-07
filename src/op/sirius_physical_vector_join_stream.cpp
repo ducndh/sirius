@@ -2877,6 +2877,24 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             rotated_probe->data(),
             stream);
         }
+        {
+          rmm::device_uvector<unsigned long long> tiny(1, stream, mr);
+          CUDF_CUDA_TRY(cudaMemsetAsync(tiny.data(), 0, sizeof(unsigned long long), stream.get()));
+          vss::count_tiny_nonzero(rotated_probe ? rotated_probe->data() : search_queries.data_handle(),
+                                  n_left * dim,
+                                  tiny.data(),
+                                  stream);
+          unsigned long long n_tiny = 0;
+          CUDF_CUDA_TRY(cudaMemcpyAsync(
+            &n_tiny, tiny.data(), sizeof(n_tiny), cudaMemcpyDeviceToHost, stream.get()));
+          stream.synchronize();
+          if (n_tiny != 0) {
+            throw std::invalid_argument(
+              "INT8 lists: " + std::to_string(n_tiny) +
+              " nonzero probe component(s) are below 2^-63 in magnitude, outside the codes' error "
+              "bound; use lists stored as 'float32' or 'float16'");
+          }
+        }
         vss::quantize_rows_int8(
           rotated_probe ? rotated_probe->data() : search_queries.data_handle(),
           n_left,
@@ -3042,8 +3060,12 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       probe_half_error.emplace(static_cast<std::size_t>(n_left), stream, mr);
       rmm::device_uvector<unsigned int> max_sq_bits(1, stream, mr);
       CUDF_CUDA_TRY(cudaMemsetAsync(max_sq_bits.data(), 0, sizeof(unsigned int), stream.get()));
+      rmm::device_uvector<unsigned long long> probe_tiny(1, stream, mr);
+      CUDF_CUDA_TRY(
+        cudaMemsetAsync(probe_tiny.data(), 0, sizeof(unsigned long long), stream.get()));
       if (probe_rows_on_host) {
         for_each_host_piece([&](float const* rows, std::int64_t at, std::int64_t n) {
+          vss::count_tiny_nonzero(rows, n * dim, probe_tiny.data(), stream);
           vss::narrow_to_float16(rows, n * dim, probe_f16->data() + at * dim, stream);
           vss::half_rows_norms(rows,
                                probe_f16->data() + at * dim,
@@ -3056,6 +3078,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                stream);
         });
       } else {
+        vss::count_tiny_nonzero(
+          search_queries.data_handle(), n_left * dim, probe_tiny.data(), stream);
         vss::narrow_to_float16(
           search_queries.data_handle(), n_left * dim, probe_f16->data(), stream);
         vss::half_rows_norms(search_queries.data_handle(),
@@ -3069,13 +3093,17 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                              stream);
       }
       unsigned int bits = 0;
+      unsigned long long tiny = 0;
       CUDF_CUDA_TRY(cudaMemcpyAsync(
         &bits, max_sq_bits.data(), sizeof(bits), cudaMemcpyDeviceToHost, stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        &tiny, probe_tiny.data(), sizeof(tiny), cudaMemcpyDeviceToHost, stream.get()));
       stream.sync();
       float max_sq = 0;
       std::memcpy(&max_sq, &bits, sizeof(max_sq));
       float const probe_norm_max = std::sqrt(max_sq);
-      probe_in_f16_range         = probe_norm_max < 65504.f;
+      // Condition D3 holds for the probe rows too: a component below 2^-63 is searched in FP32.
+      probe_in_f16_range         = probe_norm_max < 65504.f && tiny == 0;
       if (!probe_in_f16_range) {
         SIRIUS_LOG_INFO(
           "[sirius_physical_vector_join_stream] a probe row norm of {} is outside float16's "
@@ -3115,7 +3143,9 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     std::optional<rmm::device_uvector<float>> code_limit;
     // A radius join whose score is never read keeps the filter's verdict where it already proves
     // the pair is inside the radius, and re-scores only the rest.
-    bool const skip_certain = radius_join && rescore && !_request.score_read && !best_only;
+    // Inner-product threshold joins re-score every pair.
+    bool const skip_certain =
+      radius_join && rescore && !_request.score_read && !best_only && !ip;
     std::optional<rmm::device_uvector<float>> certain_limit;
     std::optional<rmm::device_uvector<float>> ip_probe_zero_sq, ip_row_zero_sq;
     // The FLOAT16 rows' largest rounding error and norm, which the filter limit allows for: the
@@ -4427,7 +4457,14 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
         }
         if (skip_certain) {
           certain_limit.emplace(static_cast<std::size_t>(n_left), stream, mr);
-          code_limits(bound->data(), certain_limit->data(), true);
+          // A pair skips its re-score only when its code distance proves D <= b (1 - 2 rho), rho
+          // the re-score's relative error: its FP32 distance is then below b, so the join returns
+          // exactly the pairs whose FP32 distance is within the radius.
+          auto const rho = 1.01 * (static_cast<double>((dim + 31) / 32) + 7) * 0x1p-24;
+          rmm::device_uvector<float> strict(static_cast<std::size_t>(n_left), stream, mr);
+          vss::fill_bound(
+            strict.data(), n_left, static_cast<float>(radius_bound * (1 - 2 * rho)), stream);
+          code_limits(strict.data(), certain_limit->data(), true);
         }
         // A radius join's buffer only has to amortize the flush that appends it to the result.
         candidates.emplace(radius_join

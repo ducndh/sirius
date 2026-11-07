@@ -280,7 +280,8 @@ void seed_bound_f16(uint16_t const* x,
 void scale_in_place(float* d, int64_t n, float factor, rmm::cuda_stream_view stream);
 
 /// Each of the @p n rows of @p x (@p dim components) divided by its L2 norm, into @p out (which
-/// may be @p x). A zero row stays zero.
+/// may be @p x). A row whose squared norm leaves FP32's normal range is scaled by a power of two
+/// first. Throws std::invalid_argument for a zero row, which has no direction. Synchronizes.
 void normalize_rows(
   float const* x, int64_t n, int64_t dim, float* out, rmm::cuda_stream_view stream);
 

@@ -311,6 +311,19 @@ __global__ void scatter_rows_kernel(
   }
 }
 
+// Condition D3 of the exactness proof: a nonzero component below 2^-63 in magnitude has a square
+// below FP32's normal range, so the coding error the screen's limit is widened by could underflow.
+__global__ void count_tiny_nonzero_kernel(float const* v, int64_t n, unsigned long long* out)
+{
+  unsigned long long bad = 0;
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const a = fabsf(v[i]);
+    bad += a != 0.f && a < 0x1p-63f;
+  }
+  if (bad != 0) { atomicAdd(out, bad); }
+}
+
 __global__ void count_non_uint8_kernel(float const* v, int64_t n, unsigned long long* out)
 {
   unsigned long long bad = 0;
@@ -946,6 +959,17 @@ void scatter_rows(std::byte const* src,
       <<<std::min(grid_for(n * row_bytes), 65535), kBlock, 0, stream.get()>>>(
         reinterpret_cast<uint8_t const*>(src), row_bytes, dest, n, reinterpret_cast<uint8_t*>(out));
   }
+  CUDF_CHECK_CUDA(stream.get());
+}
+
+void count_tiny_nonzero(float const* values,
+                        int64_t n,
+                        unsigned long long* out,
+                        rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  count_tiny_nonzero_kernel<<<std::min(grid_for(n), 4096), kBlock, 0, stream.get()>>>(
+    values, n, out);
   CUDF_CHECK_CUDA(stream.get());
 }
 

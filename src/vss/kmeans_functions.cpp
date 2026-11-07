@@ -1227,6 +1227,10 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
   persistent.sync();
 
   std::optional<rmm::device_uvector<unsigned int>> code_error_bits, half_error_bits;
+  // Components the codes' error bound cannot cover (Condition D3), counted as rows are coded.
+  rmm::device_uvector<unsigned long long> tiny_components(1, stream, mr);
+  CUDF_CUDA_TRY(
+    cudaMemsetAsync(tiny_components.data(), 0, sizeof(unsigned long long), stream.get()));
   if (encoding == list_encoding::float16 && lists.has_exact_rows()) {
     half_error_bits.emplace(1, stream, mr);
     CUDF_CUDA_TRY(cudaMemsetAsync(half_error_bits->data(), 0, sizeof(unsigned int), stream.get()));
@@ -1335,6 +1339,7 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
         auto* const sq =
           sq_buf ? sq_buf->data() : static_cast<float*>(lists.row_sq_f32->data()) + first;
         if (encoding == list_encoding::float16) {
+          count_tiny_nonzero(x, rows * dim, tiny_components.data(), stream);
           half_rows_norms(x,
                           reinterpret_cast<std::uint16_t const*>(coded),
                           rows,
@@ -1357,6 +1362,7 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
         if (to_code == nullptr) {
           timed(t_rotate, [&] { to_code = rotated_rows(x, rows); });
         }
+        count_tiny_nonzero(to_code, rows * dim, tiny_components.data(), stream);
         timed(t_code, [&] {
           quantize_rows_int8(to_code,
                              rows,
@@ -1594,6 +1600,7 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
         if (coded_f16) {
           // The FP16 search compares rounded rows, so it needs their norms and how far each is
           // from the row it stands for.
+          count_tiny_nonzero(in_rows, rows * dim, tiny_components.data(), stream);
           half_rows_norms(in_rows,
                           coded_f16->data(),
                           rows,
@@ -1618,6 +1625,7 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
         coded_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
         float const* to_code = nullptr;
         timed(t_rotate, [&] { to_code = rotated_rows(in_rows, rows); });
+        count_tiny_nonzero(to_code, rows * dim, tiny_components.data(), stream);
         timed(t_code, [&] {
           quantize_rows_int8(to_code,
                              rows,
@@ -1702,6 +1710,25 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
       throw duckdb::InvalidInputException(fn + ": a row norm of " +
                                           std::to_string(lists.max_row_norm) +
                                           " is outside float16's range; use storage => 'float32'");
+    }
+    // Condition D4 of the exactness proof: the codes' error must be small against the rows'
+    // norms, which holds unless every row lies within sqrt(d) 2^-14 of the origin.
+    if ((encoding == list_encoding::float16 || encoding == list_encoding::int8) &&
+        !(lists.max_row_norm >= std::sqrt(static_cast<float>(dim)) * 0x1p-14f)) {
+      throw duckdb::InvalidInputException(
+        fn + ": every row norm is at most " + std::to_string(lists.max_row_norm) +
+        ", too close to the origin for the codes' error bound; use storage => 'float32'");
+    }
+  }
+  if (encoding == list_encoding::float16 || encoding == list_encoding::int8) {
+    unsigned long long tiny = 0;
+    CUDF_CUDA_TRY(cudaMemcpy(
+      &tiny, tiny_components.data(), sizeof(tiny), cudaMemcpyDeviceToHost));
+    if (tiny != 0) {
+      throw duckdb::InvalidInputException(
+        fn + ": " + std::to_string(tiny) +
+        " nonzero component(s) are below 2^-63 in magnitude, outside the codes' error bound; "
+        "use storage => 'float32'");
     }
   }
 

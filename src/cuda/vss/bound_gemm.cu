@@ -40,6 +40,8 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <type_traits>
 
@@ -1761,24 +1763,44 @@ __global__ void scale_kernel(float* d, int64_t n, float factor)
   }
 }
 
-__global__ void normalize_rows_kernel(float const* x, int64_t n, int64_t dim, float* out)
+__global__ void normalize_rows_kernel(
+  float const* x, int64_t n, int64_t dim, float* out, unsigned long long* zero_rows)
 {
   int const lane   = threadIdx.x % 32;
   auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
   for (int64_t r = (blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x) / 32; r < n;
        r += warps) {
-    float s = 0.f;
+    float s = 0.f, amax = 0.f;
     for (int64_t c = lane; c < dim; c += 32) {
       float const v = x[r * dim + c];
       s             = fmaf(v, v, s);
+      amax          = fmaxf(amax, fabsf(v));
     }
 #pragma unroll
     for (int o = 16; o > 0; o /= 2) {
       s += __shfl_xor_sync(0xffffffffu, s, o);
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
     }
+    // A finite nonzero row whose squared norm leaves FP32's normal range (it overflows, or
+    // underflows and loses its direction) is normalized scaled by a power of two, which is
+    // exact and puts its squared norm in [1, dim]. Other rows take the unscaled path unchanged.
+    float scale = 1.f;
+    if (!(s >= 0x1p-126f && s <= 3.4028235e38f) && amax > 0.f && amax <= 3.4028235e38f) {
+      scale = ldexpf(1.f, -ilogbf(amax));
+      s     = 0.f;
+      for (int64_t c = lane; c < dim; c += 32) {
+        float const v = x[r * dim + c] * scale;
+        s             = fmaf(v, v, s);
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o /= 2) {
+        s += __shfl_xor_sync(0xffffffffu, s, o);
+      }
+    }
+    if (amax == 0.f && lane == 0 && zero_rows != nullptr) { atomicAdd(zero_rows, 1ull); }
     float const inv = s > 0.f ? rsqrtf(s) : 0.f;
     for (int64_t c = lane; c < dim; c += 32) {
-      out[r * dim + c] = x[r * dim + c] * inv;
+      out[r * dim + c] = (x[r * dim + c] * scale) * inv;
     }
   }
 }
@@ -2192,8 +2214,19 @@ void normalize_rows(
 {
   if (n == 0) { return; }
   auto const grid = static_cast<int>(std::clamp<int64_t>((n + 7) / 8, 1, 65535));
-  normalize_rows_kernel<<<grid, 256, 0, stream.get()>>>(x, n, dim, out);
+  rmm::device_buffer zero_rows(sizeof(unsigned long long), stream);
+  CUDF_CUDA_TRY(cudaMemsetAsync(zero_rows.data(), 0, sizeof(unsigned long long), stream.get()));
+  normalize_rows_kernel<<<grid, 256, 0, stream.get()>>>(
+    x, n, dim, out, static_cast<unsigned long long*>(zero_rows.data()));
   CUDF_CUDA_TRY(cudaGetLastError());
+  unsigned long long zeros = 0;
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    &zeros, zero_rows.data(), sizeof(zeros), cudaMemcpyDeviceToHost, stream.get()));
+  stream.synchronize();
+  if (zeros != 0) {
+    throw std::invalid_argument("cosine distance is undefined for a zero vector: " +
+                                std::to_string(zeros) + " row(s) of the join's input are zero");
+  }
 }
 
 void sqrt_in_place(float* d, int64_t n, rmm::cuda_stream_view stream)
