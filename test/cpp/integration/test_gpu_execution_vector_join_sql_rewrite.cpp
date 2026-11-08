@@ -586,9 +586,9 @@ TEST_CASE_METHOD(SqlRewriteFixture,
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {
   // No clustering exists for the corpus: the setting has the rewrite fit one and write its lists
-  // inside the statement, then search ceil(c * sqrt(N)) of them: 4,000 rows get sqrt(4,000) = 63
-  // clusters (no more, which would leave a cluster under 256 rows), and c = 0.25 is
-  // ceil(0.25 * 7.94) = 2 of those. The lists
+  // inside the statement, then search ceil(c * sqrt(N)) of them: for 4,000 rows the cost model
+  // weighs a quarter of sqrt(4,000) = 63 up to 63 (more would leave a cluster under 256 rows), and
+  // 30 probe rows cannot repay more than the fewest, 15; c = 0.25 is ceil(0.25 * 3.87) = 1 of them. The lists
   // stay, so the table function over the auto-built clustering returns the same answer, and a c
   // that reaches every cluster (c >= sqrt(N)) is DuckDB's.
   SqlRewriteTables tables(*this);
@@ -619,12 +619,12 @@ TEST_CASE_METHOD(SqlRewriteFixture,
     "sirius_kmeans_centroids('__sirius_auto_sr_fresh_vec');");
   REQUIRE_FALSE(centroids->HasError());
   auto const n_clusters = centroids->Collection().GetValue(0, 0).GetValue<std::int64_t>();
-  REQUIRE(n_clusters == 63);
+  REQUIRE(n_clusters == 15);
   auto const tvf = sorted_rows(
     *con,
     "SELECT left_id, right_id, distance FROM sirius_knn_join('sr_fresh_probe','vec','sr_fresh',"
     "'vec', probe_source => 'scan', search_mode => 'approx', "
-    "clustering => '__sirius_auto_sr_fresh_vec', n_probes => 2, k => 5);");
+    "clustering => '__sirius_auto_sr_fresh_vec', n_probes => 1, k => 5);");
   REQUIRE(rows_match(got, tvf));
   run_ok("SET vector_join_probes = " + std::to_string(n_clusters) + ";");
   require_gpu_matches_duckdb(*con, sql);
