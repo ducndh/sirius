@@ -3303,7 +3303,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     std::optional<rmm::device_uvector<float>> bound;
     std::optional<vss::bound_candidates> candidates;
     std::int64_t pending = 0, bounded_emitted = 0, bounded_merges = 0, bounded_launches = 0,
-                 bounded_padded = 0;
+                 bounded_padded = 0, replay_launches = 0, replay_padded = 0;
     // The kernels compare squared distances.
     auto const radius_bound = search_metric == cuvs::distance::DistanceType::L2SqrtExpanded
                                 ? search_radius * search_radius
@@ -4051,6 +4051,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     std::function<void(bounded_slice const&)> replay_slice = [&](bounded_slice const& sl) {
       while (true) {
         launch_bounded(sl);
+        ++replay_launches;
+        replay_padded += ((sl.n + 127) / 128) * ((sl.m + 127) / 128);
         auto const total = read_count();
         if (total <= candidates->capacity()) {
           pending = total;
@@ -4101,6 +4103,23 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
       pending = total;
       group.clear();
       if (pairs_to_host_forced || pending > candidates->capacity() / 2) { make_room(); }
+    };
+    // A group's launches are checked together, so an overflow re-runs them all. A launch that
+    // screens 2^27 pairs or more takes far longer than reading the count back, so it is checked
+    // as soon as it is queued: an overflow then re-runs that launch alone. Not with grouped
+    // launches still deferred, which only check_group starts.
+    // SIRIUS_VSS_CHECK_EACH_LAUNCH=0 checks only at a group's end.
+    constexpr std::int64_t kCheckedLaunchPairs = std::int64_t{1} << 27;
+    bool const check_each_launch               = [] {
+      auto const* v = std::getenv("SIRIUS_VSS_CHECK_EACH_LAUNCH");
+      return v == nullptr || std::string_view{v} != "0";
+    }();
+    auto check_launch = [&](bounded_slice const& sl) {
+      if (!check_each_launch || !deferred.empty() || sl.n * sl.m < kCheckedLaunchPairs) {
+        return false;
+      }
+      check_group();
+      return true;
     };
 
     std::int64_t scanned_pairs = 0;
@@ -4776,6 +4795,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                   running_piece = std::min<std::int64_t>(2 * running_piece, std::int64_t{1} << 22);
                 } else if (group.size() >= kBoundedGroup) {
                   check_group();
+                } else {
+                  check_launch(piece);
                 }
               }
               continue;
@@ -4788,7 +4809,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
             ++bounded_launches;
             bounded_padded += ((slice_rows + 127) / 128) * ((m + 127) / 128);
             group.push_back(sl);
-            if (group.size() >= kBoundedGroup) { check_group(); }
+            if (group.size() >= kBoundedGroup) {
+              check_group();
+            } else {
+              check_launch(sl);
+            }
             continue;
           }
 
@@ -4998,6 +5023,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
           if (group.size() >= kBoundedGroup && group_pairs > candidates->capacity() - pending) {
             check_group();
             group_pairs = 0;
+          } else if (check_launch(piece)) {
+            group_pairs = 0;
           }
         }
         check_group();
@@ -5034,6 +5061,11 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                      static_cast<long long>(bounded_padded),
                      rescore_seconds,
                      take_seconds);
+        std::fprintf(stderr,
+                     "[vecjoin-phase] replays: %lld launches, %lld 128x128 tiles made again after "
+                     "the buffer overflowed\n",
+                     static_cast<long long>(replay_launches),
+                     static_cast<long long>(replay_padded));
         if (auto const* gpu =
               mem_space
                 ->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
