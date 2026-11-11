@@ -23,6 +23,7 @@
 #include <rmm/device_uvector.hpp>
 
 #include <cub/device/device_scan.cuh>
+#include <cub/device/device_segmented_sort.cuh>
 #include <cub/device/device_select.cuh>
 #include <thrust/iterator/counting_iterator.h>
 
@@ -32,6 +33,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <random>
@@ -752,6 +754,61 @@ __global__ void gap_rescore_bound_kernel(float const* by_row,
       last           = m;
     }
     if (lane == 0) { out[r] = best; }
+  }
+}
+
+// gap_rescore_bound_kernel's bound with each row's codes sorted ascending (a NaN or -inf code as
+// +inf, so it is never one of the j best: that kernel never takes one either). Every
+// j = 1..min(k, n_r) gives its own term max(acc_(k-j), U_r(c_(j))): the first j sorted codes are
+// j distinct pairs with codes <= c_(j). A run of equal codes is covered by its last position, as
+// there, and the others only add terms that bound the k-th too. A NaN U_r(c_(j)) gives no term
+// (fmaxf would return acc_(k-j), a bound on k - j pairs only), where that kernel stops.
+// O(min(k, n_r)) a row instead of O(min(k, n_r) n_r).
+__global__ void gap_rescore_bound_sorted_kernel(float const* sorted,
+                                                int64_t const* before,
+                                                float const* acc,
+                                                int64_t n_rows,
+                                                int64_t k,
+                                                float const* bound,
+                                                code_bound_terms const terms,
+                                                float* out)
+{
+  int const lane   = threadIdx.x % 32;
+  auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
+  for (int64_t r = blockIdx.x * static_cast<int64_t>(blockDim.x / 32) + threadIdx.x / 32;
+       r < n_rows;
+       r += warps) {
+    float best     = lane == 0 ? fminf(bound[r], acc[r * k + k - 1]) : INFINITY;
+    auto const s   = before[r];
+    auto const nr  = before[r + 1] - s;
+    auto const cap = k < nr ? k : nr;
+    for (int64_t j = lane + 1; j <= cap; j += 32) {
+      float const c = sorted[s + j - 1];
+      if (!(c < INFINITY)) { break; }
+      float const u = terms.int8
+                        ? int8_upper_bound_of(c, terms.probe_error[r], terms.row_error, terms.scale)
+                        : float16_upper_bound_of(c,
+                                                 terms.probe_sq[r],
+                                                 terms.probe_error[r],
+                                                 terms.row_error,
+                                                 terms.row_norm,
+                                                 static_cast<float>(terms.d),
+                                                 terms.inner_product);
+      float const a = j < k ? acc[r * k + k - 1 - j] : -INFINITY;
+      best          = fminf(best, u < a ? a : u);
+    }
+    for (int o = 16; o > 0; o /= 2) {
+      best = fminf(best, __shfl_xor_sync(0xffffffffu, best, o));
+    }
+    if (lane == 0) { out[r] = best; }
+  }
+}
+
+__global__ void non_finite_to_inf_kernel(float* v, int64_t n)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    if (!(v[i] > -INFINITY)) { v[i] = INFINITY; }
   }
 }
 
@@ -2019,6 +2076,38 @@ void gap_rescore_bound(int32_t const* rows,
   }
   auto const warp_grid =
     static_cast<int>(std::clamp<int64_t>((n_rows + kBlock / 32 - 1) / (kBlock / 32), 1, 65535));
+  // Sorted, a row costs a segmented sort and min(k, n_r) terms; the selection below takes up to
+  // min(k, n_r) passes over the row, so it is cheaper only for a small k. The sort holds a second
+  // buffer of the codes (4 B a candidate) beside by_row. SIRIUS_VSS_GAP_SORT=0 always selects,
+  // =1 always sorts; unset or empty, k decides.
+  constexpr int64_t kSortFromK = 128;
+  auto const* sort_env         = std::getenv("SIRIUS_VSS_GAP_SORT");
+  int const sort_setting =
+    sort_env == nullptr || sort_env[0] == '\0' ? -1 : (sort_env[0] == '0' ? 0 : 1);
+  bool const sorted_codes = sort_setting == 1 || (sort_setting == -1 && k >= kSortFromK);
+  if (sorted_codes && n > 0) {
+    non_finite_to_inf_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.get()>>>(
+      by_row.data(), n);
+    CUDF_CUDA_TRY(cudaGetLastError());
+    rmm::device_uvector<float> other(items, stream, mr);
+    cub::DoubleBuffer<float> keys(by_row.data(), other.data());
+    std::size_t sort_bytes = 0;
+    CUDF_CUDA_TRY(cub::DeviceSegmentedSort::SortKeys(
+      nullptr, sort_bytes, keys, n, n_rows, before.data(), before.data() + 1, stream.get()));
+    rmm::device_buffer sort_temp(std::max<std::size_t>(sort_bytes, 1), stream, mr);
+    CUDF_CUDA_TRY(cub::DeviceSegmentedSort::SortKeys(sort_temp.data(),
+                                                     sort_bytes,
+                                                     keys,
+                                                     n,
+                                                     n_rows,
+                                                     before.data(),
+                                                     before.data() + 1,
+                                                     stream.get()));
+    gap_rescore_bound_sorted_kernel<<<warp_grid, kBlock, 0, stream.get()>>>(
+      keys.Current(), before.data(), acc_distances, n_rows, k, bound, terms, out);
+    CUDF_CUDA_TRY(cudaGetLastError());
+    return;
+  }
   gap_rescore_bound_kernel<<<warp_grid, kBlock, 0, stream.get()>>>(
     by_row.data(), before.data(), acc_distances, n_rows, k, bound, terms, out);
   CUDF_CUDA_TRY(cudaGetLastError());

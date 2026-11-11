@@ -3789,7 +3789,8 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
     bool const hold_codes_pairs = list_no_seed && gap_rescore && running_bound_rows > 0;
     auto hold_trim              = [&] {
       if (pending == 0) { return; }
-      auto const t0 = debug_mark();
+      auto const t0          = debug_mark();
+      auto const held_before = pending;
       bounded_emitted += pending - pairs_back;
       if (!gap_limit) { gap_limit.emplace(static_cast<std::size_t>(n_left), stream, mr); }
       vss::gap_rescore_bound(candidates->rows.data(),
@@ -3821,7 +3822,15 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_stream::execute(
                                            mr);
       pairs_back = pending;
       rollback();
-      if (dbg) { trim_seconds += std::chrono::duration<double>(debug_mark() - t0).count(); }
+      if (dbg) {
+        auto const dt = std::chrono::duration<double>(debug_mark() - t0).count();
+        trim_seconds += dt;
+        std::fprintf(stderr,
+                     "[vecjoin-phase] hold trim: %lld -> %lld held (%.3f s)\n",
+                     static_cast<long long>(held_before),
+                     static_cast<long long>(pending),
+                     dt);
+      }
     };
     // A top-k join's pairs wait in the buffer for their FP32 re-score, and a flush needs far more
     // than the buffer holds: the re-score's and the merge's working space, about 64 B a pair beside
