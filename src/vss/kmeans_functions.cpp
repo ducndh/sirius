@@ -636,6 +636,36 @@ void check_lists_storage(const std::string& fn,
   }
 }
 
+/// The device admission check of lists of @p n_rows rows of @p vec_bytes in all: their footprint
+/// reserved, and at least a quarter of the device, and 2 GiB, left after it. Lists on the device
+/// are memory the engine cannot spill, so they go there only if what is left can still run joins
+/// over them (one task over a 200k-row probe chunk at 16 probes needs ~1.4 GiB); squeezed in
+/// tighter, a join's tasks run out of memory that nothing will free. Null when they do not fit.
+std::unique_ptr<cucascade::memory::reservation> reserve_device_lists(cuvs_index_cache& index_cache,
+                                                                     const kmeans_context& c,
+                                                                     std::size_t vec_bytes,
+                                                                     std::int64_t n_rows)
+{
+  auto const row_bytes = static_cast<std::size_t>(n_rows) * sizeof(std::int64_t);
+  auto reservation     = index_cache.reserve_index_memory(
+    vec_bytes + row_bytes + row_bytes / 2 + (std::size_t{1} << 24), c.target_gpu);
+  auto const headroom = std::max<std::size_t>(std::size_t{2} << 30, c.space->get_max_memory() / 4);
+  auto const reserved = reservation != nullptr;
+  auto const left     = c.space->get_available_memory();
+  if (reservation != nullptr && left < headroom) { reservation.reset(); }
+  if (std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
+    std::fprintf(stderr,
+                 "[vecjoin-lists] device admission: %zu B of lists, reserved %d, %zu B left of "
+                 "%zu B needed: %s\n",
+                 vec_bytes,
+                 static_cast<int>(reserved),
+                 reserved ? left : std::size_t{0},
+                 headroom,
+                 reservation != nullptr ? "fits" : "does not fit");
+  }
+  return reservation;
+}
+
 /// The build of run_kmeans_build_lists over the rows @p c reads, under @p centroids (@p n_clusters
 /// of them, fitted for @p centroid_metric), into @p lists. @p reserved_bytes is what its admission
 /// check reserved.
@@ -650,7 +680,8 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
                                  std::int64_t const n_clusters,
                                  cuvs::distance::DistanceType const centroid_metric,
                                  cluster_lists& lists,
-                                 std::size_t& reserved_bytes)
+                                 std::size_t& reserved_bytes,
+                                 bool int8_if_float16 = false)
 {
   device_context_guard device_guard{c.target_gpu};
   // The lists outlive this call in the index cache, and a device_buffer frees on the stream it
@@ -731,7 +762,8 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
                                         std::to_string(count) + " are not");
   };
   // INT8 codes need each component's range over every row, taken while the chunks are resident.
-  bool const want_int8 = storage == list_storage::int8;
+  // With @p int8_if_float16 'auto' takes it too, in case it settles on FLOAT16, coded as INT8.
+  bool want_int8 = storage == list_storage::int8 || int8_if_float16;
   std::optional<rmm::device_uvector<unsigned int>> col_min, col_max;
   // INT8 rows are rotated before they are coded (cluster_lists::code_rotation): by the structured
   // rotation, or a dense matrix built on the device for a width it does not cover.
@@ -937,6 +969,27 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
       f16 = c.host_space->get_available_memory() >= copy_bytes + (std::size_t{1} << 28);
     }
     storage = bytes ? list_storage::uint8 : f16 ? list_storage::exact : list_storage::float32;
+    // FLOAT16 as INT8 only if INT8 lists still pass the admission check with what pass 1 holds
+    // for their coding, as they must below. Otherwise, as for bytes (UINT8) or FP32 lists, what
+    // pass 1 kept for the codes goes now, before the lists' own admission check.
+    if (int8_if_float16 && storage == list_storage::exact) {
+      auto const values = static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(dim);
+      if (reserve_device_lists(index_cache, c, values, n_rows) != nullptr) {
+        storage = list_storage::int8;
+      }
+      if (dbg) {
+        std::fprintf(stderr,
+                     "[vecjoin-lists] auto storage: %s\n",
+                     storage == list_storage::int8 ? "int8 lists (float16 lists would not fit)"
+                                                   : "float16 lists (int8 lists no longer fit)");
+      }
+    }
+    if (int8_if_float16 && storage != list_storage::int8) {
+      want_int8 = false;
+      rotated.reset();
+      kept_rotated.reset();
+      rotation.reset();
+    }
   }
   auto const encoding = storage == list_storage::float16     ? list_encoding::float16
                         : want_int8                          ? list_encoding::int8
@@ -1079,18 +1132,8 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
   bool on_device = !host_tier && (c.tier() == cucascade::memory::Tier::GPU ||
                                   encoding != list_encoding::float32);
   if (on_device) {
-    reservation = index_cache.reserve_index_memory(
-      vec_bytes + row_bytes + row_bytes / 2 + (std::size_t{1} << 24), c.target_gpu);
-    // Lists on the device are memory the engine cannot spill, so they go there only if what is left
-    // can still run joins over them: a quarter of the device, and at least 2 GiB (one task over a
-    // 200k-row probe chunk at 16 probes needs ~1.4 GiB). Squeezed in tighter, a join's tasks run
-    // out of memory that nothing will free.
-    auto const headroom =
-      std::max<std::size_t>(std::size_t{2} << 30, c.space->get_max_memory() / 4);
-    if (reservation != nullptr && c.space->get_available_memory() < headroom) {
-      reservation.reset();
-    }
-    on_device = reservation != nullptr;
+    reservation = reserve_device_lists(index_cache, c, vec_bytes, n_rows);
+    on_device   = reservation != nullptr;
   }
   if (!on_device) {
     if (host_mr == nullptr || block_bytes == 0) {
@@ -1829,22 +1872,51 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   // Built afresh every time, so the old copy is freed before the new one is allocated.
   index_cache.erase(lists_key(req.clustering));
 
+  // 'auto' codes rows that are not bytes as FLOAT16 (build_lists). Where FLOAT16 lists would not
+  // pass the device admission check but INT8 lists, half their size, would, it codes them as INT8
+  // instead, which keeps them on the device: lists in host memory cross PCIe on every statement.
+  // The check is the one build_lists applies, made here because INT8 codes need their range taken
+  // in its first pass. Not for inner product, which searches FLOAT16 or FP32 lists only.
+  // SIRIUS_VSS_AUTO_INT8=0 keeps FLOAT16.
+  bool int8_if_float16 = false;
+  if (storage == list_storage::automatic && !host_tier &&
+      entry->meta.metric != cuvs::distance::DistanceType::InnerProduct &&
+      bound_filter_f16_supports(req.dim) &&
+      bound_filter_int8_supports(req.dim, /*rescored=*/true)) {
+    auto const* env = std::getenv("SIRIUS_VSS_AUTO_INT8");
+    if (env == nullptr || std::string_view{env} != "0") {
+      auto const values = static_cast<std::size_t>(c.n_rows()) * static_cast<std::size_t>(req.dim);
+      bool const f16_fits = reserve_device_lists(index_cache, c, values * 2, c.n_rows()) != nullptr;
+      int8_if_float16 =
+        !f16_fits && reserve_device_lists(index_cache, c, values, c.n_rows()) != nullptr;
+      if (std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
+        std::fprintf(stderr,
+                     "[vecjoin-lists] auto storage: float16 lists %s the device%s\n",
+                     f16_fits ? "fit" : "do not fit",
+                     f16_fits          ? ""
+                     : int8_if_float16 ? ", int8 lists do: int8 if not bytes"
+                                       : ", nor do int8 lists");
+      }
+    }
+  }
+
   cluster_lists lists;
   std::size_t reserved_bytes = 0;
   auto const metric          = entry->meta.metric;
   auto const n_clusters      = entry->meta.n_lists;
   auto result                = build_lists(ctx,
-                                fn,
-                                req,
-                                storage,
-                                host_tier,
-                                unit_rows,
-                                c,
-                                centroids,
-                                n_clusters,
-                                metric,
-                                lists,
-                                reserved_bytes);
+                                           fn,
+                                           req,
+                                           storage,
+                                           host_tier,
+                                           unit_rows,
+                                           c,
+                                           centroids,
+                                           n_clusters,
+                                           metric,
+                                           lists,
+                                           reserved_bytes,
+                                           int8_if_float16);
 
   index_metadata meta;
   meta.kind           = index_kind::cluster_lists;
