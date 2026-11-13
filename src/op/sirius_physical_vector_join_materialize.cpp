@@ -18,6 +18,7 @@
 
 #include "data/data_batch_utils.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "helper/numeric_narrowing.hpp"
 #include "log/logging.hpp"
 #include "pipeline/batch_lock_utils.hpp"
 #include "scan_manager/sirius_scan_manager.hpp"
@@ -614,19 +615,37 @@ std::unique_ptr<cudf::table> sirius_physical_vector_join_materialize::gather_rig
                                            stream,
                                            mr);
 
+  // A pin keeps each chunk of a column in the narrowest type that holds that chunk's values, so
+  // two chunks of one column can differ in type. Each narrowed chunk is widened to the type the
+  // pin recorded as native before the chunks are concatenated.
+  auto const& names   = _right_pin->cache_info.column_names();
+  auto const& storage = _right_pin->column_storage;
   std::vector<std::unique_ptr<cudf::column>> columns;
   for (auto const& name : _request.right.output_columns) {
+    auto const position =
+      static_cast<std::size_t>(std::find(names.begin(), names.end(), name) - names.begin());
     std::vector<vss::staged_pinned_chunk> staged;
+    std::vector<std::unique_ptr<cudf::column>> widened;
     std::vector<cudf::column_view> views;
     for (auto const c : needed) {
+      auto const chunk = static_cast<std::size_t>(c);
       staged.push_back(vss::stage_pinned_column_chunk(*_right_pin,
                                                       name,
-                                                      static_cast<std::size_t>(c),
+                                                      chunk,
                                                       space,
                                                       stream,
                                                       batch_telemetry(),
                                                       vss::staging_charge::task_reservation));
-      views.push_back(staged.back().view);
+      auto view = staged.back().view;
+      if (chunk < storage.size() && position < storage[chunk].size()) {
+        auto const native = storage[chunk][position].native;
+        if (view.type() != native && sirius::can_restore_to(view.type(), native)) {
+          widened.push_back(
+            sirius::cast_through_rep(view, native, ::cuda::stream_ref{stream.get()}, mr));
+          view = widened.back()->view();
+        }
+      }
+      views.push_back(view);
     }
     auto concat   = views.size() == 1 ? std::make_unique<cudf::column>(views.front(), stream, mr)
                                       : cudf::concatenate(views, stream, mr);

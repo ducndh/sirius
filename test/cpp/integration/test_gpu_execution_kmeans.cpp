@@ -4535,7 +4535,9 @@ std::string threshold_scan_join(std::string const& left,
 
 /// Pairs one table has and the other does not, and pairs both have at a distance further apart than
 /// rounding, ignoring those within rounding of the radius: there the two runs' searches can round
-/// a pair to either side, as they do between any two shapes of the same search.
+/// a pair to either side, as they do between any two shapes of the same search. Distances are
+/// compared squared, where a search's rounding is absolute: a row's distance to itself comes out
+/// as 0 from one call shape and about 1e-3 from another.
 std::int64_t pairs_differing(duckdb::Connection& con,
                              std::string const& a,
                              std::string const& b,
@@ -4548,7 +4550,8 @@ std::int64_t pairs_differing(duckdb::Connection& con,
       " b USING (left_id, right_id) WHERE (a.distance IS NULL AND abs(b.distance - " + radius +
       ") > 1e-4 * " + radius + ") OR (b.distance IS NULL AND abs(a.distance - " + radius +
       ") > 1e-4 * " + radius +
-      ") OR abs(a.distance - b.distance) > 1e-4 * greatest(abs(a.distance), 1.0);");
+      ") OR abs(a.distance * a.distance - b.distance * b.distance) > 1e-4 * "
+      "greatest(a.distance * a.distance, 1.0);");
 }
 
 /// Whether any (left_id, right_id) appears twice: what a replay would leave.
@@ -4798,6 +4801,43 @@ TEST_CASE(
   ok_rows(con, "SELECT * FROM unpin_table('ptl_corpus');");
 }
 
+TEST_CASE("a join reads an output column whose pinned chunks were narrowed to different types",
+          "[vss][kmeans][approx][pin_narrow][isolated_context]")
+{
+  sirius::test::scratch_dir scratch{"pin_narrow"};
+  sirius::test::shared_test_env env(write_block_rows_yaml(scratch, 2000000000, 2000000000, ""));
+  auto con = env.make_connection();
+  attach_with_small_chunks(con, scratch, "pin_narrow.db", "ptn");
+  ok_rows(con, "USE ptn;");
+  create_wide_clustered_join(con, "ptn", false, false, 16, 40000, 10000);
+  ok_rows(con, "SELECT * FROM unpin_table('ptn_probe');");
+  // In id order the first chunks' ids fit 16 bits and the last chunks' do not, so the pin keeps
+  // the column in two types.
+  ok_rows(con, "CREATE TABLE ptn_sorted AS SELECT id, vec FROM ptn_corpus ORDER BY id;");
+  ok_rows(con, "CHECKPOINT;");
+  auto const tier = GENERATE(as<std::string>{}, "host", "gpu");
+  INFO(tier);
+  ok_rows(con,
+          "SELECT * FROM pin_table(name => 'ptn_sorted', tier => '" + tier +
+            "', format => 'duckdb');");
+  ok_rows(con,
+          "CREATE OR REPLACE TABLE ptn_out AS SELECT left_id, right_id, distance FROM "
+          "sirius_knn_join('ptn_probe','vec','ptn_sorted','vec', probe_source => 'scan', metric => "
+          "'l2', join_mode => 'threshold', k => 1, eps => 1.5, left_output_columns => ['id'], "
+          "right_output_columns => ['id']);");
+  ok_rows(con, "SELECT * FROM unpin_table('ptn_sorted');");
+  REQUIRE(scalar_i64(con, "SELECT count(*) FROM ptn_out WHERE right_id < 2048;") > 0);
+  REQUIRE(scalar_i64(con, "SELECT count(*) FROM ptn_out WHERE right_id >= 32768;") > 0);
+  // Each pair's distance is the distance between the rows its ids name.
+  CHECK(scalar_i64(con,
+                   "SELECT count(*) FROM (SELECT o.distance AS got, array_distance(p.vec, c.vec) AS "
+                   "want FROM ptn_out o JOIN ptn_probe p ON o.left_id = p.id JOIN ptn_sorted c ON "
+                   "o.right_id = c.id) WHERE abs(got - want) > 1e-3;") == 0);
+  CHECK(scalar_i64(con,
+                   "SELECT count(*) FROM ptn_out o LEFT JOIN ptn_sorted c ON o.right_id = c.id "
+                   "WHERE c.id IS NULL;") == 0);
+}
+
 TEST_CASE("a pair task retried after finding pairs loses none, doubles none and re-reads one chunk",
           "[vss][kmeans][approx][pair_tasks][isolated_context]")
 {
@@ -4823,8 +4863,17 @@ TEST_CASE("a pair task retried after finding pairs loses none, doubles none and 
   auto const pairs = scalar_i64(con, "SELECT count(*) FROM ptr_plain;");
   REQUIRE(pairs > 0);
 
+  // A retried or cut-short search calls the kernel in another shape, which can round a pair
+  // within rounding of the radius to either side, so counts may differ by that many.
+  auto const near = [&](std::string const& table) {
+    auto const radius = std::to_string(eps);
+    return scalar_i64(con,
+                      "SELECT count(*) FROM " + table + " WHERE abs(distance - " + radius +
+                        ") <= 1e-4 * " + radius + ";");
+  };
   auto const same_pairs = [&](std::string const& table) {
-    CHECK(scalar_i64(con, "SELECT count(*) FROM " + table + ";") == pairs);
+    CHECK(std::llabs(scalar_i64(con, "SELECT count(*) FROM " + table + ";") - pairs) <=
+          std::max(near(table), near("ptr_plain")));
     CHECK(pairs_differing(con, "ptr_plain", table, eps) == 0);
     CHECK(pairs_twice(con, table) == 0);
   };
