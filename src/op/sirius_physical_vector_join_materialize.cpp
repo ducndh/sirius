@@ -733,6 +733,29 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
   // is on the device at a time.
   auto& registry = sirius::converter_registry::get();
   std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  // A pair task of a block finds pairs in many probe chunks, a piece each and most of a few rows.
+  // The pieces that stayed on the device leave as one batch while they hold kMergedRows rows or
+  // fewer: 38 blocks over 925 corpus chunks sent 330,000 batches on, each a task of its own above
+  // and a whole host block once moved off the device.
+  constexpr std::int64_t kMergedRows = std::int64_t{1} << 24;
+  std::vector<std::unique_ptr<cudf::table>> small;
+  std::int64_t small_rows = 0;
+  auto const flush_small  = [&] {
+    if (small.empty()) { return; }
+    auto merged = std::move(small.front());
+    if (small.size() > 1) {
+      std::vector<cudf::table_view> views;
+      views.reserve(small.size());
+      views.push_back(merged->view());
+      for (std::size_t j = 1; j < small.size(); ++j) {
+        views.push_back(small[j]->view());
+      }
+      merged = cudf::concatenate(views, stream, space->get_default_allocator());
+    }
+    batches.push_back(sirius::make_data_batch(std::move(merged), *space, stream, batch_telemetry()));
+    small.clear();
+    small_rows = 0;
+  };
   for (std::size_t i = 0; i < input_batches.size(); ++i) {
     auto const& piece                     = input_batches[i];
     cucascade::memory::memory_space* host = nullptr;
@@ -749,12 +772,20 @@ std::unique_ptr<operator_data> sirius_physical_vector_join_materialize::execute(
     auto out_table = materialize_piece(
       block != nullptr ? block->partitions()[i] : partition_idx, tv, *space, stream);
     staged.reset();
+    if (block != nullptr && host == nullptr) {
+      auto const rows = static_cast<std::int64_t>(out_table->num_rows());
+      if (small_rows + rows > kMergedRows) { flush_small(); }
+      small_rows += rows;
+      small.push_back(std::move(out_table));
+      continue;
+    }
     auto batch = sirius::make_data_batch(std::move(out_table), *space, stream, batch_telemetry());
     if (host != nullptr) {
       batch->to_mutable().convert_to<cucascade::host_data_representation>(registry, host, stream);
     }
     batches.push_back(std::move(batch));
   }
+  flush_small();
   return std::make_unique<pipelineable_operator_data>(std::move(batches));
 }
 

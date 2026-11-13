@@ -3851,6 +3851,8 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   static constexpr std::size_t kFlushBytesPerPair = 80;
   static constexpr std::size_t kFlushMargin       = std::size_t{1} << 28;
   static constexpr std::int64_t kBackPiecePairs   = std::int64_t{1} << 23;
+  /// Probe rows of a block routed, or brought back from the host, at once.
+  static constexpr std::int64_t kRoutedPieceRows  = std::int64_t{1} << 17;
 
   void phase(const char* name)
   {
@@ -3878,9 +3880,8 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   template <typename Use>
   void for_each_host_piece(Use&& use)
   {
-    constexpr std::int64_t kPieceRows = std::int64_t{1} << 17;
-    for (std::int64_t at = 0; at < n_left; at += kPieceRows) {
-      auto const rows = std::min(kPieceRows, n_left - at);
+    for (std::int64_t at = 0; at < n_left; at += kRoutedPieceRows) {
+      auto const rows = std::min(kRoutedPieceRows, n_left - at);
       rmm::device_uvector<float> piece(static_cast<std::size_t>(rows * dim), stream, mr);
       st.host_rows->copy_to_device(at, rows, piece.data());
       use(piece.data(), at, rows);
@@ -3969,14 +3970,16 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     // that cost about 3x the probes at equal recall. Contiguity comes back below by sorting
     // the (row, cluster) edges by cluster instead.
     auto const n_edges = n_left * s.n_probes;  // row-major [n_left x n_probes]
+    // Routing prepares a copy of the rows it is given, so a block on the device is routed a piece at
+    // a time too: in one call a 7.1M-row block at 1,024-d asked for its own 27 GiB again.
     auto edge_clusters = [&] {
-      if (!st.probe_rows_on_host) {
+      if (!st.probe_rows_on_host && n_left <= kRoutedPieceRows) {
         return vss::nearest_centroid_ids(
           res, st.queries, _op._centroids->view(), dim, s.n_probes, metric, stream, mr);
       }
       rmm::device_uvector<std::int32_t> all(
         static_cast<std::size_t>(vss::column_size(n_edges, "vector join routing")), stream, mr);
-      for_each_host_piece([&](float const* rows, std::int64_t at, std::int64_t n) {
+      auto const route = [&](float const* rows, std::int64_t at, std::int64_t n) {
         auto const part = vss::nearest_centroid_ids(
           res,
           raft::make_device_matrix_view<float const, std::int64_t>(rows, n, dim),
@@ -3992,7 +3995,14 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                                       cudaMemcpyDeviceToDevice,
                                       stream.get()));
         stream.sync();
-      });
+      };
+      if (st.probe_rows_on_host) {
+        for_each_host_piece(route);
+      } else {
+        for (std::int64_t at = 0; at < n_left; at += kRoutedPieceRows) {
+          route(st.queries.data_handle() + at * dim, at, std::min(kRoutedPieceRows, n_left - at));
+        }
+      }
       return all;
     }();
     phase("assign probe->clusters");
