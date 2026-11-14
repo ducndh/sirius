@@ -30,6 +30,7 @@
 #include "vss/device_context_guard.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/pinned_column.hpp"
+#include "vss/sirius_physical_vector_join_stream.hpp"
 #include "vss/vector_join_binding.hpp"
 #include "vss/vector_search_internal.hpp"
 
@@ -57,6 +58,7 @@
 #include <cucascade/memory/column_metadata.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
 #include <algorithm>
 #include <array>
@@ -81,12 +83,84 @@ namespace sirius::vss {
 
 namespace {
 
-/// Handles every kmeans function needs before it can touch a pinned column.
+/// Handles every kmeans function needs before it can touch the rows it reads: a pinned column, or
+/// the chunks a statement scanned itself (`chunks`, with no pin).
 struct kmeans_context {
   cucascade::memory::memory_space* space;
   const cucascade::memory::memory_space* host_space;
   std::shared_ptr<const scan_manager::pinned_entry> pin;
   int target_gpu;
+  op::vector_chunk_source* chunks{nullptr};
+
+  [[nodiscard]] std::int64_t n_rows() const
+  {
+    if (pin) { return static_cast<std::int64_t>(pin->num_rows); }
+    std::int64_t rows = 0;
+    for (std::size_t i = 0; i < chunks->num_chunks(); ++i) {
+      rows += static_cast<std::int64_t>(chunks->chunk_rows(i));
+    }
+    return rows;
+  }
+  [[nodiscard]] std::size_t n_chunks(const std::string& column) const
+  {
+    return pin ? pinned_column_chunk_count(*pin, column) : chunks->num_chunks();
+  }
+  /// Scanned chunks the engine may have moved off the device count as host rows: staging them
+  /// can be a copy across PCIe.
+  [[nodiscard]] cucascade::memory::Tier tier() const
+  {
+    if (pin) { return pin->tier; }
+    return chunks->is_streaming() ? cucascade::memory::Tier::HOST : cucascade::memory::Tier::GPU;
+  }
+  [[nodiscard]] std::optional<pinned_rows_map> map_rows(const std::string& column,
+                                                        std::int64_t dim,
+                                                        rmm::cuda_stream_view stream,
+                                                        rmm::device_async_resource_ref mr) const
+  {
+    if (!pin) { return std::nullopt; }
+    return map_pinned_rows(*pin, column, dim, *space, stream, mr);
+  }
+  [[nodiscard]] staged_pinned_chunk stage(const std::string& column,
+                                          std::size_t i,
+                                          rmm::cuda_stream_view stream,
+                                          const telemetry::batch_telemetry_info& telemetry) const
+  {
+    if (pin) { return stage_pinned_column_chunk(*pin, column, i, *space, stream, telemetry); }
+    auto staged = std::make_shared<op::staged_vector_chunk>(chunks->stage(i, *space, stream));
+    staged_pinned_chunk out;
+    out.view = staged->view;
+    out.keep = std::move(staged);
+    return out;
+  }
+};
+
+/// A walk over a kmeans_context's chunks: a pinned column's, prefetching the next HOST-tier chunk
+/// (pinned_chunk_walk), or a statement's own, staged one at a time.
+class context_chunk_walk {
+ public:
+  context_chunk_walk(const kmeans_context& c,
+                     const std::string& column,
+                     rmm::cuda_stream_view stream,
+                     const telemetry::batch_telemetry_info& telemetry)
+    : _c(c), _column(column), _stream(stream), _telemetry(telemetry)
+  {
+    if (c.pin) { _pin_walk.emplace(*c.pin, column, *c.space, stream, telemetry); }
+  }
+  [[nodiscard]] staged_pinned_chunk take(std::size_t i)
+  {
+    return _pin_walk ? _pin_walk->take(i) : _c.stage(_column, i, _stream, _telemetry);
+  }
+  void prefetch_after(std::size_t i)
+  {
+    if (_pin_walk) { _pin_walk->prefetch_after(i); }
+  }
+
+ private:
+  const kmeans_context& _c;
+  std::string _column;
+  rmm::cuda_stream_view _stream;
+  const telemetry::batch_telemetry_info& _telemetry;
+  std::optional<pinned_chunk_walk> _pin_walk;
 };
 
 kmeans_context resolve_context(duckdb::SiriusContext& ctx,
@@ -163,10 +237,17 @@ const cudf::column* find_clustering_centroids(duckdb::SiriusContext& ctx, const 
   return held != nullptr ? held->get() : nullptr;
 }
 
-kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_request& req)
+namespace {
+
+/// The fit of run_kmeans_fit over the rows @p c reads, into @p centroids. @p erase_named drops the
+/// clustering of that name, and its lists, before the fit reserves its memory.
+kmeans_fit_result fit_centroids(duckdb::SiriusContext& ctx,
+                                const std::string& fn,
+                                const kmeans_fit_request& req,
+                                const kmeans_context& c,
+                                bool erase_named,
+                                std::unique_ptr<cudf::column>& centroids)
 {
-  static const std::string fn = "sirius_kmeans_fit";
-  auto const c = resolve_context(ctx, fn, req.catalog, req.schema, req.table, req.table_identity);
   device_context_guard device_guard{c.target_gpu};
   // The centroids outlive this call by design -- they stay in the index cache until the session
   // ends. rmm::device_buffer records the stream it was allocated on and deallocates on that same
@@ -174,7 +255,7 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
   // and the free would run on a dead stream. The default stream outlives both.
   auto stream = cudf::get_default_stream();
 
-  auto const n_rows = static_cast<std::int64_t>(c.pin->num_rows);
+  auto const n_rows = c.n_rows();
   if (n_rows == 0) {
     throw duckdb::InvalidInputException(fn + ": table '" + req.table + "' is empty");
   }
@@ -201,8 +282,10 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
   auto& index_cache = ctx.get_cuvs_index_cache();
   // Free the old clustering's reservation before asking for the new one, so re-fitting under
   // the same name does not have to fit both at once.
-  index_cache.erase(req.name);
-  index_cache.erase(lists_key(req.name));
+  if (erase_named) {
+    index_cache.erase(req.name);
+    index_cache.erase(lists_key(req.name));
+  }
   auto reservation = index_cache.reserve_index_memory(footprint_of(train_rows), c.target_gpu);
   // The default sample shrinks to what the device can train on, down to 32 a centroid; the rows it
   // took are what the function reports. A sample asked for is not shrunk.
@@ -234,9 +317,8 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
   auto const mr = c.space->get_default_allocator();
 
   telemetry::batch_telemetry_info const telemetry_info{};
-  auto const n_chunks = pinned_column_chunk_count(*c.pin, req.column);
+  auto const n_chunks = c.n_chunks(req.column);
 
-  std::unique_ptr<cudf::column> centroids;
   std::int64_t sampled = 0;
   {
     // Each chunk is staged, reduced to its share of the sample, and released before the next
@@ -250,8 +332,8 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
     // pin's mapping. They are a few percent of the column, which staging moved whole to take them.
     // One cluster's few hundred rows are read so on either tier, without a sync per chunk.
     bool const one_mean = n_clusters == 1 && !req.spec.rows_are_centroids && one_list_fast();
-    auto const map      = c.pin->tier == cucascade::memory::Tier::HOST || one_mean
-                            ? map_pinned_rows(*c.pin, req.column, req.dim, *c.space, stream, mr)
+    auto const map      = c.tier() == cucascade::memory::Tier::HOST || one_mean
+                            ? c.map_rows(req.column, req.dim, stream, mr)
                             : std::nullopt;
     for (std::size_t i = 0; map && i < n_chunks; ++i) {
       auto const first = map->chunk_first_row[i];
@@ -265,8 +347,7 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
       sampled += take;
     }
     for (std::size_t i = 0; !map && i < n_chunks; ++i) {
-      auto staged =
-        stage_pinned_column_chunk(*c.pin, req.column, i, *c.space, stream, telemetry_info);
+      auto staged     = c.stage(req.column, i, stream, telemetry_info);
       auto const rows = static_cast<std::int64_t>(staged.view.size());
       if (rows == 0) { continue; }
 
@@ -308,6 +389,23 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
       centroids            = train_centroids(views, req.dim, spec, stream, mr);
     }
   }
+  (void)reserved_bytes;
+  return kmeans_fit_result{n_clusters, req.dim, sampled, n_rows};
+}
+
+}  // namespace
+
+kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_request& req)
+{
+  static const std::string fn = "sirius_kmeans_fit";
+  auto const c = resolve_context(ctx, fn, req.catalog, req.schema, req.table, req.table_identity);
+  device_context_guard device_guard{c.target_gpu};
+  std::unique_ptr<cudf::column> centroids;
+  auto const fitted = fit_centroids(ctx, fn, req, c, /*erase_named=*/true, centroids);
+  auto const n_rows     = fitted.n_rows;
+  auto const n_clusters = fitted.n_clusters;
+  auto const metric     = ann_distance_type_from_metric(req.metric);
+  auto& index_cache     = ctx.get_cuvs_index_cache();
   index_metadata meta;
   meta.kind           = index_kind::kmeans_centroids;
   meta.catalog_name   = req.catalog;
@@ -319,11 +417,9 @@ kmeans_fit_result run_kmeans_fit(duckdb::SiriusContext& ctx, const kmeans_fit_re
   meta.n_lists        = n_clusters;
   meta.metric         = metric;
   meta.resident_bytes = static_cast<std::size_t>(centroids->size()) * sizeof(float);
-  (void)reserved_bytes;
   index_cache.insert(
     req.name, std::move(meta), make_cuvs_index(std::move(centroids)), rmm::cuda_stream{});
-
-  return kmeans_fit_result{n_clusters, req.dim, sampled, n_rows};
+  return fitted;
 }
 
 std::unique_ptr<cucascade::host_data_representation> run_kmeans_assign(
@@ -508,18 +604,85 @@ void erase_cluster_lists(duckdb::SiriusContext& ctx, const std::string& clusteri
   ctx.get_cuvs_index_cache().erase(lists_key(clustering));
 }
 
-cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
-                                            const kmeans_assign_request& req,
-                                            list_storage storage,
-                                            bool host_tier,
-                                            bool unit_rows)
+namespace {
+
+/// The refusals of run_kmeans_build_lists that come before any lists are dropped or built.
+void check_lists_storage(const std::string& fn,
+                         const kmeans_assign_request& req,
+                         list_storage storage,
+                         bool unit_rows)
 {
-  static const std::string fn = "sirius_kmeans_build_lists";
-  if (unit_rows && (storage == list_storage::uint8 || storage == list_storage::int8)) {
+  if (unit_rows && storage == list_storage::uint8) {
     throw duckdb::InvalidInputException(
-      fn + ": metric => 'cosine' stores unit rows, which need storage => 'float16' or 'float32'");
+      fn +
+      ": metric => 'cosine' stores unit rows, which need storage => 'int8', 'float16' or "
+      "'float32'");
   }
-  auto const c = resolve_context(ctx, fn, req.catalog, req.schema, req.table, req.table_identity);
+  // INT8 and FLOAT16 lists only filter; exact answers come from the bounded search's FP32
+  // re-check, which needs these widths. Without it every join would refuse the lists (INT8) or
+  // answer from rounded rows (FLOAT16), so refuse here, before the old lists are dropped.
+  if (storage == list_storage::int8 && !bound_filter_int8_supports(req.dim, /*rescored=*/true)) {
+    throw duckdb::InvalidInputException(fn +
+                                        ": storage => 'int8' needs a vector width that is a "
+                                        "multiple of 16 and at most 15360, not " +
+                                        std::to_string(req.dim) + "; use 'float16' or 'float32'");
+  }
+  if ((storage == list_storage::float16 || storage == list_storage::exact) &&
+      !bound_filter_f16_supports(req.dim)) {
+    throw duckdb::InvalidInputException(fn +
+                                        ": storage => 'float16' needs a vector width that is "
+                                        "a multiple of 16, not " +
+                                        std::to_string(req.dim) + "; use 'float32'");
+  }
+}
+
+/// The device admission check of lists of @p n_rows rows of @p vec_bytes in all: their footprint
+/// reserved, and at least a quarter of the device, and 2 GiB, left after it. Lists on the device
+/// are memory the engine cannot spill, so they go there only if what is left can still run joins
+/// over them (one task over a 200k-row probe chunk at 16 probes needs ~1.4 GiB); squeezed in
+/// tighter, a join's tasks run out of memory that nothing will free. Null when they do not fit.
+std::unique_ptr<cucascade::memory::reservation> reserve_device_lists(cuvs_index_cache& index_cache,
+                                                                     const kmeans_context& c,
+                                                                     std::size_t vec_bytes,
+                                                                     std::int64_t n_rows)
+{
+  auto const row_bytes = static_cast<std::size_t>(n_rows) * sizeof(std::int64_t);
+  auto reservation     = index_cache.reserve_index_memory(
+    vec_bytes + row_bytes + row_bytes / 2 + (std::size_t{1} << 24), c.target_gpu);
+  auto const headroom = std::max<std::size_t>(std::size_t{2} << 30, c.space->get_max_memory() / 4);
+  auto const reserved = reservation != nullptr;
+  auto const left     = c.space->get_available_memory();
+  if (reservation != nullptr && left < headroom) { reservation.reset(); }
+  if (std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
+    std::fprintf(stderr,
+                 "[vecjoin-lists] device admission: %zu B of lists, reserved %d, %zu B left of "
+                 "%zu B needed: %s\n",
+                 vec_bytes,
+                 static_cast<int>(reserved),
+                 reserved ? left : std::size_t{0},
+                 headroom,
+                 reservation != nullptr ? "fits" : "does not fit");
+  }
+  return reservation;
+}
+
+/// The build of run_kmeans_build_lists over the rows @p c reads, under @p centroids (@p n_clusters
+/// of them, fitted for @p centroid_metric), into @p lists. @p reserved_bytes is what its admission
+/// check reserved.
+cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
+                                 const std::string& fn,
+                                 const kmeans_assign_request& req,
+                                 list_storage storage,
+                                 bool host_tier,
+                                 bool unit_rows,
+                                 const kmeans_context& c,
+                                 const cudf::column* centroids,
+                                 std::int64_t const n_clusters,
+                                 cuvs::distance::DistanceType const centroid_metric,
+                                 cluster_lists& lists,
+                                 std::size_t& reserved_bytes,
+                                 bool int8_if_float16 = false)
+{
   device_context_guard device_guard{c.target_gpu};
   // The lists outlive this call in the index cache, and a device_buffer frees on the stream it
   // was allocated on, so the persistent buffers use the default stream (as the fit's centroids
@@ -530,41 +693,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   auto const mr     = c.space->get_default_allocator();
   auto& index_cache = ctx.get_cuvs_index_cache();
 
-  const auto* entry     = find_clustering_entry(ctx, req.clustering);
-  const auto* centroids = find_clustering_centroids(ctx, req.clustering);
-  if (entry == nullptr || centroids == nullptr) {
-    throw duckdb::InvalidInputException(fn + ": no clustering named '" + req.clustering +
-                                        "'; run sirius_kmeans_fit first");
-  }
-  if (entry->meta.dim != req.dim) {
-    throw duckdb::InvalidInputException(fn + ": clustering '" + req.clustering +
-                                        "' is over FLOAT[" + std::to_string(entry->meta.dim) +
-                                        "] vectors but column '" + req.column + "' is FLOAT[" +
-                                        std::to_string(req.dim) + "]");
-  }
-  // INT8 and FLOAT16 lists only filter; exact answers come from the bounded search's FP32
-  // re-check, which needs these widths. Without it every join would refuse the lists (INT8) or
-  // answer from rounded rows (FLOAT16), so refuse here, before the old lists are dropped.
-  if (storage == list_storage::int8 && !bound_filter_int8_supports(req.dim)) {
-    throw duckdb::InvalidInputException(fn +
-                                        ": storage => 'int8' needs a vector width that is a "
-                                        "multiple of 16 and at most 256, not " +
-                                        std::to_string(req.dim) + "; use 'float16' or 'float32'");
-  }
-  if ((storage == list_storage::float16 || storage == list_storage::exact) &&
-      !bound_filter_f16_supports(req.dim)) {
-    throw duckdb::InvalidInputException(fn +
-                                        ": storage => 'float16' needs a vector width that is "
-                                        "a multiple of 16, not " +
-                                        std::to_string(req.dim) + "; use 'float32'");
-  }
-
-  // Built afresh every time, so the old copy is freed before the new one is allocated.
-  index_cache.erase(lists_key(req.clustering));
-
-  auto const n_rows     = static_cast<std::int64_t>(c.pin->num_rows);
+  auto const n_rows     = c.n_rows();
   auto const dim        = req.dim;
-  auto const n_clusters = entry->meta.n_lists;
   if (n_rows == 0) {
     throw duckdb::InvalidInputException(fn + ": table '" + req.table + "' is empty");
   }
@@ -574,7 +704,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   bool const one_list = n_clusters == 1 && one_list_fast();
 
   telemetry::batch_telemetry_info const telemetry_info{};
-  auto const n_chunks = pinned_column_chunk_count(*c.pin, req.column);
+  auto const n_chunks = c.n_chunks(req.column);
   raft::device_resources res{stream};
   // Same switch as the join's phase timer; synchronizes, so only for attribution.
   auto const dbg = std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr;
@@ -588,6 +718,20 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                  name,
                  std::chrono::duration<double>(now - phase_t0).count());
     phase_t0 = now;
+  };
+  // An INT8 build's pieces, summed over chunks; each is bracketed by a synchronize under the
+  // switch.
+  double t_rotation = 0, t_rotate = 0, t_range = 0, t_code = 0;
+  auto timed = [&](double& total, auto&& work) {
+    if (!dbg) {
+      work();
+      return;
+    }
+    stream.sync();
+    auto const t0 = std::chrono::steady_clock::now();
+    work();
+    stream.sync();
+    total += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   };
 
   // Pass 1: every row's nearest centroid, to the host. 4 bytes a row, so even 100M rows is
@@ -609,7 +753,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   // a pass of its own would copy every row across PCIe once more. A column that is not bytes is
   // then refused after the build rather than before it.
   bool const check_in_pass_2 = check_uint8 && one_list && storage == list_storage::uint8 &&
-                               c.pin->tier != cucascade::memory::Tier::GPU;
+                               c.tier() != cucascade::memory::Tier::GPU;
   rmm::device_uvector<unsigned long long> non_uint8(1, stream, mr);
   CUDF_CUDA_TRY(cudaMemsetAsync(non_uint8.data(), 0, sizeof(unsigned long long), stream.get()));
   auto const refuse_non_uint8 = [&](unsigned long long count) {
@@ -618,11 +762,18 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                         std::to_string(count) + " are not");
   };
   // INT8 codes need each component's range over every row, taken while the chunks are resident.
-  bool const want_int8 = storage == list_storage::int8;
+  // With @p int8_if_float16 'auto' takes it too, in case it settles on FLOAT16, coded as INT8.
+  bool want_int8 = storage == list_storage::int8 || int8_if_float16;
   std::optional<rmm::device_uvector<unsigned int>> col_min, col_max;
-  // INT8 rows are rotated before they are coded (cluster_lists::code_rotation), unless
-  // SIRIUS_VSS_INT8_ROTATE=0. The range pass and the coding pass both see the rotated rows.
+  // INT8 rows are rotated before they are coded (cluster_lists::code_rotation): by the structured
+  // rotation, or a dense matrix built on the device for a width it does not cover.
+  // SIRIUS_VSS_INT8_ROTATE=0 skips it, =dense and =host pick a dense matrix built on the device or
+  // the host. The range pass and the coding pass both see the rotated rows.
   std::unique_ptr<rmm::device_buffer> rotation;
+  bool rotation_structured = false;
+  auto const rotation_ref  = [&] {
+    return code_rotation_ref{rotation ? rotation->data() : nullptr, rotation_structured};
+  };
   std::optional<rmm::device_uvector<float>> rotated;
   auto const rotated_rows = [&](float const* x, std::int64_t rows) -> float const* {
     if (!rotation) { return x; }
@@ -630,7 +781,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       if (rotated) { stream.sync(); }  // the old buffer may still be read by queued work
       rotated.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
     }
-    rotate_rows(x, rows, dim, static_cast<float const*>(rotation->data()), rotated->data(), stream);
+    apply_code_rotation(rotation_ref(), x, rows, dim, rotated->data(), stream);
     return rotated->data();
   };
   if (want_int8) {
@@ -640,24 +791,46 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       col_min->data(), 0xff, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.get()));
     CUDF_CUDA_TRY(cudaMemsetAsync(
       col_max->data(), 0, static_cast<std::size_t>(dim) * sizeof(unsigned int), stream.get()));
-    auto const* env = std::getenv("SIRIUS_VSS_INT8_ROTATE");
-    if (env == nullptr || std::string_view{env} != "0") {
-      auto const host =
-        random_rotation(dim, 0x5151'7a7e'0000'0000ull + static_cast<std::uint64_t>(dim));
-      rotation = std::make_unique<rmm::device_buffer>(host.size() * sizeof(float), stream, mr);
-      CUDF_CUDA_TRY(cudaMemcpyAsync(rotation->data(),
-                                    host.data(),
-                                    host.size() * sizeof(float),
-                                    cudaMemcpyHostToDevice,
-                                    stream.get()));
-      stream.sync();  // `host` goes out of scope
+    auto const* env             = std::getenv("SIRIUS_VSS_INT8_ROTATE");
+    std::string_view const kind = env != nullptr ? env : "";
+    if (kind != "0") {
+      auto const seed = 0x5151'7a7e'0000'0000ull + static_cast<std::uint64_t>(dim);
+      timed(t_rotation, [&] {
+        if (kind == "host") {
+          auto const host = random_rotation(dim, seed);
+          rotation = std::make_unique<rmm::device_buffer>(host.size() * sizeof(float), stream, mr);
+          CUDF_CUDA_TRY(cudaMemcpyAsync(rotation->data(),
+                                        host.data(),
+                                        host.size() * sizeof(float),
+                                        cudaMemcpyHostToDevice,
+                                        stream.get()));
+          stream.sync();  // `host` goes out of scope
+        } else if (kind == "dense" || !structured_rotation_supports(dim)) {
+          auto const q = random_rotation_f64_device(dim, seed, stream, mr);
+          rotation     = std::make_unique<rmm::device_buffer>(
+            static_cast<std::size_t>(dim * dim) * sizeof(float), stream, mr);
+          narrow_rotation(q.data(), dim, static_cast<float*>(rotation->data()), stream);
+          stream.sync();  // `q` goes out of scope
+        } else {
+          auto const signs    = structured_rotation_signs(dim, seed);
+          rotation_structured = true;
+          rotation =
+            std::make_unique<rmm::device_buffer>(signs.size() * sizeof(std::uint32_t), stream, mr);
+          CUDF_CUDA_TRY(cudaMemcpyAsync(rotation->data(),
+                                        signs.data(),
+                                        signs.size() * sizeof(std::uint32_t),
+                                        cudaMemcpyHostToDevice,
+                                        stream.get()));
+          stream.sync();  // `signs` goes out of scope
+        }
+      });
     }
   }
   // One list rotated before coding keeps the rows pass 1 rotates and codes them from there, rather
   // than rotate every row again, when the device holds them besides what the lists will take and
   // the room the lists leave (below), so that where the lists go does not change.
   std::optional<rmm::device_uvector<float>> kept_rotated;
-  if (one_list && rotation && !host_tier) {
+  if (one_list && rotation && !rotation_structured && !host_tier) {
     auto const rows_bytes = static_cast<std::size_t>(n_rows * dim) * sizeof(float);
     auto const lists_bytes =
       static_cast<std::size_t>(n_rows) * (static_cast<std::size_t>(dim) + 12) +
@@ -676,10 +849,10 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     // One list (the exact join's compact layout) labels nothing: every row is in it, and the
     // labels are already zero.
     std::optional<centroid_labeler> labeler;
-    if (n_clusters > 1) { labeler.emplace(res, centroids->view(), dim, entry->meta.metric, mr); }
+    if (n_clusters > 1) { labeler.emplace(res, centroids->view(), dim, centroid_metric, mr); }
     bool check_pass_1  = check_uint8 && !check_in_pass_2;
     bool settled_early = false;
-    pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
+    context_chunk_walk walk{c, req.column, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0; i < n_chunks; ++i) {
       auto staged     = walk.take(i);
@@ -697,29 +870,43 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                         non_uint8.data(),
                         stream);
       }
+      // Outlives the chunk's kernels: released only after the synchronize below.
+      std::optional<rmm::device_uvector<float>> unit_chunk;
       if (want_int8) {
         auto const* chunk_rows = list_column_as_dataset_view(staged.view, dim).data_handle();
-        auto* const keep       = kept_rotated ? kept_rotated->data() + base * dim : nullptr;
+        // The range is of the rows the codes will stand for.
+        if (unit_rows) {
+          unit_chunk.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
+          normalize_rows(chunk_rows, rows, dim, unit_chunk->data(), stream);
+          chunk_rows = unit_chunk->data();
+        }
+        auto* const keep = kept_rotated ? kept_rotated->data() + base * dim : nullptr;
         // A rotation's range is taken as the rows are rotated, without writing them out unless
         // they are kept.
-        if (!rotation || !rotate_rows_min_max(chunk_rows,
-                                              rows,
-                                              dim,
-                                              static_cast<float const*>(rotation->data()),
-                                              col_min->data(),
-                                              col_max->data(),
-                                              stream,
-                                              keep)) {
-          if (keep != nullptr) {
-            rotate_rows(
-              chunk_rows, rows, dim, static_cast<float const*>(rotation->data()), keep, stream);
-          }
-          column_min_max(keep != nullptr ? keep : rotated_rows(chunk_rows, rows),
-                         rows,
-                         dim,
-                         col_min->data(),
-                         col_max->data(),
-                         stream);
+        bool fused = false;
+        timed(t_rotate, [&] {
+          fused = rotation && !rotation_structured &&
+                  rotate_rows_min_max(chunk_rows,
+                                      rows,
+                                      dim,
+                                      static_cast<float const*>(rotation->data()),
+                                      col_min->data(),
+                                      col_max->data(),
+                                      stream,
+                                      keep);
+        });
+        if (!fused) {
+          float const* to_scan = nullptr;
+          timed(t_rotate, [&] {
+            if (keep != nullptr) {
+              rotate_rows(
+                chunk_rows, rows, dim, static_cast<float const*>(rotation->data()), keep, stream);
+            }
+            to_scan = keep != nullptr ? keep : rotated_rows(chunk_rows, rows);
+          });
+          timed(t_range, [&] {
+            column_min_max(to_scan, rows, dim, col_min->data(), col_max->data(), stream);
+          });
         }
       }
       // Before the copy below, which waits for the labels: into pageable memory it is synchronous.
@@ -773,8 +960,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     bool const bytes = check_uint8 && non_uint8_host == 0;
     bool f16         = !bytes && bound_filter_f16_supports(req.dim);
     if (f16 && !unit_rows && !exact_copy_asked()) {
-      early_pin = map_pinned_rows(
-        *c.pin, req.column, dim, *c.space, persistent, c.space->get_default_allocator());
+      early_pin = c.map_rows(req.column, dim, persistent, c.space->get_default_allocator());
       if (early_pin && early_pin->n_rows() != n_rows) { early_pin.reset(); }
     }
     if (f16 && !early_pin) {
@@ -783,6 +969,27 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       f16 = c.host_space->get_available_memory() >= copy_bytes + (std::size_t{1} << 28);
     }
     storage = bytes ? list_storage::uint8 : f16 ? list_storage::exact : list_storage::float32;
+    // FLOAT16 as INT8 only if INT8 lists still pass the admission check with what pass 1 holds
+    // for their coding, as they must below. Otherwise, as for bytes (UINT8) or FP32 lists, what
+    // pass 1 kept for the codes goes now, before the lists' own admission check.
+    if (int8_if_float16 && storage == list_storage::exact) {
+      auto const values = static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(dim);
+      if (reserve_device_lists(index_cache, c, values, n_rows) != nullptr) {
+        storage = list_storage::int8;
+      }
+      if (dbg) {
+        std::fprintf(stderr,
+                     "[vecjoin-lists] auto storage: %s\n",
+                     storage == list_storage::int8 ? "int8 lists (float16 lists would not fit)"
+                                                   : "float16 lists (int8 lists no longer fit)");
+      }
+    }
+    if (int8_if_float16 && storage != list_storage::int8) {
+      want_int8 = false;
+      rotated.reset();
+      kept_rotated.reset();
+      rotation.reset();
+    }
   }
   auto const encoding = storage == list_storage::float16     ? list_encoding::float16
                         : want_int8                          ? list_encoding::int8
@@ -858,9 +1065,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     throw std::runtime_error(fn + ": assignment produced a label outside the clustering");
   }
 
-  cluster_lists lists;
-  lists.pin            = c.pin.get();
-  lists.pin_snapshot   = c.pin->snapshot_identity;
+  lists.pin = c.pin.get();
+  if (c.pin) { lists.pin_snapshot = c.pin->snapshot_identity; }
   lists.table          = req.table;
   lists.column         = req.column;
   lists.n_rows         = n_rows;
@@ -923,21 +1129,11 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   std::unique_ptr<cucascade::memory::reservation> reservation;
   // FP32 lists live where the pin does; UINT8 ones are a quarter of the corpus and go to the
   // device whenever they fit, which is what takes the corpus stream off the query path.
-  bool on_device = !host_tier && (c.pin->tier == cucascade::memory::Tier::GPU ||
+  bool on_device = !host_tier && (c.tier() == cucascade::memory::Tier::GPU ||
                                   encoding != list_encoding::float32);
   if (on_device) {
-    reservation = index_cache.reserve_index_memory(
-      vec_bytes + row_bytes + row_bytes / 2 + (std::size_t{1} << 24), c.target_gpu);
-    // Lists on the device are memory the engine cannot spill, so they go there only if what is left
-    // can still run joins over them: a quarter of the device, and at least 2 GiB (one task over a
-    // 200k-row probe chunk at 16 probes needs ~1.4 GiB). Squeezed in tighter, a join's tasks run
-    // out of memory that nothing will free.
-    auto const headroom =
-      std::max<std::size_t>(std::size_t{2} << 30, c.space->get_max_memory() / 4);
-    if (reservation != nullptr && c.space->get_available_memory() < headroom) {
-      reservation.reset();
-    }
-    on_device = reservation != nullptr;
+    reservation = reserve_device_lists(index_cache, c, vec_bytes, n_rows);
+    on_device   = reservation != nullptr;
   }
   if (!on_device) {
     if (host_mr == nullptr || block_bytes == 0) {
@@ -952,7 +1148,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   // made on a stream it is attached to, and these buffers outlive every stream here, so drawing
   // them through it would count each byte twice -- reserved and allocated -- which at 100M rows is
   // enough to exhaust the pool. They are allocated from the space directly and counted once.
-  auto const reserved_bytes = reservation->size();
+  reserved_bytes = reservation->size();
   reservation.reset();
   auto const persistent_mr = c.space->get_default_allocator();
 
@@ -1013,7 +1209,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     lists.exact_pin = std::move(early_pin);
   } else if ((encoding == list_encoding::float16 || encoding == list_encoding::int8) &&
              !unit_rows && !exact_copy_asked()) {
-    lists.exact_pin = map_pinned_rows(*c.pin, req.column, dim, *c.space, persistent, persistent_mr);
+    lists.exact_pin = c.map_rows(req.column, dim, persistent, persistent_mr);
     if (lists.exact_pin && lists.exact_pin->n_rows() != n_rows) { lists.exact_pin.reset(); }
   }
   if ((encoding == list_encoding::float16 || encoding == list_encoding::int8) && !lists.exact_pin) {
@@ -1074,6 +1270,10 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   persistent.sync();
 
   std::optional<rmm::device_uvector<unsigned int>> code_error_bits, half_error_bits;
+  // Components the codes' error bound cannot cover (Condition D3), counted as rows are coded.
+  rmm::device_uvector<unsigned long long> tiny_components(1, stream, mr);
+  CUDF_CUDA_TRY(
+    cudaMemsetAsync(tiny_components.data(), 0, sizeof(unsigned long long), stream.get()));
   if (encoding == list_encoding::float16 && lists.has_exact_rows()) {
     half_error_bits.emplace(1, stream, mr);
     CUDF_CUDA_TRY(cudaMemsetAsync(half_error_bits->data(), 0, sizeof(unsigned int), stream.get()));
@@ -1090,6 +1290,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     if (rotation) {
       lists.code_rotation = std::make_unique<rmm::device_buffer>(
         rotation->data(), rotation->size(), persistent, persistent_mr);
+      lists.code_rotation_structured = rotation_structured;
     }
     code_error_bits.emplace(1, stream, mr);
     CUDF_CUDA_TRY(cudaMemsetAsync(code_error_bits->data(), 0, sizeof(unsigned int), stream.get()));
@@ -1138,7 +1339,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         bytes -= now;
       }
     };
-    pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
+    context_chunk_walk walk{c, req.column, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0; i < n_chunks; ++i) {
       auto staged     = walk.take(i);
@@ -1181,6 +1382,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         auto* const sq =
           sq_buf ? sq_buf->data() : static_cast<float*>(lists.row_sq_f32->data()) + first;
         if (encoding == list_encoding::float16) {
+          count_tiny_nonzero(x, rows * dim, tiny_components.data(), stream);
           half_rows_norms(x,
                           reinterpret_cast<std::uint16_t const*>(coded),
                           rows,
@@ -1199,16 +1401,23 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         }
       }
       if (encoding == list_encoding::int8) {
-        quantize_rows_int8(kept_rotated ? kept_rotated->data() + base * dim : rotated_rows(x, rows),
-                           rows,
-                           dim,
-                           static_cast<float const*>(lists.code_offset->data()),
-                           lists.code_scale,
-                           reinterpret_cast<std::int8_t*>(coded),
-                           nullptr,
-                           code_error_bits->data(),
-                           stream,
-                           rotation ? rotation_slack(dim) : 0.f);
+        float const* to_code = kept_rotated ? kept_rotated->data() + base * dim : nullptr;
+        if (to_code == nullptr) {
+          timed(t_rotate, [&] { to_code = rotated_rows(x, rows); });
+        }
+        count_tiny_nonzero(to_code, rows * dim, tiny_components.data(), stream);
+        timed(t_code, [&] {
+          quantize_rows_int8(to_code,
+                             rows,
+                             dim,
+                             static_cast<float const*>(lists.code_offset->data()),
+                             lists.code_scale,
+                             reinterpret_cast<std::int8_t*>(coded),
+                             nullptr,
+                             code_error_bits->data(),
+                             stream,
+                             code_rotation_slack(rotation_ref(), dim));
+        });
       }
       if (encoding == list_encoding::uint8) {
         if (check_in_pass_2) { count_non_uint8(x, rows * dim, non_uint8.data(), stream); }
@@ -1331,7 +1540,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     bool const grouped_copies = !on_device || lists.exact_vectors != nullptr;
     std::vector<std::int64_t> order, grouped_dest;
     std::vector<std::int64_t> count(grouped_copies ? static_cast<std::size_t>(n_clusters) : 0);
-    pinned_chunk_walk walk{*c.pin, req.column, *c.space, stream, telemetry_info};
+    context_chunk_walk walk{c, req.column, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0, turn = 0; i < n_chunks; ++i) {
       auto staged     = walk.take(i);
@@ -1434,6 +1643,7 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
         if (coded_f16) {
           // The FP16 search compares rounded rows, so it needs their norms and how far each is
           // from the row it stands for.
+          count_tiny_nonzero(in_rows, rows * dim, tiny_components.data(), stream);
           half_rows_norms(in_rows,
                           coded_f16->data(),
                           rows,
@@ -1456,16 +1666,21 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
       if (encoding == list_encoding::int8) {
         coded_i8.emplace(static_cast<std::size_t>(rows * dim), stream, mr);
         coded_sq.emplace(static_cast<std::size_t>(rows), stream, mr);
-        quantize_rows_int8(rotated_rows(in_rows, rows),
-                           rows,
-                           dim,
-                           static_cast<float const*>(lists.code_offset->data()),
-                           lists.code_scale,
-                           coded_i8->data(),
-                           nullptr,
-                           code_error_bits->data(),
-                           stream,
-                           rotation ? rotation_slack(dim) : 0.f);
+        float const* to_code = nullptr;
+        timed(t_rotate, [&] { to_code = rotated_rows(in_rows, rows); });
+        count_tiny_nonzero(to_code, rows * dim, tiny_components.data(), stream);
+        timed(t_code, [&] {
+          quantize_rows_int8(to_code,
+                             rows,
+                             dim,
+                             static_cast<float const*>(lists.code_offset->data()),
+                             lists.code_scale,
+                             coded_i8->data(),
+                             nullptr,
+                             code_error_bits->data(),
+                             stream,
+                             code_rotation_slack(rotation_ref(), dim));
+        });
         int8_row_sq_norms(coded_i8->data(), rows, dim, coded_sq->data(), stream);
         coded_bytes = reinterpret_cast<std::byte const*>(coded_i8->data());
         scatter(coded_sq->data(), sizeof(std::int32_t), lists.row_sq->data());
@@ -1539,6 +1754,25 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                           std::to_string(lists.max_row_norm) +
                                           " is outside float16's range; use storage => 'float32'");
     }
+    // Condition D4 of the exactness proof: the codes' error must be small against the rows'
+    // norms, which holds unless every row lies within sqrt(d) 2^-14 of the origin.
+    if ((encoding == list_encoding::float16 || encoding == list_encoding::int8) &&
+        !(lists.max_row_norm >= std::sqrt(static_cast<float>(dim)) * 0x1p-14f)) {
+      throw duckdb::InvalidInputException(
+        fn + ": every row norm is at most " + std::to_string(lists.max_row_norm) +
+        ", too close to the origin for the codes' error bound; use storage => 'float32'");
+    }
+  }
+  if (encoding == list_encoding::float16 || encoding == list_encoding::int8) {
+    unsigned long long tiny = 0;
+    CUDF_CUDA_TRY(cudaMemcpy(
+      &tiny, tiny_components.data(), sizeof(tiny), cudaMemcpyDeviceToHost));
+    if (tiny != 0) {
+      throw duckdb::InvalidInputException(
+        fn + ": " + std::to_string(tiny) +
+        " nonzero component(s) are below 2^-63 in magnitude, outside the codes' error bound; "
+        "use storage => 'float32'");
+    }
   }
 
   if (half_error_bits) {
@@ -1550,9 +1784,37 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     unsigned int bits = 0;
     CUDF_CUDA_TRY(cudaMemcpy(&bits, code_error_bits->data(), sizeof(bits), cudaMemcpyDeviceToHost));
     std::memcpy(&lists.code_error, &bits, sizeof(bits));
+    // A row whose squares leave FP32's range has a coding error nobody can bound, and the join's
+    // routing over its centroids is no better.
+    if (!std::isfinite(lists.code_error)) {
+      throw duckdb::InvalidInputException(
+        fn + ": storage => 'int8' needs rows whose squared norms fit FP32 (under about 1.8e19 a " +
+        "row); use 'float32'");
+    }
   }
 
   phase("pass 2 scatter");
+  if (auto const* gpu =
+        c.space->get_memory_resource_as<cucascade::memory::reservation_aware_resource_adaptor>();
+      dbg && gpu != nullptr) {
+    std::fprintf(stderr,
+                 "[vecjoin-lists] device bytes peak so far: %zu\n",
+                 gpu->get_peak_total_allocated_bytes());
+  }
+  if (dbg && want_int8) {
+    std::fprintf(
+      stderr,
+      "[vecjoin-lists] int8 pieces: rotation %.4f rotate %.4f range %.4f code %.4f chunks %zu "
+      "code_scale %.6g code_error %.6g slack %.6g\n",
+      t_rotation,
+      t_rotate,
+      t_range,
+      t_code,
+      n_chunks,
+      lists.code_scale,
+      lists.code_error,
+      code_rotation_slack(rotation_ref(), dim));
+  }
 
   cluster_lists_result result;
   result.n_rows     = n_rows;
@@ -1572,20 +1834,155 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
     if (size == 0) { ++result.empty_lists; }
   }
 
+  (void)index_cache;
+  return result;
+}
+
+}  // namespace
+
+cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
+                                            const kmeans_assign_request& req,
+                                            list_storage storage,
+                                            bool host_tier,
+                                            bool unit_rows)
+{
+  static const std::string fn = "sirius_kmeans_build_lists";
+  // Unit rows refused before the pin is looked for, the width once the clustering is known.
+  if (unit_rows && storage == list_storage::uint8) {
+    check_lists_storage(fn, req, storage, unit_rows);
+  }
+  auto const c = resolve_context(ctx, fn, req.catalog, req.schema, req.table, req.table_identity);
+  device_context_guard device_guard{c.target_gpu};
+  auto& index_cache = ctx.get_cuvs_index_cache();
+
+  const auto* entry     = find_clustering_entry(ctx, req.clustering);
+  const auto* centroids = find_clustering_centroids(ctx, req.clustering);
+  if (entry == nullptr || centroids == nullptr) {
+    throw duckdb::InvalidInputException(fn + ": no clustering named '" + req.clustering +
+                                        "'; run sirius_kmeans_fit first");
+  }
+  if (entry->meta.dim != req.dim) {
+    throw duckdb::InvalidInputException(fn + ": clustering '" + req.clustering +
+                                        "' is over FLOAT[" + std::to_string(entry->meta.dim) +
+                                        "] vectors but column '" + req.column + "' is FLOAT[" +
+                                        std::to_string(req.dim) + "]");
+  }
+  check_lists_storage(fn, req, storage, unit_rows);
+
+  // Built afresh every time, so the old copy is freed before the new one is allocated.
+  index_cache.erase(lists_key(req.clustering));
+
+  // 'auto' codes rows that are not bytes as FLOAT16 (build_lists). Where FLOAT16 lists would not
+  // pass the device admission check but INT8 lists, half their size, would, it codes them as INT8
+  // instead, which keeps them on the device: lists in host memory cross PCIe on every statement.
+  // The check is the one build_lists applies, made here because INT8 codes need their range taken
+  // in its first pass. Not for inner product, which searches FLOAT16 or FP32 lists only.
+  // SIRIUS_VSS_AUTO_INT8=0 keeps FLOAT16.
+  bool int8_if_float16 = false;
+  if (storage == list_storage::automatic && !host_tier &&
+      entry->meta.metric != cuvs::distance::DistanceType::InnerProduct &&
+      bound_filter_f16_supports(req.dim) &&
+      bound_filter_int8_supports(req.dim, /*rescored=*/true)) {
+    auto const* env = std::getenv("SIRIUS_VSS_AUTO_INT8");
+    if (env == nullptr || std::string_view{env} != "0") {
+      auto const values = static_cast<std::size_t>(c.n_rows()) * static_cast<std::size_t>(req.dim);
+      bool const f16_fits = reserve_device_lists(index_cache, c, values * 2, c.n_rows()) != nullptr;
+      int8_if_float16 =
+        !f16_fits && reserve_device_lists(index_cache, c, values, c.n_rows()) != nullptr;
+      if (std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
+        std::fprintf(stderr,
+                     "[vecjoin-lists] auto storage: float16 lists %s the device%s\n",
+                     f16_fits ? "fit" : "do not fit",
+                     f16_fits          ? ""
+                     : int8_if_float16 ? ", int8 lists do: int8 if not bytes"
+                                       : ", nor do int8 lists");
+      }
+    }
+  }
+
+  cluster_lists lists;
+  std::size_t reserved_bytes = 0;
+  auto const metric          = entry->meta.metric;
+  auto const n_clusters      = entry->meta.n_lists;
+  auto result                = build_lists(ctx,
+                                           fn,
+                                           req,
+                                           storage,
+                                           host_tier,
+                                           unit_rows,
+                                           c,
+                                           centroids,
+                                           n_clusters,
+                                           metric,
+                                           lists,
+                                           reserved_bytes,
+                                           int8_if_float16);
+
   index_metadata meta;
   meta.kind           = index_kind::cluster_lists;
   meta.table_name     = req.table;
   meta.column_name    = req.column;
-  meta.dim            = dim;
-  meta.num_rows       = n_rows;
+  meta.dim            = req.dim;
+  meta.num_rows       = result.n_rows;
   meta.n_lists        = n_clusters;
-  meta.metric         = entry->meta.metric;
+  meta.metric         = metric;
   meta.resident_bytes = reserved_bytes;
   index_cache.insert(lists_key(req.clustering),
                      std::move(meta),
                      make_cuvs_index(std::move(lists)),
                      rmm::cuda_stream{});
   return result;
+}
+
+statement_lists build_statement_lists(duckdb::SiriusContext& ctx,
+                                      op::vector_chunk_source& chunks,
+                                      std::int64_t dim,
+                                      const std::string& metric,
+                                      std::int64_t n_clusters)
+{
+  static const std::string fn = "vector join";
+  auto& memory_manager = ctx.get_memory_manager();
+  auto gpu_spaces      = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  auto host_spaces     = memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+  if (gpu_spaces.empty() || host_spaces.empty()) {
+    throw duckdb::InvalidInputException(fn + ": no GPU or HOST memory space available");
+  }
+  auto* space = const_cast<cucascade::memory::memory_space*>(gpu_spaces.front());
+  kmeans_context const c{space, host_spaces.front(), nullptr, space->get_device_id(), &chunks};
+  device_context_guard device_guard{c.target_gpu};
+
+  // What build_lists_in_query asks of a pinned column: the fit's defaults, and lists that answer
+  // exactly, FLOAT16 for the metrics that score from them.
+  bool const cosine = metric == "cosine";
+  auto const storage =
+    cosine || metric == "ip" ? list_storage::float16 : list_storage::exact;
+  kmeans_assign_request assign;
+  assign.column = "vector";
+  assign.dim    = dim;
+  check_lists_storage(fn, assign, storage, cosine);
+
+  kmeans_fit_request fit;
+  fit.column          = assign.column;
+  fit.dim             = dim;
+  fit.spec.n_clusters = std::clamp<std::int64_t>(n_clusters, 1, std::max<std::int64_t>(c.n_rows(), 1));
+  statement_lists out;
+  auto const fitted =
+    fit_centroids(ctx, fn, fit, c, /*erase_named=*/false, out.centroids);
+  out.lists                  = std::make_unique<cluster_lists>();
+  std::size_t reserved_bytes = 0;
+  out.result                 = build_lists(ctx,
+                           fn,
+                           assign,
+                           storage,
+                           /*host_tier=*/false,
+                           cosine,
+                           c,
+                           out.centroids.get(),
+                           fitted.n_clusters,
+                           ann_distance_type_from_metric(fit.metric),
+                           *out.lists,
+                           reserved_bytes);
+  return out;
 }
 
 cucascade::read_only_data_batch lock_host_list_chunk(const cluster_lists& lists,

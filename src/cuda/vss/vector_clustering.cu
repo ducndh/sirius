@@ -636,7 +636,8 @@ centroid_labeler::centroid_labeler(raft::device_resources const& res,
   auto const n      = s.n_centers;
   if (cosine) {
     s.unit_centers.emplace(static_cast<std::size_t>(n * dim), stream, mr);
-    normalize_rows(s.centers, n, dim, s.unit_centers->data(), stream);
+    // Labeling is not a cosine distance: a zero row keeps no direction and takes the first list.
+    normalize_rows(s.centers, n, dim, s.unit_centers->data(), stream, false);
     s.centers = s.unit_centers->data();
   }
   rmm::device_uvector<std::uint16_t> half(static_cast<std::size_t>(n * dim), stream, mr);
@@ -730,7 +731,7 @@ void centroid_labeler::label(cudf::column_view const& vectors, std::int32_t* lab
     auto const m  = std::min(batch, total - at);
     auto const* x = queries.data_handle() + at * dim;
     if (unit_rows) {
-      normalize_rows(x, m, dim, unit_rows->data(), stream);
+      normalize_rows(x, m, dim, unit_rows->data(), stream, false);
       x = unit_rows->data();
     }
     s.predict(x, m, s.seeds->data(), s.n_seeds, seed.data());

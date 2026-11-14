@@ -196,22 +196,25 @@ namespace detail {
 
 /// More clusters cost the build once (the fit and the assignment grow with the count) and save
 /// every probe row search time (it scans probes x rows-per-cluster rows, which at held recall
-/// falls with the square root of the count). Picks the count, among the reference and its
-/// doublings up to 16 times it with at least 256 rows a cluster, with the least estimated build
-/// plus search for @p shape's probe rows, each count N searched through scaled_probes(@p c, N).
+/// falls with the square root of the count). Picks the count, among a quarter of the reference
+/// and its doublings up to 16 times the reference with at least 256 rows a cluster, with the least
+/// estimated build plus search for @p shape's probe rows, each count N searched through
+/// scaled_probes(@p c, N). The candidates start below the reference because a statement pays for
+/// its own build: on MS MARCO's 1M, 3M and 10M rows, a quarter of it was fastest in four of five cells.
 [[nodiscard]] inline cluster_count_choice choose_cluster_count(access_path_cost const& cost,
                                                                access_path_shape shape,
                                                                double c)
 {
   auto const reference = reference_cluster_count(shape.corpus_rows);
-  cluster_count_choice best{reference, scaled_probes(c, reference)};
+  auto const lowest    = std::max<std::int64_t>(1, reference / 4);
+  cluster_count_choice best{lowest, scaled_probes(c, lowest)};
   double best_cost = 0;
-  for (auto n = reference; n <= 16 * reference; n *= 2) {
-    if (n > reference && shape.corpus_rows / static_cast<double>(n) < 256.0) { break; }
+  for (auto n = lowest; n <= 16 * reference; n *= 2) {
+    if (n > lowest && shape.corpus_rows / static_cast<double>(n) < 256.0) { break; }
     shape.n_clusters    = static_cast<double>(n);
     auto const p        = scaled_probes(c, n);
     double const cost_n = cost.build(shape) + cost.probed(shape, static_cast<double>(p));
-    if (n == reference || cost_n < best_cost) {
+    if (n == lowest || cost_n < best_cost) {
       best      = cluster_count_choice{n, p};
       best_cost = cost_n;
     }

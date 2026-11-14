@@ -96,6 +96,7 @@ target_sources(
           sirius_physical_vector_join_reduce_local.cpp
           sirius_physical_vector_join_select.cpp
           sirius_physical_vector_join_stream.cpp
+          sirius_physical_vector_join_index.cpp
           sirius_physical_ungrouped_aggregate.cpp
           sirius_physical_union.cpp
           sirius_physical_vector_threshold_join.cpp

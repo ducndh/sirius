@@ -23,6 +23,7 @@ target_sources(
           scan/strings/dictionary.cu
           scan/strings/fsst.cu
           scan/strings/uncompressed.cu
+          vss/cagra_index.cu
           vss/cudf_raft_interop.cu
           vss/brute_force_search.cu
           vss/brute_force_threshold.cu

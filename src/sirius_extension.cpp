@@ -111,6 +111,9 @@ extern "C" int cudaProfilerStop();
 #include "sirius_sql_rewrite.hpp"
 #include "util/segfault_backtrace.hpp"
 #include "vss/cluster_lists.hpp"
+#include "telemetry/data_batch_probe.hpp"
+#include "vss/cagra_join_index.hpp"
+#include "vss/cagra_partitions.hpp"
 #include "vss/cuvs_index_cache.hpp"
 #include "vss/distance_metric.hpp"
 #include "vss/kmeans_functions.hpp"
@@ -1651,6 +1654,174 @@ static void SiriusSetQueryLabelFunction(ClientContext& context,
   data.finished = true;
 }
 
+//! sirius_vector_join_index_stats(): one row on the last index join: whether its index was built
+//! in the statement or reused, and where its time went. No rows before any index join.
+struct VectorJoinIndexStatsState : public GlobalTableFunctionState {
+  bool finished = false;
+};
+
+static unique_ptr<FunctionData> VectorJoinIndexStatsBind(ClientContext&,
+                                                         TableFunctionBindInput&,
+                                                         vector<LogicalType>& return_types,
+                                                         vector<Identifier>& names)
+{
+  auto const column = [&](char const* name, LogicalType type) {
+    names.emplace_back(name);
+    return_types.push_back(std::move(type));
+  };
+  column("index_event", LogicalType::VARCHAR);
+  for (auto const* name :
+       {"build_convert_s", "build_s", "probe_convert_s", "search_s", "rescore_s", "route_s", "move_s"}) {
+    column(name, LogicalType::DOUBLE);
+  }
+  for (auto const* name :
+       {"build_peak_bytes", "index_bytes", "batches", "probe_rows", "misses"}) {
+    column(name, LogicalType::BIGINT);
+  }
+  return make_uniq<TableFunctionData>();
+}
+
+static unique_ptr<GlobalTableFunctionState> VectorJoinIndexStatsInit(ClientContext&,
+                                                                     TableFunctionInitInput&)
+{
+  return make_uniq<VectorJoinIndexStatsState>();
+}
+
+static void VectorJoinIndexStatsFunction(ClientContext& context,
+                                         TableFunctionInput& data_p,
+                                         DataChunk& output)
+{
+  auto& gstate = data_p.global_state->Cast<VectorJoinIndexStatsState>();
+  if (gstate.finished) { return; }
+  gstate.finished = true;
+  auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+  if (!sirius_ctx) { return; }
+  auto const s = sirius_ctx->get_vector_join_index_stats();
+  if (s.index_event.empty()) { return; }
+  idx_t col = 0;
+  output.data[col++].Append(Value(s.index_event));
+  for (double const v : {s.build_convert_seconds,
+                         s.build_seconds,
+                         s.probe_convert_seconds,
+                         s.search_seconds,
+                         s.rescore_seconds,
+                         s.route_seconds,
+                         s.move_seconds}) {
+    output.data[col++].Append(Value::DOUBLE(v));
+  }
+  for (uint64_t const v : {s.build_peak_bytes, s.index_bytes, s.batches, s.probe_rows, s.misses}) {
+    output.data[col++].Append(Value::BIGINT(static_cast<int64_t>(v)));
+  }
+  output.CheckCardinality(1);
+}
+
+//! The CAGRA options, on sirius_knn_join and sirius_create_ann_index.
+static void add_cagra_options(TypedKwargs& options)
+{
+  options.Add("graph_degree", LogicalType::BIGINT);
+  options.Add("intermediate_graph_degree", LogicalType::BIGINT);
+  options.Add("build_algo", LogicalType::VARCHAR);
+  options.Add("nn_descent_niter", LogicalType::BIGINT);
+  options.Add("ivf_pq_n_lists", LogicalType::BIGINT);
+  options.Add("ivf_pq_n_probes", LogicalType::BIGINT);
+  options.Add("row_type", LogicalType::VARCHAR);
+  options.Add("itopk", LogicalType::BIGINT);
+  options.Add("search_width", LogicalType::BIGINT);
+  options.Add("partitions", LogicalType::BIGINT);
+  options.Add("partition_probes", LogicalType::BIGINT);
+}
+
+//! Takes one CAGRA option into @p settings, noting its name in @p given. False if @p key is not one.
+static bool parse_cagra_option(std::string const& fn,
+                               std::string const& key,
+                               Value const& value,
+                               sirius::vss::cagra_join_settings& settings,
+                               std::vector<std::string>& given)
+{
+  bool build_setting = true;
+  if (key == "graph_degree") {
+    settings.build.graph_degree = value.GetValue<int64_t>();
+  } else if (key == "intermediate_graph_degree") {
+    settings.build.intermediate_graph_degree = value.GetValue<int64_t>();
+  } else if (key == "nn_descent_niter") {
+    settings.build.nn_descent_niter = value.GetValue<int64_t>();
+  } else if (key == "ivf_pq_n_lists") {
+    settings.build.ivf_pq_n_lists = value.GetValue<int64_t>();
+  } else if (key == "ivf_pq_n_probes") {
+    settings.build.ivf_pq_n_probes = value.GetValue<int64_t>();
+  } else if (key == "partitions") {
+    settings.build.partitions = value.GetValue<int64_t>();
+  } else if (key == "build_algo") {
+    auto const algo = StringUtil::Lower(value.ToString());
+    if (algo == "nn_descent") {
+      settings.build.builder = sirius::vss::cagra_graph_builder::nn_descent;
+    } else if (algo == "ivf_pq") {
+      settings.build.builder = sirius::vss::cagra_graph_builder::ivf_pq;
+    } else if (algo == "iterative_search") {
+      settings.build.builder = sirius::vss::cagra_graph_builder::iterative_search;
+    } else {
+      throw BinderException(fn +
+                            ": build_algo must be 'nn_descent', 'ivf_pq' or 'iterative_search'");
+    }
+  } else if (key == "row_type") {
+    auto const type = StringUtil::Lower(value.ToString());
+    if (type == "float16") {
+      settings.build.row_type = sirius::vss::cagra_row_type::float16;
+    } else if (type == "float32") {
+      settings.build.row_type = sirius::vss::cagra_row_type::float32;
+    } else {
+      throw BinderException(fn + ": row_type must be 'float16' or 'float32'");
+    }
+  } else {
+    build_setting = false;
+    if (key == "itopk") {
+      settings.search.itopk = value.GetValue<int64_t>();
+    } else if (key == "search_width") {
+      settings.search.search_width = value.GetValue<int64_t>();
+    } else if (key == "partition_probes") {
+      settings.search.partition_probes = value.GetValue<int64_t>();
+    } else if (key == "index_type") {
+      auto const type = StringUtil::Lower(value.ToString());
+      if (type != "cagra") {
+        throw BinderException(fn + ": index_type must be 'cagra', got '" + type + "'");
+      }
+    } else {
+      return false;
+    }
+  }
+  settings.build_settings_given = settings.build_settings_given || build_setting;
+  given.push_back(key);
+  return true;
+}
+
+static void check_cagra_settings(std::string const& fn,
+                                 sirius::vss::cagra_join_settings const& s)
+{
+  auto const positive = [&](char const* name, int64_t v) {
+    if (v < 1) { throw BinderException(fn + ": " + name + " must be >= 1"); }
+  };
+  positive("graph_degree", s.build.graph_degree);
+  positive("intermediate_graph_degree", s.build.intermediate_graph_degree);
+  positive("nn_descent_niter", s.build.nn_descent_niter);
+  positive("itopk", s.search.itopk);
+  positive("search_width", s.search.search_width);
+  if (s.build.ivf_pq_n_lists < 0 || s.build.ivf_pq_n_probes < 0) {
+    throw BinderException(fn + ": ivf_pq_n_lists and ivf_pq_n_probes must be >= 0");
+  }
+  if (s.build.intermediate_graph_degree < s.build.graph_degree) {
+    throw BinderException(fn + ": intermediate_graph_degree must be >= graph_degree");
+  }
+  auto const p = s.build.partitions;
+  if (p != 1 && p != 2 && p != 4 && p != 8) {
+    throw BinderException(fn + ": partitions must be 1, 2, 4 or 8");
+  }
+  // Without partitions in the statement, the index the column has decides how many there are.
+  if (s.search.partition_probes < 0 || s.search.partition_probes > 8 ||
+      (p > 1 && s.search.partition_probes > p)) {
+    throw BinderException(fn + ": partition_probes must be at most partitions");
+  }
+}
+
 struct CreateAnnIndexData : public TableFunctionData {
   std::string table_name;
   std::string column_name;
@@ -1658,6 +1829,7 @@ struct CreateAnnIndexData : public TableFunctionData {
   std::string metric      = "l2";        ///< lowercased; one of l2 / cosine
   std::string schema_name = "main";
   int64_t n_lists         = 0;  ///< IVF-Flat list count; 0 = choose a default at build time
+  sirius::vss::cagra_join_settings cagra;  ///< index_type => 'cagra'
 };
 
 // Per-execution state
@@ -1685,6 +1857,7 @@ static unique_ptr<FunctionData> SiriusCreateAnnIndexBind(ClientContext& context,
   result->table_name  = input.inputs[0].ToString();
   result->column_name = input.inputs[1].ToString();
 
+  std::vector<std::string> cagra_options;
   for (auto& kv : input.named_parameters) {
     auto const key = StringUtil::Lower(kv.first.GetIdentifierName());
     if (kv.second.IsNull()) {
@@ -1699,12 +1872,20 @@ static unique_ptr<FunctionData> SiriusCreateAnnIndexBind(ClientContext& context,
       result->n_lists = kv.second.GetValue<int64_t>();
     } else if (key == "schema_name") {
       result->schema_name = kv.second.ToString();
+    } else if (key != "index_type") {
+      parse_cagra_option("sirius_create_ann_index", key, kv.second, result->cagra, cagra_options);
     }
   }
 
-  if (result->index_type != "ivf_flat") {
+  if (result->index_type != "ivf_flat" && result->index_type != "cagra") {
     throw BinderException("sirius_create_ann_index: unsupported index_type '" + result->index_type +
-                          "'; only 'ivf_flat' is supported");
+                          "'; only 'ivf_flat' and 'cagra' are supported");
+  }
+  if (result->index_type == "cagra") {
+    check_cagra_settings("sirius_create_ann_index", result->cagra);
+  } else if (!cagra_options.empty()) {
+    throw BinderException("sirius_create_ann_index: " + cagra_options.front() +
+                          " only applies under index_type => 'cagra'");
   }
   if (result->metric != "l2" && result->metric != "cosine") {
     throw BinderException("sirius_create_ann_index: metric must be one of 'l2', 'cosine', got '" +
@@ -1812,6 +1993,52 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
       table_name,
       {entry.oid, entry.GetStorage().GetRowGroupCollection()});
   sirius::scan_manager::pinned_entry const* pin = pin_owner.get();
+  if (data.index_type == "cagra") {
+    if (pin == nullptr) {
+      throw InvalidInputException("sirius_create_ann_index: table '" + data.table_name +
+                                  "' must be pinned before building an index");
+    }
+    sirius::telemetry::batch_telemetry_info const telemetry_info{};
+    sirius::vss::cagra_build_report report;
+    sirius::vss::cagra_index_target const target{
+      entry_catalog,
+      entry_schema,
+      table_name,
+      data.column_name,
+      {entry.oid, entry.GetStorage().GetRowGroupCollection()},
+      dim};
+    if (data.cagra.build.partitions > 1) {
+      auto const host_spaces =
+        memory_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
+      static_cast<void>(sirius::vss::build_partitioned_cagra_index_for_pin(
+        "sirius_create_ann_index",
+        sirius_ctx->get_cuvs_index_cache(),
+        target,
+        pin_owner,
+        data.cagra.build,
+        *target_space,
+        *host_spaces.front(),
+        telemetry_info,
+        report));
+    } else {
+      static_cast<void>(sirius::vss::build_cagra_index_for_pin("sirius_create_ann_index",
+                                                               sirius_ctx->get_cuvs_index_cache(),
+                                                               target,
+                                                               pin_owner,
+                                                               data.cagra.build,
+                                                               *target_space,
+                                                               telemetry_info,
+                                                               report));
+    }
+    sirius_ctx->begin_vector_join_index_stats("built");
+    sirius_ctx->record_vector_join_index_build(
+      report.convert_seconds, report.build_seconds, report.peak_bytes, report.resident_bytes);
+    sirius_ctx->record_vector_join_index_moves(0, report.move_seconds);
+    output.data[0].Append(Value::BOOLEAN(true));
+    output.CheckCardinality(1);
+    gstate.finished = true;
+    return;
+  }
   if (pin == nullptr || pin->tier != cucascade::memory::Tier::GPU) {
     throw InvalidInputException("sirius_create_ann_index: table '" + data.table_name +
                                 "' must be pinned on the GPU tier before building an index");
@@ -1883,8 +2110,12 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
   bool removed_existing = false;
   // Destructive path: not enough memory to hold all indexes so release the current one first
   if (!reservation) {
-    removed_existing = index_cache.erase_by_column(
-                         entry_catalog, entry_schema, table_name, data.column_name, metric) > 0;
+    removed_existing = index_cache.erase_by_column(entry_catalog,
+                                                   entry_schema,
+                                                   table_name,
+                                                   data.column_name,
+                                                   metric,
+                                                   sirius::vss::index_kind::ivf_flat) > 0;
     released_first = true;
     reservation    = index_cache.reserve_index_memory(footprint, target_gpu);
     if (!reservation) {
@@ -1982,7 +2213,12 @@ static void SiriusCreateAnnIndexFunction(ClientContext& context,
 
   // Non-destructive path: remove the old one now that the new one is built
   if (!released_first) {
-    index_cache.erase_by_column(entry_catalog, entry_schema, table_name, data.column_name, metric);
+    index_cache.erase_by_column(entry_catalog,
+                                entry_schema,
+                                table_name,
+                                data.column_name,
+                                metric,
+                                sirius::vss::index_kind::ivf_flat);
   }
   index_cache.insert(
     std::move(index_name), std::move(meta), std::move(handle), std::move(build_stream));
@@ -2806,6 +3042,41 @@ using sirius::vss::SiriusVectorJoinBindData;
 using sirius::vss::vector_join_mode;
 using sirius::vss::vector_join_output_type;
 using sirius::vss::vector_join_search_mode;
+//! What an index join does not answer. Each is refused, none falls back to another search.
+static void refuse_for_index_join(sirius::vss::vector_join_request const& req,
+                                  bool join_mode_is_set,
+                                  bool eps_is_set)
+{
+  auto const refuse = [](std::string const& what) {
+    throw BinderException("sirius_knn_join: search_mode => 'index' " + what);
+  };
+  if (eps_is_set || (join_mode_is_set && req.mode == vector_join_mode::threshold)) {
+    refuse("answers top-k per row, and a graph walk cannot prove a threshold join's pairs "
+           "complete; use search_mode => 'exact' or 'approx' with eps");
+  }
+  if (join_mode_is_set && req.mode != vector_join_mode::per_row_top_k) {
+    refuse("answers top-k per row, not join_mode => 'global'");
+  }
+  if (req.metric != "l2" && req.metric != "cosine") {
+    refuse("answers metric => 'l2' and, over unit rows, 'cosine', not '" + req.metric + "'");
+  }
+  if (req.k < 1) { refuse("needs k >= 1"); }
+  if (req.best_only || !req.earlier_by.empty()) {
+    refuse("does not take keep, earlier_by or other_by");
+  }
+  if (!req.clustering.empty() || !req.build_cluster_column.empty() || req.n_probes > 1) {
+    refuse("does not take clustering, cluster_column or n_probes, which belong to 'approx'");
+  }
+  if (req.build_from_scan) {
+    refuse("keeps one index per table and column, so it needs the corpus pinned, not "
+           "build_source => 'scan'");
+  }
+  if (const char* env = std::getenv("SIRIUS_VECTOR_JOIN_STREAMING");
+      env != nullptr && std::string_view{env} == "0") {
+    refuse("runs on the streaming operator, which SIRIUS_VECTOR_JOIN_STREAMING=0 turns off");
+  }
+}
+
 //! Shared bind for both surfaces. `relational` selects the one whose probe side is a bound
 //! subquery rather than a table name: its vector column and output columns are resolved against
 //! the input relation's schema, and it needs no pin on that side at all.
@@ -2835,6 +3106,7 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   auto const right_table  = input.inputs[2].ToString();
   auto const right_column = input.inputs[3].ToString();
 
+  std::vector<std::string> cagra_options;
   // Optional params' default values
   req.metric               = "l2";
   req.k                    = 10;
@@ -2845,6 +3117,7 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   bool join_mode_is_set    = false;
   bool output_type_is_set  = false;
   bool eps_is_set          = false;
+  bool search_mode_is_set  = false;
   std::string left_schema  = "main";
   std::string right_schema = "main";
   std::vector<std::string> left_out_cols;
@@ -2870,7 +3143,8 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
     } else if (key == "metric") {
       req.metric = StringUtil::Lower(kv.second.ToString());
     } else if (key == "search_mode") {
-      auto const mode = StringUtil::Lower(kv.second.ToString());
+      search_mode_is_set = true;
+      auto const mode    = StringUtil::Lower(kv.second.ToString());
       // 'exact' is the exact join the SQL rewrite runs; 'exact-gemm' and 'exact-direct' are kept
       // for the harnesses that name them, and run the same search.
       if (mode == "exact" || mode == "exact-gemm") {
@@ -2879,10 +3153,12 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
         req.search_mode = vector_join_search_mode::exact_direct;
       } else if (mode == "approx") {
         req.search_mode = vector_join_search_mode::approx;
+      } else if (mode == "index") {
+        req.search_mode = vector_join_search_mode::index;
       } else {
         throw BinderException(
-          "sirius_knn_join: search_mode must be 'exact' or 'approx' (also accepted: "
-          "'exact-gemm' and 'exact-direct', both the same as 'exact')");
+          "sirius_knn_join: search_mode must be 'exact' or 'approx', or 'index' for a join through "
+          "a CAGRA index (also accepted: 'exact-gemm' and 'exact-direct', both the same as 'exact')");
       }
     } else if (key == "join_mode") {
       auto const jm = StringUtil::Lower(kv.second.ToString());
@@ -2939,6 +3215,8 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
       }
       req.earlier_by  = kv.second.ToString();
       req.key_differs = key == "other_by";
+    } else if (parse_cagra_option("sirius_knn_join", key, kv.second, req.cagra, cagra_options)) {
+      // Taken; whether it applies is checked with the rest of the request below.
     } else if (key == "left_schema_name") {
       left_schema = kv.second.ToString();
     } else if (key == "right_schema_name") {
@@ -2950,6 +3228,13 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
     }
   }
   if (req.k < 0) { throw BinderException("sirius_knn_join: k must be >= 0"); }
+  if (req.search_mode == vector_join_search_mode::index) {
+    refuse_for_index_join(req, join_mode_is_set, eps_is_set);
+    check_cagra_settings("sirius_knn_join", req.cagra);
+  } else if (!cagra_options.empty()) {
+    throw BinderException("sirius_knn_join: " + cagra_options.front() +
+                          " only applies under search_mode => 'index'");
+  }
   if (req.n_clusters < 0) { throw BinderException("sirius_knn_join: n_clusters must be >= 0"); }
   if (req.n_probes < 1) { throw BinderException("sirius_knn_join: n_probes must be >= 1"); }
   // Approximate search is unimplemented: nothing downstream reads search_mode beyond the
@@ -3096,6 +3381,39 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   }
   req.dim = left_dim;
 
+  if (req.search_mode == vector_join_search_mode::index) {
+    // A plain error here; the plan generator's would turn into a CPU fallback.
+    if (req.right.is_view || req.right.from_relation) {
+      throw BinderException(
+        "sirius_knn_join: search_mode => 'index' keeps one index per table and column, so the "
+        "corpus must be a pinned base table");
+    }
+    auto const pin = sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
+      req.right.catalog, req.right.schema, req.right.table, req.right.table_identity);
+    if (pin == nullptr) {
+      throw BinderException("sirius_knn_join: search_mode => 'index' needs the corpus '" +
+                            req.right.table + "' pinned");
+    }
+    sirius::vss::cagra_index_target const target{req.right.catalog,
+                                                 req.right.schema,
+                                                 req.right.table,
+                                                 req.right.column,
+                                                 req.right.table_identity,
+                                                 req.dim};
+    auto const wanted =
+      req.cagra.build_settings_given ? std::optional{req.cagra.build} : std::nullopt;
+    if (sirius::vss::find_usable_cagra_index(
+          sirius_ctx->get_cuvs_index_cache(), target, *pin, wanted) == nullptr) {
+      auto const gpu_spaces =
+        sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+      if (gpu_spaces.empty()) {
+        throw BinderException("sirius_knn_join: no GPU memory space available");
+      }
+      sirius::vss::check_cagra_build_fits(
+        "sirius_knn_join", target, *pin, req.cagra.build, *gpu_spaces.front());
+    }
+  }
+
   // Lists remember the pin they were built from; after the corpus is pinned again they answer in
   // a row space that is gone. The join would find out only while the scheduler asks it for work,
   // where nothing turns the error into a query error, so it is checked here.
@@ -3188,6 +3506,28 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
         req.right.table + "' is pinned in " + std::to_string(right_chunks) +
         " chunks. Unset the variable to use the streaming operator.");
     }
+  }
+
+  // The exact join over the corpus's codes, as the plain-SQL rewrite runs the same join: built
+  // now and kept beside a pinned corpus, or by the join over a corpus it scans. With no
+  // search_mode, the session's vector_join_probes makes it approximate as it does plain SQL.
+  if (req.clustering.empty() && req.build_cluster_column.empty() &&
+      req.search_mode == vector_join_search_mode::exact_gemm) {
+    duckdb::TableCatalogEntry* pinned_corpus = nullptr;
+    if (!req.build_from_scan) {
+      pinned_corpus = &Catalog::GetEntry(context,
+                                         CatalogType::TABLE_ENTRY,
+                                         QualifiedName(Identifier(req.right.catalog),
+                                                       Identifier(req.right.schema),
+                                                       Identifier(req.right.table)))
+                         .Cast<duckdb::TableCatalogEntry>();
+    }
+    std::ignore = sirius::vss::choose_corpus_lists(context,
+                                                   req,
+                                                   pinned_corpus,
+                                                   result->right_rows,
+                                                   static_cast<double>(result->left_rows),
+                                                   /*approximate=*/!search_mode_is_set);
   }
 
   return_types.push_back(LogicalType::FLOAT);
@@ -3545,6 +3885,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
                                  SiriusCreateAnnIndexBind,
                                  SiriusCreateAnnIndexInit);
   create_ann_index.GetSignature().WithTypedKwargs("options", [](TypedKwargs& options) {
+    add_cagra_options(options);
     options.Add("metric", LogicalType::VARCHAR);
     options.Add("index_type", LogicalType::VARCHAR);
     options.Add("n_lists", LogicalType::BIGINT);
@@ -3644,6 +3985,14 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
   CreateTableFunctionInfo kmeans_centroids_info(kmeans_centroids);
   catalog.CreateTableFunction(transaction, kmeans_centroids_info);
 
+  TableFunction vector_join_index_stats("sirius_vector_join_index_stats",
+                                        {},
+                                        VectorJoinIndexStatsFunction,
+                                        VectorJoinIndexStatsBind,
+                                        VectorJoinIndexStatsInit);
+  CreateTableFunctionInfo vector_join_index_stats_info(vector_join_index_stats);
+  catalog.CreateTableFunction(transaction, vector_join_index_stats_info);
+
   // sirius_knn_join(left_table, left_column, right_table, right_column, k =>, metric =>,
   //   search_mode =>, join_mode =>, n_clusters =>, n_probes =>, eps =>, output_type =>,
   //   left_schema_name =>, right_schema_name =>,
@@ -3673,6 +4022,7 @@ void SiriusRegistration::RegisterGPUFunctions(DatabaseInstance& instance)
     options.Add("keep", LogicalType::VARCHAR);
     options.Add("earlier_by", LogicalType::VARCHAR);
     options.Add("other_by", LogicalType::VARCHAR);
+    add_cagra_options(options);
   };
   vector_join.GetSignature().WithTypedKwargs("options", vector_join_options);
   vector_join.cardinality                              = SiriusVectorJoinCardinality;
@@ -4336,6 +4686,14 @@ void SiriusRegistration::InitialGPUConfigs(DBConfig& config,
                     "clusters, at most 1024, up to 16 times that)",
                     LogicalType::BIGINT,
                     Value::BIGINT(0));
+  add_sirius_option(config,
+                    option_visibility::user,
+                    "vector_join_index",
+                    "'cagra' runs a top-k vector join over a pinned corpus through one global "
+                    "CAGRA index, built in the statement or reused (empty: lists or brute force)",
+                    LogicalType::VARCHAR,
+                    Value(""));
+
   add_sirius_option(config,
                     option_visibility::user,
                     "vector_join_clustering",

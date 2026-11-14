@@ -449,6 +449,24 @@ class SiriusContext : public ClientContextState {
     uint64_t chunks_available = 0;
   };
 
+  /// What the last index join did, for sirius_vector_join_index_stats(): whether its index was built
+  /// in the statement or reused shows in no result set, and neither do the times of its phases.
+  struct vector_join_index_stats {
+    std::string index_event;  ///< "built" or "reused"; empty before any index join
+    double build_convert_seconds = 0;
+    double build_seconds         = 0;
+    double probe_convert_seconds = 0;
+    double search_seconds        = 0;
+    double rescore_seconds       = 0;
+    double route_seconds         = 0;
+    double move_seconds          = 0;
+    uint64_t build_peak_bytes    = 0;
+    uint64_t index_bytes         = 0;
+    uint64_t batches             = 0;
+    uint64_t probe_rows          = 0;
+    uint64_t misses              = 0;
+  };
+
   /// What the vector join did with probe blocks' FP32 rows in the host pool, over the session. The
   /// rows' tier and lifetime do not show in a result set, so these are what a test can assert on.
   struct vector_join_host_rows_stats {
@@ -899,6 +917,24 @@ class SiriusContext : public ClientContextState {
                                 uint64_t chunks_staged,
                                 uint64_t chunks_available) noexcept;
 
+  /// \brief Start the record of an index join, whose index was @p index_event.
+  void begin_vector_join_index_stats(std::string index_event);
+  /// \brief The index this join built.
+  void record_vector_join_index_build(double convert_seconds,
+                                      double build_seconds,
+                                      uint64_t peak_bytes,
+                                      uint64_t resident_bytes);
+  /// \brief A partitioned index join's routing of its probe rows and its moves across the link.
+  void record_vector_join_index_moves(double route_seconds, double move_seconds);
+  /// \brief One task of the index join.
+  void record_vector_join_index_task(double convert_seconds,
+                                     double search_seconds,
+                                     double rescore_seconds,
+                                     int64_t batches,
+                                     int64_t probe_rows,
+                                     int64_t misses);
+  [[nodiscard]] vector_join_index_stats get_vector_join_index_stats() const;
+
   /// \brief Snapshot what the vector join has done with probe rows in the host pool this session.
   [[nodiscard]] vector_join_host_rows_stats get_vector_join_host_rows_stats() const noexcept;
 
@@ -1063,6 +1099,8 @@ class SiriusContext : public ClientContextState {
   std::atomic<uint64_t> transparent_fallback_count_{0};
   std::atomic<uint64_t> transparent_execution_count_{0};
   std::atomic<uint64_t> transparent_runtime_fallback_count_{0};
+  mutable std::mutex vector_join_index_stats_mutex_;
+  vector_join_index_stats vector_join_index_stats_;
   std::atomic<uint64_t> vector_join_pairs_scored_{0};
   std::atomic<uint64_t> vector_join_pairs_exhaustive_{0};
   std::atomic<uint64_t> vector_join_chunks_staged_{0};

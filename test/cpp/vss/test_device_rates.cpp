@@ -121,12 +121,12 @@ TEST_CASE("lists a statement builds for itself get more clusters for a larger pr
   s.list_bytes_per_value = 1;
   s.lists_on_device      = true;
 
-  // A few thousand probe rows cannot repay a larger build: sqrt(rows) clusters, at most 1,024.
-  // c = 0.5 visits ceil(0.5 * sqrt(1024)) = 16 of them.
+  // A few thousand probe rows cannot repay a larger build: the fewest candidates, a quarter of
+  // sqrt(rows) capped at 1,024. c = 0.5 visits ceil(0.5 * sqrt(256)) = 8 of them.
   s.probe_rows     = 1e4;
   auto const small = choose_cluster_count(cost, s, 0.5);
-  CHECK(small.n_clusters == 1024);
-  CHECK(small.probes == 16);
+  CHECK(small.n_clusters == 256);
+  CHECK(small.probes == 8);
 
   // A self-join can, and its probes follow the square root of the count.
   s.probe_rows    = 1e8;
@@ -144,10 +144,10 @@ TEST_CASE("lists a statement builds for itself get more clusters for a larger pr
   }
 
   // A c that visits every cluster of every count asks for the exact answer, which more clusters
-  // only delay.
+  // only delay: the fewest candidates.
   s.probe_rows = 1e8;
-  CHECK(choose_cluster_count(cost, s, 1e6).n_clusters == 1024);
-  CHECK(choose_cluster_count(cost, s, std::numeric_limits<double>::infinity()).n_clusters == 1024);
+  CHECK(choose_cluster_count(cost, s, 1e6).n_clusters == 256);
+  CHECK(choose_cluster_count(cost, s, std::numeric_limits<double>::infinity()).n_clusters == 256);
 
   // No count leaves a cluster fewer than 256 rows.
   s.corpus_rows = 1e5;

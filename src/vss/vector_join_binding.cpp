@@ -526,6 +526,20 @@ void serialize_vector_join_bind_data(duckdb::Serializer& serializer,
   serializer.WriteProperty(142, "probe_is_relation", data.probe_is_relation);
   serializer.WriteProperty(143, "key_differs", req.key_differs);
   serializer.WriteProperty(144, "key_is_rowid", req.key_is_rowid);
+  serializer.WriteProperty(145, "statement_clusters", req.statement_clusters);
+  serializer.WriteProperty(146, "cagra_graph_degree", req.cagra.build.graph_degree);
+  serializer.WriteProperty(
+    147, "cagra_intermediate_graph_degree", req.cagra.build.intermediate_graph_degree);
+  serializer.WriteProperty(148, "cagra_builder", static_cast<std::uint8_t>(req.cagra.build.builder));
+  serializer.WriteProperty(149, "cagra_nn_descent_niter", req.cagra.build.nn_descent_niter);
+  serializer.WriteProperty(150, "cagra_ivf_pq_n_lists", req.cagra.build.ivf_pq_n_lists);
+  serializer.WriteProperty(151, "cagra_ivf_pq_n_probes", req.cagra.build.ivf_pq_n_probes);
+  serializer.WriteProperty(152, "cagra_row_type", static_cast<std::uint8_t>(req.cagra.build.row_type));
+  serializer.WriteProperty(153, "cagra_itopk", req.cagra.search.itopk);
+  serializer.WriteProperty(154, "cagra_search_width", req.cagra.search.search_width);
+  serializer.WriteProperty(155, "cagra_build_settings_given", req.cagra.build_settings_given);
+  serializer.WriteProperty(156, "cagra_partitions", req.cagra.build.partitions);
+  serializer.WriteProperty(157, "cagra_partition_probes", req.cagra.search.partition_probes);
 }
 
 duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
@@ -569,6 +583,27 @@ duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
   result->probe_is_relation = deserializer.ReadProperty<bool>(142, "probe_is_relation");
   req.key_differs           = deserializer.ReadProperty<bool>(143, "key_differs");
   req.key_is_rowid          = deserializer.ReadProperty<bool>(144, "key_is_rowid");
+  req.statement_clusters    = deserializer.ReadProperty<std::int64_t>(145, "statement_clusters");
+  req.cagra.build.graph_degree = deserializer.ReadProperty<std::int64_t>(146, "cagra_graph_degree");
+  req.cagra.build.intermediate_graph_degree =
+    deserializer.ReadProperty<std::int64_t>(147, "cagra_intermediate_graph_degree");
+  req.cagra.build.builder =
+    static_cast<cagra_graph_builder>(deserializer.ReadProperty<std::uint8_t>(148, "cagra_builder"));
+  req.cagra.build.nn_descent_niter =
+    deserializer.ReadProperty<std::int64_t>(149, "cagra_nn_descent_niter");
+  req.cagra.build.ivf_pq_n_lists =
+    deserializer.ReadProperty<std::int64_t>(150, "cagra_ivf_pq_n_lists");
+  req.cagra.build.ivf_pq_n_probes =
+    deserializer.ReadProperty<std::int64_t>(151, "cagra_ivf_pq_n_probes");
+  req.cagra.build.row_type =
+    static_cast<cagra_row_type>(deserializer.ReadProperty<std::uint8_t>(152, "cagra_row_type"));
+  req.cagra.search.itopk        = deserializer.ReadProperty<std::int64_t>(153, "cagra_itopk");
+  req.cagra.search.search_width = deserializer.ReadProperty<std::int64_t>(154, "cagra_search_width");
+  req.cagra.build_settings_given =
+    deserializer.ReadProperty<bool>(155, "cagra_build_settings_given");
+  req.cagra.build.partitions = deserializer.ReadProperty<std::int64_t>(156, "cagra_partitions");
+  req.cagra.search.partition_probes =
+    deserializer.ReadProperty<std::int64_t>(157, "cagra_partition_probes");
   return std::move(result);
 }
 

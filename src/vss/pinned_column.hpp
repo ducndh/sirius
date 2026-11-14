@@ -82,6 +82,8 @@ struct staged_pinned_chunk {
   cudf::column_view view;
   std::shared_ptr<::cucascade::data_batch> owner;
   std::shared_ptr<::cucascade::memory::reservation> reservation;
+  /// Whatever else keeps @c view readable, for a chunk staged from something other than a pin.
+  std::shared_ptr<void> keep;
 };
 
 /// Chunks the pinned column is stored in, on either tier.

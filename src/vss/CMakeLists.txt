@@ -1,6 +1,8 @@
 target_sources(
   sirius_objects
   PRIVATE block_host_rows.cpp
+          cagra_join_index.cpp
+          cagra_partitions.cpp
           cuvs_index_cache.cpp
           device_rates.cpp
           distance_metric.cpp

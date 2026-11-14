@@ -23,6 +23,7 @@
 #include <rmm/device_uvector.hpp>
 
 #include <cub/device/device_scan.cuh>
+#include <cub/device/device_segmented_sort.cuh>
 #include <cub/device/device_select.cuh>
 #include <thrust/iterator/counting_iterator.h>
 
@@ -32,6 +33,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <random>
@@ -114,10 +116,13 @@ __global__ void fold_topk_rows_kernel(float* acc_d,
 // row from a shared tile (rows padded to an odd word stride, so the lanes' reads fall in distinct
 // banks) and the probe row from shared memory (one address, broadcast). Lanes meet only when a
 // row beats the probe's current k-th: lane 0 keeps the top k and broadcasts its threshold.
-template <bool F16>
+// Wide: rows past what shared memory holds whole come a segment of seg_words at a time, one warp's
+// worth of rows a tile, the probe rows segment by segment too, each lane's sum carried between.
+template <bool F16, bool Wide = false>
 __global__ void nearest_cluster_topk_kernel(nearest_task const* tasks,
                                             std::uint32_t const* compact,
                                             int64_t row_words,
+                                            int64_t seg_words,
                                             int64_t tile_rows,
                                             void const* row_sq,
                                             int64_t const* routed_rows,
@@ -134,13 +139,13 @@ __global__ void nearest_cluster_topk_kernel(nearest_task const* tasks,
   int const warp      = static_cast<int>(threadIdx.x / 32);
   int const lane      = static_cast<int>(threadIdx.x % 32);
   int const n_warps   = static_cast<int>(blockDim.x / 32);
-  auto const stride   = row_words + 1;
+  auto const stride   = seg_words + 1;
   auto* probe_rows    = smem;
-  auto* tile          = smem + n_warps * row_words;
+  auto* tile          = smem + n_warps * seg_words;
   bool const active   = warp < task.n_probes;
   int64_t const probe = active ? routed_rows[task.edge_begin + warp] : 0;
-  auto* my_probe      = probe_rows + warp * row_words;
-  if (active) {
+  auto* my_probe      = probe_rows + warp * seg_words;
+  if (active && !Wide) {
     for (int64_t w = lane; w < row_words; w += 32) {
       my_probe[w] = probes[probe * row_words + w];
     }
@@ -157,12 +162,36 @@ __global__ void nearest_cluster_topk_kernel(nearest_task const* tasks,
   auto const* src = compact + task.row_offset * row_words;
   for (int64_t r0 = 0; r0 < task.n_rows; r0 += tile_rows) {
     auto const rn = std::min<int64_t>(tile_rows, task.n_rows - r0);
-    __syncthreads();
-    for (int64_t i = threadIdx.x; i < rn * row_words; i += blockDim.x) {
-      auto const r                         = i / row_words;
-      tile[r * stride + i - r * row_words] = src[r0 * row_words + i];
+    int wide_acc  = 0;
+    if constexpr (Wide) {
+      for (int64_t w0 = 0; w0 < row_words; w0 += seg_words) {
+        auto const words = std::min<int64_t>(seg_words, row_words - w0);
+        __syncthreads();
+        if (active) {
+          for (int64_t w = lane; w < words; w += 32) {
+            my_probe[w] = probes[probe * row_words + w0 + w];
+          }
+        }
+        for (int64_t i = threadIdx.x; i < rn * words; i += blockDim.x) {
+          auto const r                     = i / words;
+          tile[r * stride + i - r * words] = src[(r0 + r) * row_words + w0 + i - r * words];
+        }
+        __syncthreads();
+        if (active && lane < rn) {
+          auto const* row = tile + lane * stride;
+          for (int64_t w = 0; w < words; ++w) {
+            wide_acc = __dp4a(static_cast<int>(row[w]), static_cast<int>(my_probe[w]), wide_acc);
+          }
+        }
+      }
+    } else {
+      __syncthreads();
+      for (int64_t i = threadIdx.x; i < rn * row_words; i += blockDim.x) {
+        auto const r                         = i / row_words;
+        tile[r * stride + i - r * row_words] = src[r0 * row_words + i];
+      }
+      __syncthreads();
     }
-    __syncthreads();
     if (!active) { continue; }
     for (int64_t rb = 0; rb < rn; rb += 32) {
       auto const r  = rb + lane;
@@ -171,7 +200,9 @@ __global__ void nearest_cluster_topk_kernel(nearest_task const* tasks,
       if (ok) {
         auto const* row = tile + r * stride;
         float dot;
-        if constexpr (F16) {
+        if constexpr (Wide) {
+          dot = static_cast<float>(wide_acc);
+        } else if constexpr (F16) {
           float acc = 0.f;
           for (int64_t w = 0; w < row_words; ++w) {
             std::uint32_t const a = row[w];
@@ -280,6 +311,19 @@ __global__ void scatter_rows_kernel(
     auto const i                           = p / width;
     out[dest[i] * width + (p - i * width)] = src[p];
   }
+}
+
+// Condition D3 of the exactness proof: a nonzero component below 2^-63 in magnitude has a square
+// below FP32's normal range, so the coding error the screen's limit is widened by could underflow.
+__global__ void count_tiny_nonzero_kernel(float const* v, int64_t n, unsigned long long* out)
+{
+  unsigned long long bad = 0;
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const a = fabsf(v[i]);
+    bad += a != 0.f && a < 0x1p-63f;
+  }
+  if (bad != 0) { atomicAdd(out, bad); }
 }
 
 __global__ void count_non_uint8_kernel(float const* v, int64_t n, unsigned long long* out)
@@ -439,6 +483,10 @@ __global__ void quantize_rows_int8_kernel(float const* x,
   auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
   auto const lane  = static_cast<int64_t>(threadIdx.x % 32);
   float const inv  = 1.f / scale;
+  // Rounded up so the float sum cannot understate the error it bounds: each lane's chain of d / 32
+  // terms and the 5 additions between lanes, at most (d / 32 + 5) 2^-24 of the sum, plus the sqrt
+  // and the products here.
+  float const round_up = 1.f + fmaxf(1e-6f, static_cast<float>(d / 32 + 8) * 5.9604645e-8f);
   for (int64_t r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32; r < rows; r += warps) {
     float err = 0.f, sq = 0.f;
     for (int64_t j = lane; j < d; j += 32) {
@@ -454,8 +502,7 @@ __global__ void quantize_rows_int8_kernel(float const* x,
       sq += __shfl_xor_sync(0xffffffffu, sq, o);
     }
     if (lane == 0) {
-      // Rounded up by a relative 1e-6 so the float sum cannot understate the error it bounds.
-      float const e = (sqrtf(err) + norm_slack * sqrtf(sq)) * (1.f + 1e-6f);
+      float const e = (sqrtf(err) + norm_slack * sqrtf(sq)) * round_up;
       if (row_error != nullptr) { row_error[r] = e; }
       if (max_error_bits != nullptr) { atomicMax(max_error_bits, __float_as_uint(e)); }
     }
@@ -479,11 +526,12 @@ __global__ void int8_code_limit_kernel(float const* bound,
     }
     if (lower) {
       float const reach = (sqrtf(fmaxf(b, 0.f)) - probe_error[i] - code_error) / scale;
-      limit[i]          = reach > 0.f ? reach * reach * (1.f - 1e-6f) : -INFINITY;
+      limit[i] = reach > 0.f && reach < INFINITY ? reach * reach * (1.f - 1e-6f) : -INFINITY;
       continue;
     }
+    // A row outside FP32's squares leaves a NaN error: nothing is known, so nothing is dropped.
     float const reach = (sqrtf(fmaxf(b, 0.f)) + probe_error[i] + code_error) / scale;
-    limit[i]          = reach * reach * (1.f + 1e-6f);
+    limit[i]          = reach >= 0.f ? reach * reach * (1.f + 1e-6f) : INFINITY;
   }
 }
 
@@ -589,7 +637,7 @@ __device__ __forceinline__ float int8_upper_bound_of(float b,
                                                      float scale)
 {
   float const reach = scale * sqrtf(fmaxf(b, 0.f)) + probe_error + code_error;
-  return reach * reach * (1.f + 1e-6f);
+  return reach >= 0.f ? reach * reach * (1.f + 1e-6f) : INFINITY;
 }
 
 // A finite FP16-computed distance b as an FP32 bound (see float16_seed_upper_bound): the FP32
@@ -706,6 +754,61 @@ __global__ void gap_rescore_bound_kernel(float const* by_row,
       last           = m;
     }
     if (lane == 0) { out[r] = best; }
+  }
+}
+
+// gap_rescore_bound_kernel's bound with each row's codes sorted ascending (a NaN or -inf code as
+// +inf, so it is never one of the j best: that kernel never takes one either). Every
+// j = 1..min(k, n_r) gives its own term max(acc_(k-j), U_r(c_(j))): the first j sorted codes are
+// j distinct pairs with codes <= c_(j). A run of equal codes is covered by its last position, as
+// there, and the others only add terms that bound the k-th too. A NaN U_r(c_(j)) gives no term
+// (fmaxf would return acc_(k-j), a bound on k - j pairs only), where that kernel stops.
+// O(min(k, n_r)) a row instead of O(min(k, n_r) n_r).
+__global__ void gap_rescore_bound_sorted_kernel(float const* sorted,
+                                                int64_t const* before,
+                                                float const* acc,
+                                                int64_t n_rows,
+                                                int64_t k,
+                                                float const* bound,
+                                                code_bound_terms const terms,
+                                                float* out)
+{
+  int const lane   = threadIdx.x % 32;
+  auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
+  for (int64_t r = blockIdx.x * static_cast<int64_t>(blockDim.x / 32) + threadIdx.x / 32;
+       r < n_rows;
+       r += warps) {
+    float best     = lane == 0 ? fminf(bound[r], acc[r * k + k - 1]) : INFINITY;
+    auto const s   = before[r];
+    auto const nr  = before[r + 1] - s;
+    auto const cap = k < nr ? k : nr;
+    for (int64_t j = lane + 1; j <= cap; j += 32) {
+      float const c = sorted[s + j - 1];
+      if (!(c < INFINITY)) { break; }
+      float const u = terms.int8
+                        ? int8_upper_bound_of(c, terms.probe_error[r], terms.row_error, terms.scale)
+                        : float16_upper_bound_of(c,
+                                                 terms.probe_sq[r],
+                                                 terms.probe_error[r],
+                                                 terms.row_error,
+                                                 terms.row_norm,
+                                                 static_cast<float>(terms.d),
+                                                 terms.inner_product);
+      float const a = j < k ? acc[r * k + k - 1 - j] : -INFINITY;
+      best          = fminf(best, u < a ? a : u);
+    }
+    for (int o = 16; o > 0; o /= 2) {
+      best = fminf(best, __shfl_xor_sync(0xffffffffu, best, o));
+    }
+    if (lane == 0) { out[r] = best; }
+  }
+}
+
+__global__ void non_finite_to_inf_kernel(float* v, int64_t n)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    if (!(v[i] > -INFINITY)) { v[i] = INFINITY; }
   }
 }
 
@@ -916,6 +1019,17 @@ void scatter_rows(std::byte const* src,
   CUDF_CHECK_CUDA(stream.get());
 }
 
+void count_tiny_nonzero(float const* values,
+                        int64_t n,
+                        unsigned long long* out,
+                        rmm::cuda_stream_view stream)
+{
+  if (n == 0) { return; }
+  count_tiny_nonzero_kernel<<<std::min(grid_for(n), 4096), kBlock, 0, stream.get()>>>(
+    values, n, out);
+  CUDF_CHECK_CUDA(stream.get());
+}
+
 void count_non_uint8(float const* values,
                      int64_t n,
                      unsigned long long* out,
@@ -1027,7 +1141,7 @@ float decode_ordered_float(unsigned int bits)
   return f;
 }
 
-std::vector<float> random_rotation(int64_t d, std::uint64_t seed)
+std::vector<double> random_rotation_f64(int64_t d, std::uint64_t seed)
 {
   std::mt19937_64 gen{seed};
   std::normal_distribution<double> normal{0.0, 1.0};
@@ -1064,7 +1178,505 @@ std::vector<float> random_rotation(int64_t d, std::uint64_t seed)
       }
     }
   }
+  return m;
+}
+
+std::vector<float> random_rotation(int64_t d, std::uint64_t seed)
+{
+  auto const m = random_rotation_f64(d, seed);
   return std::vector<float>(m.begin(), m.end());
+}
+
+namespace {
+
+__device__ __forceinline__ std::uint64_t splitmix64(std::uint64_t z)
+{
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+  return z ^ (z >> 31);
+}
+
+// Box-Muller over two hashes of the element's index, so a draw does not depend on the launch.
+__global__ void gaussian_doubles_kernel(double* out, int64_t n, std::uint64_t seed)
+{
+  constexpr std::uint64_t kGolden = 0x9e3779b97f4a7c15ull;
+  for (int64_t e = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; e < n;
+       e += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    auto const i   = static_cast<std::uint64_t>(e);
+    auto const h0  = splitmix64(seed + (2 * i + 1) * kGolden);
+    auto const h1  = splitmix64(seed + (2 * i + 2) * kGolden);
+    double const u = (static_cast<double>(h0 >> 11) + 1.0) * 0x1p-53;  // (0, 1]
+    double const v = static_cast<double>(h1 >> 11) * 0x1p-53;
+    out[e]         = sqrt(-2.0 * log(u)) * cos(6.283185307179586 * v);
+  }
+}
+
+__global__ void narrow_doubles_kernel(double const* in, int64_t n, float* out)
+{
+  for (int64_t e = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; e < n;
+       e += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    out[e] = static_cast<float>(in[e]);
+  }
+}
+
+__global__ void widen_floats_kernel(float const* in, int64_t n, double* out)
+{
+  for (int64_t e = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; e < n;
+       e += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    out[e] = static_cast<double>(in[e]);
+  }
+}
+
+constexpr int kDgemmTile = 64;
+constexpr int kDgemmStep = 16;
+
+// out[i, j] = sum_k a[i, k] b(j, k), or base[i, j] minus that: b(j, k) is b[j, k] with kBRows, else
+// b[k, j]. Every output is one fma chain in k order whatever the tile, launch or stream, so the
+// result is the same for the same arguments, which cuBLAS does not promise (see
+// rotate_rows_kernel).
+template <bool kBRows>
+__global__ void __launch_bounds__(256) dgemm_tile_kernel(double const* a,
+                                                         int64_t a_pitch,
+                                                         int64_t rows,
+                                                         double const* b,
+                                                         int64_t b_pitch,
+                                                         int64_t cols,
+                                                         int64_t depth,
+                                                         double const* base,
+                                                         int64_t base_pitch,
+                                                         double* out,
+                                                         int64_t out_pitch)
+{
+  __shared__ double as[kDgemmStep][kDgemmTile], bs[kDgemmStep][kDgemmTile];
+  auto const row0  = static_cast<int64_t>(blockIdx.x) * kDgemmTile;
+  auto const col0  = static_cast<int64_t>(blockIdx.y) * kDgemmTile;
+  int const tx     = threadIdx.x % 16;
+  int const ty     = threadIdx.x / 16;
+  double acc[4][4] = {};
+  for (int64_t k0 = 0; k0 < depth; k0 += kDgemmStep) {
+    for (int e = threadIdx.x; e < kDgemmTile * kDgemmStep; e += 256) {
+      int const i = e / kDgemmStep, kk = e % kDgemmStep;
+      auto const k = k0 + kk;
+      as[kk][i]    = (row0 + i < rows && k < depth) ? a[(row0 + i) * a_pitch + k] : 0.0;
+      if (col0 + i < cols && k < depth) {
+        bs[kk][i] = kBRows ? b[(col0 + i) * b_pitch + k] : b[k * b_pitch + col0 + i];
+      } else {
+        bs[kk][i] = 0.0;
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < kDgemmStep; ++kk) {
+      double x[4], y[4];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        x[q] = as[kk][4 * ty + q];
+        y[q] = bs[kk][4 * tx + q];
+      }
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          acc[p][q] = fma(x[p], y[q], acc[p][q]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int p = 0; p < 4; ++p) {
+    auto const i = row0 + 4 * ty + p;
+    if (i >= rows) { continue; }
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      auto const j = col0 + 4 * tx + q;
+      if (j < cols) {
+        out[i * out_pitch + j] = base != nullptr ? base[i * base_pitch + j] - acc[p][q] : acc[p][q];
+      }
+    }
+  }
+}
+
+template <bool kBRows>
+void launch_dgemm(double const* a,
+                  int64_t a_pitch,
+                  int64_t rows,
+                  double const* b,
+                  int64_t b_pitch,
+                  int64_t cols,
+                  int64_t depth,
+                  double const* base,
+                  int64_t base_pitch,
+                  double* out,
+                  int64_t out_pitch,
+                  rmm::cuda_stream_view stream)
+{
+  if (rows == 0 || cols == 0) { return; }
+  dim3 const grid(static_cast<unsigned>((rows + kDgemmTile - 1) / kDgemmTile),
+                  static_cast<unsigned>((cols + kDgemmTile - 1) / kDgemmTile));
+  dgemm_tile_kernel<kBRows><<<grid, 256, 0, stream.get()>>>(
+    a, a_pitch, rows, b, b_pitch, cols, depth, base, base_pitch, out, out_pitch);
+  CUDF_CHECK_CUDA(stream.get());
+}
+
+// @p g (n x n, symmetric, row-major) becomes the inverse of its Cholesky factor. False when a pivot
+// falls under @p floor, i.e. a row inside the span of the others.
+bool invert_cholesky(std::vector<double>& g, int64_t n, double floor)
+{
+  std::vector<double> l(static_cast<std::size_t>(n * n), 0.0);
+  for (int64_t i = 0; i < n; ++i) {
+    for (int64_t j = 0; j <= i; ++j) {
+      double v = g[i * n + j];
+      for (int64_t k = 0; k < j; ++k) {
+        v -= l[i * n + k] * l[j * n + k];
+      }
+      if (i == j) {
+        if (!(v >= floor)) { return false; }
+        l[i * n + i] = std::sqrt(v);
+      } else {
+        l[i * n + j] = v / l[j * n + j];
+      }
+    }
+  }
+  std::fill(g.begin(), g.end(), 0.0);
+  for (int64_t c = 0; c < n; ++c) {
+    g[c * n + c] = 1.0 / l[c * n + c];
+    for (int64_t i = c + 1; i < n; ++i) {
+      double v = 0;
+      for (int64_t k = c; k < i; ++k) {
+        v -= l[i * n + k] * g[k * n + c];
+      }
+      g[i * n + c] = v / l[i * n + i];
+    }
+  }
+  return true;
+}
+
+orthogonality_defect defect_of_rows(double const* q,
+                                    int64_t d,
+                                    rmm::cuda_stream_view stream,
+                                    rmm::device_async_resource_ref mr)
+{
+  rmm::device_uvector<double> g(static_cast<std::size_t>(d * d), stream, mr);
+  launch_dgemm<true>(q, d, d, q, d, d, d, nullptr, 0, g.data(), d, stream);
+  std::vector<double> host(static_cast<std::size_t>(d * d));
+  stream.sync();
+  CUDF_CUDA_TRY(
+    cudaMemcpy(host.data(), g.data(), host.size() * sizeof(double), cudaMemcpyDeviceToHost));
+  orthogonality_defect out;
+  double sum = 0;
+  for (int64_t i = 0; i < d; ++i) {
+    for (int64_t j = 0; j < d; ++j) {
+      double const e = host[i * d + j] - (i == j ? 1.0 : 0.0);
+      out.max_abs    = std::max(out.max_abs, std::abs(e));
+      sum += e * e;
+    }
+  }
+  out.frobenius = std::sqrt(sum);
+  return out;
+}
+
+}  // namespace
+
+rmm::device_uvector<double> random_rotation_f64_device(int64_t d,
+                                                       std::uint64_t seed,
+                                                       rmm::cuda_stream_view stream,
+                                                       rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(d > 0, "random_rotation_device: width must be positive");
+  constexpr int64_t kPanel = 64;
+  rmm::device_uvector<double> q(static_cast<std::size_t>(d * d), stream, mr);
+  auto const panel_cap = std::min(kPanel, d);
+  rmm::device_uvector<double> scratch(static_cast<std::size_t>(panel_cap * d), stream, mr);
+  rmm::device_uvector<double> c(static_cast<std::size_t>(panel_cap * d), stream, mr);
+  rmm::device_uvector<double> g(static_cast<std::size_t>(panel_cap * panel_cap), stream, mr);
+  std::vector<double> host_g;
+  auto const grid = [](int64_t n) { return std::min(grid_for(n), 65535); };
+  gaussian_doubles_kernel<<<grid(d * d), kBlock, 0, stream.get()>>>(q.data(), d * d, seed);
+  CUDF_CHECK_CUDA(stream.get());
+  for (int64_t s = 0; s < d; s += kPanel) {
+    auto const b = std::min(kPanel, d - s);
+    auto* panel  = q.data() + s * d;
+    host_g.resize(static_cast<std::size_t>(b * b));
+    // Each pass projects the panel off the rows before it and orthonormalizes it. A panel's rows
+    // inside the span of the rest, never seen with Gaussian rows, are drawn again.
+    for (int pass = 0, redraws = 0; pass < 2; ++pass) {
+      if (s > 0) {
+        launch_dgemm<true>(panel, d, b, q.data(), d, s, d, nullptr, 0, c.data(), s, stream);
+        launch_dgemm<false>(c.data(), s, b, q.data(), d, d, s, panel, d, panel, d, stream);
+      }
+      launch_dgemm<true>(panel, d, b, panel, d, b, d, nullptr, 0, g.data(), b, stream);
+      stream.sync();
+      CUDF_CUDA_TRY(cudaMemcpy(
+        host_g.data(), g.data(), host_g.size() * sizeof(double), cudaMemcpyDeviceToHost));
+      if (!invert_cholesky(host_g, b, 1e-12)) {
+        CUDF_EXPECTS(++redraws <= 8, "random_rotation_device: could not complete the basis");
+        auto const redraw_seed = seed + static_cast<std::uint64_t>(redraws) * 0x10001ull;
+        gaussian_doubles_kernel<<<grid(b * d), kBlock, 0, stream.get()>>>(
+          panel, b * d, redraw_seed + static_cast<std::uint64_t>(s));
+        CUDF_CHECK_CUDA(stream.get());
+        pass = -1;
+        continue;
+      }
+      CUDF_CUDA_TRY(cudaMemcpy(
+        g.data(), host_g.data(), host_g.size() * sizeof(double), cudaMemcpyHostToDevice));
+      launch_dgemm<false>(g.data(), b, b, panel, d, d, b, nullptr, 0, scratch.data(), d, stream);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(panel,
+                                    scratch.data(),
+                                    static_cast<std::size_t>(b * d) * sizeof(double),
+                                    cudaMemcpyDeviceToDevice,
+                                    stream.get()));
+    }
+  }
+  stream.sync();
+  return q;
+}
+
+void narrow_rotation(double const* q, int64_t d, float* out, rmm::cuda_stream_view stream)
+{
+  narrow_doubles_kernel<<<std::min(grid_for(d * d), 65535), kBlock, 0, stream.get()>>>(
+    q, d * d, out);
+  CUDF_CHECK_CUDA(stream.get());
+}
+
+orthogonality_defect rotation_defect(double const* q,
+                                     int64_t d,
+                                     rmm::cuda_stream_view stream,
+                                     rmm::device_async_resource_ref mr)
+{ return defect_of_rows(q, d, stream, mr); }
+
+orthogonality_defect rotation_defect(float const* q,
+                                     int64_t d,
+                                     rmm::cuda_stream_view stream,
+                                     rmm::device_async_resource_ref mr)
+{
+  rmm::device_uvector<double> wide(static_cast<std::size_t>(d * d), stream, mr);
+  widen_floats_kernel<<<std::min(grid_for(d * d), 65535), kBlock, 0, stream.get()>>>(
+    q, d * d, wide.data());
+  CUDF_CHECK_CUDA(stream.get());
+  return defect_of_rows(wide.data(), d, stream, mr);
+}
+
+namespace {
+
+struct small_rotation {
+  float c[15][15];
+};
+
+// A row's signs, its small factor per group of M consecutive components, then 2^a-point Walsh
+// transforms across the groups, in shared memory, then the scale. Every output is the same
+// expression whatever the block, so a row's rotation does not depend on what it is batched with.
+template <int Rho>
+__device__ __forceinline__ void walsh_pass(float* tile, int in_block, int a, int m, int d, int b)
+{
+  constexpr int R  = 1 << Rho;
+  int const groups = a - Rho;
+  int const low    = (1 << b) - 1;
+  for (int w = threadIdx.x; w < (in_block << groups); w += blockDim.x) {
+    int const ig = w & ((1 << groups) - 1);
+    int const i0 = ((ig >> b) << (b + Rho)) | (ig & low);
+    float* row   = tile + (w >> groups) * d + i0 * m;
+    int const st = m << b;
+    for (int t = 0; t < m; ++t) {
+      float v[R];
+#pragma unroll
+      for (int k = 0; k < R; ++k) {
+        v[k] = row[t + k * st];
+      }
+#pragma unroll
+      for (int h = 1; h < R; h *= 2) {
+#pragma unroll
+        for (int g = 0; g < R; g += 2 * h) {
+#pragma unroll
+          for (int j = g; j < g + h; ++j) {
+            float const x = v[j], y = v[j + h];
+            v[j]     = x + y;
+            v[j + h] = x - y;
+          }
+        }
+      }
+#pragma unroll
+      for (int k = 0; k < R; ++k) {
+        row[t + k * st] = v[k];
+      }
+    }
+  }
+}
+
+template <int M>
+__global__ void structured_rotation_kernel(float const* x,
+                                           int64_t rows,
+                                           int d,
+                                           int a,
+                                           int rows_per_block,
+                                           std::uint32_t const* signs,
+                                           small_rotation const small,
+                                           float norm,
+                                           float* out)
+{
+  extern __shared__ float rows_smem[];
+  auto const row0    = static_cast<int64_t>(blockIdx.x) * rows_per_block;
+  int const in_block = static_cast<int>(std::min<int64_t>(rows_per_block, rows - row0));
+  auto* sign_words   = reinterpret_cast<std::uint32_t*>(rows_smem + rows_per_block * d);
+  for (int w = threadIdx.x; w < (d + 31) / 32; w += blockDim.x) {
+    sign_words[w] = signs[w];
+  }
+  __syncthreads();
+  for (int w = threadIdx.x; w < (in_block << a); w += blockDim.x) {
+    int const r     = w >> a;
+    int const base  = (w & ((1 << a) - 1)) * M;
+    float const* in = x + (row0 + r) * d + base;
+    float v[M];
+#pragma unroll
+    for (int t = 0; t < M; ++t) {
+      int const j    = base + t;
+      auto const bit = (sign_words[j >> 5] >> (j & 31)) & 1u;
+      v[t]           = __uint_as_float(__float_as_uint(in[t]) ^ (bit << 31));
+    }
+    float* row = rows_smem + r * d + base;
+    if constexpr (M == 1) {
+      row[0] = v[0];
+    } else {
+#pragma unroll
+      for (int q = 0; q < M; ++q) {
+        float acc = 0.f;
+#pragma unroll
+        for (int t = 0; t < M; ++t) {
+          acc = fmaf(v[t], small.c[q][t], acc);
+        }
+        row[q] = acc;
+      }
+    }
+  }
+  __syncthreads();
+  int b = 0;
+  switch (a % 4) {
+    case 1:
+      walsh_pass<1>(rows_smem, in_block, a, M, d, 0);
+      b = 1;
+      break;
+    case 2:
+      walsh_pass<2>(rows_smem, in_block, a, M, d, 0);
+      b = 2;
+      break;
+    case 3:
+      walsh_pass<3>(rows_smem, in_block, a, M, d, 0);
+      b = 3;
+      break;
+    default: break;
+  }
+  if (b > 0) { __syncthreads(); }
+  for (; b < a; b += 4) {
+    walsh_pass<4>(rows_smem, in_block, a, M, d, b);
+    __syncthreads();
+  }
+  for (int j = threadIdx.x; j < in_block * d; j += blockDim.x) {
+    out[row0 * d + j] = rows_smem[j] * norm;
+  }
+}
+
+// d = 2^a m with m odd. A Householder reflection for m = 3, whose largest entry is the smallest a
+// real orthogonal 3 x 3 can have, else a DCT-II: each spreads a group's energy across its outputs.
+small_rotation small_rotation_of(int m)
+{
+  small_rotation out{};
+  for (int q = 0; q < m; ++q) {
+    for (int t = 0; t < m; ++t) {
+      double v = 0;
+      if (m == 3) {
+        v = (q == t ? 1.0 : 0.0) - 2.0 / 3.0;
+      } else {
+        v = (q == 0 ? std::sqrt(1.0 / m) : std::sqrt(2.0 / m)) *
+            std::cos(3.14159265358979323846 * (2 * t + 1) * q / (2.0 * m));
+      }
+      out.c[q][t] = static_cast<float>(v);
+    }
+  }
+  return out;
+}
+
+struct width_factors {
+  int a{0}, m{1};
+};
+
+width_factors factor_width(int64_t d)
+{
+  width_factors f;
+  auto n = static_cast<std::uint64_t>(d);
+  while (n % 2 == 0) {
+    n /= 2;
+    ++f.a;
+  }
+  f.m = static_cast<int>(n);
+  return f;
+}
+
+}  // namespace
+
+bool structured_rotation_supports(std::int64_t d)
+{
+  if (d <= 0 || d % 16 != 0 || d > 15'360) { return false; }
+  return factor_width(d).m <= 15;
+}
+
+std::vector<std::uint32_t> structured_rotation_signs(std::int64_t d, std::uint64_t seed)
+{
+  std::mt19937_64 gen{seed};
+  std::vector<std::uint32_t> out(static_cast<std::size_t>((d + 31) / 32));
+  for (auto& w : out) {
+    w = static_cast<std::uint32_t>(gen());
+  }
+  return out;
+}
+
+void structured_rotate_rows(float const* x,
+                            int64_t rows,
+                            int64_t d,
+                            std::uint32_t const* signs,
+                            float* out,
+                            rmm::cuda_stream_view stream)
+{
+  if (rows == 0) { return; }
+  CUDF_EXPECTS(structured_rotation_supports(d), "structured_rotate_rows: unsupported width");
+  auto const factors = factor_width(d);
+  int const a = factors.a, m = factors.m;
+  auto const sign_bytes       = static_cast<std::size_t>((d + 31) / 32) * 4;
+  constexpr std::size_t kRoom = std::size_t{48} << 10;
+  auto const row_bytes        = static_cast<std::size_t>(d) * sizeof(float);
+  int const per_block =
+    static_cast<int>(std::max<std::size_t>(1, (kRoom - std::min(kRoom, sign_bytes)) / row_bytes));
+  auto const smem  = per_block * row_bytes + sign_bytes;
+  auto const norm  = static_cast<float>(std::pow(2.0, -0.5 * a));
+  auto const small = m > 1 ? small_rotation_of(m) : small_rotation{};
+  auto const grid  = static_cast<unsigned>((rows + per_block - 1) / per_block);
+  auto go          = [&](auto kernel) {
+    if (smem > kRoom) {
+      CUDF_CUDA_TRY(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+    }
+    kernel<<<grid, 256, smem, stream.get()>>>(
+      x, rows, static_cast<int>(d), a, per_block, signs, small, norm, out);
+  };
+  switch (m) {
+    case 1: go(structured_rotation_kernel<1>); break;
+    case 3: go(structured_rotation_kernel<3>); break;
+    case 5: go(structured_rotation_kernel<5>); break;
+    case 7: go(structured_rotation_kernel<7>); break;
+    case 9: go(structured_rotation_kernel<9>); break;
+    case 11: go(structured_rotation_kernel<11>); break;
+    case 13: go(structured_rotation_kernel<13>); break;
+    default: go(structured_rotation_kernel<15>); break;
+  }
+  CUDF_CHECK_CUDA(stream.get());
+}
+
+float structured_rotation_slack(std::int64_t d)
+{
+  auto const factors = factor_width(d);
+  double const r     = static_cast<double>(factors.m);
+  double const small = factors.m > 1 ? r * std::sqrt(r) + std::sqrt(r) : 0.0;
+  return static_cast<float>((small + factors.a + 2 + int8_rounding_terms(d)) *
+                            5.9604644775390625e-8 * 1.01);
 }
 
 namespace {
@@ -1246,7 +1858,7 @@ int wide_rotation_q(int64_t d, float const* x, float const* rotation)
 {
   bool const aligned = reinterpret_cast<std::uintptr_t>(x) % 16 == 0 &&
                        reinterpret_cast<std::uintptr_t>(rotation) % 16 == 0;
-  if (d % 16 != 0 || d > 1024 || !aligned) { return 0; }
+  if (d % 16 != 0 || !aligned) { return 0; }
   auto const tiles = (d + 127) / 128;
   return static_cast<int>((d / tiles + 15) / 16);
 }
@@ -1317,6 +1929,21 @@ bool rotate_rows_min_max(float const* x,
     launch_wide_rotation<true>(q, x, rows, d, rotation, out, min_bits, max_bits, stream);
   }
   return true;
+}
+
+void apply_code_rotation(code_rotation_ref rotation,
+                         float const* x,
+                         int64_t rows,
+                         int64_t d,
+                         float* out,
+                         rmm::cuda_stream_view stream)
+{
+  if (rotation.structured) {
+    structured_rotate_rows(
+      x, rows, d, static_cast<std::uint32_t const*>(rotation.data), out, stream);
+  } else {
+    rotate_rows(x, rows, d, static_cast<float const*>(rotation.data), out, stream);
+  }
 }
 
 void quantize_rows_int8(float const* x,
@@ -1449,6 +2076,38 @@ void gap_rescore_bound(int32_t const* rows,
   }
   auto const warp_grid =
     static_cast<int>(std::clamp<int64_t>((n_rows + kBlock / 32 - 1) / (kBlock / 32), 1, 65535));
+  // Sorted, a row costs a segmented sort and min(k, n_r) terms; the selection below takes up to
+  // min(k, n_r) passes over the row, so it is cheaper only for a small k. The sort holds a second
+  // buffer of the codes (4 B a candidate) beside by_row. SIRIUS_VSS_GAP_SORT=0 always selects,
+  // =1 always sorts; unset or empty, k decides.
+  constexpr int64_t kSortFromK = 128;
+  auto const* sort_env         = std::getenv("SIRIUS_VSS_GAP_SORT");
+  int const sort_setting =
+    sort_env == nullptr || sort_env[0] == '\0' ? -1 : (sort_env[0] == '0' ? 0 : 1);
+  bool const sorted_codes = sort_setting == 1 || (sort_setting == -1 && k >= kSortFromK);
+  if (sorted_codes && n > 0) {
+    non_finite_to_inf_kernel<<<std::min(grid_for(n), 65535), kBlock, 0, stream.get()>>>(
+      by_row.data(), n);
+    CUDF_CUDA_TRY(cudaGetLastError());
+    rmm::device_uvector<float> other(items, stream, mr);
+    cub::DoubleBuffer<float> keys(by_row.data(), other.data());
+    std::size_t sort_bytes = 0;
+    CUDF_CUDA_TRY(cub::DeviceSegmentedSort::SortKeys(
+      nullptr, sort_bytes, keys, n, n_rows, before.data(), before.data() + 1, stream.get()));
+    rmm::device_buffer sort_temp(std::max<std::size_t>(sort_bytes, 1), stream, mr);
+    CUDF_CUDA_TRY(cub::DeviceSegmentedSort::SortKeys(sort_temp.data(),
+                                                     sort_bytes,
+                                                     keys,
+                                                     n,
+                                                     n_rows,
+                                                     before.data(),
+                                                     before.data() + 1,
+                                                     stream.get()));
+    gap_rescore_bound_sorted_kernel<<<warp_grid, kBlock, 0, stream.get()>>>(
+      keys.Current(), before.data(), acc_distances, n_rows, k, bound, terms, out);
+    CUDF_CUDA_TRY(cudaGetLastError());
+    return;
+  }
   gap_rescore_bound_kernel<<<warp_grid, kBlock, 0, stream.get()>>>(
     by_row.data(), before.data(), acc_distances, n_rows, k, bound, terms, out);
   CUDF_CUDA_TRY(cudaGetLastError());
@@ -1669,23 +2328,48 @@ void nearest_cluster_topk(nearest_task const* tasks,
                           rmm::cuda_stream_view stream)
 {
   if (n_tasks == 0) { return; }
-  CUDF_EXPECTS(row_bytes % 4 == 0 && row_bytes / 4 <= 32 * 16,
-               "nearest_cluster_topk: rows must be whole 32-bit words, at most 512 of them");
+  CUDF_EXPECTS(row_bytes % 4 == 0 && (!f16 || row_bytes / 4 <= 32 * 16),
+               "nearest_cluster_topk: rows must be whole 32-bit words, FP16 at most 512 of them");
   CUDF_EXPECTS(k >= 1 && k <= 64, "nearest_cluster_topk: k must be in [1, 64]");
   auto const row_words = row_bytes / 4;
   auto const threads   = 32 * kNearestTaskProbes;
+  // Past 512 words the probe rows and one warp of rows no longer fit in shared memory at all.
+  constexpr int64_t kSegmentWords = 240;
+  bool const wide                 = row_words > 32 * 16;
+  auto const seg_words            = wide ? kSegmentWords : row_words;
   // The block's probe rows, then a tile of slice rows at the padded stride: whole warps of rows,
-  // as many as fit beside the probe rows in about 48 KiB (at least one warp's worth).
-  auto const probe_bytes = static_cast<std::size_t>(kNearestTaskProbes * row_words) * 4;
-  auto const row_slot    = static_cast<std::size_t>(row_words + 1) * 4;
+  // as many as fit beside the probe rows in about 48 KiB (at least one warp's worth), and only one
+  // warp's worth a tile when they come in segments.
+  auto const probe_bytes = static_cast<std::size_t>(kNearestTaskProbes * seg_words) * 4;
+  auto const row_slot    = static_cast<std::size_t>(seg_words + 1) * 4;
   auto const fit         = (std::size_t{48} << 10) > probe_bytes
                              ? ((std::size_t{48} << 10) - probe_bytes) / row_slot
                              : std::size_t{0};
   auto const tile_rows =
-    static_cast<int64_t>(std::max<std::size_t>(32, std::min<std::size_t>(256, fit / 32 * 32)));
+    wide
+      ? int64_t{32}
+      : static_cast<int64_t>(std::max<std::size_t>(32, std::min<std::size_t>(256, fit / 32 * 32)));
   auto const smem        = probe_bytes + static_cast<std::size_t>(tile_rows) * row_slot;
   auto const* rows       = static_cast<std::uint32_t const*>(compact);
   auto const* probe_rows = static_cast<std::uint32_t const*>(probes);
+  if (wide) {
+    // kSegmentWords keeps these under 48 KiB, so no attribute is needed.
+    nearest_cluster_topk_kernel<false, true>
+      <<<static_cast<unsigned>(n_tasks), threads, smem, stream.get()>>>(tasks,
+                                                                        rows,
+                                                                        row_words,
+                                                                        seg_words,
+                                                                        tile_rows,
+                                                                        row_sq,
+                                                                        routed_rows,
+                                                                        probe_rows,
+                                                                        probe_sq,
+                                                                        k,
+                                                                        acc_distances,
+                                                                        acc_neighbors);
+    CUDF_CHECK_CUDA(stream.get());
+    return;
+  }
   if (smem > (std::size_t{48} << 10)) {
     CUDF_CUDA_TRY(cudaFuncSetAttribute(
       f16 ? nearest_cluster_topk_kernel<true> : nearest_cluster_topk_kernel<false>,
@@ -1697,6 +2381,7 @@ void nearest_cluster_topk(nearest_task const* tasks,
       <<<static_cast<unsigned>(n_tasks), threads, smem, stream.get()>>>(tasks,
                                                                         rows,
                                                                         row_words,
+                                                                        seg_words,
                                                                         tile_rows,
                                                                         row_sq,
                                                                         routed_rows,
@@ -1710,6 +2395,7 @@ void nearest_cluster_topk(nearest_task const* tasks,
       <<<static_cast<unsigned>(n_tasks), threads, smem, stream.get()>>>(tasks,
                                                                         rows,
                                                                         row_words,
+                                                                        seg_words,
                                                                         tile_rows,
                                                                         row_sq,
                                                                         routed_rows,

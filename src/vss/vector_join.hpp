@@ -19,6 +19,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb_table_identity.hpp"
+#include "vss/cagra_settings.hpp"
 
 #include <cstdint>
 #include <string>
@@ -41,10 +42,14 @@ enum class vector_join_mode : std::uint8_t {
 /// - exact_direct: search_mode => 'exact-direct' (undocumented): the same exhaustive search;
 ///                 kept for the harnesses that name it.
 /// - approx:       search_mode => 'approx': through the lists of a clustering, n_probes of them.
+/// - index:        search_mode => 'index': an index nested-loop join, every probe row walking one
+///                 global index over the pinned corpus (index_type => 'cagra'), built inside the
+///                 statement or reused. Approximate, and top-k per row only.
 enum class vector_join_search_mode : std::uint8_t {
   exact_direct,
   exact_gemm,
   approx,
+  index,
 };
 
 /// The type of score to emit for each result pair, and which value space the join
@@ -128,6 +133,10 @@ struct vector_join_request {
   /// phase is verified against the pin path; the SQL surface that replaces it is the
   /// LATERAL-rewrite rule, which will set this unconditionally.
   bool build_from_scan{false};
+  /// On the build path: clusters of the lists the join builds over the corpus it scanned, once the
+  /// scan is done, and searches through n_probes of them; 1 is the exact join's single list of
+  /// codes. 0 searches the scanned rows as they are. The lists are the statement's own.
+  std::int64_t statement_clusters{0};
   /// Same for the probe side (`probe_source => 'scan'`). Independent of build_from_scan so each
   /// side can be A/B'd against its pinned path on its own.
   bool probe_from_scan{false};
@@ -152,6 +161,8 @@ struct vector_join_request {
   /// Whether a threshold join that re-reads its corpus may run in build and pair tasks, from the
   /// operator parameter of that name. The planner sets it.
   bool pair_tasks{false};
+  /// search_mode => 'index' only.
+  cagra_join_settings cagra;
 };
 
 struct SiriusVectorJoinBindData : public duckdb::TableFunctionData {

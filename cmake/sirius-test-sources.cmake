@@ -154,11 +154,13 @@ set(TEST_SOURCES
     test/cpp/integration/test_gpu_execution_unfolded_constants.cpp
     test/cpp/integration/test_gpu_execution_vector_search.cpp
     test/cpp/integration/test_gpu_execution_vector_threshold_join.cpp
+    test/cpp/integration/test_gpu_execution_vector_join_cagra.cpp
     test/cpp/integration/test_gpu_execution_vector_topk_join.cpp
     test/cpp/integration/test_gpu_execution_aggregate_filter.cpp
     test/cpp/integration/test_gpu_execution_kmeans.cpp
     test/cpp/integration/test_gpu_execution_vector_join_exact_per_row.cpp
     test/cpp/integration/test_gpu_execution_vector_join_sql_rewrite.cpp
+    test/cpp/integration/test_gpu_execution_vector_join_uncached.cpp
     test/cpp/integration/test_gpu_execution_vector_join_inner_product.cpp
     test/cpp/integration/test_gpu_execution_window.cpp
     test/cpp/integration/test_pin_registry_epoch.cpp

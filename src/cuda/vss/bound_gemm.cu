@@ -40,6 +40,8 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <type_traits>
 
@@ -314,8 +316,14 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
     if (row >= 0) {
       auto const qsq = static_cast<float>(probe_sq[row]);
       auto const qn  = sqrtf(qsq);
-      tile_qsq[r]    = qsq;
-      tile_limit[r]  = bound[row] + slack.a * qn * slack.x_max +
+      // INT8 keeps |q|^2 as the int32's bits: as a float it is exact only below 2^24 (256-d), and
+      // the epilogue's integer compare needs it exact at any width.
+      if constexpr (sizeof(T) == 1) {
+        tile_qsq[r] = __int_as_float(static_cast<int32_t>(probe_sq[row]));
+      } else {
+        tile_qsq[r] = qsq;
+      }
+      tile_limit[r] = bound[row] + slack.a * qn * slack.x_max +
                       slack.b * (qn + slack.x_max) * (qn + slack.x_max) +
                       slack.c * (qn + slack.x_max);
     } else {
@@ -463,14 +471,19 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
         // A pair's distance is only formed again for a survivor, where it is written out.
         auto distance = [&](int h, int c, typename mma_traits<T>::accumulator a) {
           if constexpr (sizeof(T) == 1) {
-            return static_cast<float>(static_cast<int32_t>(qs[h]) - xs[c] - 2 * a);
+            // Rounded up: past 2^24 a float cannot hold every integer, and a code distance read
+            // back as a float (int8_upper_bound_of, the radius join's certain test) must never
+            // understate it; against a float limit an integer c <= limit iff ru(c) <= limit.
+            return __int2float_ru(__float_as_int(qs[h]) - xs[c] - 2 * a);
           } else {
             return qs[h] + xs[c] - 2.f * a;
           }
         };
-        // INT8: qs + xs - 2 acc is an integer below 2^24, so it is <= limit exactly when it is <=
+        // INT8: qs + xs - 2 acc is an integer, so it is <= limit exactly when it is <=
         // floor(limit), i.e. when 2 acc - xs >= qs - floor(limit) = base: one shift-add and one
-        // compare per pair. |2 acc| < 2^24 and |base| <= 10^9 + 2^24, so none of it overflows.
+        // compare per pair, in int32 at any width bound_filter_int8_supports allows (codes in
+        // [-128, 127], D <= 15,360): |2 acc - xs| <= 3 * 2^14 D < 2^31, qs <= 2^14 D, and
+        // |floor(limit)| <= 10^9, the clamp, which is above every code distance (<= 255^2 D).
         int32_t base[2] = {0, 0};
         if constexpr (sizeof(T) == 1) {
 #pragma unroll
@@ -478,7 +491,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
             auto const l = limit[h] >= 1e9f    ? 1000000000
                            : limit[h] <= -1e9f ? -1000000000
                                                : static_cast<int32_t>(floorf(limit[h]));
-            base[h]      = static_cast<int32_t>(qs[h]) - l;
+            base[h]      = __float_as_int(qs[h]) - l;
           }
         }
         auto pass = [&](int j, int t) {
@@ -552,8 +565,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2)
             float dist        = 0.f;
             if (row >= 0 && xj < n) {
               if constexpr (sizeof(T) == 1) {
-                dist = static_cast<float>(static_cast<int32_t>(tile_qsq[r]) + x_sq[xj] -
-                                          2 * scores[warp][e]);
+                dist = __int2float_ru(__float_as_int(tile_qsq[r]) + x_sq[xj] - 2 * scores[warp][e]);
               } else {
                 dist = tile_qsq[r] + x_sq[xj] - 2.f * scores[warp][e];
               }
@@ -1212,11 +1224,16 @@ bound_candidates::bound_candidates(int64_t capacity,
     count(1, stream, mr)
 { CUDF_CUDA_TRY(cudaMemsetAsync(count.data(), 0, sizeof(unsigned long long), stream.get())); }
 
-bool bound_filter_int8_supports(int64_t dim)
+bool bound_filter_int8_supports(int64_t dim, bool rescored)
 {
-  // 16-byte loads of whole row segments, and exact int32 distances that also convert to float
-  // exactly: 4 * 128^2 * dim < 2^24.
-  return dim > 0 && dim % 16 == 0 && dim <= 256;
+  // 16-byte loads of whole row segments, and an exact integer compare (bound_filter_kernel's
+  // epilogue): codes in [-128, 127] keep every int32 sum under 2^31 and every code distance
+  // (<= 255^2 dim) under the limit's 10^9 clamp up to dim = 15,360 (998,784,000). Distances leave
+  // the filter rounded up to float, which only ever overstates them -- enough where an FP32
+  // re-score answers (INT8 codes). Lossless byte rows answer from those floats themselves, exact
+  // only below 2^24, so they keep 256 (255^2 * 256 < 2^24).
+  if (dim <= 0 || dim % 16 != 0) { return false; }
+  return dim <= (rescored ? int64_t{15'360} : int64_t{256});
 }
 
 void bound_filter_int8(int8_t const* x,
@@ -1234,7 +1251,8 @@ void bound_filter_int8(int8_t const* x,
                        rmm::cuda_stream_view stream)
 {
   if (n == 0 || m == 0) { return; }
-  CUDF_EXPECTS(bound_filter_int8_supports(dim), "bound_filter_int8: unsupported vector width");
+  CUDF_EXPECTS(bound_filter_int8_supports(dim, /*rescored=*/true),
+               "bound_filter_int8: unsupported vector width");
   if (launch_small(x,
                    x_sq,
                    n,
@@ -1745,24 +1763,44 @@ __global__ void scale_kernel(float* d, int64_t n, float factor)
   }
 }
 
-__global__ void normalize_rows_kernel(float const* x, int64_t n, int64_t dim, float* out)
+__global__ void normalize_rows_kernel(
+  float const* x, int64_t n, int64_t dim, float* out, unsigned long long* zero_rows)
 {
   int const lane   = threadIdx.x % 32;
   auto const warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / 32);
   for (int64_t r = (blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x) / 32; r < n;
        r += warps) {
-    float s = 0.f;
+    float s = 0.f, amax = 0.f;
     for (int64_t c = lane; c < dim; c += 32) {
       float const v = x[r * dim + c];
       s             = fmaf(v, v, s);
+      amax          = fmaxf(amax, fabsf(v));
     }
 #pragma unroll
     for (int o = 16; o > 0; o /= 2) {
       s += __shfl_xor_sync(0xffffffffu, s, o);
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
     }
+    // A finite nonzero row whose squared norm leaves FP32's normal range (it overflows, or
+    // underflows and loses its direction) is normalized scaled by a power of two, which is
+    // exact and puts its squared norm in [1, dim]. Other rows take the unscaled path unchanged.
+    float scale = 1.f;
+    if (!(s >= 0x1p-126f && s <= 3.4028235e38f) && amax > 0.f && amax <= 3.4028235e38f) {
+      scale = ldexpf(1.f, -ilogbf(amax));
+      s     = 0.f;
+      for (int64_t c = lane; c < dim; c += 32) {
+        float const v = x[r * dim + c] * scale;
+        s             = fmaf(v, v, s);
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o /= 2) {
+        s += __shfl_xor_sync(0xffffffffu, s, o);
+      }
+    }
+    if (amax == 0.f && lane == 0 && zero_rows != nullptr) { atomicAdd(zero_rows, 1ull); }
     float const inv = s > 0.f ? rsqrtf(s) : 0.f;
     for (int64_t c = lane; c < dim; c += 32) {
-      out[r * dim + c] = x[r * dim + c] * inv;
+      out[r * dim + c] = (x[r * dim + c] * scale) * inv;
     }
   }
 }
@@ -1845,7 +1883,7 @@ __global__ void __launch_bounds__(kSeedWarps * 32)
       for (int o = W / 2; o > 0; o /= 2) {
         dot += __shfl_xor_sync(0xffffffffu, dot, o, W);
       }
-      if (sl == 0 && i < cnt) { my[i] = static_cast<float>(probe_sq[r] + x_sq[row] - 2 * dot); }
+      if (sl == 0 && i < cnt) { my[i] = __int2float_ru(probe_sq[r] + x_sq[row] - 2 * dot); }
     }
     __syncwarp();
     float const kth = seed_kth(my, cnt, k, lane);
@@ -1966,8 +2004,8 @@ __global__ void __launch_bounds__(kSeedWarps * 32)
         for (int o = W / 2; o > 0; o /= 2) {
           dot += __shfl_xor_sync(0xffffffffu, dot, o, W);
         }
-        dist = static_cast<float>(static_cast<int32_t const*>(probe_sq_v)[r] +
-                                  static_cast<int32_t const*>(x_sq_v)[row] - 2 * dot);
+        dist = __int2float_ru(static_cast<int32_t const*>(probe_sq_v)[r] +
+                              static_cast<int32_t const*>(x_sq_v)[row] - 2 * dot);
       }
       if (sl == 0 && i < stride) { my[i] = i < cnt ? dist : inf; }
     }
@@ -2171,13 +2209,33 @@ void scale_in_place(float* d, int64_t n, float factor, rmm::cuda_stream_view str
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
-void normalize_rows(
-  float const* x, int64_t n, int64_t dim, float* out, rmm::cuda_stream_view stream)
+void normalize_rows(float const* x,
+                    int64_t n,
+                    int64_t dim,
+                    float* out,
+                    rmm::cuda_stream_view stream,
+                    bool zero_rows_are_errors)
 {
   if (n == 0) { return; }
   auto const grid = static_cast<int>(std::clamp<int64_t>((n + 7) / 8, 1, 65535));
-  normalize_rows_kernel<<<grid, 256, 0, stream.get()>>>(x, n, dim, out);
+  if (!zero_rows_are_errors) {
+    normalize_rows_kernel<<<grid, 256, 0, stream.get()>>>(x, n, dim, out, nullptr);
+    CUDF_CUDA_TRY(cudaGetLastError());
+    return;
+  }
+  rmm::device_buffer zero_rows(sizeof(unsigned long long), stream);
+  CUDF_CUDA_TRY(cudaMemsetAsync(zero_rows.data(), 0, sizeof(unsigned long long), stream.get()));
+  normalize_rows_kernel<<<grid, 256, 0, stream.get()>>>(
+    x, n, dim, out, static_cast<unsigned long long*>(zero_rows.data()));
   CUDF_CUDA_TRY(cudaGetLastError());
+  unsigned long long zeros = 0;
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    &zeros, zero_rows.data(), sizeof(zeros), cudaMemcpyDeviceToHost, stream.get()));
+  stream.synchronize();
+  if (zeros != 0) {
+    throw std::invalid_argument("cosine distance is undefined for a zero vector: " +
+                                std::to_string(zeros) + " row(s) of the join's input are zero");
+  }
 }
 
 void sqrt_in_place(float* d, int64_t n, rmm::cuda_stream_view stream)

@@ -132,6 +132,15 @@ side make_side(int64_t rows, int64_t d, bool f16, std::mt19937& gen)
   return s;
 }
 
+/// An int8 distance as the kernel writes it: the exact integer rounded up to a float (the same
+/// value below 2^24).
+double as_written_int8(double dist)
+{
+  auto f = static_cast<float>(dist);
+  if (static_cast<double>(f) < dist) { f = std::nextafter(f, INFINITY); }
+  return static_cast<double>(f);
+}
+
 double distance(side const& p, int64_t pr, side const& x, int64_t xr, int64_t d)
 {
   double s = 0;
@@ -188,7 +197,13 @@ void check_pairs(std::map<pair_key, float> const& got,
         REQUIRE(it == got.end());
       }
       if (it != got.end()) {
-        REQUIRE(std::abs(it->second - dist) <= tol);
+        if (f16) {
+          REQUIRE(std::abs(it->second - dist) <= tol);
+        } else {
+          INFO("row " << r << " id " << key.second << " distance " << dist << " got "
+                      << it->second);
+          REQUIRE(static_cast<double>(it->second) == as_written_int8(dist));
+        }
         expected_seen.emplace(key, it->second);
       }
     }
@@ -272,6 +287,83 @@ TEST_CASE("the bounded int8 search returns exactly the pairs under each row's bo
   }
   check_single(128, 1024, 96, false, true, 7);
   check_single(17, 129, 128, false, false, 8);
+}
+
+TEST_CASE("the bounded int8 search stays exact for wide rows, past 2^24", "[vss]")
+{
+  // Uniform bytes put |q|^2 near 5,461 d: past 2^24 from about 3,072-d, where a float norm or
+  // distance no longer holds every integer. The pairs must still be exactly those under each
+  // bound, and each distance the exact integer rounded up to float.
+  for (int64_t const d : {272, 512, 1024, 2048, 3072, 4096, 6144}) {
+    check_single(130, 640, d, false, false, 23 + static_cast<uint32_t>(d));
+  }
+  check_single(17, 300, 4096, false, true, 9);
+}
+
+TEST_CASE("the bounded int8 search is exact at the widest rows and the extreme codes", "[vss]")
+{
+  // 15,360-d is the widest INT8 codes allow (bound_filter_int8_supports); rows of all 127, all
+  // -128 and alternating ones put every int32 sum of the epilogue and the largest code distance,
+  // 255^2 * 15,360 = 998,784,000, next to their limits. Byte rows keep 256.
+  int64_t const d = 15'360;
+  REQUIRE(sirius::vss::bound_filter_int8_supports(d, true));
+  REQUIRE_FALSE(sirius::vss::bound_filter_int8_supports(d + 16, true));
+  REQUIRE(sirius::vss::bound_filter_int8_supports(256, false));
+  REQUIRE_FALSE(sirius::vss::bound_filter_int8_supports(272, false));
+  auto make = [&](std::vector<int> const& kinds) {
+    side s;
+    s.rows = static_cast<int64_t>(kinds.size());
+    for (auto const kind : kinds) {
+      double sq = 0;
+      for (int64_t c = 0; c < d; ++c) {
+        int const v = kind == 0   ? 127
+                      : kind == 1 ? -128
+                                  : ((c % 2 == 0) == (kind == 2) ? 127 : -128);
+        s.i8.push_back(static_cast<int8_t>(v));
+        s.value.push_back(v);
+        sq += static_cast<double>(v) * v;
+      }
+      s.sq_i8.push_back(static_cast<int32_t>(sq));
+    }
+    return s;
+  };
+  auto const p     = make({0, 1, 2, 3});
+  auto const x     = make({1, 0, 3, 2, 0, 1, 2});
+  double const far = 255.0 * 255.0 * static_cast<double>(d);
+  std::vector<float> const bound{std::numeric_limits<float>::infinity(),
+                                 static_cast<float>(far),
+                                 0.5f,
+                                 static_cast<float>(far) - 64.f};
+  std::vector<int64_t> const rows{0, 1, 2, 3};
+  int64_t const n = x.rows, m = p.rows, id_base = 10;
+  auto const mr = cudf::get_current_device_resource_ref();
+  bound_candidates out(1024, stream(), mr);
+  REQUIRE(cudaMemsetAsync(out.count.data(), 0, sizeof(unsigned long long), stream().get()) ==
+          cudaSuccess);
+  auto const dx = to_device(x.i8), dp = to_device(p.i8);
+  auto const dxs = to_device(x.sq_i8), dps = to_device(p.sq_i8);
+  auto const d_rows  = to_device(rows);
+  auto const d_bound = to_device(bound);
+  sirius::vss::bound_filter_int8(dx.data(),
+                                 dxs.data(),
+                                 n,
+                                 id_base,
+                                 nullptr,
+                                 dp.data(),
+                                 dps.data(),
+                                 d_rows.data(),
+                                 m,
+                                 d,
+                                 d_bound.data(),
+                                 out,
+                                 stream());
+  auto const got = read_out(out);
+  std::map<pair_key, float> seen;
+  check_pairs(got, p, rows, x, 0, n, d, bound, false, [&](int64_t j) { return id_base + j; }, seen);
+  REQUIRE(seen.size() == got.size());
+  // Row 0 (no bound) and row 1 (bound = the largest distance) keep everything; row 2 only its
+  // equal rows; row 3 all but the two farthest.
+  REQUIRE(got.size() == 7 + 7 + 2 + 5);
 }
 
 TEST_CASE("the bounded half search returns the pairs under each row's bound", "[vss]")

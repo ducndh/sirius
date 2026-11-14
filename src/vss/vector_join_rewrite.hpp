@@ -20,14 +20,31 @@
 #include "duckdb/function/aggregate_function.hpp"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace duckdb {
 class Binder;
 class ClientContext;
 class LogicalOperator;
+class TableCatalogEntry;
 }  // namespace duckdb
 
 namespace sirius::vss {
+
+struct vector_join_request;
+
+/// How a join over @p req's corpus (@p rows rows, for about @p probe_rows probe rows) runs, chosen
+/// as the plain-SQL rewrite chooses: through the codes or lists of the pinned table @p
+/// pinned_corpus (built now and kept when it has none that answer), or, for a corpus the join
+/// scans (@p pinned_corpus null), through codes or lists the join builds over its scan; or by brute
+/// force, which returns false. @p approximate lets the session's vector_join_probes make it an
+/// approximate join. Sets the request's search mode, clustering, probes and statement_clusters.
+bool choose_corpus_lists(duckdb::ClientContext& context,
+                         vector_join_request& req,
+                         duckdb::TableCatalogEntry* pinned_corpus,
+                         std::uint64_t rows,
+                         double probe_rows,
+                         bool approximate);
 
 /**
  * @brief Turn plain-SQL vector joins in an optimized DuckDB plan into the vector-join operator.

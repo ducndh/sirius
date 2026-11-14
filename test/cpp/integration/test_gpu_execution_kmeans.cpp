@@ -1289,6 +1289,194 @@ TEST_CASE_METHOD(
 }
 
 TEST_CASE_METHOD(KMeansFixture,
+                 "wide int8 lists give DuckDB's answer under every rotation",
+                 "[integration][gpu_execution][array][vss][kmeans][lists]")
+{
+  // 272 = 16 x 17 has no structured rotation; 3,072 rows are past the 512 words a tile holds whole.
+  auto const dim    = GENERATE(272, 512, 768, 3072);
+  auto const rotate = GENERATE(std::string("1"), std::string("dense"), std::string("host"));
+  if (rotate == "host" && dim > 768) { return; }  // tens of seconds a build, and no new path
+  // Early components carry most of the energy, the shape a rotation exists to spread.
+  auto const gen = [&](const std::string& seed) {
+    return "list_transform(range(" + std::to_string(dim) + "), lambda d: ((hash(i * 10000 + d + " +
+           seed +
+           ") % 1000)::FLOAT / 1000.0 - 0.5) * CASE WHEN d < 32 THEN 30 ELSE 1 END)::FLOAT[" +
+           std::to_string(dim) + "]";
+  };
+  auto const prefix = "kmw_" + std::to_string(dim) + "_" + rotate;
+  run_ok("CREATE TABLE " + prefix + "_corpus AS SELECT i::INTEGER AS id, " + gen("0") +
+         " AS vec FROM range(2000) t(i);");
+  run_ok("CREATE TABLE " + prefix + "_probe AS SELECT i::INTEGER AS id, " + gen("5555555") +
+         " AS vec FROM range(100) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => '" + prefix +
+         "_probe', tier => 'gpu', format => 'duckdb');");
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_INT8_ROTATE"); }
+  } unset_env;
+  ::setenv("SIRIUS_VSS_INT8_ROTATE", rotate.c_str(), 1);
+  auto const name = prefix + "_c";
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + name +
+         "', n_clusters => 4);");
+  auto const built = ok_rows(*con,
+                             "SELECT encoding FROM sirius_kmeans_build_lists('" + prefix +
+                               "_corpus','vec','" + name + "', storage => 'int8');");
+  REQUIRE(built.at(0).at(0) == "int8");
+
+  // An answer does not show wrong codes, only a limit that drops nothing: one list and these
+  // clusters each code a row within half a step a component, and join the same.
+  auto const one_name = prefix + "_o";
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + one_name +
+         "', n_clusters => 1);");
+  auto const coding_error_ok = [&](std::string const& clustering) {
+    ::setenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG", "1", 1);
+    std::string log;
+    {
+      stderr_to_string capture{log};
+      ok_rows(*con,
+              "SELECT encoding FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" +
+                clustering + "', storage => 'int8');");
+    }
+    ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    auto const scale_at = log.find("code_scale ");
+    auto const error_at = log.find("code_error ");
+    REQUIRE(scale_at != std::string::npos);
+    REQUIRE(error_at != std::string::npos);
+    auto const scale = std::stod(log.substr(scale_at + 11));
+    auto const error = std::stod(log.substr(error_at + 11));
+    INFO("scale " << scale << " error " << error);
+    CHECK(scale < 10.0);
+    CHECK(error <= scale * std::sqrt(static_cast<double>(dim)));
+  };
+  coding_error_ok(one_name);
+  coding_error_ok(name);
+
+  // Every cluster probed: the exact join, against DuckDB's distances on the CPU.
+  auto const knn    = "FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
+                      "_corpus','vec', metric => 'l2', k => 10, search_mode => 'approx', "
+                      "clustering => '" +
+                      name + "', n_probes => 4)";
+  auto const oracle = distance_multiset(
+    *con,
+    "SELECT left_id, distance FROM (SELECT p.id AS left_id, array_distance(p.vec, c.vec) AS "
+    "distance, row_number() OVER (PARTITION BY p.id ORDER BY array_distance(p.vec, c.vec)) AS rk "
+    "FROM " +
+      prefix + "_probe p, " + prefix + "_corpus c) WHERE rk <= 10;");
+  auto const got = distance_multiset(*con, "SELECT left_id, distance " + knn + ";");
+  REQUIRE(oracle.size() == 100u * 10u);
+  REQUIRE(got.size() == oracle.size());
+  std::size_t mismatched = 0;
+  for (std::size_t i = 0; i < oracle.size(); ++i) {
+    mismatched +=
+      got[i].first != oracle[i].first || std::llabs(got[i].second - oracle[i].second) > 1;
+  }
+  CHECK(mismatched == 0);
+
+  // Unit rows: the threshold join on cosine, at a radius that keeps some pairs and drops most.
+  auto const cos_name = prefix + "_u";
+  run_ok("SELECT * FROM sirius_kmeans_fit('" + prefix + "_corpus','vec', name => '" + cos_name +
+         "', n_clusters => 4, metric => 'cosine');");
+  auto const unit =
+    ok_rows(*con,
+            "SELECT encoding FROM sirius_kmeans_build_lists('" + prefix + "_corpus','vec','" +
+              cos_name + "', storage => 'int8', metric => 'cosine');");
+  REQUIRE(unit.at(0).at(0) == "int8");
+  // A radius that keeps some pairs and drops most, whatever the width.
+  auto const quantile =
+    ok_rows(*con,
+            "SELECT quantile_cont(array_cosine_similarity(p.vec, c.vec), 0.999)::DOUBLE FROM " +
+              prefix + "_probe p, " + prefix + "_corpus c;");
+  double const threshold = std::stod(quantile.at(0).at(0));
+  auto const pairs_of    = [&](const std::string& sql) {
+    std::set<std::pair<std::string, std::string>> out;
+    for (auto const& row : ok_rows(*con, sql)) {
+      out.emplace(row.at(0), row.at(1));
+    }
+    return out;
+  };
+  auto const margin = [&](double delta) {
+    return "SELECT p.id, c.id FROM " + prefix + "_probe p, " + prefix +
+           "_corpus c WHERE array_cosine_similarity(p.vec, c.vec) >= " +
+           std::to_string(threshold + delta);
+  };
+  auto const must = pairs_of(margin(1e-5) + ";");
+  auto const may  = pairs_of(margin(-1e-5) + ";");
+  auto const join = pairs_of(
+    "SELECT left_id, right_id FROM sirius_knn_join('" + prefix + "_probe','vec','" + prefix +
+    "_corpus','vec', metric => 'cosine', output_type => 'similarity', search_mode => 'approx', "
+    "clustering => '" +
+    cos_name + "', n_probes => 4, join_mode => 'threshold', eps => " + std::to_string(threshold) +
+    ");");
+  // The radius must separate the rows for the check to mean anything.
+  REQUIRE(must.size() > 100u);
+  REQUIRE(may.size() < 100u * 2000u / 100u);
+  std::size_t missed = 0, extra = 0;
+  for (auto const& e : must) {
+    missed += join.count(e) == 0;
+  }
+  for (auto const& e : join) {
+    extra += may.count(e) == 0;
+  }
+  CHECK(missed == 0);
+  CHECK(extra == 0);
+
+  if (rotate != "1") { return; }
+  // The dedup forms over these lists: each row's best match among rows of smaller id, through the
+  // table function and through the plain LATERAL query the rewrite turns into it.
+  auto const best_oracle =
+    ok_rows(*con,
+            "SELECT a.id, max(array_cosine_similarity(a.vec, b.vec))::DOUBLE FROM " + prefix +
+              "_corpus a, " + prefix +
+              "_corpus b WHERE b.id < a.id GROUP BY a.id HAVING "
+              "max(array_cosine_similarity(a.vec, b.vec)) >= " +
+              std::to_string(threshold) + ";");
+  REQUIRE(best_oracle.size() > 5u);
+  auto const rows_of = [&](std::string const& sql) {
+    std::map<std::string, double> out;
+    for (auto const& row : ok_rows(*con, sql)) {
+      CHECK(out.emplace(row.at(0), std::stod(row.at(1))).second);
+    }
+    return out;
+  };
+  auto const check_best = [&](std::map<std::string, double> const& got) {
+    std::size_t wrong = 0;
+    for (auto const& row : best_oracle) {
+      auto const it = got.find(row.at(0));
+      auto const s  = std::stod(row.at(1));
+      if (it == got.end()) {
+        wrong += s >= threshold + 1e-5;
+      } else {
+        wrong += std::abs(it->second - s) > 1e-5;
+      }
+    }
+    CHECK(wrong == 0);
+    CHECK(got.size() + 2 >= best_oracle.size());
+    CHECK(got.size() <= best_oracle.size() + 2);
+  };
+  check_best(rows_of("SELECT left_id, similarity FROM sirius_knn_join('" + prefix +
+                     "_corpus','vec','" + prefix +
+                     "_corpus','vec', probe_source => 'pin', metric => 'cosine', output_type => "
+                     "'similarity', search_mode => 'approx', clustering => '" +
+                     cos_name + "', n_probes => 4, join_mode => 'threshold', eps => " +
+                     std::to_string(threshold) + ", keep => 'best', earlier_by => 'id');"));
+  run_ok("SET vector_join_clustering = '" + cos_name + "';");
+  run_ok("SET vector_join_probes = 4;");
+  auto const lateral = "SELECT r.id, m.sim FROM " + prefix + "_corpus r, LATERAL (SELECT s.id, " +
+                       "array_cosine_similarity(r.vec, s.vec) AS sim FROM " + prefix +
+                       "_corpus s WHERE s.id < r.id ORDER BY array_cosine_distance(r.vec, s.vec) "
+                       "LIMIT 1) m WHERE m.sim >= " +
+                       std::to_string(threshold);
+  // With the fallback off, only a query the rewrite took can succeed: DuckDB's plan would not run.
+  run_ok("SET enable_duckdb_fallback = false;");
+  check_best(rows_of(lateral + ";"));
+  run_ok("RESET enable_duckdb_fallback;");
+  run_ok("RESET vector_join_probes;");
+  run_ok("RESET vector_join_clustering;");
+}
+
+TEST_CASE_METHOD(KMeansFixture,
                  "int8 lists over a component 300x wider than the rest give the exact answer",
                  "[integration][gpu_execution][array][vss][kmeans][lists][running_bound]")
 {
@@ -1296,7 +1484,7 @@ TEST_CASE_METHOD(KMeansFixture,
   // filter little, and the answer must still be exact, whether the rows were rotated before coding
   // (spreading component 0 over all of them) or not. Over host lists one task per probe chunk, so
   // chunks are searched concurrently.
-  auto const rotate = GENERATE(std::string("1"), std::string("0"));
+  auto const rotate = GENERATE(std::string("1"), std::string("dense"), std::string("0"));
   auto const tier   = GENERATE(std::string("gpu"), std::string("host"));
   auto const gen    = [](const std::string& seed) {
     return "list_transform(range(64), lambda d: ((hash(i * 1000 + d + " + seed +
@@ -1655,7 +1843,7 @@ TEST_CASE_METHOD(KMeansFixture,
   expect_error(*con,
                "SELECT * FROM sirius_kmeans_build_lists('kmrb_corpus','vec','kmrb_c', "
                "storage => 'int8');",
-               "multiple of 16 and at most 256");
+               "multiple of 16 and at most 15360");
   expect_error(*con,
                "SELECT * FROM sirius_kmeans_build_lists('kmrb_corpus','vec','kmrb_c', "
                "storage => 'float16');",
@@ -3412,16 +3600,13 @@ TEST_CASE_METHOD(KMeansFixture,
     }
     run_ok("SELECT * FROM sirius_kmeans_fit('" + p + "_cent','vec', name => '" + p +
            "_c', rows_are_centroids => true);");
-    run_ok("SELECT * FROM sirius_kmeans_build_lists('" + p + "_corpus','vec','" + p +
-           "_c', storage => 'float16');");
+    // Every row lies within sqrt(d) 2^-14 of the origin, so FLOAT16 lists are refused (Condition D4 of the
+    // exactness proof); before that check this case joined exactly.
     INFO("k " << k);
-    CHECK(relative_mismatches(
-            exact_distances(*con,
-                            "SELECT left_id, distance FROM sirius_knn_join('" + p +
-                              "_probe','vec','" + p + "_corpus','vec', metric => 'l2', k => " + n +
-                              ", search_mode => 'approx', clustering => '" + p +
-                              "_c', n_probes => 2);"),
-            cpu_exact_top_k(*con, p, k, 1)) == 0);
+    expect_error(*con,
+                 "SELECT * FROM sirius_kmeans_build_lists('" + p + "_corpus','vec','" + p +
+                   "_c', storage => 'float16');",
+                 "too close to the origin");
     for (auto const* t : {"_corpus", "_probe", "_cent"}) {
       run_ok("SELECT * FROM unpin_table('" + p + t + "');");
     }
@@ -3718,9 +3903,9 @@ TEST_CASE_METHOD(KMeansFixture,
                  "read-free float16 bounds stay off where they do not apply",
                  "[integration][gpu_execution][array][vss][kmeans][approx][vector_join]")
 {
-  // By the phase log: byte and int8 codes, a scanned corpus, a radius (with its keyed and
-  // best-match forms) and an inner product take none of them, whatever the sweep-0 rule says. Their
-  // answers are the older tests' to check.
+  // By the phase log: byte and int8 codes (bar one int8 list, without a seed, below), a scanned
+  // corpus, a radius (with its keyed and best-match forms) and an inner product take none of them,
+  // whatever the sweep-0 rule says. Their answers are the older tests' to check.
   struct unset_on_exit {
     ~unset_on_exit()
     {
@@ -3792,7 +3977,6 @@ TEST_CASE_METHOD(KMeansFixture,
   };
   std::vector<off_case> const cases{
     {"int8 lists", knn("off_probe", "off_corpus", "off_i8", 8, ", metric => 'l2'")},
-    {"one int8 list", knn("off_probe", "off_corpus", "off_i8one", 1, ", metric => 'l2'")},
     {"byte lists", knn("off_bytes_probe", "off_bytes", "off_u8", 8, ", metric => 'l2'")},
     {"one byte list", knn("off_bytes_probe", "off_bytes", "off_u8one", 1, ", metric => 'l2'")},
     {"scanned corpus",
@@ -3822,6 +4006,111 @@ TEST_CASE_METHOD(KMeansFixture,
   auto const one = paths_of(knn("off_probe", "off_corpus", "off_one", 1, ", metric => 'l2'"));
   INFO(one);
   CHECK(one.find("single list without a seed 1") != std::string::npos);
+  auto const one_i8 = paths_of(knn("off_probe", "off_corpus", "off_i8one", 1, ", metric => 'l2'"));
+  INFO(one_i8);
+  CHECK(one_i8.find("single list without a seed 1") != std::string::npos);
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "int8 lists refuse rows whose squares leave FP32's range",
+                 "[integration][gpu_execution][array][vss][kmeans][lists]")
+{
+  run_ok(
+    "CREATE TABLE i8big_corpus AS SELECT i::INTEGER AS id, list_transform(range(32), lambda "
+    "d: (3e19 + (i + d) * 1e15)::FLOAT)::FLOAT[32] AS vec FROM range(200) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'i8big_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok(
+    "SELECT * FROM sirius_kmeans_fit('i8big_corpus','vec', name => 'i8big_c', n_clusters => "
+    "1);");
+  expect_error(*con,
+               "SELECT * FROM sirius_kmeans_build_lists('i8big_corpus','vec','i8big_c', storage => "
+               "'int8');",
+               "squared norms fit FP32");
+}
+
+TEST_CASE_METHOD(KMeansFixture,
+                 "int8 lists over rows closer than the code error give the exact answer",
+                 "[integration][gpu_execution][array][vss][kmeans][lists][vector_join]")
+{
+  // Two rows 100 from the rest set the scale, so a code step is about 1 and the coding error
+  // about 0.3 sqrt(d), while the other rows lie within 0.05 sqrt(d) of each other: limits drop
+  // nothing and all 6M pairs pass, past the buffer's 4M. Over one list and four, under the code
+  // bound, the seed and slices cut to fit, against DuckDB's distances on the CPU.
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_INT8_NO_SEED");
+      ::unsetenv("SIRIUS_VSS_PAIRS_TO_HOST");
+      ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+      ::unsetenv("SIRIUS_VSS_INT8_ROTATE");
+    }
+  } unset_env;
+  auto const dim    = GENERATE(256, 512);
+  auto const rotate = GENERATE(std::string("1"), std::string("0"));
+  auto const p      = "cl" + std::to_string(dim) + "_" + rotate;
+  auto const gen    = [&](std::string const& seed) {
+    return "list_transform(range(" + std::to_string(dim) +
+           "), lambda d: (CASE WHEN i = 0 THEN 100.0 WHEN i = 1 THEN -100.0 ELSE 1.0 + (hash(i * "
+           "10000 + d + " +
+           seed + ") % 1000)::FLOAT / 10000.0 END)::FLOAT)::FLOAT[" + std::to_string(dim) + "]";
+  };
+  run_ok("CREATE TABLE " + p + "_corpus AS SELECT i::INTEGER AS id, " + gen("0") +
+         " AS vec FROM range(6000) t(i);");
+  run_ok("CREATE TABLE " + p + "_probe AS SELECT i::INTEGER AS id, " + gen("7777777") +
+         " AS vec FROM range(2, 1002) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => '" + p + "_corpus', tier => 'gpu', format => 'duckdb');");
+  run_ok("SELECT * FROM pin_table(name => '" + p + "_probe', tier => 'gpu', format => 'duckdb');");
+  ::setenv("SIRIUS_VSS_INT8_ROTATE", rotate.c_str(), 1);
+  auto const build = [&](std::string const& name, int clusters) {
+    run_ok("SELECT * FROM sirius_kmeans_fit('" + p + "_corpus','vec', name => '" + name +
+           "', n_clusters => " + std::to_string(clusters) + ", seed => 3);");
+    run_ok("SELECT * FROM sirius_kmeans_build_lists('" + p + "_corpus','vec','" + name +
+           "', storage => 'int8');");
+  };
+  build(p + "_one", 1);
+  build(p + "_four", 4);
+  ::unsetenv("SIRIUS_VSS_INT8_ROTATE");
+  auto const reference = cpu_exact_top_k(*con, p, 10, 1);
+  REQUIRE(reference.size() == 1000u * 10u);
+  auto const join = [&](std::string const& name, int probes) {
+    return "SELECT left_id, distance FROM sirius_knn_join('" + p + "_probe','vec','" + p +
+           "_corpus','vec', metric => 'l2', k => 10, search_mode => 'approx', clustering => '" +
+           name + "', n_probes => " + std::to_string(probes) + ");";
+  };
+  for (auto const* cut : {"", "force"}) {
+    INFO("pairs to host setting '" << cut << "'");
+    if (*cut != 0) { ::setenv("SIRIUS_VSS_PAIRS_TO_HOST", cut, 1); }
+    CHECK(relative_mismatches(exact_distances(*con, join(p + "_one", 1)), reference) == 0);
+    CHECK(relative_mismatches(exact_distances(*con, join(p + "_four", 4)), reference) == 0);
+    ::setenv("SIRIUS_VSS_INT8_NO_SEED", "0", 1);
+    CHECK(relative_mismatches(exact_distances(*con, join(p + "_one", 1)), reference) == 0);
+    ::unsetenv("SIRIUS_VSS_INT8_NO_SEED");
+    ::unsetenv("SIRIUS_VSS_PAIRS_TO_HOST");
+  }
+  auto const log_of = [&](std::string const& sql) {
+    ::setenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG", "1", 1);
+    std::string log;
+    {
+      stderr_to_string capture{log};
+      ok_rows(*con, sql);
+    }
+    ::unsetenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG");
+    return log;
+  };
+  auto const no_seed = log_of(join(p + "_one", 1));
+  INFO(no_seed);
+  CHECK(no_seed.find("single list without a seed 1") != std::string::npos);
+  // A seed's first piece is every row, 6M pairs at once: the slice has to be cut, not just asked to
+  // be.
+  ::setenv("SIRIUS_VSS_INT8_NO_SEED", "0", 1);
+  ::setenv("SIRIUS_VSS_PAIRS_TO_HOST", "force", 1);
+  auto const log = log_of(join(p + "_one", 1));
+  ::unsetenv("SIRIUS_VSS_PAIRS_TO_HOST");
+  ::unsetenv("SIRIUS_VSS_INT8_NO_SEED");
+  INFO(log);
+  CHECK(log.find("slice cuts") != std::string::npos);
 }
 
 TEST_CASE_METHOD(KMeansFixture,
@@ -4602,6 +4891,12 @@ class scoped_env {
 TEST_CASE("a threshold join in pair tasks finds what one task per probe chunk finds",
           "[vss][kmeans][approx][pair_tasks][isolated_context]")
 {
+  // The exact cases compare the two task shapes over the scanned corpus. Left to its cost model, an
+  // exact join may build lists over that corpus and run on them, with no probe blocks at all.
+  struct unset_on_exit {
+    ~unset_on_exit() { ::unsetenv("SIRIUS_VSS_ACCESS_PATH"); }
+  } const restore_access_path;
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "brute", 1);
   sirius::test::scratch_dir scratch{"pair_tasks_same"};
   auto const disk = scratch.path() / "disk";
   std::filesystem::create_directories(disk);

@@ -21,6 +21,8 @@
 #include "telemetry/data_batch_probe.hpp"
 #include "vss/pair_schedule.hpp"
 #include "vss/vector_join.hpp"
+#include "cuda/vss/cudf_raft_interop.hpp"
+#include "vss/join_result_shaping.hpp"
 #include "vss/vector_join_materialized_side.hpp"
 
 #include <cudf/column/column_view.hpp>
@@ -67,6 +69,8 @@ struct cluster_lists;
 }  // namespace sirius::vss
 
 namespace sirius::op {
+
+struct vector_join_index_state;
 
 /// Under SIRIUS_VECTOR_JOIN_PHASE_DEBUG only: a phase line with a scope's wall time as it ends. One
 /// that ends in an exception says so, since the engine retries those and their time counts too.
@@ -447,6 +451,13 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// @ref build_side_ready_locked, so callers must check that first.
   void ensure_initialized_locked();
   void initialize_locked();
+  /// Lists of a corpus this join scanned, built once the scan is done (@c
+  /// vector_join_request::statement_clusters), and searched in place of the scanned chunks. A
+  /// build that is refused leaves the scanned chunks to be searched as they are. Caller holds
+  /// _op_mutex.
+  void build_statement_lists_locked();
+  /// HOST-tier lists' chunks into this query's repository manager. Caller holds _op_mutex.
+  void register_host_lists_locked();
 
   /// Build @c _chunk_cluster_runs and @c _cluster_rows on first use. Deferred out of init
   /// because reading the cluster column needs a memory space, which only a running task
@@ -519,6 +530,20 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
     return _blocks.empty() ? _num_left : _blocks.size();
   }
 
+  /// search_mode => 'index', in sirius_physical_vector_join_index.cpp. Finds or plans the index and
+  /// sizes the search batches. Caller holds _op_mutex.
+  void prepare_index_join_locked();
+  void set_index_join_limits_locked(std::size_t room);
+  [[nodiscard]] std::size_t index_join_estimate(std::size_t n_left) const;
+  /// One task's probe rows through the index, re-scored: per-row top-k, shaped.
+  vss::shaped_join_result index_join_task(vss::dataset_matrix_view queries,
+                                          std::size_t left_idx,
+                                          std::int64_t k_join,
+                                          ::cucascade::memory::memory_space& space,
+                                          rmm::cuda_stream_view stream,
+                                          rmm::device_async_resource_ref mr);
+  std::shared_ptr<vector_join_index_state> _index_join;
+
   /// The corpus row order, shared with materialize. Null on the pinned path, where the
   /// pinned_entry plays the same role.
   std::shared_ptr<sirius::vss::materialized_side_buffer> _build_side;
@@ -540,6 +565,10 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// is what lets the downgrade executor spill them when the host fills; emptied when the
   /// operator finishes so the manager does not report them as leaked.
   ::cucascade::shared_data_repository* _lists_repo{nullptr};
+  /// What @c _centroids and @c _lists point at when this join built them over its scanned corpus,
+  /// rather than borrowing them from the index cache.
+  std::shared_ptr<const cudf::column> _statement_centroids;
+  std::shared_ptr<const sirius::vss::cluster_lists> _statement_lists;
   /// Probe blocks' FP32 rows while their tasks run, registered the same way under port "host_rows".
   /// Each task's vss::block_host_rows owns its entries. The sweep takes this operator's ports in
   /// name order, so the rows spill after the idle build and probe batches.
