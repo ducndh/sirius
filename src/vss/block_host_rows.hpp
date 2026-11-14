@@ -82,6 +82,8 @@ class block_host_rows {
  private:
   [[nodiscard]] bool make_room(std::size_t bytes);
   void seal_open_part();
+  void hold(std::size_t part);
+  void release_holds() noexcept;
   template <typename Read>
   void with_part(std::size_t part, Read&& read);
   template <typename Row>
@@ -96,6 +98,9 @@ class block_host_rows {
   std::int64_t _rows_per_part;
   rmm::cuda_stream_view _stream;
   std::vector<std::shared_ptr<cucascade::data_batch>> _parts;
+  /// Parts this block has subscribed to, which keeps the spill sweep off them.
+  std::vector<bool> _held;
+  bool _hold_parts{true};
   cucascade::memory::fixed_multiple_blocks_allocation _open;
   std::int64_t _open_capacity{0};
   std::int64_t _open_rows{0};

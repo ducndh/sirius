@@ -4231,6 +4231,7 @@ TEST_CASE("a probe block's rows spilled to disk between reads give the same answ
       ::unsetenv("SIRIUS_VSS_BLOCK_ROWS_ON_HOST");
       ::unsetenv("SIRIUS_VSS_PROBE_BLOCK_ROWS");
       ::unsetenv("SIRIUS_VSS_DEVICE_BLOCK_TASKS");
+      ::unsetenv("SIRIUS_VSS_HOLD_BLOCK_ROWS");
     }
   } unset_env;
   auto const join = [](std::string const& probe) {
@@ -4256,8 +4257,17 @@ TEST_CASE("a probe block's rows spilled to disk between reads give the same answ
   ::unsetenv("SIRIUS_VSS_BLOCK_ROWS_ON_HOST");
 
   auto const pool_before = host_pool_available(con);
+  SECTION("a block holds its rows against the monitor")
+  {
+    CHECK(distance_mismatches(distance_multiset(con, join("brs_probe")), on_device) == 0);
+    auto const after = sirius::test::get_vector_join_host_rows_stats(con);
+    CHECK(after.batches_made - stats.batches_made == 3);
+    CHECK(after.batches_restored == stats.batches_restored);
+    CHECK(after.blocks_on_device == 0);
+  }
   SECTION("one block")
   {
+    ::setenv("SIRIUS_VSS_HOLD_BLOCK_ROWS", "0", 1);
     CHECK(distance_mismatches(distance_multiset(con, join("brs_probe")), on_device) == 0);
     auto const after = sirius::test::get_vector_join_host_rows_stats(con);
     CHECK(after.batches_made - stats.batches_made == 3);
@@ -4267,6 +4277,7 @@ TEST_CASE("a probe block's rows spilled to disk between reads give the same answ
   }
   SECTION("blocks, two at once")
   {
+    ::setenv("SIRIUS_VSS_HOLD_BLOCK_ROWS", "0", 1);
     ::setenv("SIRIUS_VSS_PROBE_BLOCK_ROWS", "25000", 1);
     ::setenv("SIRIUS_VSS_DEVICE_BLOCK_TASKS", "2", 1);
     CHECK(distance_mismatches(distance_multiset(con, join("brs_probe")), on_device) == 0);

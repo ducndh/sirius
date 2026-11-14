@@ -31,11 +31,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <new>
 #include <numeric>
 #include <stdexcept>
+#include <string_view>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -108,17 +110,40 @@ block_host_rows::block_host_rows(cucascade::shared_data_repository& repository,
                                 _row_bytes))),
     _stream(stream)
 {
+  // Off, the engine may spill a part between two reads of it; kept for exercising that path.
+  auto const* hold = std::getenv("SIRIUS_VSS_HOLD_BLOCK_ROWS");
+  _hold_parts      = hold == nullptr || std::string_view{hold} != "0";
 }
 
 block_host_rows::~block_host_rows()
 {
   // A task that failed with a batch half written may have copies running into its blocks.
   if (_open) { _stream.synchronize_no_throw(); }
+  release_holds();
   for (auto const& part : _parts) {
     try {
       std::ignore = _repository.pop_data_batch_by_id(part->get_batch_id());
     } catch (...) {
     }
+  }
+}
+
+void block_host_rows::hold(std::size_t part)
+{
+  if (!_hold_parts || _held.at(part)) { return; }
+  _parts[part]->subscribe();
+  _held[part] = true;
+}
+
+void block_host_rows::release_holds() noexcept
+{
+  for (std::size_t part = 0; part < _held.size(); ++part) {
+    if (!_held[part]) { continue; }
+    try {
+      _parts[part]->unsubscribe();
+    } catch (...) {
+    }
+    _held[part] = false;
   }
 }
 
@@ -150,6 +175,8 @@ bool block_host_rows::append(float const* device_rows, std::int64_t rows)
         _open =
           host_mr->allocate_multiple_blocks(static_cast<std::size_t>(_open_capacity) * _row_bytes);
       } catch (std::bad_alloc const&) {
+        // The pool may be full of this block's own parts; let the engine spill them.
+        release_holds();
         return false;
       }
     }
@@ -189,8 +216,12 @@ void block_host_rows::seal_open_part()
   auto batch = cucascade::data_batch::make(
     sirius::get_next_batch_id(),
     std::make_unique<cucascade::host_data_representation>(std::move(table), &_host_space));
+  // The executor's sweep skips a subscribed batch. Without this it takes the rows of the block
+  // being searched before any idle batch of a later operator, and each read brings them back.
+  if (_hold_parts) { batch->subscribe(); }
   _repository.add_data_batch(batch);
   _parts.push_back(std::move(batch));
+  _held.push_back(_hold_parts);
   _ctx.record_vector_join_host_batch(_repository.total_size());
 }
 
@@ -218,6 +249,7 @@ void block_host_rows::with_part(std::size_t part, Read&& read)
         }
       }
       if (bytes == 0) {
+        hold(part);
         auto const& table =
           lock.get_data()->cast<cucascade::host_data_representation>().get_host_table();
         read(*table->allocation, table->columns.front().data_offset);
@@ -231,6 +263,8 @@ void block_host_rows::with_part(std::size_t part, Read&& read)
         std::to_string(bytes) + " bytes in a host pool of " +
         std::to_string(_host_space.get_max_memory()) + ", and nothing more can be spilled");
     }
+    // The room may have to come from this block's other parts.
+    release_holds();
     if (!make_room(bytes)) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
   }
 }
