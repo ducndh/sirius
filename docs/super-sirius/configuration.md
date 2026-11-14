@@ -181,6 +181,7 @@ Controls the disk spill tier. Data evicted from host memory is written here. Dis
 | `disk_id` | int | 0 | Identifier for the disk space. |
 | `capacity_bytes` | bytes | 1Ti | Maximum disk space for spill files. |
 | `downgrade_root_dirs` | string | "" | Directory path for spill files. **Must be set** to enable disk spilling. Use a fast local mount (NVMe preferred). |
+| `direct_io` | bool | false | Read and write spill files with `O_DIRECT`, bypassing the page cache. Leave off when spilling is occasional: a batch spilled a moment ago is usually still cached. Turn on when more is spilled than free host memory can cache, or when spilled batches are read back many times. A filesystem that refuses `O_DIRECT` (tmpfs) is used buffered, with a warning. |
 
 ### Input-table compression (`sirius.compression`)
 
