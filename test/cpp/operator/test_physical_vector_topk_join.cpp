@@ -16,6 +16,7 @@
 
 #include "helper/type_conversions.hpp"
 #include "operator_test_utils.hpp"
+#include "utils/test_physical_operator.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
@@ -142,11 +143,11 @@ topk_ops make_ops(std::int64_t k,
                   duckdb::JoinType join_type = duckdb::JoinType::INNER)
 {
   auto const vec = duckdb::LogicalType::ARRAY(duckdb::LogicalType::FLOAT, DIM);
-  auto left      = duckdb::make_uniq<sirius_physical_operator>(
+  auto left      = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{vec, duckdb::LogicalType::INTEGER}),
     0);
-  auto right = duckdb::make_uniq<sirius_physical_operator>(
+  auto right = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER, vec}),
     0);
@@ -591,11 +592,11 @@ std::unique_ptr<sirius_physical_vector_topk_join> make_global_join(std::int64_t 
                                                                    bool is_similarity)
 {
   auto const vec = duckdb::LogicalType::ARRAY(duckdb::LogicalType::FLOAT, DIM);
-  auto left      = duckdb::make_uniq<sirius_physical_operator>(
+  auto left      = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{vec, duckdb::LogicalType::INTEGER}),
     0);
-  auto right = duckdb::make_uniq<sirius_physical_operator>(
+  auto right = duckdb::make_uniq<sirius::op::test_physical_operator>(
     SiriusPhysicalOperatorType::PROJECTION,
     sirius::from_duckdb_vec(duckdb::vector<duckdb::LogicalType>{duckdb::LogicalType::INTEGER, vec}),
     0);

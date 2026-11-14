@@ -91,6 +91,11 @@ class sirius_physical_vector_topk_join : public sirius_physical_partition_consum
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::VECTOR_TOPK_JOIN;
 
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
  public:
   sirius_physical_vector_topk_join(duckdb::unique_ptr<sirius_physical_operator> left,
                                    duckdb::unique_ptr<sirius_physical_operator> right,

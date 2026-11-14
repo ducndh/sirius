@@ -38,6 +38,11 @@ class sirius_physical_vector_topk_merge : public sirius_physical_partition_consu
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::VECTOR_TOPK_MERGE;
 
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   sirius_physical_vector_topk_merge(
     const sirius_physical_vector_topk_join& join,
     uint64_t batch_bytes = sirius::config::DEFAULT_CONCAT_BATCH_BYTES);

@@ -50,7 +50,10 @@ class sirius_physical_vector_join_reduce_local
   // Source + sink: blocking reduction between the selection and materialize pipelines.
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
-  bool sink_order_dependent() const override { return false; }
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
 
   /// Drains all partials of one partition (one left batch) per call.
   std::unique_ptr<operator_data> get_next_task_input_data() override;

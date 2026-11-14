@@ -42,6 +42,11 @@ class sirius_physical_vector_threshold_join : public sirius_physical_partition_c
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::VECTOR_THRESHOLD_JOIN;
 
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
  public:
   sirius_physical_vector_threshold_join(
     duckdb::LogicalOperator& op,

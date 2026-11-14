@@ -207,6 +207,12 @@ struct arrow_import_ingestible::impl {
       if (!input.batch || input.batch->row_count() > limits.max_rows)
         throw std::invalid_argument("Arrow producer exceeded its declared row bound");
       input.batch->validate_for(binding.program);
+    } catch (transparent::arrow_schema_drift_error const& error) {
+      if (auto counters = info.profiles->counters)
+        counters->arrow_schema_drift_refusals.fetch_add(1, std::memory_order_relaxed);
+      throw transparent::classified_execution_error(transparent::late_failure_cause::physical_input,
+                                                    error.what(),
+                                                    transparent::kArrowSchemaDrift);
     } catch (std::invalid_argument const& error) {
       throw transparent::classified_execution_error(transparent::late_failure_cause::physical_input,
                                                     error.what());
@@ -342,7 +348,8 @@ scan::filtered_table arrow_import_ingestible::materialize_metadata_to_table(
   ::cuda::stream_ref stream,
   bool like,
   std::shared_ptr<sirius::like_multiliteral_cache const> cache,
-  expression_query_policy policy)
+  expression_query_policy policy,
+  scan_execution_context /*execution*/)
 {
   impl_->check_stop();
   scan::validate_split_for_gpu(impl_->info.contract_id,

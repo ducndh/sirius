@@ -383,6 +383,11 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM;
 
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   /// @param build_side  When non-null the corpus comes from this operator's build port -- a
   ///                    child scan materialized by the build phase -- instead of a pinned
   ///                    catalog table, and the buffer is the row order both this operator and

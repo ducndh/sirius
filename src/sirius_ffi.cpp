@@ -38,7 +38,6 @@
 #include "exec/streaming_fragment.hpp"    // sirius::exec::streaming_fragment, fragment_spec
 #include "from_substrait.hpp"             // duckdb::SubstraitToDuckDB (compiled into libsirius)
 #include "helper/type_conversions.hpp"    // sirius::from_duckdb
-#include "io/io_errors.hpp"               // sirius::io::credential_error
 #include "io/rest/s3/endpoint.hpp"        // sirius::io::rest::s3::parse_endpoint
 #include "io/s3/scope_policy.hpp"
 #include "log/logging.hpp"                    // SIRIUS_LOG_INFO
@@ -50,6 +49,8 @@
 #include "sirius_config.hpp"   // sirius::sirius_config
 #include "sirius_context.hpp"  // duckdb::SiriusContext
 #include "sirius_ffi_testing.hpp"
+
+#include <cucascade/io/io_errors.hpp>  // cucascade::io::credential_error
 
 #include <algorithm>
 #include <array>
@@ -208,7 +209,7 @@ void check_endpoint(const std::string& endpoint)
   }
   try {
     (void)sirius::io::rest::s3::parse_endpoint(endpoint);
-  } catch (sirius::io::credential_error const&) {
+  } catch (cucascade::io::credential_error const&) {
     invalid_field("endpoint", "malformed");
   }
 }
@@ -333,21 +334,13 @@ void refuse_remote_reads(const std::vector<std::string>& remote_paths,
 }
 
 // Options the configured IO backend cannot honor are refused rather than ignored. At this tree
-// the registered backends are the Sirius stack (uring + REST) and kvikIO: no S3-over-RDMA
-// backend exists, and kvikIO's remote handle consumes endpoint/region/credentials only.
+// the only registered backend is the Sirius stack (uring + REST), whatever the configuration
+// selects: no S3-over-RDMA backend exists.
 void check_backend_support(const ObjectStoreConfig& cfg,
-                           const sirius::scan_manager::scan_manager_config& scan_manager)
+                           const sirius::scan_manager::scan_manager_config& /*scan_manager*/)
 {
   if (cfg.transport == Transport::kRdma) {
     invalid_field("transport", "no S3-over-RDMA backend is registered in this build");
-  }
-  if (scan_manager.backend == sirius::scan_manager::io_backend::kvikio) {
-    if (cfg.signing_mode != SigningMode::kPresigned) {
-      invalid_field("signing_mode", "the configured kvikio backend does not honor a signing mode");
-    }
-    if (!cfg.ca_bundle_path.empty()) {
-      invalid_field("ca_bundle_path", "the configured kvikio backend does not honor a CA bundle");
-    }
   }
 }
 

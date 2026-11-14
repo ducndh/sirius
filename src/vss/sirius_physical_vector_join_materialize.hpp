@@ -82,7 +82,10 @@ class sirius_physical_vector_join_materialize : public sirius_physical_partition
 
   bool is_source() const override { return true; }
   bool is_sink() const override { return true; }
-  bool sink_order_dependent() const override { return false; }
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
 
   /// Drains all merge outputs of one partition (one left batch) per call.
   std::unique_ptr<operator_data> get_next_task_input_data() override;

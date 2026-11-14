@@ -103,6 +103,11 @@ class sirius_physical_vector_join_select : public sirius_physical_operator {
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::VECTOR_JOIN_SELECT;
 
+  [[nodiscard]] sirius::OrderPreservationType output_order_preservation() const override
+  {
+    return sirius::OrderPreservationType::NO_ORDER;
+  }
+
   sirius_physical_vector_join_select(duckdb::vector<sirius::logical_type> types,
                                      duckdb::idx_t estimated_cardinality,
                                      sirius::vss::vector_join_request request,
