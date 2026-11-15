@@ -84,13 +84,16 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <format>
+#include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -386,11 +389,10 @@ std::optional<spilled_column_layout> spilled_layout(cucascade::read_only_data_ba
 
 /// Reads @p layout's buffers from the file of the spilled batch @p ro (held read-locked, which
 /// keeps the file in place) into @p buffer and returns the column's view over it.
-cudf::column_view read_spilled_column(cucascade::read_only_data_batch const& ro,
-                                      std::size_t column,
-                                      spilled_column_layout const& layout,
-                                      rmm::device_buffer& buffer,
-                                      rmm::cuda_stream_view stream)
+void fill_spilled_column(cucascade::read_only_data_batch const& ro,
+                         spilled_column_layout const& layout,
+                         rmm::device_buffer& buffer,
+                         rmm::cuda_stream_view stream)
 {
   auto const& path = dynamic_cast<cucascade::disk_data_representation const&>(*ro.get_data())
                        .get_disk_table()
@@ -408,9 +410,17 @@ cudf::column_view read_spilled_column(cucascade::read_only_data_batch const& ro,
     vss::copy_file_to_device(
       fd, m.data_offset, m.data_size, static_cast<std::byte*>(buffer.data()) + at, stream, path);
   };
-  auto const& values = *layout.values;
   if (layout.offsets != nullptr) { copy(*layout.offsets, 0); }
-  copy(values, layout.values_at);
+  copy(*layout.values, layout.values_at);
+}
+
+/// The view of the column fill_spilled_column() reads into @p buffer.
+cudf::column_view spilled_column_view(cucascade::read_only_data_batch const& ro,
+                                      std::size_t column,
+                                      spilled_column_layout const& layout,
+                                      rmm::device_buffer const& buffer)
+{
+  auto const& values = *layout.values;
   cudf::column_view const values_view{
     cudf::data_type{static_cast<cudf::type_id>(values.type_id)},
     values.num_rows,
@@ -517,6 +527,14 @@ class materialized_chunk_source : public vector_chunk_source {
   {
     return resident(i, space, stream, /*own_reservation=*/false);
   }
+  deferred_vector_chunk stage_deferred(std::size_t i,
+                                       cucascade::memory::memory_space& space,
+                                       rmm::cuda_stream_view stream) override
+  {
+    deferred_vector_chunk out;
+    out.chunk = resident(i, space, stream, /*own_reservation=*/true, &out.fill);
+    return out;
+  }
   void count_reads() override { _count_reads = true; }
 
  private:
@@ -525,10 +543,12 @@ class materialized_chunk_source : public vector_chunk_source {
     if (_count_reads && _ctx != nullptr) { _ctx->record_vector_join_corpus_stage(bytes_moved); }
   }
 
+  /// @p defer, when given, may be handed the read of a chunk on disk in place of running it.
   staged_vector_chunk resident(std::size_t i,
                                cucascade::memory::memory_space& space,
                                rmm::cuda_stream_view stream,
-                               bool own_reservation)
+                               bool own_reservation,
+                               std::function<void()>* defer = nullptr)
   {
     auto batch = fetch(_batch_ids.at(i));
     auto ro    = batch->to_read_only();
@@ -560,8 +580,17 @@ class materialized_chunk_source : public vector_chunk_source {
           layout->bytes,
           stream,
           reservation ? reservation->get_memory_resource() : space.get_default_allocator());
-        auto const view = read_spilled_column(ro, _column_index, *layout, *buffer, stream);
-        staged_vector_chunk out{view, nullptr, std::move(reservation)};
+        staged_vector_chunk out{
+          spilled_column_view(ro, _column_index, *layout, *buffer), nullptr, std::move(reservation)};
+        if (defer != nullptr) {
+          // The read lock goes with the read: it is what keeps the file in place.
+          *defer = [reader = std::make_shared<cucascade::read_only_data_batch>(std::move(ro)),
+                    layout = *layout,
+                    target = buffer.get(),
+                    stream] { fill_spilled_column(*reader, layout, *target, stream); };
+        } else {
+          fill_spilled_column(ro, *layout, *buffer, stream);
+        }
         out.buffer = std::move(buffer);
         return out;
       }
@@ -1260,6 +1289,80 @@ staged_vector_chunk stage_for_fold(vector_chunk_source& source,
     return source.stage_for_task(j, space, stream);
   }
 }
+
+/// Runs one corpus chunk's read at a time on a thread of its own. Read on the task's thread, the
+/// next chunk overlaps the device's work on this one, but not the task's own merge and re-score of
+/// it, which wait for the device and then run on the thread the read would need.
+class chunk_read_ahead {
+ public:
+  chunk_read_ahead() { CUDF_CUDA_TRY(cudaGetDevice(&_device)); }
+  ~chunk_read_ahead()
+  {
+    {
+      std::lock_guard<std::mutex> const lock(_mutex);
+      _stop = true;
+    }
+    _wake.notify_all();
+    if (_thread.joinable()) { _thread.join(); }
+  }
+  chunk_read_ahead(chunk_read_ahead const&)            = delete;
+  chunk_read_ahead& operator=(chunk_read_ahead const&) = delete;
+
+  void start(std::function<void()> read)
+  {
+    {
+      std::lock_guard<std::mutex> const lock(_mutex);
+      _read    = std::move(read);
+      _running = true;
+      _error   = nullptr;
+    }
+    if (!_thread.joinable()) {
+      _thread = std::thread([this] { run(); });
+    }
+    _wake.notify_all();
+  }
+
+  /// Returns once the read start() was given has finished; rethrows what it threw.
+  void wait()
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _wake.wait(lock, [this] { return !_running; });
+    if (_error) { std::rethrow_exception(std::exchange(_error, nullptr)); }
+  }
+
+ private:
+  void run()
+  {
+    cudaSetDevice(_device);
+    std::unique_lock<std::mutex> lock(_mutex);
+    for (;;) {
+      _wake.wait(lock, [this] { return _stop || _read; });
+      if (!_read) { return; }
+      auto read = std::exchange(_read, nullptr);
+      lock.unlock();
+      std::exception_ptr error;
+      try {
+        read();
+      } catch (...) {
+        error = std::current_exception();
+      }
+      read = nullptr;  // drops the batch's read lock before the task is told
+      lock.lock();
+      _error   = error;
+      _running = false;
+      _wake.notify_all();
+    }
+  }
+
+  int _device{0};
+  std::mutex _mutex;
+  std::condition_variable _wake;
+  std::function<void()> _read;
+  std::exception_ptr _error;
+  bool _running{false};
+  bool _stop{false};
+  std::thread _thread;
+};
 
 }  // namespace
 
@@ -2438,6 +2541,19 @@ struct sirius_physical_vector_join_stream::block_state {
     /// Moved pairs back in the buffer: already counted as passed.
     std::int64_t pairs_back{0};
     std::vector<std::int32_t> host_row_slot;
+    /// Pinned, where the re-score gathers host probe rows: their copy to the device then starts
+    /// from here instead of going through the driver's own staging a piece at a time.
+    struct pinned_rows {
+      float* data{nullptr};
+      pinned_rows() = default;
+      pinned_rows(pinned_rows const&)            = delete;
+      pinned_rows& operator=(pinned_rows const&) = delete;
+      ~pinned_rows()
+      {
+        if (data != nullptr) { cudaFreeHost(data); }
+      }
+    };
+    pinned_rows rescore_rows;
     host_pair_queue host_pairs;
     std::optional<rmm::device_uvector<float>> moved_codes;
 
@@ -3895,6 +4011,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       gathered = std::min(gathered, pair_call_rows(dim));
     }
     routed_queries.emplace(static_cast<std::size_t>(gathered * dim), stream, mr);
+    read_ahead.wait();
     prefetched = stage_next(j);
     search_chunk(pair_step->chunk);
     if (s.any_bounded) {
@@ -4916,7 +5033,12 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                                   stream.get()));
     stream.sync();
     std::vector<std::int32_t> distinct;
-    std::vector<float> staged;
+    if (w.rescore_rows.data == nullptr) {
+      void* pinned = nullptr;
+      CUDF_CUDA_TRY(cudaMallocHost(&pinned, kRows * row_bytes));
+      w.rescore_rows.data = static_cast<float*>(pinned);
+    }
+    auto* const staged = w.rescore_rows.data;
     for (std::size_t from = 0; from < rows.size();) {
       distinct.clear();
       auto to = from;
@@ -4929,17 +5051,18 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         }
         rows[to] = slot;
       }
-      staged.resize(distinct.size() * static_cast<std::size_t>(dim));
-      st.host_rows->gather(distinct.data(), distinct.size(), staged.data());
+      auto const staged_floats = distinct.size() * static_cast<std::size_t>(dim);
+      st.host_rows->gather(distinct.data(), distinct.size(), staged);
       for (auto const row : distinct) {
         w.host_row_slot[static_cast<std::size_t>(row)] = -1;
       }
-      rmm::device_uvector<float> device_rows(staged.size(), stream, mr);
+      rmm::device_uvector<float> device_rows(staged_floats, stream, mr);
       rmm::device_uvector<std::int32_t> slots(to - from, stream, mr);
-      // From pageable vectors, so the copies have completed when the calls return.
+      // The rows' copy is still running when the call returns, and has landed by the sync below,
+      // before the next slice gathers over them.
       CUDF_CUDA_TRY(cudaMemcpyAsync(device_rows.data(),
-                                    staged.data(),
-                                    staged.size() * sizeof(float),
+                                    staged,
+                                    staged_floats * sizeof(float),
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
       CUDF_CUDA_TRY(cudaMemcpyAsync(slots.data(),
@@ -5625,6 +5748,33 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                                 : stage_for_fold(source, j, *mem_space, stage_on, stream);
   }
 
+  /// As stage_next(), with the read of a streamed chunk on disk left to the read-ahead thread.
+  /// take_prefetched() waits for it.
+  void prefetch(std::size_t j)
+  {
+    if (!read_ahead_on || copy_compact || direct || pair_step != nullptr || !staging_stream) {
+      prefetched = stage_next(j);
+      return;
+    }
+    vector_chunk_source* source = _op._corpus.get();
+    if (s.exact_lists_corpus) { source = &*s.exact_lists_corpus; }
+    deferred_vector_chunk next;
+    try {
+      next = source->stage_deferred(j, *mem_space, stage_on);
+    } catch (rmm::out_of_memory const&) {
+      // As stage_for_fold(): from the task's own reservation, on its stream.
+      next = deferred_vector_chunk{source->stage_for_task(j, *mem_space, stream), nullptr};
+    }
+    prefetched = std::move(next.chunk);
+    if (next.fill) { read_ahead.start(std::move(next.fill)); }
+  }
+
+  [[nodiscard]] staged_vector_chunk take_prefetched()
+  {
+    read_ahead.wait();
+    return std::move(prefetched);
+  }
+
   // A sample is a quarter of its cluster, at least eight times k rows (and 64) and at most the
   // larger of that and kSeedSample: a sample near the whole cluster is the sweep again, on CUDA
   // cores. Past kSeedSample rows the seed ranks it through device memory, not shared memory.
@@ -5791,6 +5941,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     auto const& nearest_edges = s.routed->nearest_edges;
     stretches.clear();
     if (!building_for_pairs) {
+      read_ahead.wait();
       prefetched = chunks->empty() ? staged_vector_chunk{} : stage_next((*chunks)[0]);
     }
     if (sweep == 0 && s.seed) {
@@ -5944,7 +6095,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     auto const& edge_begin    = s.routed->edge_begin;
     auto const& nearest_edges = s.routed->nearest_edges;
     auto const j              = (*chunks)[ci];
-    auto staged               = std::move(prefetched);
+    auto staged               = take_prefetched();
     // A pair task's kernels may still be reading the chunk if it fails, and the reader goes with
     // it.
     std::optional<sync_stream_on_exit> quiesce;
@@ -6400,8 +6551,11 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     // The searches above are issued, not finished. Staging the next needed chunk now runs its
     // H2D while the GPU works on this one.
     if (s.lists_on_host) { launch_deferred(); }
-    prefetched = pair_step == nullptr && ci + 1 < chunks->size() ? stage_next((*chunks)[ci + 1])
-                                                                 : staged_vector_chunk{};
+    if (pair_step == nullptr && ci + 1 < chunks->size()) {
+      prefetch((*chunks)[ci + 1]);
+    } else {
+      prefetched = staged_vector_chunk{};
+    }
     if (s.keep_chunks && sweep == 0 && can_keep()) {
       kept.emplace(j, std::move(staged));
     } else {
@@ -6677,6 +6831,13 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     return v == nullptr || std::string_view{v} != "0";
   }();
   staged_vector_chunk prefetched;
+  // Declared after the staging stream and the chunk it reads into: it goes first, and its
+  // destructor waits for a read still running.
+  chunk_read_ahead read_ahead;
+  bool const read_ahead_on = [] {
+    auto const* v = std::getenv("SIRIUS_VSS_READ_AHEAD");
+    return v == nullptr || std::string_view{v} != "0";
+  }();
   // The compact chunks sweep 0 copied in stay on the device for sweep 1 while the budget still
   // has a margin free, and sweep 1 starts with them: lists that nearly fit are read about once.
   std::map<std::size_t, staged_vector_chunk> kept;

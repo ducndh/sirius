@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -145,6 +146,13 @@ struct staged_vector_chunk {
   std::unique_ptr<rmm::device_buffer> buffer;
 };
 
+/// A staged chunk and, when its bytes are still to be read, the read (see
+/// vector_chunk_source::stage_deferred).
+struct deferred_vector_chunk {
+  staged_vector_chunk chunk;
+  std::function<void()> fill;
+};
+
 /**
  * @brief Where the streamed (corpus) side's chunks come from.
  *
@@ -165,6 +173,17 @@ class vector_chunk_source {
   virtual staged_vector_chunk stage(std::size_t i,
                                     ::cucascade::memory::memory_space& space,
                                     rmm::cuda_stream_view stream) = 0;
+
+  /// As stage(), except that the chunk's bytes may not be in yet: @c fill, when set, reads them
+  /// into the copy stage_deferred() allocated and may run on another thread. The chunk is not to
+  /// be used, nor dropped, before @c fill has returned. Device memory is accounted to the thread
+  /// that allocates it, so the allocation stays with the caller and only the read moves.
+  virtual deferred_vector_chunk stage_deferred(std::size_t i,
+                                               ::cucascade::memory::memory_space& space,
+                                               rmm::cuda_stream_view stream)
+  {
+    return deferred_vector_chunk{stage(i, space, stream), nullptr};
+  }
 
   /// As stage(), for the chunk a task holds for its whole run (its probe batch). The copy is
   /// allocated on @p stream, the task's own, so it draws on the reservation the task was admitted

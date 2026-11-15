@@ -113,6 +113,9 @@ block_host_rows::block_host_rows(cucascade::shared_data_repository& repository,
   // Off, the engine may spill a part between two reads of it; kept for exercising that path.
   auto const* hold = std::getenv("SIRIUS_VSS_HOLD_BLOCK_ROWS");
   _hold_parts      = hold == nullptr || std::string_view{hold} != "0";
+  if (auto const* threads = std::getenv("SIRIUS_VSS_GATHER_THREADS")) {
+    _gather_threads = std::max<std::size_t>(1, std::strtoull(threads, nullptr, 10));
+  }
 }
 
 block_host_rows::~block_host_rows()
@@ -312,16 +315,40 @@ void block_host_rows::gather_rows(Row const* rows, std::size_t n, float* out)
   for (std::size_t i = 0; i < n;) {
     auto const part = part_of(i);
     with_part(static_cast<std::size_t>(part), [&](blocks const& allocation, std::size_t base) {
-      for (; i < n && part_of(i) == part; ++i) {
-        auto const in_part = static_cast<std::int64_t>(rows[order[i]]) - part * _rows_per_part;
-        auto* dst = reinterpret_cast<std::byte*>(out + static_cast<std::int64_t>(order[i]) * _dim);
-        for_each_block_range(allocation,
-                             base + static_cast<std::size_t>(in_part) * _row_bytes,
-                             _row_bytes,
-                             [&](std::byte const* block, std::size_t before, std::size_t bytes) {
-                               std::memcpy(dst + before, block, bytes);
-                             });
+      auto end = i;
+      while (end < n && part_of(end) == part) {
+        ++end;
       }
+      auto const copy = [&](std::size_t from, std::size_t to) {
+        for (auto at = from; at < to; ++at) {
+          auto const in_part = static_cast<std::int64_t>(rows[order[at]]) - part * _rows_per_part;
+          auto* dst =
+            reinterpret_cast<std::byte*>(out + static_cast<std::int64_t>(order[at]) * _dim);
+          for_each_block_range(allocation,
+                               base + static_cast<std::size_t>(in_part) * _row_bytes,
+                               _row_bytes,
+                               [&](std::byte const* block, std::size_t before, std::size_t bytes) {
+                                 std::memcpy(dst + before, block, bytes);
+                               });
+        }
+      };
+      // One thread copies a few GB/s of rows scattered over the part; below a few MB each the
+      // threads cost more than they copy.
+      constexpr std::size_t kBytesPerThread = std::size_t{4} << 20;
+      auto const threads =
+        std::min(_gather_threads, std::max<std::size_t>(1, (end - i) * _row_bytes / kBytesPerThread));
+      if (threads < 2) {
+        copy(i, end);
+      } else {
+        auto const each = (end - i + threads - 1) / threads;
+        std::vector<std::jthread> helpers;
+        helpers.reserve(threads - 1);
+        for (std::size_t t = 1; t < threads; ++t) {
+          helpers.emplace_back(copy, std::min(end, i + t * each), std::min(end, i + (t + 1) * each));
+        }
+        copy(i, std::min(end, i + each));
+      }
+      i = end;
     });
   }
 }

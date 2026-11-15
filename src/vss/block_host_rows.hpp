@@ -101,6 +101,7 @@ class block_host_rows {
   /// Parts this block has subscribed to, which keeps the spill sweep off them.
   std::vector<bool> _held;
   bool _hold_parts{true};
+  std::size_t _gather_threads{8};
   cucascade::memory::fixed_multiple_blocks_allocation _open;
   std::int64_t _open_capacity{0};
   std::int64_t _open_rows{0};
