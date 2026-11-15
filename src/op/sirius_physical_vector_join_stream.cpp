@@ -2554,6 +2554,61 @@ struct sirius_physical_vector_join_stream::block_state {
       }
     };
     pinned_rows rescore_rows;
+    /// Two pinned buffers a slice's queries are gathered into in turn, so the gather of one slice
+    /// runs while the copy of the last one is still queued behind the search before it.
+    struct pinned_stage {
+      std::array<float*, 2> data{nullptr, nullptr};
+      std::array<cudaEvent_t, 2> landed{nullptr, nullptr};
+      std::array<bool, 2> in_flight{false, false};
+      std::size_t floats{0};
+      std::size_t at{0};
+      pinned_stage() = default;
+      pinned_stage(pinned_stage const&)            = delete;
+      pinned_stage& operator=(pinned_stage const&) = delete;
+      ~pinned_stage() { release(); }
+      /// The buffer to gather the next @p n floats into; its last copy has landed.
+      float* next(std::size_t n)
+      {
+        at ^= 1;
+        if (n > floats) {
+          release();
+          floats = n;
+        }
+        if (in_flight[at]) {
+          CUDF_CUDA_TRY(cudaEventSynchronize(landed[at]));
+          in_flight[at] = false;
+        }
+        if (data[at] == nullptr) {
+          void* pinned = nullptr;
+          CUDF_CUDA_TRY(cudaMallocHost(&pinned, floats * sizeof(float)));
+          data[at] = static_cast<float*>(pinned);
+          CUDF_CUDA_TRY(cudaEventCreateWithFlags(&landed[at], cudaEventDisableTiming));
+        }
+        return data[at];
+      }
+      /// The copy out of the buffer next() gave was queued on @p stream.
+      void sent(rmm::cuda_stream_view stream)
+      {
+        CUDF_CUDA_TRY(cudaEventRecord(landed[at], stream.get()));
+        in_flight[at] = true;
+      }
+      void release() noexcept
+      {
+        for (std::size_t i = 0; i < 2; ++i) {
+          if (in_flight[i]) { cudaEventSynchronize(landed[i]); }
+          if (data[i] != nullptr) { cudaFreeHost(data[i]); }
+          if (landed[i] != nullptr) { cudaEventDestroy(landed[i]); }
+          data[i]      = nullptr;
+          landed[i]    = nullptr;
+          in_flight[i] = false;
+        }
+        floats = 0;
+      }
+    };
+    pinned_stage query_stage;
+    /// Each cluster's nearest rows on the host, cluster after cluster, and where each begins.
+    std::vector<std::int64_t> nearest_rows;
+    std::vector<std::int64_t> nearest_at;
     host_pair_queue host_pairs;
     std::optional<rmm::device_uvector<float>> moved_codes;
 
@@ -5065,24 +5120,30 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                                     staged_floats * sizeof(float),
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
-      CUDF_CUDA_TRY(cudaMemcpyAsync(slots.data(),
-                                    rows.data() + from,
-                                    slots.size() * sizeof(std::int32_t),
-                                    cudaMemcpyHostToDevice,
-                                    stream.get()));
-      vss::exact_distances(device_rows.data(),
-                           slots.data(),
-                           0,
-                           w.candidates->ids.data() + from,
-                           w.candidates->distances.data() + from,
-                           static_cast<std::int64_t>(to - from),
-                           exact_source,
-                           dim,
-                           stream,
-                           mr,
-                           nullptr,
-                           0.f,
-                           ip);
+      try {
+        CUDF_CUDA_TRY(cudaMemcpyAsync(slots.data(),
+                                      rows.data() + from,
+                                      slots.size() * sizeof(std::int32_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        vss::exact_distances(device_rows.data(),
+                             slots.data(),
+                             0,
+                             w.candidates->ids.data() + from,
+                             w.candidates->distances.data() + from,
+                             static_cast<std::int64_t>(to - from),
+                             exact_source,
+                             dim,
+                             stream,
+                             mr,
+                             nullptr,
+                             0.f,
+                             ip);
+      } catch (...) {
+        // The rows' copy may still be reading the pinned buffer.
+        stream.synchronize_no_throw();
+        throw;
+      }
       stream.sync();
       from = to;
     }
@@ -6259,21 +6320,51 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       auto const* rows_c = s.routed_rows + eb;
       if (st.probe_rows_on_host) {
         if (sweep == 0) {
-          std::vector<std::int64_t> slice_rows_c(static_cast<std::size_t>(m));
-          CUDF_CUDA_TRY(cudaMemcpyAsync(slice_rows_c.data(),
-                                        rows_c,
-                                        slice_rows_c.size() * sizeof(std::int64_t),
-                                        cudaMemcpyDeviceToHost,
-                                        stream.get()));
-          stream.sync();
-          std::vector<float> gathered(static_cast<std::size_t>(m * dim));
-          st.host_rows->gather(slice_rows_c.data(), slice_rows_c.size(), gathered.data());
-          // From a pageable vector, so the copy has completed when the call returns.
+          auto const cluster = static_cast<std::size_t>(slice.cluster);
+          std::vector<std::int64_t> slice_rows_c;
+          std::int64_t const* host_rows_c = nullptr;
+          if (eb == edge_begin[cluster] && ee == split) {
+            // The usual sweep 0, a cluster's nearest rows. They are read on the host for every
+            // slice, and a copy per slice would wait for the search of the slice before it, so
+            // they all come over once.
+            if (w.nearest_at.empty()) {
+              w.nearest_at.assign(nearest_edges.size() + 1, 0);
+              for (std::size_t c = 0; c < nearest_edges.size(); ++c) {
+                w.nearest_at[c + 1] = w.nearest_at[c] + static_cast<std::int64_t>(nearest_edges[c]);
+              }
+              w.nearest_rows.resize(static_cast<std::size_t>(w.nearest_at.back()));
+              for (std::size_t c = 0; c < nearest_edges.size(); ++c) {
+                if (nearest_edges[c] == 0) { continue; }
+                CUDF_CUDA_TRY(cudaMemcpyAsync(
+                  w.nearest_rows.data() + w.nearest_at[c],
+                  s.routed_rows + edge_begin[c],
+                  static_cast<std::size_t>(nearest_edges[c]) * sizeof(std::int64_t),
+                  cudaMemcpyDeviceToHost,
+                  stream.get()));
+              }
+              stream.sync();
+            }
+            host_rows_c = w.nearest_rows.data() + w.nearest_at[cluster];
+          } else {
+            slice_rows_c.resize(static_cast<std::size_t>(m));
+            CUDF_CUDA_TRY(cudaMemcpyAsync(slice_rows_c.data(),
+                                          rows_c,
+                                          slice_rows_c.size() * sizeof(std::int64_t),
+                                          cudaMemcpyDeviceToHost,
+                                          stream.get()));
+            stream.sync();
+            host_rows_c = slice_rows_c.data();
+          }
+          auto const floats = static_cast<std::size_t>(m * dim);
+          auto* const gathered =
+            w.query_stage.next(std::max(floats, static_cast<std::size_t>(routed_queries->size())));
+          st.host_rows->gather(host_rows_c, static_cast<std::size_t>(m), gathered);
           CUDF_CUDA_TRY(cudaMemcpyAsync(routed_queries->data(),
-                                        gathered.data(),
-                                        gathered.size() * sizeof(float),
+                                        gathered,
+                                        floats * sizeof(float),
                                         cudaMemcpyHostToDevice,
                                         stream.get()));
+          w.query_stage.sent(stream);
         }
       } else if (!direct && pair_step == nullptr) {
         vss::gather_rows(
