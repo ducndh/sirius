@@ -154,6 +154,10 @@ class context_chunk_walk {
   {
     if (_pin_walk) { _pin_walk->prefetch_after(i); }
   }
+  void prefetch_after_async(std::size_t i)
+  {
+    if (_pin_walk) { _pin_walk->prefetch_after_async(i); }
+  }
 
  private:
   const kmeans_context& _c;
@@ -855,7 +859,9 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
     context_chunk_walk walk{c, req.column, stream, telemetry_info};
     std::int64_t base = 0;
     for (std::size_t i = 0; i < n_chunks; ++i) {
-      auto staged     = walk.take(i);
+      auto staged = walk.take(i);
+      // Every chunk is labeled, and labeling blocks, so the next chunk's copy is started first.
+      if (labeler) { walk.prefetch_after_async(i); }
       auto const rows = static_cast<std::int64_t>(staged.view.size());
       if (rows == 0) { continue; }
       if (base + rows > n_rows) {
@@ -910,7 +916,7 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
         }
       }
       // Before the copy below, which waits for the labels: into pageable memory it is synchronous.
-      walk.prefetch_after(i);
+      if (!labeler) { walk.prefetch_after(i); }
       if (labeler) {
         CUDF_CUDA_TRY(cudaMemcpyAsync(labels.get() + base,
                                       chunk_labels.data(),

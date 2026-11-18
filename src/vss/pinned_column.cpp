@@ -454,6 +454,7 @@ pinned_chunk_walk::pinned_chunk_walk(const scan_manager::pinned_entry& pin,
 
 staged_pinned_chunk pinned_chunk_walk::take(std::size_t chunk_index)
 {
+  if (_pending.valid()) { _ahead = _pending.get(); }
   if (_ahead && _ahead_index == chunk_index) {
     auto staged = std::move(*_ahead);
     _ahead.reset();
@@ -470,6 +471,7 @@ void pinned_chunk_walk::prefetch_after(std::size_t chunk_index)
 {
   auto const next = chunk_index + 1;
   if (_pin.tier != cucascade::memory::Tier::HOST || next >= _n_chunks) { return; }
+  if (_pending.valid()) { _pending.get(); }
   // The staging copy syncs only the stream it is given, so on this one it does not wait for the
   // caller's work on the current chunk, and the transfer runs alongside it.
   _ahead       = stage_chunk(_pin,
@@ -481,6 +483,27 @@ void pinned_chunk_walk::prefetch_after(std::size_t chunk_index)
                        staging_charge::own_reservation,
                        true);
   _ahead_index = next;
+}
+
+void pinned_chunk_walk::prefetch_after_async(std::size_t chunk_index)
+{
+  auto const next = chunk_index + 1;
+  if (_pin.tier != cucascade::memory::Tier::HOST || next >= _n_chunks) { return; }
+  if (_pending.valid()) { _pending.wait(); }
+  _ahead.reset();
+  _ahead_index      = next;
+  auto const device = _gpu_space.get_device_id();
+  _pending          = std::async(std::launch::async, [this, next, device] {
+    CUDF_CUDA_TRY(cudaSetDevice(device));
+    return stage_chunk(_pin,
+                       _column_name,
+                       next,
+                       _gpu_space,
+                       _copy_stream.view(),
+                       _telemetry_info,
+                       staging_charge::own_reservation,
+                       true);
+  });
 }
 
 staged_pinned_column stage_pinned_column(const scan_manager::pinned_entry& pin,

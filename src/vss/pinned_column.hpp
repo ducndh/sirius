@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -180,6 +181,10 @@ class pinned_chunk_walk {
   /// before waiting for it. Returns when the copy is done.
   void prefetch_after(std::size_t chunk_index);
 
+  /// As @ref prefetch_after, but the copy is staged from another thread and this returns at once,
+  /// so it overlaps work on @p chunk_index that blocks the caller. @ref take waits for it.
+  void prefetch_after_async(std::size_t chunk_index);
+
  private:
   const scan_manager::pinned_entry& _pin;
   std::string _column_name;
@@ -190,6 +195,8 @@ class pinned_chunk_walk {
   rmm::cuda_stream _copy_stream;
   std::optional<staged_pinned_chunk> _ahead;
   std::size_t _ahead_index{0};
+  // Last, so it is waited for before the members its copy uses go.
+  std::future<std::optional<staged_pinned_chunk>> _pending;
 };
 
 /**
