@@ -30,6 +30,7 @@
 #include <fcntl.h>
 #include <log/logging.hpp>
 #include <sys/syscall.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include <array>
@@ -124,7 +125,38 @@ static const char* signal_name(int sig)
   }
 }
 
-static void segfault_handler(int sig)
+// Writes "<label>0x<hex>\n" with write() alone, so it is safe in the handler.
+static void write_hex_line(int fd, const char* label, unsigned long value)
+{
+  std::array<char, 2 + 2 * sizeof(unsigned long) + 1> buf{};
+  char* p = buf.data() + buf.size();
+  *--p    = '\n';
+  do {
+    *--p = "0123456789abcdef"[value & 0xf];
+    value >>= 4;
+  } while (value != 0);
+  *--p = 'x';
+  *--p = '0';
+  write(fd, label, strlen(label));
+  write(fd, p, static_cast<size_t>((buf.data() + buf.size()) - p));
+}
+
+// The faulting instruction's address from the signal's machine context, or 0 where unknown.
+static unsigned long fault_pc(void* context)
+{
+  if (context == nullptr) { return 0; }
+  auto const* uc = static_cast<ucontext_t const*>(context);
+#if defined(__x86_64__)
+  return static_cast<unsigned long>(uc->uc_mcontext.gregs[REG_RIP]);
+#elif defined(__aarch64__)
+  return static_cast<unsigned long>(uc->uc_mcontext.pc);
+#else
+  (void)uc;
+  return 0;
+#endif
+}
+
+static void segfault_handler(int sig, siginfo_t* info, void* context)
 {
   // Re-entrancy guard: SA_RESETHAND resets only the delivered signal, so a
   // *different* fault raised while we run the allocation-heavy backtrace or the
@@ -174,6 +206,14 @@ static void segfault_handler(int sig)
     write(fd, suffix, __builtin_strlen(suffix));
   };
 
+  // The address the access faulted at (SIGSEGV, SIGBUS) or of the faulting instruction (SIGILL,
+  // SIGFPE); a small address is a member read through a null pointer.
+  auto const fault_addr = info != nullptr ? reinterpret_cast<unsigned long>(info->si_addr) : 0UL;
+  auto const pc         = fault_pc(context);
+  auto write_fault      = [fault_addr, pc](int fd) {
+    write_hex_line(fd, "Fault address: ", fault_addr);
+    write_hex_line(fd, "Faulting instruction: ", pc);
+  };
   auto write_tid = [tid](int fd) {
     write(fd, "Faulting thread id: ", 19);
     std::array<char, 24> buf{};
@@ -200,6 +240,7 @@ static void segfault_handler(int sig)
     if (log_fd >= 0) {
       write_header(log_fd);
       write_tid(log_fd);
+      write_fault(log_fd);
       write_backtrace(log_fd);
       const char* tail = "*** end backtrace ***\n";
       write(log_fd, tail, __builtin_strlen(tail));
@@ -209,6 +250,7 @@ static void segfault_handler(int sig)
 
   write_header(STDERR_FILENO);
   write_tid(STDERR_FILENO);
+  write_fault(STDERR_FILENO);
   write_backtrace(STDERR_FILENO);
   const char* tail = "*** end backtrace ***\n";
   write(STDERR_FILENO, tail, __builtin_strlen(tail));
@@ -281,9 +323,9 @@ void install_segfault_backtrace_handler()
   sigaltstack(&ss, nullptr);
 
   struct sigaction sa{};
-  sa.sa_handler = segfault_handler;
+  sa.sa_sigaction = segfault_handler;
   sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_RESETHAND | SA_ONSTACK;
+  sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK;
   sigaction(SIGSEGV, &sa, nullptr);
   sigaction(SIGBUS, &sa, nullptr);
   sigaction(SIGABRT, &sa, nullptr);

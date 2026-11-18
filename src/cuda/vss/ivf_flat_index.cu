@@ -16,6 +16,7 @@
 
 #include "cuda/vss/cudf_raft_interop.hpp"
 #include "ivf_flat_index.hpp"
+#include "vss/scoped_device_resource.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/types.hpp>
@@ -41,29 +42,6 @@
 #include <vector>
 
 namespace sirius::vss {
-
-namespace {
-
-/// RAII: route allocations on the current device through @p mr for the guard's
-/// lifetime, restoring the previous resource on exit. The evicted resource is
-/// captured by value (an owning any_resource) per the rmm 26.06 behavior
-/// documented in sirius_memory_reservation_manager, capturing a non-owning ref
-/// would dangle once the per-device map entry is moved out.
-struct scoped_current_device_resource {
-  ::cuda::mr::any_resource<::cuda::mr::device_accessible> prev;
-
-  explicit scoped_current_device_resource(rmm::device_async_resource_ref mr)
-    : prev(cudf::set_current_device_resource(mr))
-  {
-  }
-  scoped_current_device_resource(const scoped_current_device_resource&)            = delete;
-  scoped_current_device_resource& operator=(const scoped_current_device_resource&) = delete;
-  scoped_current_device_resource(scoped_current_device_resource&&)                 = delete;
-  scoped_current_device_resource& operator=(scoped_current_device_resource&&)      = delete;
-  ~scoped_current_device_resource() { cudf::set_current_device_resource(std::move(prev)); }
-};
-
-}  // namespace
 
 std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_batches(
   std::vector<cudf::column_view> const& batches,
