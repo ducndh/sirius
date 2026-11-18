@@ -573,6 +573,38 @@ void float16_bound_limit(float const* bound,
                          bool lower         = false,
                          bool inner_product = false);
 
+/// The relative widening half_interval_upper() applies for width-@p d rows: it covers the FP32
+/// rounding of the two re-scored distances compared (each a lane-wise sum of m = d / 32 terms and
+/// a warp reduction, relative error up to (m + 7) 2^-24), of the row's rounding error, and of the
+/// arithmetic applying it. The stored error (half_rows_norms) is itself such a sum's root times
+/// 1 + 1e-6 and can fall short of the true one by ((m + 5) / 2 + 2) 2^-24 - 9.54e-7 of itself:
+/// 2.7e-7 at d = 1,024, 3.1e-6 at d = 4,096, within what is added here.
+[[nodiscard]] inline float half_interval_widening(std::int64_t d)
+{
+  auto const sums = 1.01 * (static_cast<double>((d + 31) / 32) + 7) * 0x1p-24;
+  return static_cast<float>(2 * sums + 2e-6);
+}
+
+/// d[i], the FP32 squared L2 distance from a probe row to the half-rounded copy of a corpus row,
+/// becomes an upper bound of the FP32 squared distance to the row itself, in place:
+/// ((sqrt(d[i]) + e) (1 + widening))^2 with e that row's rounding error |x - half(x)|, read as
+/// row_error[ids[i] - id_base] or, with no @p row_error, @p error for every pair (the triangle
+/// inequality in distances, not squares). A row that equals its half copy (e == 0) keeps d[i]: its
+/// distance is already the exact one. Pairs with ids[i] < 0 and misses (+inf) are left alone.
+/// With @p probe_error, d[i] was computed from the probe row's half-rounded copy as well and e
+/// also counts that row's rounding error, probe_error[rows[i]] (probe_error[i] without @p rows):
+/// the triangle inequality on both sides.
+void half_interval_upper(float* d,
+                         std::int64_t const* ids,
+                         std::int64_t id_base,
+                         float const* row_error,
+                         float error,
+                         float widening,
+                         std::int64_t n,
+                         rmm::cuda_stream_view stream,
+                         std::int32_t const* rows   = nullptr,
+                         float const* probe_error   = nullptr);
+
 /// A FLOAT16 seed (seed_bound_f16's k-th FP16-computed distance) as an FP32 bound, in place: the
 /// rounded pair's distance is within the FP32 sums' error of the computed one (as in
 /// float16_bound_limit), and the true pair within probe_error[r] + row_error of the rounded one.

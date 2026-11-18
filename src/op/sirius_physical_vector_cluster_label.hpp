@@ -17,12 +17,18 @@
 #pragma once
 
 #include "op/sirius_physical_operator.hpp"
+#include "vss/vector_join_materialized_side.hpp"
 
 #include <cudf/column/column.hpp>
 
 #include <cuvs/distance/distance.hpp>
 
 #include <cstdint>
+#include <memory>
+
+namespace duckdb {
+class SiriusContext;
+}  // namespace duckdb
 
 namespace sirius {
 namespace op {
@@ -62,15 +68,47 @@ class sirius_physical_vector_cluster_label : public sirius_physical_operator {
   void sort_by_label(bool on) { _sort_by_label = on; }
 
   /// Emit the vector column in half precision: each value's IEEE half bits in an INT16 child, which
-  /// the join's chunk source widens as it stages a chunk. The tiers then hold and move half the
-  /// bytes. Only for values that all survive the rounding (the join would otherwise score rounded
-  /// rows): a batch with one that does not fails the query.
+  /// the join's chunk source widens as it stages a chunk. The join then reads half the bytes on
+  /// every pass. Only for values that all survive the rounding (the join would otherwise score
+  /// rounded rows): a batch with one that does not fails the query.
   void store_half(bool on) { _store_half = on; }
 
+  /// As store_half(), for any values: the batch also carries, after its other columns, the
+  /// vector column as it came (FP32) and a FLOAT column of each row's rounding error
+  /// |x - half(x)|. The join filters and scores against the half rows, turns the error into an
+  /// interval around each distance, and reads single FP32 rows for the pairs the intervals leave
+  /// open.
+  void store_half_with_exact(bool on)
+  {
+    _store_half = on;
+    _keep_exact = on;
+  }
+
+  /// As store_half_with_exact(), with the FP32 rows kept out of the batch: they go to @p side as
+  /// batches of their own, in arrival order, held in a repository registered for @p reader (the
+  /// join that reads them) with @p context's repository manager, and the batch carries after its
+  /// other columns each row's rounding error and its vss::exact_rows_side::position() (BIGINT).
+  /// What is sorted and merged downstream is then the half rows and eight bytes a row. Needs
+  /// sort_by_label(): the batch that leaves is a copy, and the input becomes the side batch.
+  void store_half_beside(std::shared_ptr<vss::exact_rows_side> side,
+                         duckdb::SiriusContext* context,
+                         const sirius_physical_operator* reader)
+  {
+    _store_half         = true;
+    _keep_exact         = true;
+    _exact_side         = std::move(side);
+    _exact_side_context = context;
+    _exact_side_reader  = reader;
+  }
+
   /// The labeler holds a half-precision copy of a batch's vectors and the candidates of its rows;
-  /// a sorted batch is a second copy of it while the input is still held.
+  /// a sorted batch is a second copy of it while the input is still held. A batch that keeps its
+  /// FP32 rows beside their half copy is half as large again, and so is its sorted copy.
   [[nodiscard]] std::size_t no_history_peak_memory_estimate(const input_stats& stats) const override
   {
+    if (_keep_exact && !_exact_side) {
+      return memory::saturating_mul(stats.bytes, _sort_by_label ? 3 : 2);
+    }
     return _sort_by_label ? memory::saturating_mul(stats.bytes, 2) : stats.bytes;
   }
 
@@ -85,6 +123,10 @@ class sirius_physical_vector_cluster_label : public sirius_physical_operator {
   cuvs::distance::DistanceType _metric;
   bool _sort_by_label{false};
   bool _store_half{false};
+  bool _keep_exact{false};
+  std::shared_ptr<vss::exact_rows_side> _exact_side;
+  duckdb::SiriusContext* _exact_side_context{nullptr};
+  const sirius_physical_operator* _exact_side_reader{nullptr};
 };
 
 }  // namespace op

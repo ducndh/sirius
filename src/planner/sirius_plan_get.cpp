@@ -1613,11 +1613,48 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
                                                               /*exact_unexpanded=*/false),
         cardinality);
       auto* label_ptr = label.get();
-      // SIRIUS_VSS_TIER_HALF=1: the corpus goes to the tiers in half precision (see store_half()).
-      // Not when the join's output reads the vectors back from these batches.
-      if (auto const* half = std::getenv("SIRIUS_VSS_TIER_HALF");
-          half != nullptr && std::string_view{half} == "1") {
-        label_ptr->store_half(true);
+      // SIRIUS_VSS_TIER_HALF=1: the corpus goes to the tiers in half precision (see store_half()),
+      // for values that survive it. =2: for any values, each batch also carrying its FP32 rows and
+      // their rounding errors after its other columns (store_half_with_exact()), which the join
+      // reads a row at a time. The join bounds a distance from the error by the triangle
+      // inequality, so that form is for a top-k join by L2 distance; any other keeps the corpus in
+      // full precision. It returns the neighbours a full-precision corpus would give; the
+      // distances it reports are within each row's rounding error of the FP32 ones (see
+      // sirius_physical_vector_join_stream::half_corpus_columns()). Neither form when the join's
+      // output reads the vectors back from these batches.
+      if (auto const* half = std::getenv("SIRIUS_VSS_TIER_HALF"); half != nullptr) {
+        if (std::string_view{half} == "1") {
+          label_ptr->store_half(true);
+        } else if (std::string_view{half} == "2" && req.metric == "l2" &&
+                   req.mode == sirius::vss::vector_join_mode::per_row_top_k) {
+          // The FP32 rows are read a row at a time and only for a few pairs, so they need not be
+          // sorted with the corpus: they stay in arrival order beside it and each row carries
+          // where its own is (store_half_beside()), unless the probe reads the corpus scan's own
+          // batches (a shared self-join), the corpus goes through the general sort, which takes
+          // the label operator's batches as they are, or the join will not run the search that
+          // reads half rows (one probe, a width or a switch that rules it out): that one reads
+          // the FP32 rows as the corpus, from its batches. SIRIUS_VSS_HALF_SIDE=0 keeps them in
+          // the corpus batches.
+          auto const* beside  = std::getenv("SIRIUS_VSS_HALF_SIDE");
+          auto const* general = std::getenv("SIRIUS_VSS_INGEST_SORT");
+          if (!req.probe_shares_build && prune_stats != nullptr &&
+              sirius::op::sirius_physical_vector_join_stream::scanned_search_reads_half(
+                req, static_cast<std::int64_t>(centroids->size())) &&
+              !(beside != nullptr && std::string_view{beside} == "0") &&
+              !(general != nullptr && std::string_view{general} == "1")) {
+            auto side = std::make_shared<sirius::vss::exact_rows_side>();
+            label_ptr->store_half_beside(side, prune_stats, stream_op.get());
+            stream_op->half_corpus_side(types.size(), types.size() + 1, std::move(side));
+            types.push_back(sirius::from_duckdb(duckdb::LogicalType::FLOAT));
+            types.push_back(sirius::from_duckdb(duckdb::LogicalType::BIGINT));
+          } else {
+            label_ptr->store_half_with_exact(true);
+            stream_op->half_corpus_columns(types.size(), types.size() + 1);
+            types.push_back(types[0]);
+            types.push_back(sirius::from_duckdb(duckdb::LogicalType::FLOAT));
+          }
+          label_ptr->types = types;
+        }
       }
       label->children.push_back(std::move(scan));
       auto by_label = [&] {

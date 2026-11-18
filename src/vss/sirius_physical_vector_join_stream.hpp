@@ -29,7 +29,9 @@
 
 #include <raft/core/device_resources.hpp>
 
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+#include <rmm/resource_ref.hpp>
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -46,6 +48,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -217,6 +220,26 @@ class vector_chunk_source {
   /// estimate has to size a task before any copy happens.
   [[nodiscard]] virtual std::size_t chunk_rows(std::size_t i) const  = 0;
   [[nodiscard]] virtual std::size_t chunk_bytes(std::size_t i) const = 0;
+
+  /// Row @c row of chunk @c chunk.
+  struct chunk_row {
+    std::size_t chunk{0};
+    std::int64_t row{0};
+  };
+
+  /// Copies single rows of FLOAT list column @p column of the chunks' batches to host memory:
+  /// out[i * dim ...] receives @p rows[i], which are ordered by chunk. For a source whose chunks
+  /// are batches with further columns (a corpus stored in half precision beside its FP32 rows);
+  /// the rows come from wherever each batch is, a spilled one's from its file, a row per read.
+  /// Device memory is taken on the calling thread only. Returns the seconds spent reading.
+  virtual double read_rows(std::size_t /*column*/,
+                           std::vector<chunk_row> const& /*rows*/,
+                           float* /*out*/,
+                           rmm::cuda_stream_view /*stream*/,
+                           rmm::device_async_resource_ref /*mr*/)
+  {
+    throw std::logic_error("this chunk source does not read single rows");
+  }
 };
 
 /// GPU-tier pin: chunks are already device-resident, so staging is a no-op view.
@@ -466,6 +489,48 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
 
   std::string params_to_string() const override;
 
+  /// The scanned corpus's vector column holds half-rounded rows that need not equal the FP32 rows
+  /// they were made from: each batch carries those in column @p exact_column and each row's
+  /// rounding error |x - half(x)| in FLOAT column @p error_column (see
+  /// sirius_physical_vector_cluster_label::store_half_with_exact()).
+  ///
+  /// The join then returns, for each probe row, the same k neighbours as over the FP32 rows (up
+  /// to which of several pairs tied at the k-th distance it keeps), having read the half rows on
+  /// every pass and single FP32 rows only for the pairs the rounding leaves open. A reported
+  /// distance is the FP32 one for a pair whose row was read and otherwise the distance to the
+  /// half-rounded row (from the probe row's half copy when the block's probe rows are held on the
+  /// host), within the rounding errors of the rows it was computed from: distances, and the order
+  /// of a row's neighbours by them, are not those of a join over the FP32 rows unless
+  /// SIRIUS_VSS_HALF_EXACT_DISTANCES=1 has every reported pair's row read.
+  void half_corpus_columns(std::size_t exact_column, std::size_t error_column)
+  {
+    _half_exact_column = exact_column;
+    _half_error_column = error_column;
+  }
+
+  /// Whether, as far as the plan can tell, the bounded half-precision search answers a top-k L2
+  /// join of @p request over a scanned corpus of @p n_clusters clusters: more than one cluster
+  /// probed, a width its filter takes, no earlier_by cut, and none of the switches that turn it
+  /// off (SIRIUS_VSS_GEMM_TOPK, SIRIUS_VSS_BOUND_GEMM, SIRIUS_VSS_SCAN_BOUNDED). Only then may the
+  /// corpus's FP32 rows be kept outside its batches (half_corpus_side()): any other search reads
+  /// them as the corpus. What the plan cannot tell is a probe row outside half's range.
+  [[nodiscard]] static bool scanned_search_reads_half(
+    const sirius::vss::vector_join_request& request, std::int64_t n_clusters);
+
+  /// As half_corpus_columns(), with the FP32 rows outside the corpus batches, in @p side: each
+  /// batch carries each row's rounding error in @p error_column and where its FP32 row is there
+  /// (vss::exact_rows_side::position(), BIGINT) in @p position_column (see
+  /// sirius_physical_vector_cluster_label::store_half_beside()). Not for a probe that reads the
+  /// corpus scan's own batches: those hold no FP32 rows.
+  void half_corpus_side(std::size_t error_column,
+                        std::size_t position_column,
+                        std::shared_ptr<sirius::vss::exact_rows_side> side)
+  {
+    _half_error_column    = error_column;
+    _half_position_column = position_column;
+    _half_side            = std::move(side);
+  }
+
  private:
   /// A threshold task's pairs, a task's probe rows and what its search holds across corpus chunks,
   /// the task's steps over them, and the clustered search among those steps. Defined beside
@@ -643,6 +708,21 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// Per cluster id, how many corpus rows it holds across every chunk. Lets a probe row's
   /// candidate count be known before any search is issued.
   std::vector<std::int64_t> _cluster_rows;
+  /// Set by half_corpus_columns(); with them, each corpus row's rounding error in corpus row
+  /// order and each chunk's largest, read with the cluster index.
+  std::optional<std::size_t> _half_exact_column;
+  std::optional<std::size_t> _half_error_column;
+  std::vector<float> _half_row_error;
+  std::vector<float> _half_chunk_error;
+  /// Set by half_corpus_side(); with them, where each corpus row's FP32 row is in the side
+  /// (in corpus row order, read with the cluster index), the side's batches as a chunk source,
+  /// and the chunk each of its batch numbers is there (-1 for a number without a batch).
+  std::optional<std::size_t> _half_position_column;
+  std::shared_ptr<sirius::vss::exact_rows_side> _half_side;
+  std::vector<std::int64_t> _half_row_source;
+  sirius::vss::materialized_side_buffer _exact_side_buffer;
+  std::unique_ptr<vector_chunk_source> _exact_rows;
+  std::vector<std::int32_t> _half_side_chunk;
   std::int64_t _n_clusters{0};
   bool _cluster_index_built{false};
   std::mutex _op_mutex;
@@ -655,6 +735,8 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   std::unique_ptr<vector_chunk_source> _probe;
   //! Streamed side, behind the tier-agnostic seam.
   std::unique_ptr<vector_chunk_source> _corpus;
+  //! With half_corpus_columns(): the same batches read by their FP32 column.
+  std::unique_ptr<vector_chunk_source> _corpus_exact;
   //! Total right-table rows, used to clamp k the way the plan already does.
   std::int64_t _right_total_rows{0};
   //! Largest corpus chunk in bytes; reserved per task when the corpus is streamed.

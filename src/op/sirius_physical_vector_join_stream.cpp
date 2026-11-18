@@ -613,6 +613,199 @@ class materialized_chunk_source : public vector_chunk_source {
   }
   void count_reads() override { _count_reads = true; }
 
+  double read_rows(std::size_t column,
+                   std::vector<chunk_row> const& rows,
+                   float* out,
+                   rmm::cuda_stream_view stream,
+                   rmm::device_async_resource_ref mr) override
+  {
+    auto const from     = std::chrono::steady_clock::now();
+    auto const row_size = row_bytes();
+    // A spilled batch's rows are read after every batch's place is known, on threads that only
+    // read. The batches stay where they are while their read locks are held.
+    struct file_read {
+      int fd;
+      bool direct;
+      std::string const* path;
+      std::size_t offset;
+      std::byte* to;
+    };
+    std::vector<file_read> reads;
+    std::vector<cucascade::read_only_data_batch> held;
+    struct open_files {
+      std::vector<int> fds;
+      ~open_files()
+      {
+        for (auto const fd : fds) {
+          ::close(fd);
+        }
+      }
+    } files;
+    auto const refuse = [&](std::size_t chunk) {
+      throw std::runtime_error("[sirius_physical_vector_join_stream] column " +
+                               std::to_string(column) + " of corpus batch " +
+                               std::to_string(chunk) + " does not hold the rows asked of it as " +
+                               std::to_string(_dim) + " FLOATs each");
+    };
+    for (std::size_t first = 0; first < rows.size();) {
+      auto last = first;
+      std::int64_t largest = 0;
+      for (; last < rows.size() && rows[last].chunk == rows[first].chunk; ++last) {
+        largest = std::max(largest, rows[last].row);
+      }
+      auto const chunk = rows[first].chunk;
+      auto const n     = last - first;
+      auto* const to   = reinterpret_cast<std::byte*>(out) + first * row_size;
+      auto batch       = fetch(_batch_ids.at(chunk));
+      auto ro          = batch->to_read_only();
+      auto const list_of_floats = [&](cucascade::memory::column_metadata const& meta) {
+        return static_cast<cudf::type_id>(meta.type_id) == cudf::type_id::LIST &&
+               meta.children.size() == 2 && meta.children[1].has_data &&
+               static_cast<cudf::type_id>(meta.children[1].type_id) == cudf::type_id::FLOAT32 &&
+               // Every row's values where its position says, as a whole unsliced batch has them.
+               meta.children[1].data_size == static_cast<std::size_t>(meta.num_rows) * row_size &&
+               largest < meta.num_rows;
+      };
+      if (ro.get_current_tier() == cucascade::memory::Tier::GPU) {
+        auto const view = sirius::get_cudf_table_view(ro).column(static_cast<cudf::size_type>(column));
+        if (view.type().id() != cudf::type_id::LIST || view.offset() != 0 || largest >= view.size()) {
+          refuse(chunk);
+        }
+        auto const values = cudf::lists_column_view{view}.child();
+        if (values.type().id() != cudf::type_id::FLOAT32 ||
+            static_cast<std::size_t>(values.size()) !=
+              static_cast<std::size_t>(view.size()) * static_cast<std::size_t>(_dim)) {
+          refuse(chunk);
+        }
+        std::vector<std::int64_t> ids(n);
+        for (std::size_t i = 0; i < n; ++i) {
+          ids[i] = rows[first + i].row;
+        }
+        rmm::device_uvector<std::int64_t> device_ids(n, stream, mr);
+        rmm::device_uvector<float> gathered(n * static_cast<std::size_t>(_dim), stream, mr);
+        // From a pageable vector, so the copy has completed when the call returns.
+        CUDF_CUDA_TRY(cudaMemcpyAsync(device_ids.data(),
+                                      ids.data(),
+                                      n * sizeof(std::int64_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        vss::gather_rows(values.data<float>(),
+                         _dim,
+                         device_ids.data(),
+                         static_cast<std::int64_t>(n),
+                         gathered.data(),
+                         stream);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          to, gathered.data(), n * row_size, cudaMemcpyDeviceToHost, stream.get()));
+        stream.sync();
+      } else if (ro.get_current_tier() == cucascade::memory::Tier::DISK) {
+        auto const& table = ro.get_data()->cast<cucascade::disk_data_representation>().get_disk_table();
+        auto const& meta  = table.columns.at(column);
+        if (!list_of_floats(meta)) { refuse(chunk); }
+        // Direct where the filesystem allows, as the chunk reads are: the rows' pages are read
+        // once and would only crowd the page cache.
+        bool direct = vss::detail::spill_direct_enabled();
+        int fd      = direct ? ::open(table.file_path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC) : -1;
+        if (fd < 0) {
+          direct = false;
+          fd     = ::open(table.file_path.c_str(), O_RDONLY | O_CLOEXEC);
+        }
+        if (fd < 0) {
+          throw std::runtime_error(
+            "[sirius_physical_vector_join_stream] cannot open spilled batch " + table.file_path);
+        }
+        files.fds.push_back(fd);
+        for (std::size_t i = 0; i < n; ++i) {
+          reads.push_back(
+            {fd,
+             direct,
+             &table.file_path,
+             meta.children[1].data_offset + static_cast<std::size_t>(rows[first + i].row) * row_size,
+             to + i * row_size});
+        }
+        note_read(n * row_size);
+        held.push_back(std::move(ro));
+      } else {
+        auto const& table = *host_repr(ro).get_host_table();
+        auto const& meta  = table.columns.at(column);
+        if (!list_of_floats(meta)) { refuse(chunk); }
+        auto const blocks     = table.allocation->get_blocks();
+        auto const block_size = table.allocation->block_size();
+        for (std::size_t i = 0; i < n; ++i) {
+          auto at = meta.children[1].data_offset +
+                    static_cast<std::size_t>(rows[first + i].row) * row_size;
+          for (std::size_t done = 0; done < row_size;) {
+            auto const within = at % block_size;
+            auto const piece  = std::min(row_size - done, block_size - within);
+            std::memcpy(to + i * row_size + done, blocks[at / block_size] + within, piece);
+            done += piece;
+            at += piece;
+          }
+        }
+      }
+      first = last;
+    }
+    if (!reads.empty()) {
+      std::atomic<std::size_t> next{0};
+      std::atomic<bool> failed{false};
+      auto const read_some = [&] {
+        // A direct read covers whole 4 KiB blocks of the file, into an aligned buffer: a row at
+        // any offset lies within its size rounded up plus one block.
+        constexpr std::size_t kAlign = 4096;
+        void* raw                    = nullptr;
+        if (::posix_memalign(&raw, kAlign, rmm::align_up(row_size, kAlign) + kAlign) != 0) {
+          failed = true;
+          return;
+        }
+        auto* const block = static_cast<std::byte*>(raw);
+        for (auto i = next.fetch_add(1); i < reads.size() && !failed; i = next.fetch_add(1)) {
+          auto const& read = reads[i];
+          // One direct read of the blocks covering the row; a short or refused one is read again
+          // through the page cache.
+          bool done = false;
+          if (read.direct) {
+            auto const base = read.offset / kAlign * kAlign;
+            auto const need = read.offset + row_size - base;
+            ssize_t r       = 0;
+            do {
+              r = ::pread(read.fd, block, rmm::align_up(need, kAlign), static_cast<off_t>(base));
+            } while (r < 0 && errno == EINTR);
+            if (r >= static_cast<ssize_t>(need)) {
+              std::memcpy(read.to, block + (read.offset - base), row_size);
+              done = true;
+            }
+          }
+          if (done) { continue; }
+          int const fd = read.direct ? ::open(read.path->c_str(), O_RDONLY | O_CLOEXEC) : read.fd;
+          for (std::size_t got = 0; fd >= 0 && !done;) {
+            auto const r =
+              ::pread(fd, read.to + got, row_size - got, static_cast<off_t>(read.offset + got));
+            if (r < 0 && errno == EINTR) { continue; }
+            if (r <= 0) { break; }
+            got += static_cast<std::size_t>(r);
+            done = got == row_size;
+          }
+          if (read.direct && fd >= 0) { ::close(fd); }
+          if (!done) { failed = true; }
+        }
+        std::free(raw);
+      };
+      std::vector<std::thread> readers;
+      for (std::size_t t = 1; t < std::min<std::size_t>(16, (reads.size() + 63) / 64); ++t) {
+        readers.emplace_back(read_some);
+      }
+      read_some();
+      for (auto& reader : readers) {
+        reader.join();
+      }
+      if (failed) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_stream] reading single rows of a spilled batch failed");
+      }
+    }
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - from).count();
+  }
+
  private:
   void note_read(std::size_t bytes_moved) const
   {
@@ -704,10 +897,14 @@ class materialized_chunk_source : public vector_chunk_source {
           sirius::converter_registry::get(), sirius::get_next_batch_id(), &space, stream);
         staged->to_mutable().rebind_stream(stream);
         auto const table = sirius::get_cudf_table_view(*staged);
-        return staged_vector_chunk{table.column(static_cast<cudf::size_type>(_column_index)),
-                                   std::move(staged),
-                                   nullptr,
-                                   std::move(ro)};
+        return widened(
+          staged_vector_chunk{table.column(static_cast<cudf::size_type>(_column_index)),
+                              std::move(staged),
+                              nullptr,
+                              std::move(ro)},
+          space,
+          stream,
+          own_reservation);
       }
       if (auto const layout = spilled_layout(ro, _column_index)) {
         note_read(layout->bytes);
@@ -1778,8 +1975,13 @@ void sirius_physical_vector_join_stream::initialize_locked()
     // A self-join's probe is the corpus side's own batches, in the snapshot both read.
     auto* port = get_port(_request.probe_shares_build ? "build" : "default");
     _probe_side->ensure_snapshot(*port->repo);
+    // Over a corpus stored in half precision beside its FP32 rows, a self-join probes with those.
     _probe = make_materialized_chunk_source(
-      *_probe_side, /*column_index=*/0, _request.dim, batch_telemetry(), _sirius_ctx);
+      *_probe_side,
+      /*column_index=*/_request.probe_shares_build && _half_exact_column ? *_half_exact_column : 0,
+      _request.dim,
+      batch_telemetry(),
+      _sirius_ctx);
     if (_request.probe_shares_build && std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
       std::fprintf(stderr,
                    "[vecjoin-phase] self-join: the probe reads the corpus scan's %zu batches\n",
@@ -1799,6 +2001,31 @@ void sirius_physical_vector_join_stream::initialize_locked()
     _build_side->ensure_snapshot(*port->repo);
     _corpus = make_materialized_chunk_source(
       *_build_side, /*column_index=*/0, _request.dim, batch_telemetry(), _sirius_ctx);
+    if (_half_exact_column) {
+      _corpus_exact = make_materialized_chunk_source(
+        *_build_side, *_half_exact_column, _request.dim, batch_telemetry(), _sirius_ctx);
+    }
+    if (_half_side) {
+      if (_request.probe_shares_build) {
+        throw std::logic_error(
+          "[sirius_physical_vector_join_stream] a probe that reads the corpus scan's batches "
+          "needs their FP32 rows in them");
+      }
+      // The build pipeline has finished, so every side batch is in.
+      auto const ids = _half_side->batch_ids();
+      std::vector<std::uint64_t> present;
+      _half_side_chunk.assign(ids.size(), -1);
+      for (std::size_t number = 0; number < ids.size(); ++number) {
+        if (ids[number] == vss::exact_rows_side::kNoBatch) { continue; }
+        _half_side_chunk[number] = static_cast<std::int32_t>(present.size());
+        present.push_back(ids[number]);
+      }
+      if (!present.empty()) {
+        _exact_side_buffer.adopt(*_half_side->repo(), std::move(present));
+        _exact_rows = make_materialized_chunk_source(
+          _exact_side_buffer, /*column_index=*/0, _request.dim, batch_telemetry(), _sirius_ctx);
+      }
+    }
     for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
       _max_chunk_bytes = std::max(_max_chunk_bytes, _corpus->chunk_bytes(i));
     }
@@ -1855,6 +2082,8 @@ void sirius_physical_vector_join_stream::initialize_locked()
   }
 
   _corpus->count_reads();
+  if (_corpus_exact) { _corpus_exact->count_reads(); }
+  if (_exact_rows) { _exact_rows->count_reads(); }
   for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
     _max_corpus_chunk_rows = std::max(_max_corpus_chunk_rows, _corpus->chunk_rows(i));
   }
@@ -2326,6 +2555,9 @@ void sirius_physical_vector_join_stream::on_finalize_operator()
     _sirius_ctx->record_vector_join_host_left(_host_rows_repo->total_size());
   }
   drain(_host_rows_repo);
+  // The FP32 rows kept beside a half-precision corpus are this query's alone.
+  _exact_rows.reset();
+  if (_half_side) { drain(_half_side->repo()); }
   if (_host_rows_repo != nullptr && _sirius_ctx != nullptr &&
       std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
     auto const stats = _sirius_ctx->get_vector_join_host_rows_stats();
@@ -2528,6 +2760,23 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
     }
   }
 
+  // A corpus stored in half precision beside its FP32 rows: each row's rounding error is read
+  // here once, four bytes a row, so no pass over the corpus reads the errors again.
+  std::unique_ptr<vector_chunk_source> build_errors;
+  if (_build_side && _half_error_column) {
+    build_errors = make_materialized_chunk_source(
+      *_build_side, *_half_error_column, /*dim=*/1, batch_telemetry(), _sirius_ctx);
+    _half_row_error.clear();
+    _half_chunk_error.assign(_corpus->num_chunks(), 0.f);
+  }
+  // And where each row's FP32 row is, when those are kept beside the corpus: eight bytes a row.
+  std::unique_ptr<vector_chunk_source> build_positions;
+  if (_build_side && _half_position_column) {
+    build_positions = make_materialized_chunk_source(
+      *_build_side, *_half_position_column, /*dim=*/2, batch_telemetry(), _sirius_ctx);
+    _half_row_source.clear();
+  }
+
   auto const n_chunks = build_labels
                           ? build_labels->num_chunks()
                           : vss::pinned_column_chunk_count(*pin, _request.build_cluster_column);
@@ -2593,6 +2842,49 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
     stream.sync();
     row_base += static_cast<std::int64_t>(rows);
 
+    if (build_errors) {
+      auto const staged_errors = stage_for_fold(*build_errors, j, space, stream, stream);
+      if (staged_errors.view.type().id() != cudf::type_id::FLOAT32 ||
+          static_cast<std::size_t>(staged_errors.view.size()) != rows) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] corpus batch " +
+                                 std::to_string(j) +
+                                 " does not carry its rows' half-precision rounding errors");
+      }
+      auto const before = _half_row_error.size();
+      _half_row_error.resize(before + rows);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(_half_row_error.data() + before,
+                                    staged_errors.view.data<float>(),
+                                    rows * sizeof(float),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      stream.sync();
+      // An error that is not a number (a value outside half's range) is no bound: infinite.
+      float largest = 0.f;
+      for (auto i = before; i < _half_row_error.size(); ++i) {
+        auto& error = _half_row_error[i];
+        if (!(error >= 0.f)) { error = std::numeric_limits<float>::infinity(); }
+        largest = std::max(largest, error);
+      }
+      _half_chunk_error[j] = largest;
+    }
+    if (build_positions) {
+      auto const staged_positions = stage_for_fold(*build_positions, j, space, stream, stream);
+      if (staged_positions.view.type().id() != cudf::type_id::INT64 ||
+          static_cast<std::size_t>(staged_positions.view.size()) != rows) {
+        throw std::runtime_error("[sirius_physical_vector_join_stream] corpus batch " +
+                                 std::to_string(j) +
+                                 " does not carry where its rows' FP32 copies are");
+      }
+      auto const before = _half_row_source.size();
+      _half_row_source.resize(before + rows);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(_half_row_source.data() + before,
+                                    staged_positions.view.data<std::int64_t>(),
+                                    rows * sizeof(std::int64_t),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      stream.sync();
+    }
+
     // A chunk is read as runs of one cluster each, and a cluster may come as several runs --
     // within a chunk as across chunks, since a slice carries its own chunk and nothing reads
     // across a run. A build phase's batches are ordered spans of an ORDER BY, but the stage that
@@ -2640,6 +2932,21 @@ void sirius_physical_vector_join_stream::ensure_cluster_index(
   }
 
   _cluster_index_built = true;
+
+  if (build_errors && std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
+    std::size_t inexact = 0;
+    float largest       = 0.f;
+    for (auto const error : _half_row_error) {
+      inexact += error > 0.f ? 1 : 0;
+      largest = std::max(largest, error);
+    }
+    std::fprintf(stderr,
+                 "[vecjoin-phase] half-stored corpus: %zu of %zu rows differ from their half "
+                 "copy, by at most %.6g\n",
+                 inexact,
+                 _half_row_error.size(),
+                 static_cast<double>(largest));
+  }
 
   if (std::getenv("SIRIUS_VECTOR_JOIN_PRUNE_DEBUG") != nullptr) {
     std::size_t empty = 0;
@@ -2879,6 +3186,23 @@ struct sirius_physical_vector_join_stream::block_state {
     std::int64_t running_piece{0};
     std::int64_t since_merge{0};
 
+    /// Over a corpus whose staged rows are half-rounded (search_state::half_intervals): the pairs
+    /// that could still be among their row's k nearest when they were merged, with the distance to
+    /// the half-rounded row. Held on the host until the block's end, where each row's are settled.
+    std::vector<std::int32_t> half_rows;
+    std::vector<std::int64_t> half_ids;
+    std::vector<float> half_distances;
+    /// Per logged pair: its distance is already the FP32 one to the corpus row itself.
+    std::vector<std::uint8_t> half_exact;
+    /// With search_state::half_probe, each probe row's rounding error |q - half(q)|.
+    std::vector<float> half_probe_error;
+    std::int64_t half_logged{0};
+    std::int64_t half_prunes{0};
+    std::int64_t half_rows_settled_early{0};
+    std::int64_t half_pairs_read{0};
+    std::int64_t half_rows_read{0};
+    double half_read_seconds{0};
+
     // What the search did.
     std::int64_t scanned_pairs{0};
     std::int64_t bounded_emitted{0};
@@ -2953,6 +3277,17 @@ struct sirius_physical_vector_join_stream::block_state {
     /// Every probe row of the block equals its half-precision rounding, so the device's half copy
     /// holds the rows the re-score reads and none is fetched from the host.
     bool probe_exact_in_half{false};
+    /// The scanned corpus's chunks are half-rounded rows that need not equal the FP32 rows they
+    /// stand for: a re-scored distance is one end of an interval, and the accumulator holds
+    /// upper ends (see settle_half_intervals()).
+    bool half_intervals{false};
+    /// With half_intervals, the re-score reads the probe rows' half copies on the device too (the
+    /// block's rows are on the host and not all equal to their half copies): a pair's interval
+    /// then counts both rows' rounding errors.
+    bool half_probe{false};
+    /// The corpus is such a one and this block's search does not allow for it: its chunks are
+    /// staged from the batches' FP32 column.
+    bool fp32_corpus{false};
     /// A scanned corpus read once per block: a row's bound comes from the first cluster of its
     /// probes the read reaches, set as that cluster's chunk is filtered (see first_met_rule()).
     bool first_met{false};
@@ -4912,6 +5247,48 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     if (scan_f16_shape || f16_lists_shape) { probe_in_f16_range = code_probe_f16(); }
     s.scan_f16    = scan_f16_shape && probe_in_f16_range;
     s.f16_bounded = s.scan_f16 || (f16_lists_shape && probe_in_f16_range);
+    if (_op._half_error_column) {
+      // The corpus's vector column holds the rows' half copies. Only the bounded search over a
+      // scanned corpus allows for what they lost; any other would score the copies as the rows.
+      // A block that search does not take (a probe row outside half's range, one probe, the
+      // bounded search switched off, an earlier_by cut) reads the batches' FP32 column instead,
+      // as it would a corpus stored in full precision.
+      if (pair_step != nullptr || building_for_pairs) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_stream] the corpus was stored in half precision beside its "
+          "FP32 rows (SIRIUS_VSS_TIER_HALF=2), which a join run as pair tasks does not read; unset "
+          "SIRIUS_VSS_TIER_HALF for this join");
+      }
+      if (!s.scan_f16 && !_op._corpus_exact) {
+        throw std::runtime_error(
+          "[sirius_physical_vector_join_stream] the corpus was stored in half precision with its "
+          "FP32 rows in arrival order beside it (SIRIUS_VSS_TIER_HALF=2), which the bounded "
+          "half-precision search reads, and this block cannot take that search: a probe row lies "
+          "outside half precision's range. SIRIUS_VSS_HALF_SIDE=0 keeps the FP32 rows in the "
+          "corpus batches, which any search can read");
+      }
+      s.half_intervals = s.scan_f16;
+      s.fp32_corpus    = !s.scan_f16;
+      // The candidates' re-score would bring FP32 probe rows over from the host, a gather and a
+      // copy per chunk. It reads the half copies the device already holds instead, as it does
+      // for rows that equal them (probe_exact_in_half), and the intervals allow for what those
+      // lost as they do for the corpus rows'. SIRIUS_VSS_RESCORE_FROM_HALF=0 keeps the host rows.
+      static bool const from_half_on = [] {
+        auto const* v = std::getenv("SIRIUS_VSS_RESCORE_FROM_HALF");
+        return v == nullptr || std::string_view{v} != "0";
+      }();
+      if (s.half_intervals && st.probe_rows_on_host && !s.probe_exact_in_half &&
+          s.probe_f16.has_value() && from_half_on) {
+        s.half_probe = true;
+        w.half_probe_error.resize(static_cast<std::size_t>(n_left));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(w.half_probe_error.data(),
+                                      s.probe_half_error->data(),
+                                      w.half_probe_error.size() * sizeof(float),
+                                      cudaMemcpyDeviceToHost,
+                                      stream.get()));
+        stream.sync();
+      }
+    }
     // FLOAT16 lists the bounded search does not answer (a cosine join over rows as they are, a
     // probe row past half's range, the bounded search switched off): their chunks are staged from
     // the kept FP32 rows, in layout order, so the FP32 search scores what the rows hold. Over the
@@ -5531,7 +5908,8 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         rows[to] = slot;
       }
       auto const staged_floats = distinct.size() * static_cast<std::size_t>(dim);
-      bool const from_half     = s.probe_exact_in_half && s.probe_f16.has_value();
+      bool const from_half =
+        (s.probe_exact_in_half || s.half_probe) && s.probe_f16.has_value();
       if (!from_half) { st.host_rows->gather(distinct.data(), distinct.size(), staged); }
       for (auto const row : distinct) {
         w.host_row_slot[static_cast<std::size_t>(row)] = -1;
@@ -5539,8 +5917,9 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       rmm::device_uvector<float> device_rows(staged_floats, stream, mr);
       rmm::device_uvector<std::int32_t> slots(to - from, stream, mr);
       if (from_half) {
-        // The rows equal their halves, which the device holds: widened here, they are the FP32
-        // rows the host would send, without the gather or the copy.
+        // The rows' halves, which the device holds, widened here without the gather or the copy:
+        // the FP32 rows the host would send when the rows equal their halves, and otherwise
+        // (half_probe) rows whose rounding the candidates' intervals allow for.
         std::vector<std::int64_t> wide_rows(distinct.begin(), distinct.end());
         rmm::device_uvector<std::int64_t> device_ids(wide_rows.size(), stream, mr);
         rmm::device_uvector<std::uint16_t> halves(staged_floats, stream, mr);
@@ -5790,6 +6169,33 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       if (dbg) { w.take_seconds += std::chrono::duration<double>(debug_mark() - t1).count(); }
       return;
     }
+    std::optional<rmm::device_uvector<float>> to_half;
+    if (s.half_intervals) {
+      // The re-score read the half-rounded rows. The accumulator ranks each pair by the upper end
+      // of its interval, so a row's k-th entry bounds its k-th FP32 distance from above and is a
+      // bound the filter may use.
+      if (!chunk_error) {
+        throw std::logic_error(
+          "[sirius_physical_vector_join_stream] candidates over half-rounded rows outlived "
+          "their chunk");
+      }
+      to_half.emplace(static_cast<std::size_t>(w.pending), stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(to_half->data(),
+                                    w.candidates->distances.data(),
+                                    static_cast<std::size_t>(w.pending) * sizeof(float),
+                                    cudaMemcpyDeviceToDevice,
+                                    stream.get()));
+      vss::half_interval_upper(w.candidates->distances.data(),
+                               w.candidates->ids.data(),
+                               chunk_error_base,
+                               chunk_error->data(),
+                               0.f,
+                               vss::half_interval_widening(dim),
+                               w.pending,
+                               stream,
+                               s.half_probe ? w.candidates->rows.data() : nullptr,
+                               s.half_probe ? s.probe_half_error->data() : nullptr);
+    }
     vss::merge_bound_candidates(st.acc_distances->mutable_view().data<float>(),
                                 st.acc_neighbors->mutable_view().data<std::int64_t>(),
                                 n_left,
@@ -5800,10 +6206,357 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                                 stream,
                                 mr);
     refresh_code_limit(s.bound->data());
+    if (to_half) { keep_half_contenders(*to_half); }
     CUDF_CUDA_TRY(
       cudaMemsetAsync(w.candidates->count.data(), 0, sizeof(unsigned long long), stream.get()));
     w.pending = 0;
     if (dbg) { w.take_seconds += std::chrono::duration<double>(debug_mark() - t1).count(); }
+  }
+
+  /// A pair's interval, in distances (not squares), from its FP32 distance @p to_half to the
+  /// half-rounded corpus row and that row's rounding error @p error: the FP32 distance to the row
+  /// itself lies within it, by the triangle inequality and half_interval_widening() for the FP32
+  /// sums. With half_probe, @p to_half is the distance between the two rows' half copies and
+  /// @p error the sum of their rounding errors. half_interval_upper() computes the same upper end
+  /// in FP32. A pair of rows that equal their half copies has the distance itself; an error that
+  /// is no number bounds nothing.
+  struct half_interval {
+    double lower;
+    double upper;
+  };
+  [[nodiscard]] half_interval interval_of(float to_half, float error) const
+  {
+    auto const root = std::sqrt(static_cast<double>(std::max(to_half, 0.f)));
+    if (error == 0.f) { return {root, root}; }
+    if (!(error < std::numeric_limits<float>::infinity())) {
+      return {0.0, std::numeric_limits<double>::infinity()};
+    }
+    auto const widening = static_cast<double>(vss::half_interval_widening(dim));
+    return {std::max(0.0, root / (1 + widening) - error * (1 + widening)),
+            (root + error) * (1 + widening)};
+  }
+
+  /// The interval of logged pair @p i: a point once its FP32 row has been read.
+  [[nodiscard]] half_interval logged_interval(std::size_t i) const
+  {
+    if (w.half_exact[i] != 0) { return interval_of(w.half_distances[i], 0.f); }
+    // Added in FP32, as half_interval_upper() adds them: zero only when both are.
+    float const error =
+      _op._half_row_error[static_cast<std::size_t>(w.half_ids[i])] +
+      (s.half_probe ? w.half_probe_error[static_cast<std::size_t>(w.half_rows[i])] : 0.f);
+    return interval_of(w.half_distances[i], error);
+  }
+
+  /// Replaces the logged pairs @p pairs' distances to the half-rounded rows by the FP32 distances
+  /// to the rows themselves: each distinct corpus row is read once, from wherever its batch is
+  /// (vector_chunk_source::read_rows), and scored against the pair's probe row by the kernel every
+  /// re-score uses. Reorders @p pairs.
+  void read_exact(std::vector<std::uint32_t>& pairs)
+  {
+    auto& rows = w.half_rows;
+    auto& ids  = w.half_ids;
+    auto& dist = w.half_distances;
+    // By where the corpus row's FP32 copy is (its corpus row, or its place in the side batches):
+    // a row several probe rows ask for is read once, and a batch's rows together.
+    bool const beside = _op._half_position_column.has_value();
+    auto const place  = [&](std::uint32_t i) {
+      return beside ? _op._half_row_source[static_cast<std::size_t>(ids[i])] : ids[i];
+    };
+    if (beside && !_op._exact_rows && !pairs.empty()) {
+      throw std::logic_error(
+        "[sirius_physical_vector_join_stream] no FP32 rows were kept beside the corpus");
+    }
+    std::sort(pairs.begin(), pairs.end(), [&](std::uint32_t a, std::uint32_t b) {
+      return place(a) != place(b) ? place(a) < place(b) : rows[a] < rows[b];
+    });
+    auto const row_floats = static_cast<std::size_t>(dim);
+    auto const piece_pairs =
+      std::max<std::size_t>(1, (std::size_t{128} << 20) / (row_floats * sizeof(float)));
+    std::vector<vector_chunk_source::chunk_row> refs;
+    std::vector<float> corpus_rows, probe_rows, exact;
+    std::vector<std::int64_t> corpus_slot;
+    std::vector<std::int32_t> probe_slot, distinct_probe;
+    auto const& chunk_base = _op._chunk_row_base;
+    for (std::size_t at = 0; at < pairs.size();) {
+      auto const n = std::min(piece_pairs, pairs.size() - at);
+      refs.clear();
+      corpus_slot.resize(n);
+      for (std::size_t p = 0; p < n; ++p) {
+        auto const id = ids[pairs[at + p]];
+        if (p == 0 || id != ids[pairs[at + p - 1]]) {
+          if (beside) {
+            auto const at_side = place(pairs[at + p]);
+            auto const number  = static_cast<std::size_t>(at_side >> 32);
+            if (number >= _op._half_side_chunk.size() || _op._half_side_chunk[number] < 0) {
+              throw std::runtime_error(
+                "[sirius_physical_vector_join_stream] corpus row " + std::to_string(id) +
+                " points at a batch of FP32 rows that was never stored");
+            }
+            refs.push_back({static_cast<std::size_t>(_op._half_side_chunk[number]),
+                            at_side & std::int64_t{0xffffffff}});
+          } else {
+            auto const chunk = static_cast<std::size_t>(
+              std::upper_bound(chunk_base.begin(), chunk_base.end(), id) - chunk_base.begin() - 1);
+            refs.push_back({chunk, id - chunk_base[chunk]});
+          }
+        }
+        corpus_slot[p] = static_cast<std::int64_t>(refs.size() - 1);
+      }
+      corpus_rows.resize(refs.size() * row_floats);
+      w.half_read_seconds +=
+        beside
+          ? _op._exact_rows->read_rows(0, refs, corpus_rows.data(), stream, mr)
+          : _op._corpus->read_rows(*_op._half_exact_column, refs, corpus_rows.data(), stream, mr);
+      w.half_rows_read += static_cast<std::int64_t>(refs.size());
+      w.half_pairs_read += static_cast<std::int64_t>(n);
+
+      probe_slot.resize(n);
+      float const* probe = nullptr;
+      rmm::device_uvector<float> device_probe(0, stream, mr);
+      if (st.probe_rows_on_host) {
+        distinct_probe.resize(n);
+        for (std::size_t p = 0; p < n; ++p) {
+          distinct_probe[p] = rows[pairs[at + p]];
+        }
+        std::sort(distinct_probe.begin(), distinct_probe.end());
+        distinct_probe.erase(std::unique(distinct_probe.begin(), distinct_probe.end()),
+                             distinct_probe.end());
+        for (std::size_t p = 0; p < n; ++p) {
+          probe_slot[p] = static_cast<std::int32_t>(
+            std::lower_bound(distinct_probe.begin(), distinct_probe.end(), rows[pairs[at + p]]) -
+            distinct_probe.begin());
+        }
+        probe_rows.resize(distinct_probe.size() * row_floats);
+        st.host_rows->gather(distinct_probe.data(), distinct_probe.size(), probe_rows.data());
+        device_probe.resize(probe_rows.size(), stream);
+        // From pageable vectors, here and below: each copy has completed when its call returns.
+        CUDF_CUDA_TRY(cudaMemcpyAsync(device_probe.data(),
+                                      probe_rows.data(),
+                                      probe_rows.size() * sizeof(float),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        probe = device_probe.data();
+      } else {
+        for (std::size_t p = 0; p < n; ++p) {
+          probe_slot[p] = rows[pairs[at + p]];
+        }
+        probe = s.search_queries.data_handle();
+      }
+      rmm::device_uvector<float> device_corpus(corpus_rows.size(), stream, mr);
+      rmm::device_uvector<std::int32_t> device_rows(n, stream, mr);
+      rmm::device_uvector<std::int64_t> device_ids(n, stream, mr);
+      rmm::device_uvector<float> device_exact(n, stream, mr);
+      rmm::device_uvector<float const*> device_base(1, stream, mr);
+      float const* const base = device_corpus.data();
+      CUDF_CUDA_TRY(cudaMemcpyAsync(device_corpus.data(),
+                                    corpus_rows.data(),
+                                    corpus_rows.size() * sizeof(float),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(device_rows.data(),
+                                    probe_slot.data(),
+                                    n * sizeof(std::int32_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(device_ids.data(),
+                                    corpus_slot.data(),
+                                    n * sizeof(std::int64_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        device_base.data(), &base, sizeof(base), cudaMemcpyHostToDevice, stream.get()));
+      vss::exact_rows fetched;
+      fetched.copy_blocks    = device_base.data();
+      fetched.rows_per_block = std::numeric_limits<std::int64_t>::max();
+      vss::exact_distances(probe,
+                           device_rows.data(),
+                           0,
+                           device_ids.data(),
+                           device_exact.data(),
+                           static_cast<std::int64_t>(n),
+                           fetched,
+                           dim,
+                           stream,
+                           mr);
+      exact.resize(n);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(exact.data(),
+                                    device_exact.data(),
+                                    n * sizeof(float),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      stream.sync();
+      for (std::size_t p = 0; p < n; ++p) {
+        dist[pairs[at + p]]         = exact[p];
+        w.half_exact[pairs[at + p]] = 1;
+      }
+      at += n;
+    }
+  }
+
+  /// Keeps the logged pairs @p keep marks, in their order.
+  void compact_half_log(std::vector<std::uint8_t> const& keep)
+  {
+    std::size_t to = 0;
+    for (std::size_t i = 0; i < keep.size(); ++i) {
+      if (keep[i] == 0) { continue; }
+      w.half_rows[to]      = w.half_rows[i];
+      w.half_ids[to]       = w.half_ids[i];
+      w.half_distances[to] = w.half_distances[i];
+      w.half_exact[to]     = w.half_exact[i];
+      ++to;
+    }
+    w.half_rows.resize(to);
+    w.half_ids.resize(to);
+    w.half_distances.resize(to);
+    w.half_exact.resize(to);
+  }
+
+  /// Bounds the log: every row holding more than @p most pairs (@p held counts them) has the FP32
+  /// rows of its pairs read and keeps its k nearest by (FP32 distance, corpus row). The pairs
+  /// dropped each have k pairs before them in that order, so none is among the row's k nearest
+  /// except as one of several tied at the k-th distance. Without this a group of rows within their
+  /// rounding error of each other (duplicates, padding) would stay in the log whole, for every
+  /// probe row near it.
+  void settle_crowded_rows(std::vector<std::uint32_t>& held, std::size_t most)
+  {
+    auto const k = static_cast<std::size_t>(k_join);
+    std::vector<std::uint32_t> crowded, unread;
+    for (std::size_t i = 0; i < w.half_rows.size(); ++i) {
+      if (held[static_cast<std::size_t>(w.half_rows[i])] <= most) { continue; }
+      crowded.push_back(static_cast<std::uint32_t>(i));
+      if (logged_interval(i).lower != logged_interval(i).upper) {
+        unread.push_back(static_cast<std::uint32_t>(i));
+      }
+    }
+    if (crowded.empty()) { return; }
+    read_exact(unread);
+    std::sort(crowded.begin(), crowded.end(), [&](std::uint32_t a, std::uint32_t b) {
+      if (w.half_rows[a] != w.half_rows[b]) { return w.half_rows[a] < w.half_rows[b]; }
+      if (w.half_distances[a] != w.half_distances[b]) {
+        return w.half_distances[a] < w.half_distances[b];
+      }
+      return w.half_ids[a] < w.half_ids[b];
+    });
+    std::vector<std::uint8_t> keep(w.half_rows.size(), 1);
+    for (std::size_t from = 0; from < crowded.size();) {
+      auto to = from;
+      for (; to < crowded.size() && w.half_rows[crowded[to]] == w.half_rows[crowded[from]]; ++to) {
+        // Each distance is now the FP32 one, whether its row was read or equals its half copy.
+        w.half_exact[crowded[to]] = 1;
+        if (to - from >= k) { keep[crowded[to]] = 0; }
+      }
+      held[static_cast<std::size_t>(w.half_rows[crowded[from]])] =
+        static_cast<std::uint32_t>(std::min(to - from, k));
+      ++w.half_rows_settled_early;
+      from = to;
+    }
+    compact_half_log(keep);
+  }
+
+  /// After a merge over half-rounded rows: the merged candidates that may still be among their
+  /// row's k nearest -- the lower end of the interval within the row's bound -- go to the host
+  /// log with their distances to the half rows (@p to_half, as the re-score left them). The test
+  /// here uses the chunk's largest error and a wider margin, so it keeps a superset of them;
+  /// settle_half_intervals() applies each row's own.
+  void keep_half_contenders(rmm::device_uvector<float> const& to_half)
+  {
+    CUDF_CUDA_TRY(cudaMemcpyAsync(w.candidates->distances.data(),
+                                  to_half.data(),
+                                  static_cast<std::size_t>(w.pending) * sizeof(float),
+                                  cudaMemcpyDeviceToDevice,
+                                  stream.get()));
+    rmm::device_uvector<float> limit(static_cast<std::size_t>(n_left), stream, mr);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(limit.data(),
+                                  s.bound->data(),
+                                  static_cast<std::size_t>(n_left) * sizeof(float),
+                                  cudaMemcpyDeviceToDevice,
+                                  stream.get()));
+    vss::half_interval_upper(limit.data(),
+                             nullptr,
+                             0,
+                             nullptr,
+                             row_half_error,
+                             3 * vss::half_interval_widening(dim),
+                             n_left,
+                             stream,
+                             nullptr,
+                             s.half_probe ? s.probe_half_error->data() : nullptr);
+    auto const kept = static_cast<std::size_t>(vss::keep_within_row_limit(w.candidates->rows.data(),
+                                                                          w.candidates->ids.data(),
+                                                                          w.candidates->distances.data(),
+                                                                          w.pending,
+                                                                          limit.data(),
+                                                                          n_left,
+                                                                          k_join,
+                                                                          nullptr,
+                                                                          stream,
+                                                                          mr));
+    if (kept == 0) { return; }
+    auto const held = w.half_rows.size();
+    // Pairs are addressed by 32-bit positions in the log, which the bound below keeps far smaller.
+    if (held + kept > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] one corpus chunk left " + std::to_string(kept) +
+        " pairs open for a block of " + std::to_string(n_left) +
+        " probe rows over half-precision rows; use smaller probe blocks or unset "
+        "SIRIUS_VSS_TIER_HALF");
+    }
+    w.half_rows.resize(held + kept);
+    w.half_ids.resize(held + kept);
+    w.half_distances.resize(held + kept);
+    w.half_exact.resize(held + kept, 0);
+    w.half_logged += static_cast<std::int64_t>(kept);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(w.half_rows.data() + held,
+                                  w.candidates->rows.data(),
+                                  kept * sizeof(std::int32_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(w.half_ids.data() + held,
+                                  w.candidates->ids.data(),
+                                  kept * sizeof(std::int64_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(w.half_distances.data() + held,
+                                  w.candidates->distances.data(),
+                                  kept * sizeof(float),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    stream.sync();
+    // The log is held to 3 k pairs a probe row. Past that: the bounds only fall, so pairs logged
+    // under an earlier, looser one go; then a row still holding more than 2 k is settled to k
+    // (settle_crowded_rows()), and if that leaves more than half the limit, every row holding
+    // more than k is, which leaves at most k a row.
+    auto const k     = static_cast<std::size_t>(k_join);
+    auto const n     = static_cast<std::size_t>(n_left);
+    // SIRIUS_VSS_HALF_LOG_PAIRS sets the limit itself (tests: a small one settles rows early).
+    static std::size_t const forced_limit = [] {
+      auto const* v = std::getenv("SIRIUS_VSS_HALF_LOG_PAIRS");
+      return v != nullptr ? static_cast<std::size_t>(std::strtoull(v, nullptr, 10)) : std::size_t{0};
+    }();
+    auto const limit_pairs =
+      forced_limit > 0 ? forced_limit : std::max<std::size_t>(std::size_t{1} << 22, 3 * k * n);
+    if (w.half_rows.size() < limit_pairs) { return; }
+    std::vector<float> bound(n);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(bound.data(),
+                                  s.bound->data(),
+                                  bound.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    stream.sync();
+    std::vector<std::uint32_t> per_row(n, 0);
+    std::vector<std::uint8_t> keep(w.half_rows.size(), 0);
+    for (std::size_t i = 0; i < keep.size(); ++i) {
+      auto const row = static_cast<std::size_t>(w.half_rows[i]);
+      // Compared as distances: a root squared need not round back to what it was taken of.
+      if (logged_interval(i).lower <= std::sqrt(static_cast<double>(bound[row]))) {
+        keep[i] = 1;
+        ++per_row[row];
+      }
+    }
+    compact_half_log(keep);
+    ++w.half_prunes;
+    settle_crowded_rows(per_row, 2 * k);
+    if (w.half_rows.size() > limit_pairs / 2) { settle_crowded_rows(per_row, k); }
   }
 
   [[nodiscard]] bool joins_group(std::int64_t m, std::int64_t n)
@@ -6253,7 +7006,9 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       }
       return stage_compact(j);
     }
-    auto& source = s.exact_lists_corpus ? *s.exact_lists_corpus : *_op._corpus;
+    auto& source = s.exact_lists_corpus ? *s.exact_lists_corpus
+                   : s.fp32_corpus      ? *_op._corpus_exact
+                                        : *_op._corpus;
     if (direct) { return staged_vector_chunk{}; }
     return pair_step != nullptr ? source.stage_for_pair(j, *mem_space, stream)
                                 : stage_for_fold(source, j, *mem_space, stage_on, stream);
@@ -6268,7 +7023,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       prefetched = stage_next(j);
       return;
     }
-    vector_chunk_source* source = _op._corpus.get();
+    vector_chunk_source* source = s.fp32_corpus ? _op._corpus_exact.get() : _op._corpus.get();
     if (s.exact_lists_corpus) { source = &*s.exact_lists_corpus; }
     deferred_vector_chunk next;
     try {
@@ -6291,7 +7046,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         !staging_stream) {
       return;
     }
-    vector_chunk_source* source = _op._corpus.get();
+    vector_chunk_source* source = s.fp32_corpus ? _op._corpus_exact.get() : _op._corpus.get();
     if (s.exact_lists_corpus) { source = &*s.exact_lists_corpus; }
     // Position ci + 1 is prefetch()'s, taken at the end of this chunk from the queue's front when
     // it holds one.
@@ -6805,6 +7560,16 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                              nullptr,
                              0.f,
                              ip);
+        if (s.half_intervals) {
+          vss::half_interval_upper(knn.distances->mutable_view().data<float>(),
+                                   nullptr,
+                                   0,
+                                   nullptr,
+                                   _op._half_chunk_error[j],
+                                   vss::half_interval_widening(dim),
+                                   m * knn.k,
+                                   stream);
+        }
         if (knn.k == k_join) {
           vss::lower_bound_to_row_max(
             knn.distances->view().data<float>(), rows_c, m, knn.k, s.bound->data(), stream);
@@ -6944,6 +7709,24 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         std::memcpy(&row_half_error, &bits[0], sizeof(float));
         std::memcpy(&max_sq, &bits[1], sizeof(float));
         row_norm_max = std::sqrt(max_sq);
+        if (s.half_intervals) {
+          // The staged rows are the half copies themselves; what the rounding took from each
+          // FP32 row is on record, and the filter limit allows for the chunk's largest.
+          if (_op._half_row_error.size() < static_cast<std::size_t>(chunk_base + chunk_n)) {
+            throw std::runtime_error(
+              "[sirius_physical_vector_join_stream] corpus chunk " + std::to_string(j) +
+              " has rows without a half-precision rounding error on record");
+          }
+          row_half_error = _op._half_chunk_error[j];
+          chunk_error.emplace(static_cast<std::size_t>(chunk_n), stream, mr);
+          chunk_error_base = chunk_base;
+          // From a pageable vector, so the copy has completed when the call returns.
+          CUDF_CUDA_TRY(cudaMemcpyAsync(chunk_error->data(),
+                                        _op._half_row_error.data() + chunk_base,
+                                        static_cast<std::size_t>(chunk_n) * sizeof(float),
+                                        cudaMemcpyHostToDevice,
+                                        stream.get()));
+        }
         if (!(row_norm_max < 65504.f)) {
           throw std::runtime_error(
             "[sirius_physical_vector_join_stream] a corpus row norm of " +
@@ -7307,6 +8090,17 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                              0.f,
                              ip);
       }
+      if (s.half_intervals) {
+        // The bound this sweep leaves is the largest of k upper ends.
+        vss::half_interval_upper(knn.distances->mutable_view().data<float>(),
+                                 nullptr,
+                                 0,
+                                 nullptr,
+                                 _op._half_chunk_error[j],
+                                 vss::half_interval_widening(dim),
+                                 m * knn.k,
+                                 stream);
+      }
       // Fold in place: a row is routed to a cluster at most once, so the rows of one slice
       // are distinct and no two threads of the fold write the same accumulator row.
       vss::fold_topk_rows(st.acc_distances->mutable_view().data<float>(),
@@ -7341,6 +8135,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         check_group();
         flush();
         exact_source = vss::exact_rows{};
+        chunk_error.reset();
       } else if (s.any_bounded && (staged.buffer || staged.owner || staged.reader)) {
         check_group();
       }
@@ -7450,6 +8245,218 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     }
   }
 
+  /// Turns the accumulator of upper ends and the logged pairs into each row's k nearest by FP32
+  /// distance to the corpus rows themselves, of which the search has only read half-rounded copies.
+  ///
+  /// For row r let U be its k-th smallest upper end (the accumulator's last entry): k pairs lie
+  /// within U, so r's k-th FP32 distance does too. Every pair whose FP32 distance is within U has
+  /// its lower end within U, passed the filter under a bound no smaller than U, and is in the log
+  /// (or was dropped from it behind k nearer pairs, settle_crowded_rows()).
+  /// The CONTENDERS are the logged pairs with lower end <= U; any other pair is farther than U
+  /// and so strictly past the k-th. Then:
+  ///  - exactly k contenders (or fewer, a row with fewer than k candidates): they are the answer;
+  ///  - otherwise a contender is IN when fewer than k other contenders have a lower end within its
+  ///    upper end, since then at most k - 1 pairs can be as near as it. The rest are OPEN: the
+  ///    FP32 row of each is read (one row, from wherever its batch is) and its distance computed
+  ///    by the kernel every re-score uses, against the same probe row. The answer is the IN pairs
+  ///    and the nearest of the OPEN ones by those distances, up to k.
+  /// A contender whose distance is already that one (its corpus row equals its half copy, and
+  /// with half_probe its probe row does too) is not read.
+  ///
+  /// The distance reported is the FP32 one for a pair that was read and, for one that was not,
+  /// the distance to the half-rounded corpus row (with half_probe, between the two rows' half
+  /// copies): within the corpus row's rounding error of the FP32 one, in distances (plus the probe
+  /// row's with half_probe), so a row's distances, and its neighbours' order by them, can differ
+  /// by that much from a join over the FP32 rows; the set of neighbours does not, up to ties at
+  /// the k-th distance. SIRIUS_VSS_HALF_EXACT_DISTANCES=1 reads the FP32 row of every reported pair
+  /// instead, up to k single-row reads a probe row. Runs while the block's probe rows are held.
+  void settle_half_intervals()
+  {
+    auto const from = std::chrono::steady_clock::now();
+    auto const n    = static_cast<std::size_t>(n_left);
+    auto const k    = static_cast<std::size_t>(k_join);
+    static bool const exact_distances = [] {
+      auto const* v = std::getenv("SIRIUS_VSS_HALF_EXACT_DISTANCES");
+      return v != nullptr && std::string_view{v} == "1";
+    }();
+    std::vector<float> acc_d(n * k);
+    std::vector<std::int64_t> acc_n(n * k);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(acc_d.data(),
+                                  st.acc_distances->view().data<float>(),
+                                  acc_d.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(acc_n.data(),
+                                  st.acc_neighbors->view().data<std::int64_t>(),
+                                  acc_n.size() * sizeof(std::int64_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    stream.sync();
+    auto& rows       = w.half_rows;
+    auto& ids        = w.half_ids;
+    auto& dist       = w.half_distances;
+    auto const total = rows.size();
+    // The log in row order.
+    std::vector<std::size_t> row_begin(n + 1, 0);
+    for (auto const r : rows) {
+      ++row_begin[static_cast<std::size_t>(r) + 1];
+    }
+    for (std::size_t r = 0; r < n; ++r) {
+      row_begin[r + 1] += row_begin[r];
+    }
+    std::vector<std::uint32_t> order(total);
+    {
+      auto at = row_begin;
+      for (std::size_t i = 0; i < total; ++i) {
+        order[at[static_cast<std::size_t>(rows[i])]++] = static_cast<std::uint32_t>(i);
+      }
+    }
+    enum : std::uint8_t { kOut, kIn, kOpen, kOpenExact };
+    std::vector<std::uint8_t> state(total, kOut);
+
+    // Host work only: no thread here touches the device.
+    auto const n_threads = std::clamp<std::size_t>(std::thread::hardware_concurrency(), 1, 16);
+    auto const over_rows = [&](auto const& body) {
+      std::vector<std::thread> pool;
+      for (std::size_t t = 1; t < n_threads; ++t) {
+        pool.emplace_back([&, t] { body(n * t / n_threads, n * (t + 1) / n_threads, t); });
+      }
+      body(0, n / n_threads, 0);
+      for (auto& thread : pool) {
+        thread.join();
+      }
+    };
+
+    std::vector<std::vector<std::uint32_t>> open_of(n_threads);
+    std::vector<std::size_t> contenders_of(n_threads, 0), open_rows_of(n_threads, 0);
+    over_rows([&](std::size_t first, std::size_t last, std::size_t t) {
+      std::vector<std::uint32_t> members;
+      std::vector<half_interval> intervals;
+      std::vector<double> lowers;
+      for (auto r = first; r < last; ++r) {
+        // Compared as distances: a root squared need not round back to what it was taken of.
+        auto const within = std::sqrt(static_cast<double>(acc_d[r * k + k - 1]));
+        members.clear();
+        intervals.clear();
+        lowers.clear();
+        for (auto x = row_begin[r]; x < row_begin[r + 1]; ++x) {
+          auto const i = order[x];
+          auto const v = logged_interval(i);
+          if (v.lower <= within) {
+            members.push_back(i);
+            intervals.push_back(v);
+            lowers.push_back(v.lower);
+          }
+        }
+        contenders_of[t] += members.size();
+        bool const settled = members.size() <= k;
+        std::sort(lowers.begin(), lowers.end());
+        bool open_row = false;
+        for (std::size_t m = 0; m < members.size(); ++m) {
+          auto const i     = members[m];
+          bool const exact = intervals[m].lower == intervals[m].upper;
+          // Its own lower end is among those counted.
+          bool const in = settled ||
+                          static_cast<std::size_t>(
+                            std::upper_bound(lowers.begin(), lowers.end(), intervals[m].upper) -
+                            lowers.begin()) <= k;
+          if (in && (exact || !exact_distances)) {
+            state[i] = kIn;
+          } else if (exact) {
+            state[i] = kOpenExact;
+            open_row = open_row || !in;
+          } else {
+            state[i] = kOpen;
+            open_of[t].push_back(i);
+            open_row = open_row || !in;
+          }
+        }
+        open_rows_of[t] += open_row ? 1 : 0;
+      }
+    });
+    std::vector<std::uint32_t> open;
+    std::size_t contenders = 0, open_rows = 0;
+    for (std::size_t t = 0; t < n_threads; ++t) {
+      open.insert(open.end(), open_of[t].begin(), open_of[t].end());
+      contenders += contenders_of[t];
+      open_rows += open_rows_of[t];
+    }
+    auto const read_before = w.half_pairs_read;
+    read_exact(open);
+    for (auto const i : open) {
+      state[i] = kOpenExact;
+    }
+
+    std::atomic<bool> inconsistent{false};
+    over_rows([&](std::size_t first, std::size_t last, std::size_t) {
+      using scored = std::pair<float, std::int64_t>;
+      std::vector<scored> in, opened;
+      for (auto r = first; r < last; ++r) {
+        in.clear();
+        opened.clear();
+        for (auto x = row_begin[r]; x < row_begin[r + 1]; ++x) {
+          auto const i = order[x];
+          if (state[i] == kIn) {
+            in.emplace_back(dist[i], ids[i]);
+          } else if (state[i] == kOpenExact) {
+            opened.emplace_back(dist[i], ids[i]);
+          }
+        }
+        if (in.size() > k) {
+          inconsistent = true;
+          continue;
+        }
+        auto const take = std::min(k - in.size(), opened.size());
+        std::partial_sort(
+          opened.begin(), opened.begin() + static_cast<std::ptrdiff_t>(take), opened.end());
+        in.insert(in.end(), opened.begin(), opened.begin() + static_cast<std::ptrdiff_t>(take));
+        std::sort(in.begin(), in.end());
+        for (std::size_t c = 0; c < k; ++c) {
+          acc_d[r * k + c] = c < in.size() ? in[c].first : std::numeric_limits<float>::infinity();
+          acc_n[r * k + c] = c < in.size() ? in[c].second : std::int64_t{-1};
+        }
+      }
+    });
+    if (inconsistent) {
+      throw std::logic_error(
+        "[sirius_physical_vector_join_stream] more than k pairs were certain to be among a row's "
+        "k nearest");
+    }
+    CUDF_CUDA_TRY(cudaMemcpyAsync(st.acc_distances->mutable_view().data<float>(),
+                                  acc_d.data(),
+                                  acc_d.size() * sizeof(float),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(st.acc_neighbors->mutable_view().data<std::int64_t>(),
+                                  acc_n.data(),
+                                  acc_n.size() * sizeof(std::int64_t),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
+    stream.sync();
+    if (dbg) {
+      std::fprintf(
+        stderr,
+        "[vecjoin-phase] half intervals: %lld pairs logged, %zu held at the end, %.2f contenders "
+        "a row, %zu rows left open, %lld pairs read at the end and %lld before (%lld rows settled "
+        "early in %lld prunes), %lld FP32 corpus rows read in %.3f s; settled in %.3f s\n",
+        static_cast<long long>(w.half_logged),
+        total,
+        n == 0 ? 0.0 : static_cast<double>(contenders) / static_cast<double>(n),
+        open_rows,
+        static_cast<long long>(w.half_pairs_read - read_before),
+        static_cast<long long>(read_before),
+        static_cast<long long>(w.half_rows_settled_early),
+        static_cast<long long>(w.half_prunes),
+        static_cast<long long>(w.half_rows_read),
+        w.half_read_seconds,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - from).count());
+    }
+    rows = {};
+    ids  = {};
+    dist = {};
+    w.half_exact = {};
+  }
+
   /// Takes in what is still waiting, and leaves the accumulators as the answer reads them.
   void finish()
   {
@@ -7465,6 +8472,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       } else {
         bring_pairs_back();
       }
+      if (s.half_intervals) { settle_half_intervals(); }
       // Lists hold layout rows; a scanned corpus's candidates already carry corpus rows.
       if (s.rescore && !radius_join && _lists != nullptr) {
         vss::map_ids(st.acc_neighbors->mutable_view().data<std::int64_t>(),
@@ -7602,6 +8610,9 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   std::optional<rmm::device_uvector<std::int32_t>> routed_sq;
   float row_half_error{0.f};
   float row_norm_max{0.f};
+  /// With half_intervals, the staged chunk's per-row rounding errors and its first corpus row.
+  std::optional<rmm::device_uvector<float>> chunk_error;
+  std::int64_t chunk_error_base{0};
   std::optional<rmm::device_uvector<std::uint16_t>> routed_f16;
   std::optional<rmm::device_uvector<float>> routed_sqf;
   vss::exact_rows exact_source{};
@@ -7891,6 +8902,16 @@ std::size_t sirius_physical_vector_join_stream::host_pair_budget() const
   }
   auto const half = hosts.front()->get_max_memory() / 2;
   return half > rows_held ? half - rows_held : 0;
+}
+
+bool sirius_physical_vector_join_stream::scanned_search_reads_half(
+  const vss::vector_join_request& request, std::int64_t n_clusters)
+{
+  auto const* bounded = std::getenv("SIRIUS_VSS_BOUND_GEMM");
+  return std::min<std::int64_t>(request.n_probes, n_clusters) > 1 && request.earlier_by.empty() &&
+         gemm_search_enabled() && scan_bounded_enabled() &&
+         (bounded == nullptr || std::strcmp(bounded, "0") != 0) &&
+         vss::bound_filter_f16_supports(request.dim);
 }
 
 bool sirius_physical_vector_join_stream::block_rows_on_host() const

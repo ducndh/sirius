@@ -537,6 +537,7 @@ __global__ void int8_code_limit_kernel(float const* bound,
 
 // |half(x)|^2 per row, with the row's rounding error |x - half(x)|: to row_error[r] and/or into
 // *max_error_bits, and the largest |half(x)|^2 into *max_norm_bits (all non-negative floats' bits).
+// The error is exactly zero for a row that equals its half copy and positive for any other.
 __global__ void half_rows_norms_kernel(float const* x,
                                        uint16_t const* h,
                                        int64_t rows,
@@ -550,19 +551,27 @@ __global__ void half_rows_norms_kernel(float const* x,
   auto const lane  = static_cast<int64_t>(threadIdx.x % 32);
   for (int64_t r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32; r < rows; r += warps) {
     float acc = 0.f, err = 0.f;
+    int inexact = 0;
     for (int64_t j = lane; j < d; j += 32) {
       float const v = __half2float(__ushort_as_half(h[r * d + j]));
       float const e = x[r * d + j] - v;
       acc           = fmaf(v, v, acc);
       err           = fmaf(e, e, err);
+      // The difference of two floats is exact, so it is zero only for equal values.
+      inexact |= e != 0.f ? 1 : 0;
     }
     for (int o = 16; o > 0; o /= 2) {
       acc += __shfl_xor_sync(0xffffffffu, acc, o);
       err += __shfl_xor_sync(0xffffffffu, err, o);
+      inexact |= __shfl_xor_sync(0xffffffffu, inexact, o);
     }
     if (lane == 0) {
-      sq[r]         = acc;
-      float const e = sqrtf(err) * (1.f + 1e-6f);
+      sq[r] = acc;
+      // A difference below 2^-75 squares to a denormal or to nothing: each term may lose up to
+      // 2^-149, the sum's root up to sqrt(d) 2^-74.5. A row with any inexact value gets that
+      // much more, so its error is zero only when the row equals its half copy.
+      float const e = sqrtf(err) * (1.f + 1e-6f) +
+                      (inexact != 0 ? sqrtf(static_cast<float>(d)) * 0x1p-74f : 0.f);
       if (row_error != nullptr) { row_error[r] = e; }
       if (max_error_bits != nullptr) { atomicMax(max_error_bits, __float_as_uint(e)); }
       if (max_norm_bits != nullptr) { atomicMax(max_norm_bits, __float_as_uint(acc)); }
@@ -658,6 +667,29 @@ __device__ __forceinline__ float float16_upper_bound_of(float b,
   float const sums  = 2.f * d * 5.9604645e-8f * norms * norms;
   float const reach = sqrtf(fmaxf(b + sums, 0.f)) + probe_error + row_error;
   return reach * reach * (1.f + 1e-6f);
+}
+
+__global__ void half_interval_upper_kernel(float* d,
+                                           int64_t const* ids,
+                                           int64_t id_base,
+                                           float const* row_error,
+                                           float error,
+                                           float widening,
+                                           int64_t n,
+                                           int32_t const* rows,
+                                           float const* probe_error)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    float const b = d[i];
+    if (!(b < INFINITY) || (ids != nullptr && ids[i] < 0)) { continue; }
+    float e = row_error != nullptr ? row_error[ids[i] - id_base] : error;
+    if (probe_error != nullptr) { e += probe_error[rows != nullptr ? rows[i] : i]; }
+    if (e == 0.f) { continue; }
+    float const reach = (sqrtf(fmaxf(b, 0.f)) + e) * (1.f + widening);
+    // An error that is not a number (a value outside half's range) bounds nothing.
+    d[i] = reach >= 0.f ? reach * reach : INFINITY;
+  }
 }
 
 __global__ void int8_seed_upper_bound_kernel(
@@ -2261,6 +2293,24 @@ void float16_bound_limit(float const* bound,
   auto const grid = std::min(grid_for(n), 65535);
   float16_bound_limit_kernel<<<grid, kBlock, 0, stream.get()>>>(
     bound, probe_sq, probe_error, row_error, row_norm, d, n, limit, lower, inner_product);
+  CUDF_CHECK_CUDA(stream.get());
+}
+
+void half_interval_upper(float* d,
+                         int64_t const* ids,
+                         int64_t id_base,
+                         float const* row_error,
+                         float error,
+                         float widening,
+                         int64_t n,
+                         rmm::cuda_stream_view stream,
+                         int32_t const* rows,
+                         float const* probe_error)
+{
+  if (n == 0) { return; }
+  auto const grid = std::min(grid_for(n), 65535);
+  half_interval_upper_kernel<<<grid, kBlock, 0, stream.get()>>>(
+    d, ids, id_base, row_error, error, widening, n, rows, probe_error);
   CUDF_CHECK_CUDA(stream.get());
 }
 
