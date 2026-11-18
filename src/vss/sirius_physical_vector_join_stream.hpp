@@ -539,6 +539,7 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   struct block_state;
   class block_task;
   class clustered_search;
+  struct pair_once_state;
 
   /// Resolve both pinned tables and snapshot per-batch views plus right-batch row
   /// offsets. Idempotent; caller holds _op_mutex. On the build path this is a no-op until
@@ -618,6 +619,20 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
   /// a task reads across PCIe once per sweep); leaves @c _blocks empty otherwise. Caller holds
   /// _op_mutex, after the corpus and probe sources are set up.
   void plan_probe_blocks_locked();
+  /// SIRIUS_VSS_PAIR_ONCE=1: sets up @c _pair_once when this join can run as one (see
+  /// pair_once_state). Caller holds _op_mutex, after plan_probe_blocks_locked().
+  void plan_pair_once_locked();
+  /// SIRIUS_VSS_PAIR_ONCE=1 is set.
+  [[nodiscard]] static bool pair_once_requested();
+  /// Why this join's request cannot run pair-once, or null when its shape can.
+  [[nodiscard]] char const* pair_once_shape_refusal() const;
+  /// The per-row state's host bytes for @p routed_rows routed rows, against the limits it must
+  /// stay within; refusal is null when it fits.
+  struct pair_once_host {
+    std::size_t bytes{0}, limit{0}, pool{0}, process_limit{0};
+    char const* refusal{nullptr};
+  };
+  [[nodiscard]] pair_once_host pair_once_host_check(std::int64_t routed_rows) const;
   /// Tasks to hand out: one per probe block, or one per probe chunk when there are none.
   [[nodiscard]] std::size_t num_tasks() const
   {
@@ -756,6 +771,10 @@ class sirius_physical_vector_join_stream : public sirius_physical_partition_cons
     std::int64_t rows{0};
   };
   std::vector<probe_block> _blocks;
+  /// Set when a self-join's blocks each meet every pair of rows once (plan_pair_once_locked()).
+  std::shared_ptr<pair_once_state> _pair_once;
+  /// Set once plan_pair_once_locked() has decided; until then the estimate assumes the shape's answer.
+  bool _pair_once_decided{false};
   host_pair_block_pool _host_pair_blocks;
   /// Set when the join runs in pair tasks; _blocks are then what it walks, and the other members
   /// here say how far. All read and written under _op_mutex.

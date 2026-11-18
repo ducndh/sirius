@@ -86,6 +86,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -97,6 +98,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -2102,6 +2104,7 @@ void sirius_physical_vector_join_stream::initialize_locked()
     }
   }
   plan_probe_blocks_locked();
+  plan_pair_once_locked();
   if (pair_tasks_wanted() && !_blocks.empty()) {
     _pair_schedule.emplace(_blocks.size(), scanned_block_tasks());
     _pair_states.resize(_blocks.size());
@@ -2221,6 +2224,295 @@ void sirius_physical_vector_join_stream::build_statement_lists_locked()
     built.result.exact_rows,
     built.result.tier,
     _request.n_probes);
+}
+
+/// A self-join's schedule that meets every pair of rows once (SIRIUS_VSS_PAIR_ONCE=1). Blocks of
+/// probe rows are row ranges of the corpus in cluster order, and each block streams the corpus
+/// past its rows, so each comparison of row r with row x is made twice: with r's block resident
+/// and with x's. Here block i reads only the chunks from its own first row on. While a chunk past
+/// the block is staged, it is joined both ways: the block's rows probe it, as in every block, and
+/// the chunk's rows past the block probe the block's rows, which the device holds in FP16 and the
+/// host in FP32. A row x of an earlier block is therefore met by row r only in that reverse
+/// direction, when x's block is resident, and every other pair only forward, so each comparison is
+/// made once and the corpus is read about (B + 1) / 2 times for B blocks instead of B.
+///
+/// Reverse results go to rows whose block has not run yet, so this keeps, for every row of the
+/// table, its running top-k and its bound. A block starts from what its rows hold here, and after
+/// its pass its rows have met every cluster they probe, so they are emitted with the block as
+/// before. Each row past the first block is routed once, while the first block runs, in the pieces
+/// its own block's routing cuts (see clustered_search::po_feed_pieces), so both directions read the
+/// same clusters for it.
+struct sirius_physical_vector_join_stream::pair_once_state {
+  std::int64_t rows{0};
+  std::int64_t k{0};
+  std::int64_t probes{0};
+  std::int64_t n_clusters{0};
+  /// First row of each block, and the row count after the last.
+  std::vector<std::int64_t> block_start;
+  /// Each row's top-k, nearest first (-1 at +inf for none), and an upper bound on its k-th
+  /// distance within its probed clusters. Squared distances where the search keeps them squared.
+  std::vector<std::int32_t> ids;
+  std::vector<float> distances;
+  std::vector<float> bound;
+  /// The clusters each row from block_start[1] on probes, nearest first: 16 bits each when the
+  /// clustering has at most 65,536 clusters, else 32.
+  std::vector<std::uint16_t> route16;
+  std::vector<std::int32_t> route32;
+  /// Per chunk: whether its rows past the first block are routed, and the clusters they probe.
+  std::vector<bool> chunk_routed;
+  std::vector<std::vector<std::uint64_t>> chunk_probes;
+  /// (block, chunk) pairs whose reverse results are in. A block's task that runs out of memory is
+  /// run again from its start; what it delivered to later rows must not be delivered twice.
+  std::set<std::pair<std::size_t, std::size_t>> reverse_done;
+  /// First rows of the routing pieces the first block has routed and joined in reverse
+  /// (clustered_search::po_feed_pieces), for the same reason.
+  std::set<std::int64_t> pieces_done;
+  /// Blocks whose search has ended. The reverse direction needs them in order: a block delivers
+  /// only to rows of the blocks after it.
+  std::size_t blocks_finished{0};
+  bool allocated{false};
+
+  [[nodiscard]] std::int32_t cluster(std::int64_t row, std::int64_t p) const
+  {
+    auto const at = static_cast<std::size_t>((row - block_start[1]) * probes + p);
+    return route32.empty() ? static_cast<std::int32_t>(route16[at]) : route32[at];
+  }
+  void set_cluster(std::int64_t row, std::int64_t p, std::int32_t c)
+  {
+    auto const at = static_cast<std::size_t>((row - block_start[1]) * probes + p);
+    if (route32.empty()) {
+      route16[at] = static_cast<std::uint16_t>(c);
+    } else {
+      route32[at] = c;
+    }
+  }
+  [[nodiscard]] std::size_t block_of(std::int64_t row) const
+  {
+    return static_cast<std::size_t>(
+      std::upper_bound(block_start.begin(), block_start.end(), row) - block_start.begin() - 1);
+  }
+};
+
+bool sirius_physical_vector_join_stream::pair_once_requested()
+{
+  auto const* v = std::getenv("SIRIUS_VSS_PAIR_ONCE");
+  return v != nullptr && std::string_view{v} == "1";
+}
+
+namespace {
+std::size_t process_memory_limit();
+}  // namespace
+
+sirius_physical_vector_join_stream::pair_once_host
+sirius_physical_vector_join_stream::pair_once_host_check(std::int64_t routed_rows) const
+{
+  pair_once_host out{};
+  auto const k      = static_cast<std::size_t>(std::min<std::int64_t>(_request.k, _right_total_rows));
+  auto const probes = static_cast<std::size_t>(std::max<std::int64_t>(_request.n_probes, 1));
+  auto const n_cents = _centroids != nullptr ? static_cast<std::size_t>(_centroids->size()) : 0;
+  out.bytes = static_cast<std::size_t>(_right_total_rows) * (k * 8 + 4) +
+              static_cast<std::size_t>(routed_rows) * probes * (n_cents <= 65536 ? 2 : 4);
+  out.process_limit     = process_memory_limit();
+  auto const* share_env = std::getenv("SIRIUS_VSS_PAIR_ONCE_HOST_SHARE");
+  double const asked    = share_env != nullptr ? std::atof(share_env) : 0.25;
+  double const share    = std::isfinite(asked) ? std::clamp(asked, 0.0, 1.0) : 0.0;
+  out.limit             = static_cast<std::size_t>(share * static_cast<double>(out.process_limit));
+  if (_sirius_ctx != nullptr) {
+    for (auto const* h :
+         _sirius_ctx->get_memory_manager().get_memory_spaces_for_tier(cucascade::memory::Tier::HOST)) {
+      out.pool += h->get_max_memory();
+    }
+  }
+  if (out.bytes > out.limit) {
+    out.refusal = "its per-row state would pass its share of the process's memory limit";
+  } else if (out.pool + out.bytes > out.process_limit) {
+    out.refusal = "the host pool and its per-row state together would pass the process's memory limit";
+  }
+  return out;
+}
+
+char const* sirius_physical_vector_join_stream::pair_once_shape_refusal() const
+{
+  if (!pair_once_requested()) { return "not requested"; }
+  auto const metric = vss::join_selection_distance_type_from_metric(
+    _request.metric, _request.search_mode == vss::vector_join_search_mode::exact_direct);
+  if (!_request.probe_shares_build || _build_side == nullptr || _lists != nullptr) {
+    return "not a self-join over a scanned corpus";
+  }
+  if (_centroids == nullptr || _request.search_mode == vss::vector_join_search_mode::index) {
+    return "not a clustered search";
+  }
+  if (_request.mode != vss::vector_join_mode::per_row_top_k) { return "not a per-row top-k"; }
+  if (metric != cuvs::distance::DistanceType::L2Expanded &&
+      metric != cuvs::distance::DistanceType::L2SqrtExpanded) {
+    return "not an L2 join (only its bounded FP16 search runs both ways)";
+  }
+  if (!_request.earlier_by.empty() || _request.probe_scalar) { return "keyed or scalar probe"; }
+  // The reverse direction ranks the block's rows against each chunk's rows as they are staged, as
+  // if both were the FP32 rows; over a corpus stored as half-rounded rows beside its FP32 ones it
+  // has none of the rounding intervals, contender log or FP32 reads the forward search settles
+  // with, so the pairs it delivers could be wrong.
+  if (_half_error_column) {
+    return "the corpus is stored in half precision beside its FP32 rows (SIRIUS_VSS_TIER_HALF=2), "
+           "which the reverse direction does not bound";
+  }
+  if (scanned_block_tasks() != 1 || pair_tasks_wanted()) { return "blocks run concurrently"; }
+  // What the bounded FP16 search over a scanned corpus needs that is known before any row is read
+  // (plan_search); a block whose rows turn out outside half's range is handled there.
+  if (_request.n_probes < 2 || !scan_bounded_enabled() || !gemm_search_enabled() ||
+      !vss::bound_filter_f16_supports(_request.dim) || [] {
+        auto const* b = std::getenv("SIRIUS_VSS_BOUND_GEMM");
+        return b != nullptr && std::strcmp(b, "0") == 0;
+      }()) {
+    return "the bounded FP16 search is off for this join";
+  }
+  return nullptr;
+}
+
+namespace {
+/// This process's memory limit: the host's memory, or its cgroup's limit (v2 or v1) when lower.
+std::size_t process_memory_limit()
+{
+  auto limit =
+    static_cast<std::size_t>(sysconf(_SC_PHYS_PAGES)) * static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+  auto const read_limit = [&](std::string const& path) {
+    if (std::FILE* f = std::fopen(path.c_str(), "r")) {
+      unsigned long long cap = 0;
+      if (std::fscanf(f, "%llu", &cap) == 1 && cap > 0) {
+        limit = std::min<std::size_t>(limit, static_cast<std::size_t>(cap));
+      }
+      std::fclose(f);
+    }
+  };
+  // Every cgroup from this process's up to the root bounds it, so each level's limit is read, and
+  // the mount's root too (inside a cgroup namespace the path is relative to it). cgroup v1 also
+  // reports the tightest limit above the cgroup as hierarchical_memory_limit.
+  auto const walk = [&](std::string const& mount, std::string path, std::string const& file) {
+    for (;;) {
+      read_limit(mount + path + "/" + file);
+      if (path.empty() || path == "/") { break; }
+      auto const cut = path.find_last_of('/');
+      path           = cut == std::string::npos || cut == 0 ? std::string{"/"} : path.substr(0, cut);
+    }
+    read_limit(mount + "/" + file);
+  };
+  if (std::FILE* f = std::fopen("/proc/self/cgroup", "r")) {
+    char line[4096];
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+      std::string_view entry{line};
+      while (!entry.empty() && (entry.back() == '\n' || entry.back() == '\r')) {
+        entry.remove_suffix(1);
+      }
+      auto const first = entry.find(':');
+      auto const second = first == std::string_view::npos ? first : entry.find(':', first + 1);
+      if (second == std::string_view::npos) { continue; }
+      auto const controllers = entry.substr(first + 1, second - first - 1);
+      std::string const path{entry.substr(second + 1)};
+      if (controllers.empty()) {
+        walk("/sys/fs/cgroup", path, "memory.max");
+      } else if (controllers.find("memory") != std::string_view::npos) {
+        walk("/sys/fs/cgroup/memory", path, "memory.limit_in_bytes");
+        if (std::FILE* stat = std::fopen(("/sys/fs/cgroup/memory" + path + "/memory.stat").c_str(), "r")) {
+          char key[128];
+          unsigned long long value = 0;
+          while (std::fscanf(stat, "%127s %llu", key, &value) == 2) {
+            if (std::string_view{key} == "hierarchical_memory_limit" && value > 0) {
+              limit = std::min<std::size_t>(limit, static_cast<std::size_t>(value));
+            }
+          }
+          std::fclose(stat);
+        }
+      }
+    }
+    std::fclose(f);
+  }
+  return limit;
+}
+}  // namespace
+
+void sirius_physical_vector_join_stream::plan_pair_once_locked()
+{
+  _pair_once.reset();
+  _pair_once_decided = true;
+  if (!pair_once_requested()) { return; }
+  bool const dbg      = std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr;
+  char const* why_not = [&]() -> char const* {
+    if (auto const* shape = pair_once_shape_refusal(); shape != nullptr) { return shape; }
+    if (_blocks.size() < 2) { return "one probe block"; }
+    if (_probe->num_chunks() != _corpus->num_chunks()) { return "probe chunked unlike the corpus"; }
+    for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
+      if (_probe->chunk_rows(i) != _corpus->chunk_rows(i)) { return "probe chunked unlike the corpus"; }
+    }
+    if (_right_total_rows >= std::numeric_limits<std::int32_t>::max()) {
+      return "more rows than its 32-bit ids hold";
+    }
+    return nullptr;
+  }();
+  std::vector<std::int64_t> chunk_start(_corpus->num_chunks() + 1, 0);
+  for (std::size_t i = 0; i < _corpus->num_chunks(); ++i) {
+    chunk_start[i + 1] = chunk_start[i] + static_cast<std::int64_t>(_corpus->chunk_rows(i));
+  }
+  auto state = std::make_shared<pair_once_state>();
+  state->rows = _right_total_rows;
+  if (why_not == nullptr) {
+    // Blocks are consecutive pieces of consecutive chunks, so each is one range of corpus rows.
+    for (std::size_t b = 0; b < _blocks.size(); ++b) {
+      auto const& front = _blocks[b].pieces.front();
+      auto const first  = chunk_start[front.chunk] + front.begin;
+      if (b > 0 && first != state->block_start.back() + _blocks[b - 1].rows) {
+        why_not = "a block is not one range of rows";
+        break;
+      }
+      state->block_start.push_back(first);
+    }
+    if (why_not == nullptr && state->block_start.front() != 0) { why_not = "blocks start late"; }
+    if (why_not == nullptr) {
+      state->block_start.push_back(state->block_start.back() + _blocks.back().rows);
+      if (state->block_start.back() != _right_total_rows) { why_not = "blocks miss rows"; }
+    }
+  }
+  // The per-row state is a private host allocation outside the engine's pools: refused past a share
+  // of this process's memory limit, or when the host pool and it together would pass the limit.
+  pair_once_host host{};
+  if (why_not == nullptr) {
+    host    = pair_once_host_check(_right_total_rows - state->block_start[1]);
+    why_not = host.refusal;
+  }
+  auto const host_bytes = host.bytes, host_limit = host.limit, host_pool = host.pool,
+             process_limit = host.process_limit;
+  if (why_not != nullptr) {
+    SIRIUS_LOG_INFO("[sirius_physical_vector_join_stream] SIRIUS_VSS_PAIR_ONCE=1 not taken: {}{}",
+                    why_not,
+                    host_bytes > 0
+                      ? std::format(" (state {:.1f} GiB, its limit {:.1f} GiB by "
+                                    "SIRIUS_VSS_PAIR_ONCE_HOST_SHARE; host pool {:.1f} GiB; process "
+                                    "limit {:.1f} GiB)",
+                                    host_bytes / 1073741824.0,
+                                    host_limit / 1073741824.0,
+                                    host_pool / 1073741824.0,
+                                    process_limit / 1073741824.0)
+                      : std::string{});
+    if (host_bytes > 0 || _half_error_column) {
+      SIRIUS_LOG_WARN("[sirius_physical_vector_join_stream] SIRIUS_VSS_PAIR_ONCE=1 not taken: {}",
+                      why_not);
+    }
+    if (dbg) { std::fprintf(stderr, "[vecjoin-phase] pair-once: off (%s)\n", why_not); }
+    return;
+  }
+  SIRIUS_LOG_INFO(
+    "[sirius_physical_vector_join_stream] pair-once: {} blocks; per-row state {:.2f} GiB of host "
+    "memory outside the pools",
+    _blocks.size(),
+    host_bytes / 1073741824.0);
+  if (dbg) {
+    std::fprintf(stderr,
+                 "[vecjoin-phase] pair-once: %zu blocks over %lld rows, each reading the corpus "
+                 "from its own first row on; per-row state %.2f GiB on the host\n",
+                 _blocks.size(),
+                 static_cast<long long>(_right_total_rows),
+                 host_bytes / 1073741824.0);
+  }
+  _pair_once = std::move(state);
 }
 
 void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
@@ -2570,6 +2862,7 @@ void sirius_physical_vector_join_stream::on_finalize_operator()
   }
   _host_rows_repo = nullptr;
   _pair_states.clear();
+  _pair_once.reset();
   if (_sirius_ctx != nullptr && std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
     auto const stats = _sirius_ctx->get_vector_join_pair_stats();
     std::fprintf(
@@ -3328,6 +3621,13 @@ struct sirius_physical_vector_join_stream::block_state {
     std::optional<rmm::device_uvector<float>> code_limit;
     std::optional<rmm::device_uvector<float>> certain_limit;
     std::optional<rmm::device_uvector<float>> bound;
+
+    /// Pair-once (pair_once_state): the block's cluster runs from its first row on, by chunk (empty
+    /// for the first block, which reads them all), and the largest rounding error and norm of its
+    /// rows in half precision, which a reverse filter's limit allows for on the corpus side.
+    std::vector<std::vector<chunk_cluster_run>> po_runs;
+    float probe_half_error_max{0.f};
+    float probe_norm_max{0.f};
 
     search_run run;
   };
@@ -4624,7 +4924,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   void run()
   {
     prepare();
-    for (int pass = (radius_join && s.any_bounded) || s.first_met ? 1 : 0;
+    for (int pass = (radius_join && s.any_bounded) || s.first_met || po_seeded() ? 1 : 0;
          pass < (s.any_bounded ? 2 : 1);
          ++pass) {
       begin_sweep(pass);
@@ -4634,6 +4934,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       run_stretches();
     }
     finish();
+    if (po != nullptr) { po_test_out_of_memory_after_block(); }
     phase("search+fold slices");
     // What the answer does not read goes before it is shaped, which can take a good part of the
     // device.
@@ -4757,6 +5058,27 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     if (_op._corpus->is_streaming() && !building_for_pairs) { staging_stream.emplace(); }
     stage_on = staging_stream ? staging_stream->view() : stream;
     plan_search();
+    bool const test_fallback = [] {
+      auto const* t = std::getenv("SIRIUS_VSS_PAIR_ONCE_TEST_FALLBACK");
+      return t != nullptr && std::string_view{t} == "1";
+    }();
+    if (po != nullptr && (!s.scan_f16 || test_fallback) && po_block == 0) {
+      // Nothing was delivered yet: the whole join runs as it does without the switch. The chunks
+      // this block added for the reverse direction are read and joined forward only.
+      SIRIUS_LOG_WARN(
+        "[sirius_physical_vector_join_stream] SIRIUS_VSS_PAIR_ONCE=1 not taken: the first block "
+        "cannot take the bounded FP16 search");
+      _op._pair_once.reset();
+      po = nullptr;
+    }
+    if (po != nullptr && !s.scan_f16) {
+      // The reverse direction filters with the block's FP16 rows. Earlier blocks may already have
+      // skipped this block's pairs, so there is no falling back to the other schedule here.
+      throw std::runtime_error(
+        "[sirius_physical_vector_join_stream] SIRIUS_VSS_PAIR_ONCE=1 needs the bounded FP16 search "
+        "over the scanned corpus, which this block cannot take (a row outside float16's range, or "
+        "SIRIUS_VSS_SCAN_BOUNDED=0); run without SIRIUS_VSS_PAIR_ONCE");
+    }
   }
 
   /// Each probe row's clusters, sorted by cluster, and the corpus chunks they need.
@@ -4776,6 +5098,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         _request.metric + " join");
     }
     s.n_probes = std::clamp<std::int64_t>(_request.n_probes, 1, _op._n_clusters);
+    po_setup();
     // Every cluster probed is the exact join through lists. A cosine join over lists of rows as
     // they are (not unit rows) then ranks as the exhaustive fold does: the probe and each chunk
     // normalized in FP32, L2 from the differences between them, halved at the end. No coded
@@ -4819,6 +5142,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     // Routing prepares a copy of the rows it is given, so a block on the device is routed a piece at
     // a time too: in one call a 7.1M-row block at 1,024-d asked for its own 27 GiB again.
     auto edge_clusters = [&] {
+      if (po_seeded() && !po_check_routing()) { return po_stored_routing(); }
       if (!st.probe_rows_on_host && n_left <= kRoutedPieceRows) {
         return vss::nearest_centroid_ids(
           res, st.queries, _op._centroids->view(), dim, s.n_probes, metric, stream, mr);
@@ -4852,6 +5176,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       return all;
     }();
     phase("assign probe->clusters");
+    if (po_seeded() && po_check_routing()) { po_use_stored_routing(edge_clusters); }
     first_met_rule(edge_clusters);
 
     // A row whose clusters cannot supply k is refused before a single search is issued, rather
@@ -4899,13 +5224,14 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     // The prune, made explicit: a chunk holding no cluster any row wants is never staged, so
     // an out-of-core clustered corpus pays no transfer for the part it skips.
     for (std::size_t j = 0; j < _op._chunk_cluster_runs.size(); ++j) {
-      for (auto const& slice : _op._chunk_cluster_runs[j]) {
+      for (auto const& slice : runs_of(j)) {
         if (wanted[static_cast<std::size_t>(slice.cluster)]) {
           s.needed_chunks.push_back(j);
           break;
         }
       }
     }
+    if (po != nullptr) { po_add_reverse_chunks(); }
 
     if (std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
       std::int64_t all = 0, want = 0, span = 0, n_wanted = 0;
@@ -5568,7 +5894,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     // holding one; with few probe rows that is a small part of what sweep 1 reads.
     if (s.any_bounded) {
       for (auto const j : s.needed_chunks) {
-        for (auto const& slice : _op._chunk_cluster_runs[j]) {
+        for (auto const& slice : runs_of(j)) {
           if (nearest_edges[static_cast<std::size_t>(slice.cluster)] > 0) {
             s.nearest_chunks.push_back(j);
             break;
@@ -5738,6 +6064,8 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     float max_sq = 0;
     std::memcpy(&max_sq, &bits, sizeof(max_sq));
     float const probe_norm_max = std::sqrt(max_sq);
+    std::memcpy(&s.probe_half_error_max, &error_bits, sizeof(float));
+    s.probe_norm_max = probe_norm_max;
     // The same holds for the probe rows: a block with a component below 2^-63 is searched in FP32.
     bool const in_range = probe_norm_max < 65504.f && tiny == 0;
     // The largest rounding error's bits: zero only when every row's error is exactly zero.
@@ -7289,6 +7617,10 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       s.bound.emplace(static_cast<std::size_t>(n_left), stream, mr);
       if (radius_join) {
         vss::fill_bound(s.bound->data(), n_left, s.radius_bound, stream);
+      } else if (po_seeded()) {
+        // What the earlier blocks delivered to these rows, and their bounds: each from k distinct
+        // pairs of probed clusters, so no sweep has to set one.
+        po_load_block_state();
       } else if (s.first_met) {
         // No sweep came before: each row is bounded as the read reaches its first cluster.
         vss::fill_bound(s.bound->data(), n_left, std::numeric_limits<float>::infinity(), stream);
@@ -7421,7 +7753,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     auto const* forced = std::getenv("SIRIUS_VSS_FIRST_MET");
     if (forced != nullptr && std::string_view{forced} == "0") { return; }
     if (!_op.block_rows_on_host() || radius_join || pair_step != nullptr || building_for_pairs ||
-        st.earlier_cut != nullptr || ip || _op._chunk_cluster_runs.empty()) {
+        st.earlier_cut != nullptr || ip || _op._chunk_cluster_runs.empty() || po_seeded()) {
       return;
     }
     auto const n_clusters = static_cast<std::size_t>(_op._n_clusters);
@@ -7475,7 +7807,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   /// the chunk's filter reads it.
   void bound_first_met(std::size_t j, float const* chunk_data, std::int64_t chunk_n)
   {
-    auto const& runs          = _op._chunk_cluster_runs[j];
+    auto const& runs          = runs_of(j);
     auto const& edge_begin    = s.routed->edge_begin;
     auto const& nearest_edges = s.routed->nearest_edges;
     std::vector<std::size_t> met;
@@ -7654,7 +7986,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
     };
     if (s.first_met && sweep == 1 && chunk_n > 0) { bound_first_met(j, chunk_data, chunk_n); }
     if (s.scan_f16 && chunk_n > 0) {
-      auto const& runs = _op._chunk_cluster_runs[j];
+      auto const& runs = runs_of(j);
       std::vector<float const*> bases;
       if (sweep == 1) {
         // Unsigned arithmetic: the base may lie before the allocation, and only rows of the
@@ -7741,7 +8073,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       }
     }
 
-    auto const& runs     = grouped_sweep0 ? no_runs : _op._chunk_cluster_runs[j];
+    auto const& runs     = grouped_sweep0 ? no_runs : runs_of(j);
     auto const first_run = pair_step != nullptr ? pair_step->run : std::size_t{0};
     for (auto run = first_run; run < runs.size(); ++run) {
       auto const& slice = runs[run];
@@ -8075,7 +8407,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       // distances, so they are made exact first, read from the slice's rows. The accumulator
       // may then be out of order; only that largest distance is read before it is reset.
       if (s.scan_f16) {
-        auto const s = static_cast<std::size_t>(&slice - _op._chunk_cluster_runs[j].data());
+        auto const s = static_cast<std::size_t>(&slice - runs_of(j).data());
         vss::exact_distances(routed_queries->data(),
                              nullptr,
                              knn.k,
@@ -8136,6 +8468,17 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         flush();
         exact_source = vss::exact_rows{};
         chunk_error.reset();
+        if (po != nullptr && chunk_n == 0) {
+          if (chunk_end_row(j) != _op._chunk_row_base[j]) {
+            throw std::logic_error("[sirius_physical_vector_join_stream] pair-once: vector chunk " +
+                                   std::to_string(j) + " is empty but its cluster chunk is not");
+          }
+          po->chunk_routed[j] = true;
+        } else if (po != nullptr && po_block == 0) {
+          po_feed_pieces(chunk_base, chunk_data, chunk_n);
+        } else if (po != nullptr) {
+          po_reverse(j, chunk_base, chunk_data, chunk_n, reinterpret_cast<std::uint16_t const*>(compact));
+        }
       } else if (s.any_bounded && (staged.buffer || staged.owner || staged.reader)) {
         check_group();
       }
@@ -8209,6 +8552,1218 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
       }
     }
     return true;
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Pair-once (pair_once_state)
+  //===--------------------------------------------------------------------===//
+
+  /// Whether this block's rows start from what earlier blocks delivered to them.
+  [[nodiscard]] bool po_seeded() const { return po != nullptr && po_block > 0; }
+
+  /// Chunk @p j's cluster runs as this block reads them: from its first row on.
+  [[nodiscard]] std::vector<chunk_cluster_run> const& runs_of(std::size_t j) const
+  {
+    return s.po_runs.empty() ? _op._chunk_cluster_runs[j] : s.po_runs[j];
+  }
+
+  [[nodiscard]] std::int64_t chunk_end_row(std::size_t j) const
+  {
+    return j + 1 < _op._chunk_row_base.size() ? _op._chunk_row_base[j + 1] : _op._right_total_rows;
+  }
+
+  /// This block's place in the schedule, the table-wide state on first use, and the block's
+  /// rows by cluster.
+  void po_setup()
+  {
+    po = block != nullptr && pair_step == nullptr && !building_for_pairs ? _op._pair_once.get()
+                                                                          : nullptr;
+    if (po == nullptr) { return; }
+    if (_op._half_error_column) {
+      throw std::logic_error(
+        "[sirius_physical_vector_join_stream] pair-once taken over a corpus stored in half "
+        "precision beside its FP32 rows");
+    }
+    po_block = static_cast<std::size_t>(block - _op._blocks.data());
+    // The block that ended last may run again, when what follows its search in the same task runs
+    // out of memory: its deliveries are in the done-sets, so the second run delivers nothing twice.
+    if (po_block != po->blocks_finished && po_block + 1 != po->blocks_finished) {
+      throw std::logic_error("[sirius_physical_vector_join_stream] pair-once: block " +
+                             std::to_string(po_block) + " started after " +
+                             std::to_string(po->blocks_finished) + " blocks ended");
+    }
+    po_start = po->block_start[po_block];
+    po_end   = po->block_start[po_block + 1];
+    auto const n_chunks   = _op._chunk_cluster_runs.size();
+    auto const n_clusters = _op._n_clusters;
+    // The plan placed the blocks by the vector column's chunks; the cluster runs are read from
+    // the label column's. Both are the scan's batches, so their rows line up.
+    std::int64_t at = 0;
+    for (std::size_t j = 0; j < n_chunks; ++j) {
+      if (_op._chunk_row_base[j] != at) {
+        throw std::logic_error("[sirius_physical_vector_join_stream] pair-once: cluster chunk " +
+                               std::to_string(j) + " starts at row " +
+                               std::to_string(_op._chunk_row_base[j]) + ", the vector chunk at " +
+                               std::to_string(at));
+      }
+      at += static_cast<std::int64_t>(_op._corpus->chunk_rows(j));
+    }
+    if (!po->allocated) {
+      po->k          = k_join;
+      po->probes     = s.n_probes;
+      po->n_clusters = n_clusters;
+      po->ids.assign(static_cast<std::size_t>(po->rows * k_join), -1);
+      po->distances.assign(static_cast<std::size_t>(po->rows * k_join),
+                           std::numeric_limits<float>::infinity());
+      po->bound.assign(static_cast<std::size_t>(po->rows), std::numeric_limits<float>::infinity());
+      auto const routed = static_cast<std::size_t>((po->rows - po->block_start[1]) * s.n_probes);
+      if (n_clusters <= 65536) {
+        po->route16.assign(routed, 0);
+      } else {
+        po->route32.assign(routed, 0);
+      }
+      po->chunk_routed.assign(n_chunks, false);
+      po->chunk_probes.assign(
+        n_chunks, std::vector<std::uint64_t>(static_cast<std::size_t>((n_clusters + 63) / 64), 0));
+      po->allocated = true;
+    } else if (po->k != k_join || po->probes != s.n_probes || po->n_clusters != n_clusters) {
+      throw std::logic_error("[sirius_physical_vector_join_stream] pair-once: blocks disagree on k, "
+                             "probes or clusters");
+    }
+    // The block's rows of each cluster, as block rows.
+    std::vector<std::vector<std::pair<std::int64_t, std::int64_t>>> by_cluster(
+      static_cast<std::size_t>(n_clusters));
+    for (std::size_t j = 0; j < n_chunks; ++j) {
+      auto const base = _op._chunk_row_base[j];
+      if (base >= po_end || chunk_end_row(j) <= po_start) { continue; }
+      for (auto const& run : _op._chunk_cluster_runs[j]) {
+        auto const a = std::max(base + run.begin, po_start);
+        auto const b = std::min(base + run.end, po_end);
+        if (a < b) {
+          by_cluster[static_cast<std::size_t>(run.cluster)].emplace_back(a - po_start, b - po_start);
+        }
+      }
+    }
+    po_range_at.assign(static_cast<std::size_t>(n_clusters) + 1, 0);
+    po_ranges.clear();
+    po_block_clusters.assign(static_cast<std::size_t>((n_clusters + 63) / 64), 0);
+    for (std::size_t c = 0; c < by_cluster.size(); ++c) {
+      for (auto const& r : by_cluster[c]) {
+        po_ranges.push_back(r);
+      }
+      po_range_at[c + 1] = static_cast<std::int64_t>(po_ranges.size());
+      if (!by_cluster[c].empty()) { po_block_clusters[c / 64] |= std::uint64_t{1} << (c % 64); }
+    }
+    // A later block reads the corpus from its own first row on: what lies before was met in
+    // reverse while the earlier blocks were resident.
+    s.po_runs.clear();
+    if (po_block > 0) {
+      s.po_runs.resize(n_chunks);
+      for (std::size_t j = 0; j < n_chunks; ++j) {
+        auto const base = _op._chunk_row_base[j];
+        if (chunk_end_row(j) <= po_start) { continue; }
+        for (auto const& run : _op._chunk_cluster_runs[j]) {
+          auto const from = std::max(base + run.begin, po_start) - base;
+          if (from < run.end) { s.po_runs[j].push_back({run.cluster, from, run.end}); }
+        }
+      }
+    }
+  }
+
+  /// Adds the chunks whose rows past this block probe one of its clusters. The first block reads
+  /// every chunk past it: it routes their rows for the blocks after it.
+  void po_add_reverse_chunks()
+  {
+    auto const n_chunks = _op._chunk_cluster_runs.size();
+    std::vector<char> forward(n_chunks, 0);
+    for (auto const j : s.needed_chunks) {
+      forward[j] = 1;
+    }
+    s.needed_chunks.clear();
+    for (std::size_t j = 0; j < n_chunks; ++j) {
+      bool reverse = false;
+      if (chunk_end_row(j) > po_end) {
+        if (po_block == 0 || !po->chunk_routed[j]) {
+          reverse = true;
+        } else {
+          auto const& probed = po->chunk_probes[j];
+          for (std::size_t wd = 0; wd < probed.size() && !reverse; ++wd) {
+            reverse = (probed[wd] & po_block_clusters[wd]) != 0;
+          }
+        }
+      }
+      if (forward[j] != 0 || reverse) { s.needed_chunks.push_back(j); }
+      if (forward[j] != 0 && reverse) {
+        ++pos.chunks_both;
+      } else if (forward[j] != 0) {
+        ++pos.chunks_forward;
+      } else if (reverse) {
+        ++pos.chunks_reverse;
+      } else {
+        ++pos.chunks_skipped;
+      }
+    }
+  }
+
+  /// Routes the rows of chunk @p j from the second block on, the first time a block reaches it.
+  /// Each row is routed in the piece its own block's routing (route_block) puts it in, padded to
+  /// that piece's size: the routing GEMM's arithmetic depends on its shape, so a row routed in a
+  /// piece of another size could, at a near tie, probe another cluster in each direction.
+  void po_route_chunk(std::size_t j, std::int64_t chunk_base, float const* chunk_data, std::int64_t chunk_n)
+  {
+    if (po->chunk_routed[j]) { return; }
+    auto const g_hi  = chunk_base + chunk_n;
+    auto& bits       = po->chunk_probes[j];
+    auto const probes = po->probes;
+    bits.assign(static_cast<std::size_t>((po->n_clusters + 63) / 64), 0);
+    std::vector<std::int32_t> part;
+    for (auto g = std::max(chunk_base, po->block_start[1]); g < g_hi;) {
+      auto const b  = po->block_of(g);
+      auto const bs = po->block_start[b];
+      auto const be = po->block_start[b + 1];
+      auto const ps = bs + (g - bs) / kRoutedPieceRows * kRoutedPieceRows;
+      auto const pe = std::min(ps + kRoutedPieceRows, be);
+      auto const e  = std::min(pe, g_hi);
+      rmm::device_uvector<float> piece(static_cast<std::size_t>((pe - ps) * dim), stream, mr);
+      CUDF_CUDA_TRY(cudaMemsetAsync(piece.data(), 0, piece.size() * sizeof(float), stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(piece.data() + (g - ps) * dim,
+                                    chunk_data + (g - chunk_base) * dim,
+                                    static_cast<std::size_t>((e - g) * dim) * sizeof(float),
+                                    cudaMemcpyDeviceToDevice,
+                                    stream.get()));
+      auto const ids = vss::nearest_centroid_ids(
+        res,
+        raft::make_device_matrix_view<float const, std::int64_t>(piece.data(), pe - ps, dim),
+        _op._centroids->view(),
+        dim,
+        probes,
+        metric,
+        stream,
+        mr);
+      part.resize(static_cast<std::size_t>((e - g) * probes));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(part.data(),
+                                    ids.data() + (g - ps) * probes,
+                                    part.size() * sizeof(std::int32_t),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      stream.sync();
+      for (std::int64_t r = 0; r < e - g; ++r) {
+        for (std::int64_t p = 0; p < probes; ++p) {
+          auto const c = part[static_cast<std::size_t>(r * probes + p)];
+          if (c < 0 || c >= po->n_clusters) {
+            throw std::runtime_error("[sirius_physical_vector_join_stream] row " +
+                                     std::to_string(g + r) + " was routed to cluster id " +
+                                     std::to_string(c));
+          }
+          po->set_cluster(g + r, p, c);
+          bits[static_cast<std::size_t>(c) / 64] |= std::uint64_t{1} << (c % 64);
+        }
+      }
+      pos.rows_routed += e - g;
+      g = e;
+    }
+    po->chunk_routed[j] = true;
+  }
+
+  /// A block after the first was routed for the reverse direction already: its own routing must
+  /// agree with that, or the two directions would not make today's comparisons. Counts the rows
+  /// where it does not and takes the stored routing, so each pair is still made exactly once.
+  void po_use_stored_routing(rmm::device_uvector<std::int32_t>& clusters)
+  {
+    auto const probes = s.n_probes;
+    std::vector<std::int32_t> fresh(clusters.size());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(fresh.data(),
+                                  clusters.data(),
+                                  fresh.size() * sizeof(std::int32_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    stream.sync();
+    for (std::size_t j = 0; j < po->chunk_routed.size(); ++j) {
+      if (_op._chunk_row_base[j] < po_end && chunk_end_row(j) > po_start &&
+          chunk_end_row(j) > _op._chunk_row_base[j] && !po->chunk_routed[j]) {
+        throw std::logic_error("[sirius_physical_vector_join_stream] pair-once: chunk " +
+                               std::to_string(j) + " of block " + std::to_string(po_block) +
+                               " was never routed");
+      }
+    }
+    for (std::int64_t r = 0; r < n_left; ++r) {
+      bool differs = false;
+      for (std::int64_t p = 0; p < probes; ++p) {
+        auto& c       = fresh[static_cast<std::size_t>(r * probes + p)];
+        auto const kept = po->cluster(po_start + r, p);
+        differs |= c != kept;
+        c = kept;
+      }
+      pos.route_mismatches += differs ? 1 : 0;
+    }
+    pos.route_checked += n_left;
+    if (pos.route_mismatches > 0) {
+      SIRIUS_LOG_WARN(
+        "[sirius_physical_vector_join_stream] pair-once: block {} routes {} of its rows unlike the "
+        "routing its reverse direction used; the stored routing stands, so each pair is still met "
+        "once, but the answer can differ from the join without SIRIUS_VSS_PAIR_ONCE",
+        po_block,
+        pos.route_mismatches);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(clusters.data(),
+                                    fresh.data(),
+                                    fresh.size() * sizeof(std::int32_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      stream.sync();
+    }
+  }
+
+  /// The block's rows' accumulated answers and bounds as the accumulator and bound to start from.
+  void po_load_block_state()
+  {
+    auto const n = static_cast<std::size_t>(n_left * k_join);
+    auto const at = static_cast<std::size_t>(po_start * k_join);
+    std::vector<std::int64_t> ids(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      ids[i] = po->ids[at + i];
+    }
+    // From pageable vectors, so each copy has completed when the call returns.
+    CUDF_CUDA_TRY(cudaMemcpyAsync(st.acc_neighbors->mutable_view().data<std::int64_t>(),
+                                  ids.data(),
+                                  n * sizeof(std::int64_t),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(st.acc_distances->mutable_view().data<float>(),
+                                  po->distances.data() + at,
+                                  n * sizeof(float),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(s.bound->data(),
+                                  po->bound.data() + po_start,
+                                  static_cast<std::size_t>(n_left) * sizeof(float),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
+    stream.sync();
+    for (std::int64_t r = 0; r < n_left; ++r) {
+      pos.rows_unbounded += std::isinf(po->bound[static_cast<std::size_t>(po_start + r)]) ? 1 : 0;
+    }
+  }
+
+  /// Bounds the rows [@p g0, @p g1) of chunk @p j that nothing has bounded yet, each from the first
+  /// of its probed clusters with a run of at least max(k, 64) rows in this chunk: the largest of
+  /// its k nearest rows' exact distances there, as first-met bounds a block's rows. Those pairs
+  /// only set the bound; the filter meets them where the schedule puts them.
+  void po_first_bounds(std::size_t j,
+                       std::int64_t chunk_base,
+                       float const* chunk_data,
+                       std::int64_t g0,
+                       std::int64_t g1,
+                       float* bound,
+                       std::vector<char> const* need = nullptr)
+  {
+    auto const& runs  = _op._chunk_cluster_runs[j];
+    auto const enough = std::max<std::int64_t>(k_join, 64);
+    std::vector<std::int64_t> run_of(static_cast<std::size_t>(po->n_clusters), -1);
+    for (std::size_t run = 0; run < runs.size(); ++run) {
+      auto const c = static_cast<std::size_t>(runs[run].cluster);
+      auto const n = runs[run].end - runs[run].begin;
+      if (n >= enough &&
+          (run_of[c] < 0 ||
+           n > runs[static_cast<std::size_t>(run_of[c])].end - runs[static_cast<std::size_t>(run_of[c])].begin)) {
+        run_of[c] = static_cast<std::int64_t>(run);
+      }
+    }
+    std::vector<std::vector<std::int64_t>> by_run(runs.size());
+    for (auto g = g0; g < g1; ++g) {
+      bool const unbounded = need != nullptr ? (*need)[static_cast<std::size_t>(g - g0)] != 0
+                                             : std::isinf(po->bound[static_cast<std::size_t>(g)]);
+      if (!unbounded) { continue; }
+      for (std::int64_t p = 0; p < po->probes; ++p) {
+        auto const run = run_of[static_cast<std::size_t>(po->cluster(g, p))];
+        if (run >= 0) {
+          by_run[static_cast<std::size_t>(run)].push_back(g - g0);
+          break;
+        }
+      }
+    }
+    std::vector<std::int64_t> local;
+    for (std::size_t run = 0; run < runs.size(); ++run) {
+      auto const& rows = by_run[run];
+      if (rows.empty()) { continue; }
+      auto const slice_rows = runs[run].end - runs[run].begin;
+      float const* base     = chunk_data + runs[run].begin * dim;
+      rmm::device_uvector<float const*> device_base(1, stream, mr);
+      // From a pageable value, so the copy has completed when the call returns.
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        device_base.data(), &base, sizeof(float const*), cudaMemcpyHostToDevice, stream.get()));
+      vss::exact_rows source;
+      source.copy_blocks    = device_base.data();
+      source.rows_per_block = std::numeric_limits<std::int64_t>::max();
+      auto const slice_view = raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+        base, slice_rows, dim);
+      for (std::size_t at = 0; at < rows.size(); at += static_cast<std::size_t>(kFirstMetPieceRows)) {
+        auto const m = static_cast<std::int64_t>(
+          std::min(rows.size() - at, static_cast<std::size_t>(kFirstMetPieceRows)));
+        local.resize(static_cast<std::size_t>(m));
+        for (std::int64_t i = 0; i < m; ++i) {
+          local[static_cast<std::size_t>(i)] = rows[at + static_cast<std::size_t>(i)] + (g0 - chunk_base);
+        }
+        rmm::device_uvector<std::int64_t> chunk_rows(static_cast<std::size_t>(m), stream, mr);
+        rmm::device_uvector<std::int64_t> bound_rows(static_cast<std::size_t>(m), stream, mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(chunk_rows.data(),
+                                      local.data(),
+                                      local.size() * sizeof(std::int64_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        CUDF_CUDA_TRY(cudaMemcpyAsync(bound_rows.data(),
+                                      rows.data() + at,
+                                      local.size() * sizeof(std::int64_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        rmm::device_uvector<float> queries(static_cast<std::size_t>(m * dim), stream, mr);
+        vss::gather_rows(chunk_data, dim, chunk_rows.data(), m, queries.data(), stream);
+        auto const queries_view =
+          raft::make_device_matrix_view<const float, std::int64_t, raft::row_major>(
+            queries.data(), m, dim);
+        auto const knn = vss::gemm_topk(res, slice_view, queries_view, k_join, s.search_metric, mr);
+        vss::exact_distances(queries.data(),
+                             nullptr,
+                             knn.k,
+                             knn.neighbors->view().data<std::int64_t>(),
+                             knn.distances->mutable_view().data<float>(),
+                             m * knn.k,
+                             source,
+                             dim,
+                             stream,
+                             mr,
+                             nullptr,
+                             0.f,
+                             ip);
+        if (knn.k == k_join) {
+          vss::lower_bound_to_row_max(
+            knn.distances->view().data<float>(), bound_rows.data(), m, knn.k, bound, stream);
+        }
+        pos.rows_first_bounded += m;
+        // The pieces above go with this scope; the kernels read them.
+        stream.sync();
+      }
+    }
+  }
+
+  /// The FP32 rows of this block at block rows @p local (@p n of them) into @p out on the device,
+  /// as the forward re-score reads them: widened from the device's half copy when every row of the
+  /// block equals it, else from the host (or the device when the block stayed there).
+  void po_gather_block_rows(std::int64_t const* local, std::size_t n, float* out)
+  {
+    if (s.probe_exact_in_half && s.probe_f16) {
+      rmm::device_uvector<std::int64_t> ids(n, stream, mr);
+      rmm::device_uvector<std::uint16_t> halves(n * static_cast<std::size_t>(dim), stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        ids.data(), local, n * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream.get()));
+      vss::gather_bytes(s.probe_f16->data(),
+                        dim * static_cast<std::int64_t>(sizeof(std::uint16_t)),
+                        ids.data(),
+                        static_cast<std::int64_t>(n),
+                        halves.data(),
+                        stream);
+      vss::widen_float16(
+        halves.data(), static_cast<std::int64_t>(n) * dim, out, stream);
+      stream.sync();
+    } else if (st.probe_rows_on_host) {
+      if (po_pinned.data == nullptr) {
+        void* pinned = nullptr;
+        CUDF_CUDA_TRY(cudaMallocHost(&pinned, po_gather_rows() * dim * sizeof(float)));
+        po_pinned.data = static_cast<float*>(pinned);
+      }
+      st.host_rows->gather(local, n, po_pinned.data);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(out,
+                                    po_pinned.data,
+                                    n * static_cast<std::size_t>(dim) * sizeof(float),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      stream.sync();
+    } else {
+      rmm::device_uvector<std::int64_t> ids(n, stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        ids.data(), local, n * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream.get()));
+      vss::gather_rows(st.queries.data_handle(), dim, ids.data(), static_cast<std::int64_t>(n), out, stream);
+      stream.sync();
+    }
+  }
+
+  [[nodiscard]] std::size_t po_gather_rows() const
+  {
+    return std::max<std::size_t>(1, (std::size_t{256} << 20) / (static_cast<std::size_t>(dim) * sizeof(float)));
+  }
+
+  /// The reverse rows' running answers on the device while one chunk is joined in reverse.
+  struct po_rows {
+    std::int64_t g0{0};
+    std::int64_t n{0};
+    float const* rows32{nullptr};
+    rmm::device_uvector<float> acc_distances;
+    rmm::device_uvector<std::int64_t> acc_neighbors;
+    rmm::device_uvector<float> bound, limit, sq, error;
+  };
+
+  /// Re-scores the reverse candidates in FP32, the chunk's row against the block's, and merges them
+  /// into the reverse rows' answers, lowering their bounds and filter limits.
+  void po_flush(po_rows& rv, std::int64_t pending)
+  {
+    if (pending == 0) { return; }
+    auto& cand    = *po_cand;
+    auto const t0 = debug_mark();
+    std::vector<std::int64_t> ids(static_cast<std::size_t>(pending));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(ids.data(),
+                                  cand.ids.data(),
+                                  ids.size() * sizeof(std::int64_t),
+                                  cudaMemcpyDeviceToHost,
+                                  stream.get()));
+    stream.sync();
+    if (po_slot.empty()) { po_slot.assign(static_cast<std::size_t>(n_left), -1); }
+    auto const max_rows = po_gather_rows();
+    std::vector<std::int64_t> distinct;
+    std::vector<std::int64_t> slots(ids.size());
+    for (std::size_t from = 0; from < ids.size();) {
+      distinct.clear();
+      auto to = from;
+      for (; to < ids.size(); ++to) {
+        auto& slot = po_slot[static_cast<std::size_t>(ids[to] - po_start)];
+        if (slot < 0) {
+          if (distinct.size() == max_rows) { break; }
+          slot = static_cast<std::int32_t>(distinct.size());
+          distinct.push_back(ids[to] - po_start);
+        }
+        slots[to] = slot;
+      }
+      for (auto const r : distinct) {
+        po_slot[static_cast<std::size_t>(r)] = -1;
+      }
+      rmm::device_uvector<float> gathered(distinct.size() * static_cast<std::size_t>(dim), stream, mr);
+      po_gather_block_rows(distinct.data(), distinct.size(), gathered.data());
+      float const* base = gathered.data();
+      rmm::device_uvector<float const*> device_base(1, stream, mr);
+      rmm::device_uvector<std::int64_t> device_slots(to - from, stream, mr);
+      // From pageable memory, so the copies have completed when the calls return.
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        device_base.data(), &base, sizeof(float const*), cudaMemcpyHostToDevice, stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(device_slots.data(),
+                                    slots.data() + from,
+                                    (to - from) * sizeof(std::int64_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      vss::exact_rows source;
+      source.copy_blocks    = device_base.data();
+      source.rows_per_block = std::numeric_limits<std::int64_t>::max();
+      vss::exact_distances(rv.rows32,
+                           cand.rows.data() + from,
+                           0,
+                           device_slots.data(),
+                           cand.distances.data() + from,
+                           static_cast<std::int64_t>(to - from),
+                           source,
+                           dim,
+                           stream,
+                           mr,
+                           nullptr,
+                           0.f,
+                           ip);
+      stream.sync();
+      from = to;
+    }
+    auto const t1 = debug_mark();
+    vss::merge_bound_candidates(rv.acc_distances.data(),
+                                rv.acc_neighbors.data(),
+                                rv.n,
+                                k_join,
+                                cand,
+                                pending,
+                                rv.bound.data(),
+                                stream,
+                                mr);
+    po_limits(rv);
+    CUDF_CUDA_TRY(cudaMemsetAsync(cand.count.data(), 0, sizeof(unsigned long long), stream.get()));
+    pos.rev_candidates += pending;
+    ++pos.rev_flushes;
+    if (dbg) {
+      pos.rescore_s += std::chrono::duration<double>(t1 - t0).count();
+      pos.merge_s += std::chrono::duration<double>(debug_mark() - t1).count();
+    }
+  }
+
+  /// The reverse rows' filter limits from their bounds: the chunk's rows are the probe side, the
+  /// block's the corpus side, with each side's half-precision rounding error.
+  void po_limits(po_rows& rv)
+  {
+    vss::float16_bound_limit(rv.bound.data(),
+                             rv.sq.data(),
+                             rv.error.data(),
+                             s.probe_half_error_max,
+                             s.probe_norm_max,
+                             dim,
+                             rv.n,
+                             rv.limit.data(),
+                             stream,
+                             false,
+                             ip);
+  }
+
+  /// Joins the rows of chunk @p j past this block, as probes, against the block's rows of the
+  /// clusters they probe, and keeps what they find with them (pair_once_state). The chunk is
+  /// staged: its FP32 rows @p chunk_data and its half rows @p chunk_half.
+  void po_reverse(std::size_t j,
+                  std::int64_t chunk_base,
+                  float const* chunk_data,
+                  std::int64_t chunk_n,
+                  std::uint16_t const* chunk_half)
+  {
+    auto const g0 = std::max(chunk_base, po_end);
+    auto const g1 = chunk_base + chunk_n;
+    if (g0 >= g1 || po->reverse_done.count({po_block, j}) != 0) { return; }
+    auto const t_start = debug_mark();
+    po_route_chunk(j, chunk_base, chunk_data, chunk_n);
+    if (dbg) { pos.route_s += std::chrono::duration<double>(debug_mark() - t_start).count(); }
+    auto const r0 = g0 - chunk_base;
+    po_reverse_rows(g0, g1, chunk_data + r0 * dim, chunk_half + r0 * dim, [&](float* bound) {
+      po_first_bounds(j, chunk_base, chunk_data, g0, g1, bound);
+    });
+    po->reverse_done.insert({po_block, j});
+    po_test_out_of_memory();
+  }
+
+  /// SIRIUS_VSS_PAIR_ONCE_TEST_OOM_AFTER=<block> (tests only): that block runs out of memory once
+  /// after its search has ended, as the answer's shaping can, so the same block runs again.
+  void po_test_out_of_memory_after_block()
+  {
+    static std::atomic<bool> fired{false};
+    auto const* t = std::getenv("SIRIUS_VSS_PAIR_ONCE_TEST_OOM_AFTER");
+    if (t == nullptr || std::atoll(t) != static_cast<long long>(po_block)) { return; }
+    if (!fired.exchange(true)) {
+      throw rmm::out_of_memory("pair-once test: out of memory after the block's search");
+    }
+  }
+
+  /// SIRIUS_VSS_PAIR_ONCE_TEST_OOM_MID_PIECE=1 (tests only): the first block runs out of memory
+  /// once with a routing piece half gathered, the third time one is.
+  void po_test_out_of_memory_mid_piece()
+  {
+    static std::atomic<bool> fired{false};
+    static std::atomic<int> partial{0};
+    auto const* t = std::getenv("SIRIUS_VSS_PAIR_ONCE_TEST_OOM_MID_PIECE");
+    if (t == nullptr || std::string_view{t} != "1" || fired.load()) { return; }
+    if (partial.fetch_add(1) + 1 == 3 && !fired.exchange(true)) {
+      throw rmm::out_of_memory("pair-once test: out of memory with a piece half gathered");
+    }
+  }
+
+  /// SIRIUS_VSS_PAIR_ONCE_TEST_OOM=<block> (tests only): that block runs out of memory once, right
+  /// after its second delivery to later rows, so the engine runs it again with some delivered.
+  void po_test_out_of_memory()
+  {
+    static std::atomic<bool> fired{false};
+    static std::atomic<int> deliveries{0};
+    auto const* t = std::getenv("SIRIUS_VSS_PAIR_ONCE_TEST_OOM");
+    if (t == nullptr || fired.load() || std::atoll(t) != static_cast<long long>(po_block)) { return; }
+    if (deliveries.fetch_add(1) + 1 == 2 && !fired.exchange(true)) {
+      throw rmm::out_of_memory("pair-once test: out of memory after a delivery");
+    }
+  }
+
+  /// Joins rows [@p g0, @p g1) past this block, as probes, against the block's rows of the
+  /// clusters they probe, and keeps what they find with them (pair_once_state). @p rows32 and
+  /// @p rows16 are their FP32 and half rows on the device; @p first_bounds bounds those of them
+  /// nothing has bounded yet.
+  void po_reverse_rows(std::int64_t g0,
+                       std::int64_t g1,
+                       float const* rows32,
+                       std::uint16_t const* rows16,
+                       std::function<void(float*)> const& first_bounds)
+  {
+    auto const t_start = debug_mark();
+    auto const n       = g1 - g0;
+    auto const kk      = static_cast<std::size_t>(k_join);
+    po_rows rv{g0,
+               n,
+               rows32,
+               rmm::device_uvector<float>(static_cast<std::size_t>(n) * kk, stream, mr),
+               rmm::device_uvector<std::int64_t>(static_cast<std::size_t>(n) * kk, stream, mr),
+               rmm::device_uvector<float>(static_cast<std::size_t>(n), stream, mr),
+               rmm::device_uvector<float>(static_cast<std::size_t>(n), stream, mr),
+               rmm::device_uvector<float>(static_cast<std::size_t>(n), stream, mr),
+               rmm::device_uvector<float>(static_cast<std::size_t>(n), stream, mr)};
+    {
+      auto const at = static_cast<std::size_t>(g0) * kk;
+      std::vector<std::int64_t> ids(static_cast<std::size_t>(n) * kk);
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        ids[i] = po->ids[at + i];
+      }
+      // From pageable memory, so the copies have completed when the calls return.
+      CUDF_CUDA_TRY(cudaMemcpyAsync(rv.acc_neighbors.data(),
+                                    ids.data(),
+                                    ids.size() * sizeof(std::int64_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(rv.acc_distances.data(),
+                                    po->distances.data() + at,
+                                    ids.size() * sizeof(float),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(rv.bound.data(),
+                                    po->bound.data() + g0,
+                                    static_cast<std::size_t>(n) * sizeof(float),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+    }
+    vss::half_rows_norms(rv.rows32,
+                         rows16,
+                         n,
+                         dim,
+                         rv.sq.data(),
+                         rv.error.data(),
+                         nullptr,
+                         nullptr,
+                         stream);
+    first_bounds(rv.bound.data());
+    auto const t_bounded = debug_mark();
+
+    // The (row, cluster) edges into this block, by cluster.
+    std::vector<std::int64_t> count(static_cast<std::size_t>(po->n_clusters) + 1, 0);
+    auto const in_block = [&](std::int32_t c) {
+      return (po_block_clusters[static_cast<std::size_t>(c) / 64] >> (c % 64)) & 1U;
+    };
+    for (auto g = g0; g < g1; ++g) {
+      for (std::int64_t p = 0; p < po->probes; ++p) {
+        auto const c = po->cluster(g, p);
+        if (in_block(c)) { ++count[static_cast<std::size_t>(c) + 1]; }
+      }
+    }
+    std::partial_sum(count.begin(), count.end(), count.begin());
+    std::vector<std::int64_t> edges(static_cast<std::size_t>(count.back()));
+    {
+      auto fill = count;
+      for (auto g = g0; g < g1; ++g) {
+        for (std::int64_t p = 0; p < po->probes; ++p) {
+          auto const c = po->cluster(g, p);
+          if (in_block(c)) { edges[static_cast<std::size_t>(fill[static_cast<std::size_t>(c)]++)] = g - g0; }
+        }
+      }
+    }
+    pos.rev_rows += n;
+    pos.rev_edges += static_cast<std::int64_t>(edges.size());
+    if (!edges.empty()) {
+      rmm::device_uvector<std::int64_t> device_edges(edges.size(), stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(device_edges.data(),
+                                    edges.data(),
+                                    edges.size() * sizeof(std::int64_t),
+                                    cudaMemcpyHostToDevice,
+                                    stream.get()));
+      po_limits(rv);
+      if (!po_cand) {
+        // SIRIUS_VSS_PAIR_ONCE_TEST_CANDIDATES (tests only) shrinks the buffer so that groups
+        // overflow it and are made again.
+        auto const* t = std::getenv("SIRIUS_VSS_PAIR_ONCE_TEST_CANDIDATES");
+        po_cand.emplace(t != nullptr ? std::max<std::int64_t>(1, std::atoll(t)) : kPoCandidates,
+                        stream,
+                        mr);
+      }
+      auto& cand    = *po_cand;
+      auto const cap = cand.capacity();
+      // Launches go in optimistically, a group at a time: the buffer's count, read after a group,
+      // says whether every pair that passed was kept. When one overflowed the buffer, the count goes
+      // back to where the group started (the pairs it appended are dropped), what was there before
+      // is flushed, and the group's launches are made again, each only when all its pairs would fit.
+      struct launch {
+        std::int64_t xa, xn, edge, m;
+      };
+      std::vector<launch> group;
+      std::int64_t group_from = 0, group_worst = 0;
+      auto const read_count = [&] {
+        unsigned long long total = 0;
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          &total, cand.count.data(), sizeof(total), cudaMemcpyDeviceToHost, stream.get()));
+        stream.sync();
+        return static_cast<std::int64_t>(total);
+      };
+      auto const issue = [&](launch const& l) {
+        vss::bound_filter_f16(s.probe_f16->data() + l.xa * dim,
+                              s.probe_sqf->data() + l.xa,
+                              l.xn,
+                              po_start + l.xa,
+                              rows16,
+                              rv.sq.data(),
+                              device_edges.data() + l.edge,
+                              l.m,
+                              dim,
+                              rv.limit.data(),
+                              vss::float16_slack{},
+                              cand,
+                              stream);
+        ++pos.rev_launches;
+      };
+      auto const set_count = [&](std::int64_t n_kept) {
+        auto const keep = static_cast<unsigned long long>(n_kept);
+        // From a pageable value, so the copy has completed when the call returns.
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+          cand.count.data(), &keep, sizeof(keep), cudaMemcpyHostToDevice, stream.get()));
+        stream.sync();
+      };
+      auto const check = [&] {
+        auto const total = read_count();
+        if (total <= cap) {
+          group_from = total;
+          if (total > cap / 2) {
+            po_flush(rv, total);
+            group_from = 0;
+          }
+        } else {
+          ++pos.rev_replays;
+          set_count(group_from);
+          po_flush(rv, group_from);
+          std::int64_t pending = 0;
+          for (auto const& l : group) {
+            auto const step = std::max<std::int64_t>(1, cap / l.xn);
+            for (std::int64_t at = 0; at < l.m; at += step) {
+              auto const part = launch{l.xa, l.xn, l.edge + at, std::min(step, l.m - at)};
+              if (pending + part.m * part.xn > cap) {
+                po_flush(rv, read_count());
+                pending = 0;
+              }
+              issue(part);
+              pending += part.m * part.xn;
+            }
+          }
+          group_from = read_count();
+        }
+        group.clear();
+        group_worst = 0;
+      };
+      for (std::int64_t c = 0; c < po->n_clusters; ++c) {
+        auto const e0 = count[static_cast<std::size_t>(c)];
+        auto const m  = count[static_cast<std::size_t>(c) + 1] - e0;
+        if (m == 0) { continue; }
+        for (auto r = po_range_at[static_cast<std::size_t>(c)];
+             r < po_range_at[static_cast<std::size_t>(c) + 1];
+             ++r) {
+          auto const [lo, hi] = po_ranges[static_cast<std::size_t>(r)];
+          for (auto xa = lo; xa < hi; xa += cap) {
+            auto const l = launch{xa, std::min(hi - xa, cap), e0, m};
+            issue(l);
+            group.push_back(l);
+            group_worst += l.m * l.xn;
+            w.scanned_pairs += l.m * l.xn;
+            if (group.size() >= 256 || group_worst >= 16 * cap) { check(); }
+          }
+        }
+      }
+      check();
+      po_flush(rv, group_from);
+    }
+    // The rows' answers and bounds go back to the table-wide state, and this chunk is done for this
+    // block: a retried task must not deliver them again.
+    {
+      auto const at = static_cast<std::size_t>(g0) * kk;
+      std::vector<std::int64_t> ids(static_cast<std::size_t>(n) * kk);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(ids.data(),
+                                    rv.acc_neighbors.data(),
+                                    ids.size() * sizeof(std::int64_t),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(po->distances.data() + at,
+                                    rv.acc_distances.data(),
+                                    ids.size() * sizeof(float),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(po->bound.data() + g0,
+                                    rv.bound.data(),
+                                    static_cast<std::size_t>(n) * sizeof(float),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      stream.sync();
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        po->ids[at + i] = static_cast<std::int32_t>(ids[i]);
+      }
+    }
+    if (dbg) {
+      pos.first_s += std::chrono::duration<double>(t_bounded - t_start).count();
+      pos.reverse_s += std::chrono::duration<double>(debug_mark() - t_start).count();
+    }
+  }
+
+  /// Whether a block after the first routes its own rows too, to check them against the stored
+  /// routing (SIRIUS_VSS_PAIR_ONCE_CHECK_ROUTING=1); otherwise it takes the stored routing.
+  [[nodiscard]] static bool po_check_routing()
+  {
+    auto const* v = std::getenv("SIRIUS_VSS_PAIR_ONCE_CHECK_ROUTING");
+    return v != nullptr && std::string_view{v} == "1";
+  }
+
+  /// This block's rows' stored routing, [n_left x n_probes] on the device.
+  [[nodiscard]] rmm::device_uvector<std::int32_t> po_stored_routing()
+  {
+    for (std::size_t j = 0; j < po->chunk_routed.size(); ++j) {
+      if (_op._chunk_row_base[j] < po_end && chunk_end_row(j) > po_start &&
+          chunk_end_row(j) > _op._chunk_row_base[j] && !po->chunk_routed[j]) {
+        throw std::logic_error("[sirius_physical_vector_join_stream] pair-once: chunk " +
+                               std::to_string(j) + " of block " + std::to_string(po_block) +
+                               " was never routed");
+      }
+    }
+    std::vector<std::int32_t> host(static_cast<std::size_t>(n_left * s.n_probes));
+    for (std::int64_t r = 0; r < n_left; ++r) {
+      for (std::int64_t p = 0; p < s.n_probes; ++p) {
+        host[static_cast<std::size_t>(r * s.n_probes + p)] = po->cluster(po_start + r, p);
+      }
+    }
+    rmm::device_uvector<std::int32_t> out(host.size(), stream, mr);
+    // From a pageable vector, so the copy has completed when the call returns.
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      out.data(), host.data(), host.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream.get()));
+    // The block's first routing piece is routed again and compared: one piece of the block's own
+    // routing, the check SIRIUS_VSS_PAIR_ONCE_CHECK_ROUTING=1 makes for all of them.
+    {
+      auto const m = std::min(kRoutedPieceRows, n_left);
+      std::optional<rmm::device_uvector<float>> rows;
+      float const* first = st.queries.data_handle();
+      if (st.probe_rows_on_host) {
+        rows.emplace(static_cast<std::size_t>(m * dim), stream, mr);
+        st.host_rows->copy_to_device(0, m, rows->data());
+        first = rows->data();
+      }
+      auto const fresh = vss::nearest_centroid_ids(
+        res,
+        raft::make_device_matrix_view<float const, std::int64_t>(first, m, dim),
+        _op._centroids->view(),
+        dim,
+        s.n_probes,
+        metric,
+        stream,
+        mr);
+      std::vector<std::int32_t> back(static_cast<std::size_t>(m * s.n_probes));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        back.data(), fresh.data(), back.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream.get()));
+      stream.sync();
+      for (std::int64_t r = 0; r < m; ++r) {
+        bool differs = false;
+        for (std::int64_t p = 0; p < s.n_probes; ++p) {
+          auto const at = static_cast<std::size_t>(r * s.n_probes + p);
+          differs |= back[at] != host[at];
+        }
+        pos.route_mismatches += differs ? 1 : 0;
+      }
+      pos.route_checked += m;
+      if (pos.route_mismatches > 0) {
+        SIRIUS_LOG_WARN(
+          "[sirius_physical_vector_join_stream] pair-once: block {} routes {} of the {} rows checked "
+          "unlike the routing its reverse direction used; the stored routing stands, so each pair is "
+          "still met once, but the answer can differ from the join without SIRIUS_VSS_PAIR_ONCE",
+          po_block,
+          pos.route_mismatches,
+          m);
+      }
+    }
+    return out;
+  }
+
+  /// After the first block's pass: every routing piece past it was routed and joined in reverse.
+  /// A piece left half-gathered would leave its rows routed to cluster 0 for the later blocks.
+  void po_check_pieces()
+  {
+    if (po_piece_start >= 0) {
+      throw std::logic_error("[sirius_physical_vector_join_stream] pair-once: the piece at row " +
+                             std::to_string(po_piece_start) + " was left half-gathered");
+    }
+    for (std::size_t b = 1; b + 1 < po->block_start.size(); ++b) {
+      for (auto ps = po->block_start[b]; ps < po->block_start[b + 1]; ps += kRoutedPieceRows) {
+        if (po->pieces_done.count(ps) == 0) {
+          throw std::logic_error("[sirius_physical_vector_join_stream] pair-once: the piece at row " +
+                                 std::to_string(ps) + " was never routed");
+        }
+      }
+    }
+    po_piece.reset();
+  }
+
+
+  /// The first block takes the rows past it a routing piece at a time: the pieces route_block cuts a
+  /// block into (kRoutedPieceRows from the block's first row), so each row is routed once, in the
+  /// shape its own block routes it in, and with the same result. A piece is gathered from the chunks
+  /// as they are staged, in order; once whole it is routed, bounded and joined in reverse.
+  void po_feed_pieces(std::int64_t chunk_base, float const* chunk_data, std::int64_t chunk_n)
+  {
+    auto const g_hi = chunk_base + chunk_n;
+    for (auto g = std::max(chunk_base, po->block_start[1]); g < g_hi;) {
+      auto const b  = po->block_of(g);
+      auto const bs = po->block_start[b];
+      auto const ps = bs + (g - bs) / kRoutedPieceRows * kRoutedPieceRows;
+      auto const pe = std::min(ps + kRoutedPieceRows, po->block_start[b + 1]);
+      auto const e  = std::min(pe, g_hi);
+      if (po->pieces_done.count(ps) != 0) {
+        g = e;
+        continue;
+      }
+      if (!po_piece || po_piece_start != ps) {
+        if (g != ps) {
+          throw std::logic_error("[sirius_physical_vector_join_stream] pair-once: piece at row " +
+                                 std::to_string(ps) + " reached first at row " + std::to_string(g));
+        }
+        if (!po_piece) {
+          po_piece.emplace(static_cast<std::size_t>(kRoutedPieceRows * dim), stream, mr);
+        }
+        po_piece_start = ps;
+        po_piece_filled = ps;
+      }
+      if (g != po_piece_filled) {
+        throw std::logic_error("[sirius_physical_vector_join_stream] pair-once: piece at row " +
+                               std::to_string(ps) + " filled to " + std::to_string(po_piece_filled) +
+                               ", next rows at " + std::to_string(g));
+      }
+      CUDF_CUDA_TRY(cudaMemcpyAsync(po_piece->data() + (g - ps) * dim,
+                                    chunk_data + (g - chunk_base) * dim,
+                                    static_cast<std::size_t>((e - g) * dim) * sizeof(float),
+                                    cudaMemcpyDeviceToDevice,
+                                    stream.get()));
+      po_piece_filled = e;
+      if (e != pe) { po_test_out_of_memory_mid_piece(); }
+      if (e == pe) {
+        po_piece_done(ps, pe, chunk_base, chunk_data, chunk_n);
+        po_piece_start = -1;
+      }
+      g = e;
+    }
+  }
+
+  /// A whole piece [@p ps, @p pe): routed, its rows bounded, joined in reverse, marked done.
+  void po_piece_done(std::int64_t ps,
+                     std::int64_t pe,
+                     std::int64_t chunk_base,
+                     float const* chunk_data,
+                     std::int64_t chunk_n)
+  {
+    auto const t0     = debug_mark();
+    auto const m      = pe - ps;
+    auto const probes = po->probes;
+    auto const* rows32 = po_piece->data();
+    {
+      auto const ids = vss::nearest_centroid_ids(
+        res,
+        raft::make_device_matrix_view<float const, std::int64_t>(rows32, m, dim),
+        _op._centroids->view(),
+        dim,
+        probes,
+        metric,
+        stream,
+        mr);
+      std::vector<std::int32_t> host(static_cast<std::size_t>(m * probes));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(host.data(),
+                                    ids.data(),
+                                    host.size() * sizeof(std::int32_t),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      stream.sync();
+      auto const& base = _op._chunk_row_base;
+      auto j = static_cast<std::size_t>(std::upper_bound(base.begin(), base.end(), ps) - base.begin() - 1);
+      for (std::int64_t r = 0; r < m; ++r) {
+        while (chunk_end_row(j) <= ps + r) { ++j; }
+        auto& bits = po->chunk_probes[j];
+        for (std::int64_t p = 0; p < probes; ++p) {
+          auto const c = host[static_cast<std::size_t>(r * probes + p)];
+          if (c < 0 || c >= po->n_clusters) {
+            throw std::runtime_error("[sirius_physical_vector_join_stream] row " +
+                                     std::to_string(ps + r) + " was routed to cluster id " +
+                                     std::to_string(c));
+          }
+          po->set_cluster(ps + r, p, c);
+          bits[static_cast<std::size_t>(c) / 64] |= std::uint64_t{1} << (c % 64);
+        }
+      }
+      for (std::size_t c = 0; c < po->chunk_routed.size(); ++c) {
+        if (chunk_end_row(c) <= pe && chunk_end_row(c) > po->block_start[1]) {
+          po->chunk_routed[c] = true;
+        }
+      }
+      pos.rows_routed += m;
+    }
+    rmm::device_uvector<std::uint16_t> rows16(static_cast<std::size_t>(m * dim), stream, mr);
+    vss::narrow_to_float16(rows32, m * dim, rows16.data(), stream);
+    if (dbg) { pos.route_s += std::chrono::duration<double>(debug_mark() - t0).count(); }
+    po_reverse_rows(ps, pe, rows32, rows16.data(), [&](float* bound) {
+      po_piece_first_bounds(ps, pe, rows32, rows16.data(), bound);
+      // A piece too short to hold a run of k rows (a block's tail) leaves its rows unbounded: those
+      // in the staged chunk are bounded from the chunk's runs instead.
+      auto const a = std::max(ps, chunk_base);
+      std::vector<float> host(static_cast<std::size_t>(pe - a));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(host.data(),
+                                    bound + (a - ps),
+                                    host.size() * sizeof(float),
+                                    cudaMemcpyDeviceToHost,
+                                    stream.get()));
+      stream.sync();
+      std::vector<char> need(host.size());
+      bool any = false;
+      for (std::size_t i = 0; i < host.size(); ++i) {
+        need[i] = std::isinf(host[i]) ? 1 : 0;
+        any |= need[i] != 0;
+      }
+      if (any && a < pe) {
+        auto const j = static_cast<std::size_t>(
+          std::upper_bound(_op._chunk_row_base.begin(), _op._chunk_row_base.end(), chunk_base) -
+          _op._chunk_row_base.begin() - 1);
+        po_first_bounds(j, chunk_base, chunk_data, a, std::min(pe, chunk_base + chunk_n), bound + (a - ps), &need);
+      }
+    });
+    po->pieces_done.insert(ps);
+    po_test_out_of_memory();
+  }
+
+  /// Bounds the rows of piece [@p ps, @p pe) nothing has bounded yet, each from the first of its
+  /// probed clusters with a run of at least max(k, 64) rows in the piece: its k nearest rows there
+  /// by the half rows on the tensor cores, re-scored exactly in FP32, give the largest of k exact
+  /// distances to k distinct rows of a probed cluster. Those pairs only set the bound.
+  void po_piece_first_bounds(
+    std::int64_t ps, std::int64_t pe, float const* rows32, std::uint16_t const* rows16, float* bound)
+  {
+    auto const m      = pe - ps;
+    auto const enough = std::max<std::int64_t>(k_join, 64);
+    rmm::device_uvector<float> sq(static_cast<std::size_t>(m), stream, mr);
+    vss::half_rows_norms(rows32, rows16, m, dim, sq.data(), nullptr, nullptr, nullptr, stream);
+    // The piece's cluster runs, joined across chunk ends.
+    struct piece_run {
+      std::int32_t cluster;
+      std::int64_t begin, end;
+    };
+    std::vector<piece_run> runs;
+    for (std::size_t j = 0; j < _op._chunk_cluster_runs.size(); ++j) {
+      auto const base = _op._chunk_row_base[j];
+      if (base >= pe || chunk_end_row(j) <= ps) { continue; }
+      for (auto const& r : _op._chunk_cluster_runs[j]) {
+        auto const a = std::max(base + r.begin, ps) - ps;
+        auto const b = std::min(base + r.end, pe) - ps;
+        if (a >= b) { continue; }
+        if (!runs.empty() && runs.back().cluster == r.cluster && runs.back().end == a) {
+          runs.back().end = b;
+        } else {
+          runs.push_back({r.cluster, a, b});
+        }
+      }
+    }
+    std::vector<std::int64_t> run_of(static_cast<std::size_t>(po->n_clusters), -1);
+    for (std::size_t i = 0; i < runs.size(); ++i) {
+      auto& best = run_of[static_cast<std::size_t>(runs[i].cluster)];
+      auto const n = runs[i].end - runs[i].begin;
+      if (n >= enough && (best < 0 || n > runs[static_cast<std::size_t>(best)].end -
+                                            runs[static_cast<std::size_t>(best)].begin)) {
+        best = static_cast<std::int64_t>(i);
+      }
+    }
+    std::vector<std::vector<std::int64_t>> by_run(runs.size());
+    for (auto g = ps; g < pe; ++g) {
+      if (!std::isinf(po->bound[static_cast<std::size_t>(g)])) { continue; }
+      for (std::int64_t p = 0; p < po->probes; ++p) {
+        auto const i = run_of[static_cast<std::size_t>(po->cluster(g, p))];
+        if (i >= 0) {
+          by_run[static_cast<std::size_t>(i)].push_back(g - ps);
+          break;
+        }
+      }
+    }
+    for (std::size_t i = 0; i < runs.size(); ++i) {
+      auto const& rows = by_run[i];
+      if (rows.empty()) { continue; }
+      auto const n          = runs[i].end - runs[i].begin;
+      float const* base32   = rows32 + runs[i].begin * dim;
+      rmm::device_uvector<float const*> device_base(1, stream, mr);
+      // From a pageable value, so the copy has completed when the call returns.
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+        device_base.data(), &base32, sizeof(float const*), cudaMemcpyHostToDevice, stream.get()));
+      vss::exact_rows source;
+      source.copy_blocks    = device_base.data();
+      source.rows_per_block = std::numeric_limits<std::int64_t>::max();
+      for (std::size_t at = 0; at < rows.size(); at += static_cast<std::size_t>(kFirstMetPieceRows)) {
+        auto const q = static_cast<std::int64_t>(
+          std::min(rows.size() - at, static_cast<std::size_t>(kFirstMetPieceRows)));
+        rmm::device_uvector<std::int64_t> d_rows(static_cast<std::size_t>(q), stream, mr);
+        CUDF_CUDA_TRY(cudaMemcpyAsync(d_rows.data(),
+                                      rows.data() + at,
+                                      static_cast<std::size_t>(q) * sizeof(std::int64_t),
+                                      cudaMemcpyHostToDevice,
+                                      stream.get()));
+        rmm::device_uvector<std::uint16_t> q16(static_cast<std::size_t>(q * dim), stream, mr);
+        rmm::device_uvector<float> q_sq(static_cast<std::size_t>(q), stream, mr);
+        rmm::device_uvector<float> q32(static_cast<std::size_t>(q * dim), stream, mr);
+        vss::gather_bytes(rows16,
+                          dim * static_cast<std::int64_t>(sizeof(std::uint16_t)),
+                          d_rows.data(),
+                          q,
+                          q16.data(),
+                          stream);
+        vss::gather_rows(sq.data(), 1, d_rows.data(), q, q_sq.data(), stream);
+        vss::gather_rows(rows32, dim, d_rows.data(), q, q32.data(), stream);
+        auto const knn = vss::gemm_f16_topk(res,
+                                            rows16 + runs[i].begin * dim,
+                                            sq.data() + runs[i].begin,
+                                            n,
+                                            q16.data(),
+                                            q_sq.data(),
+                                            q,
+                                            dim,
+                                            k_join,
+                                            /*take_sqrt=*/false,
+                                            mr);
+        vss::exact_distances(q32.data(),
+                             nullptr,
+                             knn.k,
+                             knn.neighbors->view().data<std::int64_t>(),
+                             knn.distances->mutable_view().data<float>(),
+                             q * knn.k,
+                             source,
+                             dim,
+                             stream,
+                             mr,
+                             nullptr,
+                             0.f,
+                             ip);
+        if (knn.k == k_join) {
+          vss::lower_bound_to_row_max(
+            knn.distances->view().data<float>(), d_rows.data(), q, knn.k, bound, stream);
+        }
+        pos.rows_first_bounded += q;
+        // The pieces above go with this scope; the kernels read them.
+        stream.sync();
+      }
+    }
+  }
+
+  void po_report()
+  {
+    std::fprintf(stderr,
+                 "[vecjoin-phase] pair-once block %zu of %zu: chunks read %zu of %zu (%lld forward "
+                 "only, %lld reverse only, %lld both), %lld skipped; forward candidates %lld; "
+                 "reverse: %lld rows, %lld edges, %lld launches (%lld groups made again), %lld candidates "
+                 "in %lld flushes; "
+                 "rows routed %lld, bounded first %lld, unbounded at start %lld, routing differs "
+                 "from the stored on %lld of %lld rows checked; reverse %.3f s (route %.3f, first bounds %.3f, "
+                 "re-score %.3f, merge %.3f, filter and the rest %.3f)\n",
+                 po_block,
+                 _op._blocks.size(),
+                 s.needed_chunks.size(),
+                 _op._chunk_cluster_runs.size(),
+                 static_cast<long long>(pos.chunks_forward),
+                 static_cast<long long>(pos.chunks_reverse),
+                 static_cast<long long>(pos.chunks_both),
+                 static_cast<long long>(pos.chunks_skipped),
+                 static_cast<long long>(w.bounded_emitted),
+                 static_cast<long long>(pos.rev_rows),
+                 static_cast<long long>(pos.rev_edges),
+                 static_cast<long long>(pos.rev_launches),
+                 static_cast<long long>(pos.rev_replays),
+                 static_cast<long long>(pos.rev_candidates),
+                 static_cast<long long>(pos.rev_flushes),
+                 static_cast<long long>(pos.rows_routed),
+                 static_cast<long long>(pos.rows_first_bounded),
+                 static_cast<long long>(pos.rows_unbounded),
+                 static_cast<long long>(pos.route_mismatches),
+                 static_cast<long long>(pos.route_checked),
+                 pos.reverse_s + pos.route_s,
+                 pos.route_s,
+                 pos.first_s,
+                 pos.rescore_s,
+                 pos.merge_s,
+                 pos.reverse_s - pos.first_s - pos.rescore_s - pos.merge_s);
   }
 
   void run_stretches()
@@ -8460,6 +10015,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   /// Takes in what is still waiting, and leaves the accumulators as the answer reads them.
   void finish()
   {
+    if (po != nullptr && po_block == 0) { po_check_pieces(); }
     if (s.any_bounded && !kept.empty()) { check_group(); }
     for (auto& entry : kept) {
       release_staged(entry.second);
@@ -8495,6 +10051,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
                        "[vecjoin-phase] first-met: %lld (cluster, piece) rankings set the bounds\n",
                        static_cast<long long>(w.first_met_slices));
         }
+        if (po != nullptr) { po_report(); }
         std::fprintf(stderr,
                      "[vecjoin-phase] replays: %lld launches, %lld 128x128 tiles made again after "
                      "the buffer overflowed\n",
@@ -8550,6 +10107,7 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
         }
       }
       if (s.gap_stats_on) { vss::add_gap_rescore_totals(w.gap_stats); }
+      if (po != nullptr) { po->blocks_finished = po_block + 1; }
       if (s.sqrt_at_end && !radius_join) {
         vss::sqrt_in_place(st.acc_distances->mutable_view().data<float>(), n_left * k_join, stream);
       }
@@ -8659,6 +10217,44 @@ class sirius_physical_vector_join_stream::clustered_search : public block_task {
   // A build task leaves out what only a walk over chunks reads.
   bool building_for_pairs{false};
   std::optional<vss::pair_schedule::step> stopped_at;
+  // Pair-once (pair_once_state): null when this join does not run so.
+  pair_once_state* po{nullptr};
+  std::size_t po_block{0};
+  std::int64_t po_start{0};
+  std::int64_t po_end{0};
+  /// The block's rows of each cluster, block rows [begin, end), clusters in order: cluster c's are
+  /// po_ranges[po_range_at[c] .. po_range_at[c + 1]). And the clusters with any, as bits.
+  std::vector<std::int64_t> po_range_at;
+  std::vector<std::pair<std::int64_t, std::int64_t>> po_ranges;
+  std::vector<std::uint64_t> po_block_clusters;
+  static constexpr std::int64_t kPoCandidates = std::int64_t{1} << 24;
+  std::optional<vss::bound_candidates> po_cand;
+  std::vector<std::int32_t> po_slot;
+  /// The first block's routing piece being gathered: its rows from po_piece_start, filled to
+  /// po_piece_filled (po_feed_pieces).
+  std::optional<rmm::device_uvector<float>> po_piece;
+  std::int64_t po_piece_start{-1};
+  std::int64_t po_piece_filled{0};
+  /// Pinned, where the reverse re-score gathers the block's host rows.
+  struct po_pinned_rows {
+    float* data{nullptr};
+    po_pinned_rows() = default;
+    po_pinned_rows(po_pinned_rows const&)            = delete;
+    po_pinned_rows& operator=(po_pinned_rows const&) = delete;
+    ~po_pinned_rows()
+    {
+      if (data != nullptr) { cudaFreeHost(data); }
+    }
+  };
+  po_pinned_rows po_pinned;
+  struct {
+    std::int64_t chunks_forward{0}, chunks_reverse{0}, chunks_both{0}, chunks_skipped{0};
+    std::int64_t rev_rows{0}, rev_edges{0}, rev_launches{0}, rev_candidates{0}, rev_flushes{0};
+    std::int64_t rev_replays{0};
+    std::int64_t rows_routed{0}, rows_first_bounded{0}, rows_unbounded{0}, route_mismatches{0};
+    std::int64_t route_checked{0};
+    double reverse_s{0}, route_s{0}, first_s{0}, rescore_s{0}, merge_s{0};
+  } pos;
 };
 
 std::unique_ptr<operator_data> sirius_physical_vector_join_stream::next_pair_step_locked()
@@ -9017,7 +10613,30 @@ std::size_t sirius_physical_vector_join_stream::estimate_for_rows(std::size_t n_
     }
   }
 
-  return (block * 6) + std::max(cuvs_scratch, gemm_scratch) + staged_chunk + routed +
+  // Pair-once (pair_once_state) adds, per task, the reverse direction's candidate buffer and the
+  // merge's sort space over it, the reverse rows' answers, bounds and edges, the block rows a
+  // re-score gathers, and a routing piece with the GEMM's prepared copy of it.
+  std::size_t pair_once = 0;
+  if (_pair_once_decided ? _pair_once != nullptr
+                         : pair_once_shape_refusal() == nullptr &&
+                             pair_once_host_check(_right_total_rows).refusal == nullptr) {
+    std::size_t max_chunk_rows = 0;
+    for (std::size_t i = 0; _corpus && i < _corpus->num_chunks(); ++i) {
+      max_chunk_rows = std::max(max_chunk_rows, _corpus->chunk_rows(i));
+    }
+    auto const probes     = static_cast<std::size_t>(std::max<std::int64_t>(_request.n_probes, 1));
+    auto const candidates = std::size_t{1} << 24;
+    auto const row        = static_cast<std::size_t>(_request.dim) * sizeof(float);
+    auto const reverse_rows = std::max<std::size_t>(max_chunk_rows, std::size_t{1} << 17);
+    pair_once = candidates * 16 + (reverse_rows * k + candidates) * 32 +
+                reverse_rows * (k * 12 + 16 + probes * 8) + (std::size_t{256} << 20) +
+                (std::size_t{1} << 17) * (2 * row + static_cast<std::size_t>(_request.dim) * 2 +
+                                          static_cast<std::size_t>(_request.dim + 4) * 4) +
+                (std::size_t{256} << 20) +
+                (std::size_t{1} << 16) * (2 * row + static_cast<std::size_t>(_request.dim) * 2);
+  }
+
+  return (block * 6) + std::max(cuvs_scratch, gemm_scratch) + staged_chunk + routed + pair_once +
          (std::size_t{1} << 20);
 }
 
