@@ -144,6 +144,11 @@ struct staged_vector_chunk {
   /// A staged copy this chunk made itself rather than through a data batch. Allocated from
   /// @c reservation, so it is declared after it and freed first.
   std::unique_ptr<rmm::device_buffer> buffer;
+  /// The chunk as its batch stores it when that is half precision (IEEE half bits, read from the
+  /// batch's file): the rows @c view was widened from, starting @c half_values_at bytes in. Kept
+  /// for the filter, which would otherwise round @c view back to this; null in every other case.
+  std::unique_ptr<rmm::device_buffer> half;
+  std::size_t half_values_at{0};
 };
 
 /// A staged chunk and, when its bytes are still to be read, the read (see

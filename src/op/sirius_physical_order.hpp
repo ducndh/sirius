@@ -19,6 +19,15 @@
 #include "duckdb/planner/bound_query_node.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
+
+#include <rmm/resource_ref.hpp>
+
+#include <memory>
+#include <mutex>
+#include <vector>
+
 namespace sirius {
 namespace op {
 
@@ -60,6 +69,21 @@ class sirius_physical_order : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          ::cuda::stream_ref stream) override;
+
+  /// The key rows execute() kept, a few of every batch it sorted, sorted together (key columns
+  /// only, in @c orders' order). Null when none were kept. A range sort cuts its partition
+  /// boundaries from these: every batch has passed through here on the device, whereas the
+  /// batches a later operator can afford to bring back are a handful, and where the input's order
+  /// follows the key at all a handful of batches does not look like the input.
+  [[nodiscard]] std::unique_ptr<cudf::table> sorted_key_sample(
+    const std::vector<cudf::order>& column_order,
+    const std::vector<cudf::null_order>& null_precedence,
+    ::cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) const;
+
+ private:
+  mutable std::mutex _key_sample_mutex;
+  std::vector<std::unique_ptr<cudf::table>> _key_samples;
 };
 
 }  // namespace op

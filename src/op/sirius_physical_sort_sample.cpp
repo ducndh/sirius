@@ -74,6 +74,7 @@ sirius_physical_sort_sample::sirius_physical_sort_sample(sirius_physical_order* 
                                 max_partition_bytes,
                                 max_partition_memory_fraction)
 {
+  this->order_by = order_by;
 }
 
 sirius_physical_sort_sample::sirius_physical_sort_sample(
@@ -288,8 +289,29 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
         num_parts);
     }
 
-    // 5. Pick P-1 evenly-spaced boundary rows from the merged sample (sort key columns only)
-    if (num_parts <= 1 || total_rows == 0) {
+    // 5. Pick P-1 evenly-spaced boundary rows (sort key columns only): from the key rows the
+    // ORDER_BY kept of every batch where it kept any, else from the merged sample batches.
+    std::unique_ptr<cudf::table> every_batch_keys;
+    if (order_by != nullptr) {
+      every_batch_keys = order_by->sorted_key_sample(
+        column_order, null_precedence, stream, space->get_default_allocator());
+    }
+    cudf::table_view sort_keys_view;
+    if (every_batch_keys && every_batch_keys->num_rows() > 0) {
+      sort_keys_view = every_batch_keys->view();
+    } else {
+      std::vector<cudf::column_view> sort_key_cols;
+      for (int idx : order_key_idx) {
+        sort_key_cols.push_back(merged_sample_view.column(idx));
+      }
+      sort_keys_view = cudf::table_view(sort_key_cols);
+    }
+    auto const boundary_rows = static_cast<size_t>(sort_keys_view.num_rows());
+    SIRIUS_LOG_DEBUG("Sort sample: boundaries from {} key rows ({})",
+                     boundary_rows,
+                     every_batch_keys ? "kept of every batch" : "the sample batches");
+    num_parts = std::min(num_parts, std::max<size_t>(1, boundary_rows));
+    if (num_parts <= 1 || boundary_rows == 0) {
       // Single partition — no boundaries needed
       _num_partitions = 1;
       _partition_boundaries.reset();
@@ -299,8 +321,10 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
       std::vector<int32_t> boundary_indices_host;
       boundary_indices_host.reserve(num_boundaries);
       for (size_t i = 1; i <= num_boundaries; i++) {
-        auto idx = static_cast<int32_t>((i * total_rows) / num_parts);
-        if (idx >= static_cast<int32_t>(total_rows)) { idx = static_cast<int32_t>(total_rows) - 1; }
+        auto idx = static_cast<int32_t>((i * boundary_rows) / num_parts);
+        if (idx >= static_cast<int32_t>(boundary_rows)) {
+          idx = static_cast<int32_t>(boundary_rows) - 1;
+        }
         boundary_indices_host.push_back(idx);
       }
 
@@ -315,13 +339,6 @@ std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operat
                                     num_boundaries * sizeof(int32_t),
                                     cudaMemcpyHostToDevice,
                                     stream.get()));
-
-      // Extract only the sort key columns from merged sample for the boundaries
-      std::vector<cudf::column_view> sort_key_cols;
-      for (int idx : order_key_idx) {
-        sort_key_cols.push_back(merged_sample_view.column(idx));
-      }
-      cudf::table_view sort_keys_view(sort_key_cols);
 
       // Gather boundary rows
       _partition_boundaries = cudf::gather(sort_keys_view,

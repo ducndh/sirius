@@ -85,8 +85,18 @@ class sirius_physical_sort_partition : public sirius_physical_operator {
   //! Get the sample operator
   sirius_physical_sort_sample* get_sample_op() const { return _sample_op; }
 
+  //! Range boundaries known when the plan is made, for one INT32 key whose values are known
+  //! (cluster ids): range i holds the keys in [upper[i-1], upper[i]). No sample operator is
+  //! needed then, so the batches are cut as they are sorted, in the pipeline that produces them.
+  void set_fixed_boundaries(std::vector<std::int32_t> upper) { _fixed_boundaries = std::move(upper); }
+
   void sink(const operator_data& output, ::cuda::stream_ref stream) override;
   void on_finalize_operator() override;
+
+ private:
+  std::vector<std::int32_t> _fixed_boundaries;
+
+ public:
 
  private:
   sirius_physical_sort_sample* _sample_op = nullptr;

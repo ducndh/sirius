@@ -287,7 +287,8 @@ std::vector<descent_step> descent_steps(sirius::op::sirius_physical_operator con
     case SiriusPhysicalOperatorType::VECTOR_JOIN_SELECT:
     case SiriusPhysicalOperatorType::VECTOR_JOIN_STREAM:
     case SiriusPhysicalOperatorType::VECTOR_JOIN_REDUCE_LOCAL:
-    case SiriusPhysicalOperatorType::VECTOR_JOIN_MATERIALIZE: return {};
+    case SiriusPhysicalOperatorType::VECTOR_JOIN_MATERIALIZE:
+    case SiriusPhysicalOperatorType::VECTOR_CLUSTER_LABEL: return {};
   }
   return {};  // unreachable
 }

@@ -193,6 +193,15 @@ void row_max_bound(float const* acc_distances,
                    float* bound,
                    rmm::cuda_stream_view stream);
 
+/// bound[rows[i]] is lowered to the largest of the k distances of row i of @p distances ([m x k])
+/// where that is smaller; @p rows are distinct. A miss among the k (+inf) leaves the bound alone.
+void lower_bound_to_row_max(float const* distances,
+                            int64_t const* rows,
+                            int64_t m,
+                            int64_t k,
+                            float* bound,
+                            rmm::cuda_stream_view stream);
+
 /// Every one of the n entries becomes a miss: id -1 at +inf.
 void fill_misses(float* distances, int64_t* ids, int64_t n, rmm::cuda_stream_view stream);
 

@@ -27,14 +27,31 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
 namespace sirius::vss {
+
+/// Where reading spilled batches back spent its time, summed over every thread of the process.
+struct spilled_read_times {
+  std::atomic<std::uint64_t> calls{0};
+  std::atomic<std::uint64_t> bytes{0};
+  std::atomic<std::uint64_t> file_ns{0};  ///< in pread
+  std::atomic<std::uint64_t> copy_ns{0};  ///< waiting for a staging piece's copy to land
+};
+
+inline spilled_read_times& spilled_read_timers()
+{
+  static spilled_read_times times;
+  return times;
+}
 
 namespace detail {
 
@@ -126,7 +143,11 @@ inline void copy_file_to_device_impl(int fd,
   std::size_t piece = 0;
   for (std::size_t at = base; at < end; at += kPiece, ++piece) {
     auto const slot = piece % 2;
+    auto const wait_from = std::chrono::steady_clock::now();
     if (pending[slot]) { CUDF_CUDA_TRY(cudaEventSynchronize(buffers.landed[slot])); }
+    auto const read_from = std::chrono::steady_clock::now();
+    spilled_read_timers().copy_ns += static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(read_from - wait_from).count());
     auto* host = static_cast<std::byte*>(buffers.host[slot]);
     // Bytes of this piece that are needed, and how much to ask the file for.
     auto const need = std::min(kPiece, end - at);
@@ -148,6 +169,10 @@ inline void copy_file_to_device_impl(int fd,
       }
       got += static_cast<std::size_t>(r);
     }
+    spilled_read_timers().file_ns += static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                           read_from)
+        .count());
     // Copy the requested part of this piece: a direct first piece starts before offset.
     auto const from = std::max(at, offset);
     auto const to   = std::min(at + need, end);
@@ -159,7 +184,15 @@ inline void copy_file_to_device_impl(int fd,
     CUDF_CUDA_TRY(cudaEventRecord(buffers.landed[slot], stream.get()));
     pending[slot] = true;
   }
+  auto const last_from = std::chrono::steady_clock::now();
   stream.sync();
+  auto& times = spilled_read_timers();
+  times.copy_ns += static_cast<std::uint64_t>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                         last_from)
+      .count());
+  times.bytes += size;
+  ++times.calls;
 }
 
 }  // namespace detail

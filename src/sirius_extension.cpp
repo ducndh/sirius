@@ -3369,7 +3369,11 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
     }
     // Without a cluster column the corpus order comes from lists built for this clustering,
     // which exist only over a pin -- never over a scanned build side.
-    if (req.build_cluster_column.empty()) {
+    // A scanned table with no cluster column is labelled and put in cluster order as it is
+    // scanned. A view or a relation arrives through a chain of its own and still needs the column.
+    req.cluster_on_ingest = req.build_cluster_column.empty() && req.build_from_scan &&
+                            !req.right.is_view && !req.right.from_relation;
+    if (req.build_cluster_column.empty() && !req.cluster_on_ingest) {
       auto ctx_for_lists = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
       const auto* lists =
         ctx_for_lists ? sirius::vss::find_cluster_lists(*ctx_for_lists, req.clustering) : nullptr;
@@ -3568,7 +3572,7 @@ static unique_ptr<FunctionData> VectorJoinBindImpl(ClientContext& context,
   // have to exist in the catalog rather than in a pin. Checked here because the plan generator
   // would otherwise throw, which is read as "this query cannot run on the GPU" and reported as
   // something else entirely.
-  if (!req.clustering.empty() && req.build_from_scan) {
+  if (!req.clustering.empty() && req.build_from_scan && !req.cluster_on_ingest) {
     // A view's columns come from binding it; a table entry's from the catalog. Casting a view
     // entry to a table entry is undefined behaviour, which is why the two are kept apart.
     vector<string> corpus_columns;

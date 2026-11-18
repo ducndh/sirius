@@ -1,0 +1,305 @@
+diff --git a/include/cucascade/memory/config.hpp b/include/cucascade/memory/config.hpp
+index 5470b90..317bfb0 100644
+--- a/include/cucascade/memory/config.hpp
++++ b/include/cucascade/memory/config.hpp
+@@ -101,6 +101,12 @@ struct disk_memory_space_config {
+   int disk_id{-1};
+   std::size_t memory_capacity{0};
+   std::string mount_paths;
++  /// Open this tier's files with O_DIRECT, bypassing the page cache. Off by default: a batch that
++  /// was spilled a moment ago is usually still cached. Worth turning on when more is spilled than
++  /// free host memory can cache, or when spilled batches are read back many times: cached pages
++  /// then only add a copy and count against the process's memory limit. A filesystem that refuses
++  /// O_DIRECT (tmpfs does) is read and written buffered, with a warning.
++  bool direct_io{false};
+ 
+   [[nodiscard]] Tier tier() const { return Tier::DISK; }
+ 
+diff --git a/include/cucascade/memory/fixed_size_host_memory_resource.hpp b/include/cucascade/memory/fixed_size_host_memory_resource.hpp
+index 1ebdf77..1b7a36f 100644
+--- a/include/cucascade/memory/fixed_size_host_memory_resource.hpp
++++ b/include/cucascade/memory/fixed_size_host_memory_resource.hpp
+@@ -393,6 +393,15 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
+   {
+   }
+ 
++  /**
++   * @brief Wake reservation waiters on this channel whenever blocks charged to the pool are
++   * returned outside a reservation, e.g. when a host batch is spilled to disk.
++   */
++  void set_release_channel(std::shared_ptr<notification_channel> channel)
++  {
++    _release_channel = std::move(channel);
++  }
++
+  protected:
+   /**
+    * @brief grows reservation by a `bytes` size
+@@ -500,6 +509,7 @@ class fixed_size_host_memory_resource : public chunked_resource_info {
+   /// reserve_for_pools() keeps it before a pool's upstream memory is taken.
+   std::vector<void*> _free_blocks;
+   mutable std::mutex _mutex;
++  std::shared_ptr<notification_channel> _release_channel;
+   utils::atomic_bounded_counter<size_t> _allocated_bytes{0};
+   utils::atomic_peak_tracker<size_t> _peak_allocated_bytes{0};
+ 
+diff --git a/include/cucascade/memory/notification_channel.hpp b/include/cucascade/memory/notification_channel.hpp
+index e2243b0..fcf66b2 100644
+--- a/include/cucascade/memory/notification_channel.hpp
++++ b/include/cucascade/memory/notification_channel.hpp
+@@ -46,9 +46,10 @@ struct notification_channel : std::enable_shared_from_this<notification_channel>
+ 
+   void shutdown();
+ 
+- private:
++  /// Wake one waiter; for memory returned to the space outside a reservation.
+   void notify();
+ 
++ private:
+   void release_notifier();
+ 
+   void acquire_notifier();
+diff --git a/include/cucascade/memory/reservation_manager_configurator.hpp b/include/cucascade/memory/reservation_manager_configurator.hpp
+index 82cab70..5a78695 100644
+--- a/include/cucascade/memory/reservation_manager_configurator.hpp
++++ b/include/cucascade/memory/reservation_manager_configurator.hpp
+@@ -166,6 +166,10 @@ class reservation_manager_configurator {
+                                              std::size_t capacity,
+                                              std::string mounting_point);
+ 
++  /// \brief open the files of every disk memory space with O_DIRECT (see
++  /// disk_memory_space_config::direct_io); off by default.
++  builder_reference& set_disk_direct_io(bool direct_io);
++
+   /// \brief build the memory space configurations based on the provided system topology
+   /// @param topology System topology information.
+   /// @return Vector of memory space configurations.
+@@ -255,6 +259,7 @@ class reservation_manager_configurator {
+   std::optional<bool> _host_memory_portability;
+ 
+   std::vector<std::tuple<int, std::size_t, std::string>> _disk_mounting_points{};
++  bool _disk_direct_io{false};
+ };
+ 
+ }  // namespace memory
+diff --git a/src/data/pipeline_io_backend.cpp b/src/data/pipeline_io_backend.cpp
+index 668b562..750c10b 100644
+--- a/src/data/pipeline_io_backend.cpp
++++ b/src/data/pipeline_io_backend.cpp
+@@ -21,6 +21,7 @@
+ #include <cucascade/cuda/event.hpp>
+ #include <cucascade/data/disk_io_backend.hpp>
+ #include <cucascade/error.hpp>
++#include <cucascade/log/logging.hpp>
+ #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
+ 
+ #include <rmm/cuda_device.hpp>
+@@ -206,9 +207,7 @@ class pipeline_io_backend : public idisk_io_backend {
+     res.order_event.record(stream);
+     res.order_event.wait(res.copy_stream);
+ 
+-    int flags = O_CREAT | O_WRONLY;
+-    if (_direct_io) { flags |= O_DIRECT; }
+-    int fd = ::open(path.c_str(), flags, 0644);
++    int fd = open_data_file(path, O_CREAT | O_WRONLY, 0644);
+     if (fd < 0) {
+       CUCASCADE_FAIL("pipeline write(device): open failed: " + std::string(std::strerror(errno)));
+     }
+@@ -285,9 +284,7 @@ class pipeline_io_backend : public idisk_io_backend {
+     res.order_event.record(stream);
+     res.order_event.wait(res.copy_stream);
+ 
+-    int flags = O_RDONLY;
+-    if (_direct_io) { flags |= O_DIRECT; }
+-    int fd = ::open(path.c_str(), flags, 0);
++    int fd = open_data_file(path, O_RDONLY, 0);
+     if (fd < 0) {
+       CUCASCADE_FAIL("pipeline read(device): open failed: " + std::string(std::strerror(errno)));
+     }
+@@ -421,9 +418,7 @@ class pipeline_io_backend : public idisk_io_backend {
+     res.order_event.record(stream);
+     res.order_event.wait(res.copy_stream);
+ 
+-    int flags = O_CREAT | O_WRONLY;
+-    if (_direct_io) { flags |= O_DIRECT; }
+-    int fd = ::open(path.c_str(), flags, 0644);
++    int fd = open_data_file(path, O_CREAT | O_WRONLY, 0644);
+     if (fd < 0) {
+       CUCASCADE_FAIL("pipeline write_batch: open failed: " + std::string(std::strerror(errno)));
+     }
+@@ -505,6 +500,21 @@ class pipeline_io_backend : public idisk_io_backend {
+   }
+ 
+   void* _buf[2]{nullptr, nullptr};
++  /// Opens a data file, with O_DIRECT while direct I/O is on. A filesystem that refuses the flag
++  /// (tmpfs does) turns direct I/O off for this backend, once and with a warning, and the file is
++  /// opened buffered instead. Called under _device_io_mutex, like every use of _direct_io.
++  int open_data_file(const std::filesystem::path& path, int flags, mode_t mode)
++  {
++    if (_direct_io) {
++      int const fd = ::open(path.c_str(), flags | O_DIRECT, mode);
++      if (fd >= 0 || errno != EINVAL) { return fd; }
++      CUCASCADE_LOG_WARN("pipeline_io_backend: O_DIRECT unavailable for '{}'; using buffered I/O",
++                         path.string());
++      _direct_io = false;
++    }
++    return ::open(path.c_str(), flags, mode);
++  }
++
+   bool _direct_io;
+   // Owns the pinned host buffers below. Declared before _buf usages-by-pointer is fine
+   // (we only call its allocate/deallocate inline in ctor/dtor), but declared before the
+diff --git a/src/memory/fixed_size_host_memory_resource.cpp b/src/memory/fixed_size_host_memory_resource.cpp
+index 11fd9f2..899002d 100644
+--- a/src/memory/fixed_size_host_memory_resource.cpp
++++ b/src/memory/fixed_size_host_memory_resource.cpp
+@@ -478,6 +478,8 @@ void fixed_size_host_memory_resource::return_allocated_chunks(std::span<std::byt
+     _free_blocks.push_back(block);
+   }
+   _allocated_bytes.sub(reclaimed_bytes);
++  // A reservation waiter is otherwise woken only by another reservation being released.
++  if (reclaimed_bytes > 0 && _release_channel) { _release_channel->notify(); }
+ }
+ 
+ bool fixed_size_host_memory_resource::do_reserve(std::size_t bytes, std::size_t mem_limit)
+diff --git a/src/memory/memory_space.cpp b/src/memory/memory_space.cpp
+index df16088..d6553cf 100644
+--- a/src/memory/memory_space.cpp
++++ b/src/memory/memory_space.cpp
+@@ -164,6 +164,7 @@ memory_space::memory_space(const host_memory_space_config& config)
+                                                       config.initial_pool_threads);
+   auto& host_allocator =
+     std::get<std::unique_ptr<fixed_size_host_memory_resource>>(_reservation_allocator);
++  host_allocator->set_release_channel(_notification_channel);
+   _reservation_allocator_resource.emplace(fixed_size_host_resource_ref{*host_allocator});
+   // Register so cross-tier code paths (e.g. representation_converter's
+   // peer-DMA-broken host-staging branch) can borrow blocks from this pool
+@@ -178,7 +179,7 @@ memory_space::memory_space(const disk_memory_space_config& config)
+     _start_downgrading_memory_threshold(config.downgrade_trigger_threshold()),
+     _stop_downgrading_memory_threshold(config.downgrade_stop_threshold()),
+     _allocator(null_device_memory_resource{}),
+-    _io_backend(cucascade::make_pipeline_io_backend())
++    _io_backend(cucascade::make_pipeline_io_backend(config.direct_io))
+ {
+   if (config.mount_paths.empty()) {
+     throw std::invalid_argument("Mount path must be provided for disk memory space");
+diff --git a/src/memory/reservation_manager_configurator.cpp b/src/memory/reservation_manager_configurator.cpp
+index bb5cbd4..42f65ab 100644
+--- a/src/memory/reservation_manager_configurator.cpp
++++ b/src/memory/reservation_manager_configurator.cpp
+@@ -199,6 +199,12 @@ builder_reference& reservation_manager_configurator::set_disk_mounting_point(
+   return *this;
+ }
+ 
++builder_reference& reservation_manager_configurator::set_disk_direct_io(bool direct_io)
++{
++  _disk_direct_io = direct_io;
++  return *this;
++}
++
+ std::vector<memory_space_config> reservation_manager_configurator::build() const
+ {
+   topology_discovery discovery;
+@@ -289,6 +295,7 @@ std::vector<memory_space_config> reservation_manager_configurator::build(
+     config.disk_id         = std::get<int>(dinfo);
+     config.mount_paths     = std::get<std::string>(dinfo);
+     config.memory_capacity = std::get<std::size_t>(dinfo);
++    config.direct_io       = _disk_direct_io;
+     configs.emplace_back(config);
+   }
+ 
+diff --git a/test/data/test_disk_io_backend.cpp b/test/data/test_disk_io_backend.cpp
+index 631cc16..3202b76 100644
+--- a/test/data/test_disk_io_backend.cpp
++++ b/test/data/test_disk_io_backend.cpp
+@@ -21,8 +21,14 @@
+ #include <cucascade/memory/memory_space.hpp>
+ 
+ #include <rmm/aligned.hpp>
++#include <rmm/cuda_stream.hpp>
++#include <rmm/device_buffer.hpp>
+ 
+ #include <catch2/catch_all.hpp>
++#include <cuda_runtime_api.h>
++
++#include <fcntl.h>
++#include <unistd.h>
+ 
+ #include <cstdint>
+ #include <filesystem>
+@@ -179,6 +185,75 @@ TEST_CASE("disk memory_space accepts custom backend", "[disk][io][memory_space]"
+   REQUIRE(&space.get_io_backend() == backend.get());
+ }
+ 
++TEST_CASE("disk memory_space with direct_io reads back what it wrote", "[disk][io][memory_space]")
++{
++  // A directory that takes O_DIRECT: the system temp directory is often tmpfs, which does not.
++  auto const dir       = std::filesystem::current_path();
++  auto const file_path = dir / "test_direct_io_space.bin";
++  int const probe      = ::open(file_path.c_str(), O_CREAT | O_WRONLY | O_DIRECT, 0600);
++  if (probe < 0) { SKIP("the test directory's filesystem does not take O_DIRECT"); }
++  ::close(probe);
++
++  cucascade::memory::disk_memory_space_config config{0, 1024 * 1024 * 1024, dir.string()};
++  config.direct_io = true;
++  cucascade::memory::memory_space space(config);
++
++  // Device memory goes through the O_DIRECT path (host metadata never does). The size is not a
++  // multiple of the 512-byte direct I/O block, so the padded tail is exercised.
++  std::vector<uint8_t> write_data(8 * 1024 * 1024 + 100);
++  std::iota(write_data.begin(), write_data.end(), static_cast<uint8_t>(0));
++  rmm::cuda_stream stream;
++  ::cuda::stream_ref const stream_ref{stream.value()};
++  rmm::device_buffer written(write_data.data(), write_data.size(), stream_ref);
++  space.get_io_backend().write(file_path, written.data(), written.size(), 0, stream_ref);
++
++  rmm::device_buffer read_back(write_data.size(), stream_ref);
++  space.get_io_backend().read(file_path, read_back.data(), read_back.size(), 0, stream_ref);
++  std::vector<uint8_t> read_data(write_data.size(), 0);
++  REQUIRE(cudaMemcpy(read_data.data(), read_back.data(), read_data.size(), cudaMemcpyDeviceToHost) ==
++          cudaSuccess);
++  REQUIRE(write_data == read_data);
++
++  std::filesystem::remove(file_path);
++}
++
++TEST_CASE("disk memory_space with direct_io falls back where O_DIRECT is refused",
++          "[disk][io][memory_space]")
++{
++  // /dev/shm is tmpfs, which refuses O_DIRECT; anywhere that takes it has nothing to fall back from.
++  std::filesystem::path const dir{"/dev/shm"};
++  if (!std::filesystem::is_directory(dir)) { SKIP("no /dev/shm"); }
++  auto const file_path = dir / "test_direct_io_fallback.bin";
++  int const probe      = ::open(file_path.c_str(), O_CREAT | O_WRONLY | O_DIRECT, 0600);
++  if (probe >= 0) {
++    ::close(probe);
++    std::filesystem::remove(file_path);
++    SKIP("/dev/shm takes O_DIRECT here");
++  }
++
++  cucascade::memory::disk_memory_space_config config{0, 1024 * 1024 * 1024, dir.string()};
++  config.direct_io = true;
++  cucascade::memory::memory_space space(config);
++
++  std::vector<uint8_t> write_data(1024 * 1024 + 100);
++  std::iota(write_data.begin(), write_data.end(), static_cast<uint8_t>(0));
++  rmm::cuda_stream stream;
++  ::cuda::stream_ref const stream_ref{stream.value()};
++  rmm::device_buffer written(write_data.data(), write_data.size(), stream_ref);
++  REQUIRE_NOTHROW(
++    space.get_io_backend().write(file_path, written.data(), written.size(), 0, stream_ref));
++
++  rmm::device_buffer read_back(write_data.size(), stream_ref);
++  REQUIRE_NOTHROW(
++    space.get_io_backend().read(file_path, read_back.data(), read_back.size(), 0, stream_ref));
++  std::vector<uint8_t> read_data(write_data.size(), 0);
++  REQUIRE(cudaMemcpy(read_data.data(), read_back.data(), read_data.size(), cudaMemcpyDeviceToHost) ==
++          cudaSuccess);
++  REQUIRE(write_data == read_data);
++
++  std::filesystem::remove(file_path);
++}
++
+ TEST_CASE("disk memory_space rejects null backend", "[disk][io][memory_space]")
+ {
+   cucascade::memory::disk_memory_space_config config{0, 1024 * 1024 * 1024, "/tmp"};

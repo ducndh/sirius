@@ -69,6 +69,47 @@ __global__ void key_edges_kernel(int32_t const* clusters,
   if (!in_range || candidates < k) { atomicMin(first_refused, static_cast<int32_t>(r)); }
 }
 
+// led[c] = 1 for every cluster that leads some row's list.
+__global__ void led_clusters_kernel(int32_t const* clusters,
+                                    int64_t n_rows,
+                                    int64_t n_probes,
+                                    int32_t n_clusters,
+                                    uint8_t* led)
+{
+  auto const r = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+  if (r >= n_rows) { return; }
+  auto const c = clusters[r * n_probes];
+  if (c >= 0 && c < n_clusters) { led[c] = 1; }
+}
+
+// Each row's cluster of the smallest order[] moves to the front of its list, in exchange for the one
+// that was there.
+__global__ void lead_with_first_kernel(int32_t* clusters,
+                                       int64_t n_rows,
+                                       int64_t n_probes,
+                                       int32_t n_clusters,
+                                       int32_t const* order)
+{
+  auto const r = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+  if (r >= n_rows) { return; }
+  auto* const row = clusters + r * n_probes;
+  int64_t best    = -1;
+  int32_t best_at = std::numeric_limits<int32_t>::max();
+  for (int64_t t = 0; t < n_probes; ++t) {
+    auto const c = row[t];
+    if (c < 0 || c >= n_clusters) { return; }  // left for the keys' check to refuse
+    if (order[c] < best_at) {
+      best_at = order[c];
+      best    = t;
+    }
+  }
+  if (best > 0) {
+    auto const first = row[0];
+    row[0]           = row[best];
+    row[best]        = first;
+  }
+}
+
 // bounds[v] = the first edge whose key is >= v.
 __global__ void key_bounds_kernel(uint64_t const* sorted_keys,
                                   int64_t n_edges,
@@ -98,6 +139,47 @@ __global__ void keys_to_rows_kernel(uint64_t* keys, int64_t n)
 }
 
 }  // namespace
+
+std::vector<std::uint8_t> clusters_leading_a_row(rmm::device_uvector<int32_t> const& clusters,
+                                                 int64_t n_rows,
+                                                 int64_t n_probes,
+                                                 int32_t n_clusters,
+                                                 rmm::cuda_stream_view stream,
+                                                 rmm::device_async_resource_ref mr)
+{
+  std::vector<std::uint8_t> led(static_cast<std::size_t>(n_clusters), 0);
+  if (n_rows == 0 || n_clusters == 0) { return led; }
+  rmm::device_uvector<std::uint8_t> device_led(led.size(), stream, mr);
+  CUDF_CUDA_TRY(cudaMemsetAsync(device_led.data(), 0, led.size(), stream.get()));
+  led_clusters_kernel<<<grid_for(n_rows), kBlock, 0, stream.get()>>>(
+    clusters.data(), n_rows, n_probes, n_clusters, device_led.data());
+  CUDF_CHECK_CUDA(stream.get());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+    led.data(), device_led.data(), led.size(), cudaMemcpyDeviceToHost, stream.get()));
+  stream.sync();
+  return led;
+}
+
+void lead_with_first_in_order(rmm::device_uvector<int32_t>& clusters,
+                              int64_t n_rows,
+                              int64_t n_probes,
+                              std::vector<int32_t> const& order,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref mr)
+{
+  if (n_rows == 0 || order.empty()) { return; }
+  rmm::device_uvector<int32_t> device_order(order.size(), stream, mr);
+  // From a pageable vector, so the copy has completed when the call returns.
+  CUDF_CUDA_TRY(cudaMemcpyAsync(device_order.data(),
+                                order.data(),
+                                order.size() * sizeof(int32_t),
+                                cudaMemcpyHostToDevice,
+                                stream.get()));
+  lead_with_first_kernel<<<grid_for(n_rows), kBlock, 0, stream.get()>>>(
+    clusters.data(), n_rows, n_probes, static_cast<int32_t>(order.size()), device_order.data());
+  CUDF_CHECK_CUDA(stream.get());
+  stream.sync();
+}
 
 keyed_edges key_routed_edges(rmm::device_uvector<int32_t> clusters,
                              int64_t n_rows,

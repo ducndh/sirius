@@ -1775,7 +1775,11 @@ void wrap_vector_join_child(sirius::op::sirius_physical_operator& join_op,
                             duckdb::SiriusContext* compressed_materialization_observer)
 {
   auto const* chain = std::getenv("SIRIUS_VSS_CORPUS_CHAIN");
-  if (join_op.children[child_idx]->type != sirius::op::SiriusPhysicalOperatorType::GPU_SCAN ||
+  // A range sort's output is as much a finished run of batches as a scan's: the corpus a scan
+  // labels and sorts by cluster goes to the port as it leaves the merge.
+  auto const child_type = join_op.children[child_idx]->type;
+  if ((child_type != sirius::op::SiriusPhysicalOperatorType::GPU_SCAN &&
+       child_type != sirius::op::SiriusPhysicalOperatorType::MERGE_SORT) ||
       (chain != nullptr && std::string_view{chain} != "0")) {
     wrap_join_child(join_op, child_idx, is_build, op_params, compressed_materialization_observer);
     sirius::op::bind_partition_input(
@@ -1784,6 +1788,8 @@ void wrap_vector_join_child(sirius::op::sirius_physical_operator& join_op,
       is_build);
     return;
   }
+  // MERGE_SORT ends its own pipeline; its output is the port's input as it stands.
+  if (child_type == sirius::op::SiriusPhysicalOperatorType::MERGE_SORT) { return; }
   wrap_child(
     join_op, child_idx, [&](duckdb::unique_ptr<sirius::op::sirius_physical_operator> child_orig) {
       auto est_card       = child_orig->estimated_cardinality;

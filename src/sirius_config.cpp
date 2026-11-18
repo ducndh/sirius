@@ -174,6 +174,7 @@ static void from_yaml(const YAML::Node& node, cucascade::memory::disk_memory_spa
   r.optional("disk_id", opt.disk_id);
   r.optional("mount_path", opt.mount_paths);
   r.optional("memory_capacity", yaml::bytes(opt.memory_capacity));
+  r.optional("direct_io", opt.direct_io);
   r.reject_unknown();
 }
 
@@ -948,6 +949,7 @@ struct disk_mem_config {
   int id{0};
   std::size_t capacity_bytes{1024UL << 30};  // 1TB
   std::string downgrade_root_dirs;
+  bool direct_io{false};
 
   static void from_yaml(const YAML::Node& node, disk_mem_config& opt)
   {
@@ -955,6 +957,7 @@ struct disk_mem_config {
     r.optional("disk_id", opt.id);
     r.optional("capacity_bytes", yaml::bytes(opt.capacity_bytes));
     r.optional("downgrade_root_dirs", opt.downgrade_root_dirs);
+    r.optional("direct_io", opt.direct_io);
     r.reject_unknown();
   }
 
@@ -962,6 +965,7 @@ struct disk_mem_config {
   {
     if (downgrade_root_dirs.empty() || capacity_bytes == 0) { return; }
     builder.set_disk_mounting_point(id, capacity_bytes, downgrade_root_dirs);
+    builder.set_disk_direct_io(direct_io);
   }
 };
 

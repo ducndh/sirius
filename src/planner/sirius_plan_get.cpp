@@ -51,6 +51,11 @@
 #include "op/scan/iceberg_metadata_reader.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "op/sirius_physical_merge_sort.hpp"
+#include "op/sirius_physical_order.hpp"
+#include "op/sirius_physical_sort_partition.hpp"
+#include "op/sirius_physical_vector_cluster_label.hpp"
+#include "vss/distance_metric.hpp"
 #include "op/sirius_physical_top_n.hpp"
 #include "planner/connector_registry.hpp"
 #include "planner/scan_returned_types.hpp"
@@ -1247,6 +1252,9 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
   // The count comes from the bind, which reads it from the pin or from the table itself
   // depending on where this join's corpus is coming from.
   auto req              = bind_data.req;
+  // From here on the label is the corpus's cluster column: the operators only ask whether
+  // there is one, and where it sits among the scanned columns.
+  if (req.cluster_on_ingest) { req.build_cluster_column = "__sirius_cluster"; }
   req.pair_tasks        = duckdb::session_operator_params(context).vector_join_pair_tasks;
   auto const right_rows = static_cast<std::int64_t>(bind_data.right_rows);
 
@@ -1436,7 +1444,7 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
       }()) {
     req.probe_shares_build  = true;
     auto const& corpus_cols = req.right.output_columns;
-    bool const has_cluster  = !req.build_cluster_column.empty();
+    bool const has_cluster  = !req.build_cluster_column.empty() || req.cluster_on_ingest;
     std::size_t const after = 1 + corpus_cols.size() + (has_cluster ? 1 : 0);
     req.left.output_positions.clear();
     for (auto const& col : req.left.output_columns) {
@@ -1585,7 +1593,87 @@ sirius_physical_plan_generator::create_plan_knn_join(duckdb::LogicalGet& op)
                                       ? std::move(*probe_child)
                                       : wired_side_scan(make_side_scan(context, req.left)));
     }
-    if (req.build_from_scan) {
+    if (req.build_from_scan && req.cluster_on_ingest) {
+      // No cluster column to read: the rows are labelled as they are scanned, and an ORDER BY on
+      // the label (the engine's sample, partition and merge on the device) leaves the batches the
+      // join reads in cluster order, the label where a cluster column would be.
+      auto scan = wired_side_scan(make_side_scan(context, req.right, {}, probe_only_columns));
+      auto const label_index = 1 + req.right.output_columns.size();
+      auto const cardinality = scan->estimated_cardinality;
+      auto types             = scan->types;
+      types.insert(types.begin() + static_cast<std::ptrdiff_t>(label_index),
+                   sirius::from_duckdb(duckdb::LogicalType::INTEGER));
+      auto label = duckdb::make_uniq<sirius::op::sirius_physical_vector_cluster_label>(
+        types,
+        std::size_t{0},
+        label_index,
+        centroids,
+        static_cast<std::int64_t>(req.dim),
+        sirius::vss::join_selection_distance_type_from_metric(req.metric,
+                                                              /*exact_unexpanded=*/false),
+        cardinality);
+      auto* label_ptr = label.get();
+      // SIRIUS_VSS_TIER_HALF=1: the corpus goes to the tiers in half precision (see store_half()).
+      // Not when the join's output reads the vectors back from these batches.
+      if (auto const* half = std::getenv("SIRIUS_VSS_TIER_HALF");
+          half != nullptr && std::string_view{half} == "1") {
+        label_ptr->store_half(true);
+      }
+      label->children.push_back(std::move(scan));
+      auto by_label = [&] {
+        duckdb::vector<duckdb::BoundOrderByNode> orders;
+        orders.emplace_back(duckdb::OrderType::ASCENDING,
+                            duckdb::OrderByNullType::NULLS_LAST,
+                            duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+                              duckdb::LogicalType::INTEGER, label_index));
+        return orders;
+      };
+      duckdb::vector<std::size_t> all_columns;
+      for (std::size_t i = 0; i < types.size(); ++i) {
+        all_columns.push_back(i);
+      }
+      auto const* general_sort = std::getenv("SIRIUS_VSS_INGEST_SORT");
+      if (general_sort != nullptr && std::string_view{general_sort} == "1") {
+        // The engine's sampled range sort, as any ORDER BY: one more pass over the parked corpus.
+        auto order = duckdb::make_uniq<sirius::op::sirius_physical_order>(
+          std::move(types), by_label(), std::move(all_columns), cardinality);
+        order->children.push_back(std::move(label));
+        stream_op->children.push_back(std::move(order));
+      } else {
+        // The key's values are known before a row is read: cluster ids, with a k-means' roughly
+        // even counts. So the ranges need no sample, and each batch is cut into them as soon as it
+        // is labelled and sorted, in the scan's own pipeline. Ranges are sized under what one
+        // list column can hold (2^31 child values), with room: they are even in cluster ids and
+        // only roughly so in rows.
+        label_ptr->sort_by_label(true);
+        auto const n_clusters  = static_cast<std::uint64_t>(centroids->size());
+        auto const row_bytes   = static_cast<std::uint64_t>(req.dim) * sizeof(float) + 16;
+        auto const corpus      = static_cast<std::uint64_t>(cardinality) * row_bytes;
+        auto const configured  = duckdb::session_operator_params(context).max_sort_partition_bytes;
+        auto const range_bytes = std::min<std::uint64_t>(
+          configured > 0 ? configured : std::uint64_t{2} << 30, std::uint64_t{4} << 30);
+        auto const n_ranges =
+          std::clamp<std::uint64_t>((corpus + range_bytes - 1) / range_bytes, 1, n_clusters);
+        std::vector<std::int32_t> upper;
+        for (std::uint64_t i = 1; i < n_ranges; ++i) {
+          upper.push_back(static_cast<std::int32_t>((i * n_clusters + n_ranges - 1) / n_ranges));
+        }
+        auto partition = duckdb::make_uniq<sirius::op::sirius_physical_sort_partition>(
+          types, by_label(), all_columns, cardinality);
+        partition->set_fixed_boundaries(std::move(upper));
+        partition->children.push_back(std::move(label));
+        // A merge per range leaves the corpus in cluster order, a cluster in one place. The
+        // merged range goes on in batches of the usual size: the join sizes its probe blocks
+        // around the corpus chunks it holds, and a whole range as one chunk made them smaller.
+        auto merge = duckdb::make_uniq<sirius::op::sirius_physical_merge_sort>(
+          std::move(types), by_label(), std::move(all_columns), cardinality, false);
+        merge->child_op = partition.get();
+        merge->set_max_output_batch_bytes(
+          duckdb::session_operator_params(context).concat_batch_bytes);
+        merge->children.push_back(std::move(partition));
+        stream_op->children.push_back(std::move(merge));
+      }
+    } else if (req.build_from_scan) {
       // The cluster ids ride along with the corpus so the fold can read them from the same
       // batches it searches. Anything else -- a second scan, a pin behind the scan -- would be
       // a different row order than the one the build side's snapshot fixed.

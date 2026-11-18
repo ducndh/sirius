@@ -104,6 +104,7 @@ target_sources(
           sirius_physical_vector_join_materialize.cpp
           sirius_physical_vector_join_reduce_local.cpp
           sirius_physical_vector_join_select.cpp
+          sirius_physical_vector_cluster_label.cpp
           sirius_physical_vector_join_stream.cpp
           sirius_physical_vector_join_index.cpp
           sirius_physical_ungrouped_aggregate.cpp

@@ -24,6 +24,10 @@
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <algorithm>
+
+#include <cudf/copying.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -117,6 +121,9 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
     } else {
       outputs.push_back(apply_final_projection(input_batches[0]));
     }
+    if (_max_output_batch_bytes > 0) {
+      return std::make_unique<pipelineable_operator_data>(outputs);
+    }
     return std::make_unique<pipelineable_operator_data>(outputs, input.get_position());
   }
 
@@ -143,13 +150,35 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   if (merged_batch) {
-    if (_final_projections.empty()) {
+    auto const merged_bytes = merged_batch->to_read_only().get_data()->get_size_in_bytes();
+    if (_final_projections.empty() && _max_output_batch_bytes > 0 &&
+        merged_bytes > _max_output_batch_bytes) {
+      // Cut by rows into even pieces of about the asked size; each is a copy, so the merged
+      // batch is released with this task.
+      auto const ro     = merged_batch->to_read_only();
+      auto const view   = sirius::get_cudf_table_view(ro);
+      auto const rows   = static_cast<std::size_t>(view.num_rows());
+      auto const pieces = std::min<std::size_t>(
+        std::max<std::size_t>(1, rows),
+        (merged_bytes + _max_output_batch_bytes - 1) / _max_output_batch_bytes);
+      std::vector<cudf::size_type> cuts;
+      for (std::size_t i = 1; i < pieces; ++i) {
+        cuts.push_back(static_cast<cudf::size_type>(i * rows / pieces));
+      }
+      for (auto const& piece : cudf::split(view, cuts, stream)) {
+        if (piece.num_rows() == 0) { continue; }
+        auto table = std::make_unique<cudf::table>(piece, stream, space->get_default_allocator());
+        outputs.push_back(sirius::make_data_batch(std::move(table), *space, stream, batch_telemetry()));
+      }
+    } else if (_final_projections.empty()) {
       outputs.push_back(std::move(merged_batch));
     } else {
       auto ro = merged_batch->to_read_only();
       outputs.push_back(apply_final_projection(ro));
     }
   }
+  // A position stands for exactly one batch; sized batches go out unpositioned, all of them.
+  if (_max_output_batch_bytes > 0) { return std::make_unique<pipelineable_operator_data>(outputs); }
   return std::make_unique<pipelineable_operator_data>(outputs, input.get_position());
 }
 

@@ -313,7 +313,7 @@ __global__ void scatter_rows_kernel(
   }
 }
 
-// Condition D3 of the exactness proof: a nonzero component below 2^-63 in magnitude has a square
+// A nonzero component below 2^-63 in magnitude has a square
 // below FP32's normal range, so the coding error the screen's limit is widened by could underflow.
 __global__ void count_tiny_nonzero_kernel(float const* v, int64_t n, unsigned long long* out)
 {

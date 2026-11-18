@@ -1080,6 +1080,21 @@ __global__ void row_max_kernel(float const* acc_d, int64_t n_rows, int64_t k, fl
   }
 }
 
+// bound[rows[i]] = min(itself, the largest of d[i * k .. i * k + k)); the rows are distinct.
+__global__ void lower_to_row_max_kernel(
+  float const* d, int64_t const* rows, int64_t m, int64_t k, float* bound)
+{
+  for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < m;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    float b = -INFINITY;
+    for (int64_t j = 0; j < k; ++j) {
+      b = fmaxf(b, d[i * k + j]);
+    }
+    auto const r = rows[i];
+    if (b < bound[r]) { bound[r] = b; }
+  }
+}
+
 __global__ void fill_misses_kernel(float* d, int64_t* ids, int64_t n)
 {
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
@@ -1647,6 +1662,18 @@ void row_max_bound(
 {
   if (n_rows == 0) { return; }
   row_max_kernel<<<grid_for(n_rows), 256, 0, stream.get()>>>(acc_distances, n_rows, k, bound);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+void lower_bound_to_row_max(float const* distances,
+                            int64_t const* rows,
+                            int64_t m,
+                            int64_t k,
+                            float* bound,
+                            rmm::cuda_stream_view stream)
+{
+  if (m == 0) { return; }
+  lower_to_row_max_kernel<<<grid_for(m), 256, 0, stream.get()>>>(distances, rows, m, k, bound);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

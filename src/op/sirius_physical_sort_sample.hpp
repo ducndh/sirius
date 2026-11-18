@@ -54,6 +54,9 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Order specification (copied from ORDER_BY) — determines which columns to sample
   duckdb::vector<duckdb::BoundOrderByNode> orders;
+  //! The ORDER_BY below, whose key rows of every batch the boundaries are cut from; null when
+  //! built from an order specification alone.
+  sirius_physical_order* order_by{nullptr};
 
  public:
   bool is_source() const override { return true; }

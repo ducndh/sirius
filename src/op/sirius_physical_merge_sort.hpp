@@ -47,9 +47,14 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   duckdb::vector<std::size_t> projections;
   bool is_index_sort;
+  uint64_t _max_output_batch_bytes{0};
 
   sirius_physical_operator* child_op;
   sirius_physical_operator* get_child_op() const { return child_op; }
+
+  //! Emit a merged partition as batches of at most @p bytes (rows in order across them)
+  //! instead of as one batch. 0, the default, keeps one batch per partition.
+  void set_max_output_batch_bytes(uint64_t bytes) { _max_output_batch_bytes = bytes; }
 
  public:
   // Source interface

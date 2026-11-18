@@ -66,6 +66,26 @@ struct sorted_edges {
                                            rmm::cuda_stream_view stream,
                                            rmm::device_async_resource_ref mr);
 
+/// led[c] != 0 for each cluster that is first in some row's list of @p clusters ([n_rows x
+/// n_probes]): the clusters a bounded search's first sweep reads.
+[[nodiscard]] std::vector<std::uint8_t> clusters_leading_a_row(
+  rmm::device_uvector<std::int32_t> const& clusters,
+  std::int64_t n_rows,
+  std::int64_t n_probes,
+  std::int32_t n_clusters,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/// Moves each row's cluster of the smallest @p order (one entry per cluster) to the front of its
+/// list, exchanging it with the one there: the cluster the row meets first when the corpus is read
+/// in that order then stands where its nearest did.
+void lead_with_first_in_order(rmm::device_uvector<std::int32_t>& clusters,
+                              std::int64_t n_rows,
+                              std::int64_t n_probes,
+                              std::vector<std::int32_t> const& order,
+                              rmm::cuda_stream_view stream,
+                              rmm::device_async_resource_ref mr);
+
 /// A stable sort on the keys' upper half, so rows keep their order within a key. Holds 16 B an
 /// edge while it sorts, 8 B an edge on return.
 [[nodiscard]] sorted_edges sort_routed_edges(keyed_edges edges,

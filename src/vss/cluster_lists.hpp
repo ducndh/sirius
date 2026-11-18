@@ -328,7 +328,7 @@ void scatter_rows(std::byte const* src,
                   rmm::cuda_stream_view stream);
 
 /// Adds to @p out the number of the @p n values that are nonzero and below 2^-63 in magnitude
-/// (Condition D3 of the exactness proof: their squares underflow FP32).
+/// (their squares underflow FP32, so the coding error a screen's limit is widened by could too).
 void count_tiny_nonzero(float const* values,
                         std::int64_t n,
                         unsigned long long* out,

@@ -151,6 +151,10 @@ struct vector_join_request {
   /// `sirius_kmeans_assign`. Pruning is only effective when the corpus is stored in cluster
   /// order, since a chunk is skipped on its [min, max] cluster range.
   std::string build_cluster_column;
+  /// The scanned corpus has no cluster column: its rows are labelled with their nearest
+  /// centroid of @c clustering as the scan delivers them and sorted by that label, and the
+  /// join reads the label as it would a cluster column.
+  bool cluster_on_ingest{false};
   /// Conjuncts over right-side output columns pushed into the join. Only ever set where
   /// filtering the corpus first gives the same pairs as filtering the join's output: a
   /// threshold join, whose pairs are independent of every other corpus row.

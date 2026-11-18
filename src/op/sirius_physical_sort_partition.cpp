@@ -25,6 +25,7 @@
 #include "sirius/exception.hpp"
 #include "telemetry/nvtx.hpp"
 
+#include <cudf/column/column_factories.hpp>
 #include <cudf/search.hpp>
 
 namespace sirius {
@@ -58,7 +59,9 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   const auto& input_batches = input.get_read_only_batches();
 
   // If no sample operator or only 1 partition, pass through
-  if (!_sample_op || !_sample_op->boundaries_computed() || _sample_op->get_num_partitions() <= 1) {
+  bool const fixed = !_fixed_boundaries.empty();
+  if (!fixed &&
+      (!_sample_op || !_sample_op->boundaries_computed() || _sample_op->get_num_partitions() <= 1)) {
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",
                      input_batches.size(),
                      _sample_op ? _sample_op->get_num_partitions() : 1);
@@ -67,9 +70,26 @@ std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
   }
 
   auto start           = std::chrono::high_resolution_clock::now();
-  size_t num_parts     = _sample_op->get_num_partitions();
-  auto& boundaries     = _sample_op->get_partition_boundaries();
-  auto boundaries_view = boundaries.view();
+  size_t num_parts = fixed ? _fixed_boundaries.size() + 1 : _sample_op->get_num_partitions();
+  std::unique_ptr<cudf::column> fixed_column;
+  cudf::table_view boundaries_view;
+  if (fixed) {
+    auto const mr = cudf::get_current_device_resource_ref();
+    fixed_column  = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                             static_cast<cudf::size_type>(_fixed_boundaries.size()),
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             mr);
+    // From a pageable vector, so the copy has completed when the call returns.
+    CUDF_CUDA_TRY(cudaMemcpyAsync(fixed_column->mutable_view().data<std::int32_t>(),
+                                  _fixed_boundaries.data(),
+                                  _fixed_boundaries.size() * sizeof(std::int32_t),
+                                  cudaMemcpyHostToDevice,
+                                  stream.get()));
+    boundaries_view = cudf::table_view({fixed_column->view()});
+  } else {
+    boundaries_view = _sample_op->get_partition_boundaries().view();
+  }
 
   // Build cudf order vectors from BoundOrderByNode
   std::vector<int> order_key_idx;
@@ -176,7 +196,9 @@ void sirius_physical_sort_partition::sink(const operator_data& output, ::cuda::s
   // Publish the full range count once before any slice becomes visible. Empty ranges retain
   // their indices; merge-sort skips them after the FULL barrier.
   std::call_once(_initialize_partitions, [&] {
-    auto count = _sample_op ? _sample_op->get_num_partitions() : std::size_t{1};
+    auto count = !_fixed_boundaries.empty() ? _fixed_boundaries.size() + 1
+                 : _sample_op             ? _sample_op->get_num_partitions()
+                                          : std::size_t{1};
     for (auto const& next : next_port_after_sink) {
       auto* repo = next.next_operator->get_port(next.next_operator_port_name)->repo;
       if (count > repo->num_partitions()) { repo->set_num_partitions(count); }

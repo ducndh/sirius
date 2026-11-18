@@ -506,6 +506,7 @@ void serialize_vector_join_bind_data(duckdb::Serializer& serializer,
   serializer.WriteProperty(130, "probe_from_scan", req.probe_from_scan);
   serializer.WriteProperty(131, "clustering", req.clustering);
   serializer.WriteProperty(132, "build_cluster_column", req.build_cluster_column);
+  serializer.WritePropertyWithDefault(170, "cluster_on_ingest", req.cluster_on_ingest, false);
   duckdb::vector<std::string> pred_columns;
   duckdb::vector<std::uint8_t> pred_ops;
   duckdb::vector<duckdb::Value> pred_values;
@@ -564,6 +565,8 @@ duckdb::unique_ptr<duckdb::FunctionData> deserialize_vector_join_bind_data(
   req.probe_from_scan      = deserializer.ReadProperty<bool>(130, "probe_from_scan");
   req.clustering           = deserializer.ReadProperty<std::string>(131, "clustering");
   req.build_cluster_column = deserializer.ReadProperty<std::string>(132, "build_cluster_column");
+  req.cluster_on_ingest =
+    deserializer.ReadPropertyWithExplicitDefault<bool>(170, "cluster_on_ingest", false);
   auto const pred_columns =
     deserializer.ReadProperty<duckdb::vector<std::string>>(133, "predicate_columns");
   auto const pred_ops =
