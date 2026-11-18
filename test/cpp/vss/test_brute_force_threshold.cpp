@@ -23,7 +23,6 @@
 #include <cuda/vss/cudf_raft_interop.hpp>
 
 #include <vss/bound_gemm.hpp>
-#include <vss/scoped_device_resource.hpp>
 
 // cudf
 #include <cudf/column/column.hpp>
@@ -40,6 +39,8 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 
+#include <cuda/memory_resource>
+
 #include <cuda_runtime_api.h>
 
 #include <cuvs/distance/distance.hpp>
@@ -54,6 +55,23 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace {
+
+/// Makes @p mr the current device resource for the scope and restores the previous one after.
+/// For single-threaded tests only: the engine never changes the current resource while it runs.
+struct test_current_device_resource {
+  ::cuda::mr::any_resource<::cuda::mr::device_accessible> prev;
+  explicit test_current_device_resource(rmm::device_async_resource_ref mr)
+    : prev(cudf::set_current_device_resource(mr))
+  {
+  }
+  test_current_device_resource(const test_current_device_resource&)            = delete;
+  test_current_device_resource& operator=(const test_current_device_resource&) = delete;
+  ~test_current_device_resource() { cudf::set_current_device_resource(std::move(prev)); }
+};
+
+}  // namespace
 
 namespace {
 
@@ -530,7 +548,7 @@ TEST_CASE("screened_threshold leaves to the differences what it cannot screen", 
     // the second from 700 on reaches 300 rows, past the limit of about 1 pair in 1,024 of a tile.
     // Its score tile alone is more than the small pool an earlier test can leave current holds.
     static rmm::mr::cuda_memory_resource device;
-    sirius::vss::scoped_current_device_resource const from_device{device};
+    test_current_device_resource const from_device{device};
     auto const big = std::int64_t{200000};
     auto x         = cloud(big, d, 0.f, 0.001f, 11);
     for (std::int64_t j = 300; j < big; ++j) {
@@ -913,7 +931,7 @@ TEST_CASE("screened_topk_fold merges every row of a round past one grid of threa
   // 3,000 rows make a tile of 44,739 probe rows, so at k 100 a round of four tiles holds about 18M
   // pairs: more than 65,535 blocks of 256 threads. A row past them must still reach the answer.
   static rmm::mr::cuda_memory_resource device;
-  sirius::vss::scoped_current_device_resource const from_device{device};
+  test_current_device_resource const from_device{device};
   raft::device_resources res;
   auto const d = std::int64_t{4};
   auto const m = std::int64_t{200000};

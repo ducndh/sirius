@@ -67,13 +67,11 @@ std::unique_ptr<any_cuvs_index> build_ivf_flat_index_from_batches(
   // build fits inside the reservation alongside the still-pinned source table.
   index_params.conservative_memory_allocation = true;
 
-  // Allocate the index (and its build-time scratch) through the reservation's
-  // resource so the whole thing lives in Sirius-reserved GPU memory. The handle
-  // is constructed inside the guard so RAFT's workspace resource is the
-  // reservation's too, not just the per-allocation default. The scope ends after
-  // the build, restoring the prior current device resource.
+  // The index and its build-time scratch come from the current device resource,
+  // which must be the reservation's, so the whole thing lives in Sirius-reserved
+  // GPU memory; RAFT's workspace resource, taken when the handle is built, too.
   auto index = [&] {
-    scoped_current_device_resource route{index_mr};
+    require_current_device_resource(index_mr, "IVF-Flat build");
     // Build on the caller's stream so the index's device buffers are bound to it
     // and so allocations charge the reservation attached to it.
     raft::device_resources res{stream};

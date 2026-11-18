@@ -186,8 +186,8 @@ std::unique_ptr<cudf::column> train_centroids(std::vector<cudf::column_view> con
                                                    mr);
 
   {
-    // cuVS takes no allocator, so its k-means scratch is routed by the ambient resource.
-    scoped_current_device_resource const route{mr};
+    // cuVS takes no allocator: its k-means scratch comes from the current device resource.
+    require_current_device_resource(mr, "k-means fit");
     raft::device_resources res{stream};
     auto centroids_view = raft::make_device_matrix_view<float, std::int64_t, raft::row_major>(
       centroid_values->mutable_view().data<float>(), n_clusters, dim);
@@ -601,8 +601,8 @@ struct centroid_labeler::impl {
 
   void predict(float const* x, std::int64_t m, float const* to, std::int64_t n_to, int* labels)
   {
-    // cuVS takes no allocator, so its scratch is routed by the ambient resource.
-    scoped_current_device_resource const route{mr};
+    // cuVS takes no allocator: its scratch comes from the current device resource.
+    require_current_device_resource(mr, "k-means predict");
     cuvs::cluster::kmeans::balanced_params params;
     params.metric = metric;
     cuvs::cluster::kmeans::predict(

@@ -50,7 +50,6 @@
 #include "transparent/sirius_optimizer_extension.hpp"
 #include "util/duckdb_error_message.hpp"
 #include "vss/cuvs_index_cache.hpp"
-#include "vss/scoped_device_resource.hpp"
 #include "vss/vector_join_binding.hpp"
 
 #include <cudf/utilities/pinned_memory.hpp>
@@ -377,8 +376,6 @@ void SiriusContext::QueryEnd()
   // The DuckDB query-end callback releases no slot or repository state: slot ownership is
   // scope-bound and the mandatory cleanup runs inside the execution window
   // (StandaloneQueryScope::finish), before the result is exposed.
-  SIRIUS_LOG_DEBUG("[sirius_context] current device resource swaps by vss guards so far: {}",
-                   sirius::vss::current_device_resource_swaps.load(std::memory_order_relaxed));
 }
 
 void SiriusContext::QueryEnd(ClientContext& context)

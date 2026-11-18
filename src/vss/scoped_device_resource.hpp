@@ -22,48 +22,27 @@
 
 #include <cuda/memory_resource>
 
-#include <atomic>
-#include <cstdint>
-#include <optional>
-#include <utility>
+#include <stdexcept>
+#include <string>
 
 namespace sirius::vss {
 
-/// Times a scoped_current_device_resource changed the current device resource. After startup every
-/// caller passes the resource that is already current, so this stays 0 in a query.
-inline std::atomic<std::uint64_t> current_device_resource_swaps{0};
-
-/// RAII: route allocations on the current device through @p mr for the guard's lifetime,
-/// restoring the previous resource on exit. Needed around any cuVS call whose internal scratch
-/// must come out of a Sirius reservation rather than the ambient default, since cuVS allocates
-/// from the current device resource and takes no allocator argument.
+/// Checks that allocations on the current device already go through @p mr, and throws if not.
+/// Called before any cuVS call whose internal scratch must come out of a Sirius reservation
+/// rather than the ambient default, since cuVS allocates from the current device resource and
+/// takes no allocator argument.
 ///
-/// The current device resource is one process-wide slot per device, and
+/// It does not change the current resource: that is one process-wide slot per device, and
 /// cudf::get_current_device_resource_ref() returns a reference into it that other threads keep
-/// and allocate through without a lock. Replacing the slot's resource while one of them does is
-/// a use of a moved-from resource, so when @p mr is already the current resource the guard
-/// leaves the slot alone.
-///
-/// The evicted resource is captured by value (an owning any_resource) per the rmm 26.06
-/// behavior documented in sirius_memory_reservation_manager: capturing a non-owning ref would
-/// dangle once the per-device map entry is moved out.
-struct scoped_current_device_resource {
-  std::optional<::cuda::mr::any_resource<::cuda::mr::device_accessible>> prev;
-
-  explicit scoped_current_device_resource(rmm::device_async_resource_ref mr)
-  {
-    if (mr == cudf::get_current_device_resource_ref()) { return; }
-    current_device_resource_swaps.fetch_add(1, std::memory_order_relaxed);
-    prev.emplace(cudf::set_current_device_resource(mr));
-  }
-  scoped_current_device_resource(const scoped_current_device_resource&)            = delete;
-  scoped_current_device_resource& operator=(const scoped_current_device_resource&) = delete;
-  scoped_current_device_resource(scoped_current_device_resource&&)                 = delete;
-  scoped_current_device_resource& operator=(scoped_current_device_resource&&)      = delete;
-  ~scoped_current_device_resource()
-  {
-    if (prev) { cudf::set_current_device_resource(std::move(*prev)); }
-  }
-};
+/// and allocate through without a lock, so replacing the slot's resource while a query runs can
+/// leave them allocating through a moved-from resource. After startup the slot holds the GPU
+/// memory space's allocator, which is what every caller passes.
+inline void require_current_device_resource(rmm::device_async_resource_ref mr, char const* what)
+{
+  if (mr == cudf::get_current_device_resource_ref()) { return; }
+  throw std::logic_error(std::string{what} +
+                         ": the current device resource is not the memory resource this call "
+                         "allocates from, and cuVS allocates its scratch from the current one");
+}
 
 }  // namespace sirius::vss

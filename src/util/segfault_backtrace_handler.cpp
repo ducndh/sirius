@@ -179,6 +179,18 @@ static void segfault_handler(int sig, siginfo_t* info, void* context)
   long tid          = static_cast<long>(syscall(SYS_gettid));
   const char* sname = signal_name(sig);
 
+  // The address the access faulted at (SIGSEGV, SIGBUS) or of the faulting instruction (SIGILL,
+  // SIGFPE); a small address is a member read through a null pointer. si_addr means that only for
+  // a signal the kernel raised (si_code > 0): for one sent by a process (SIGABRT) it holds the
+  // sender's pid and uid.
+  bool const has_addr   = info != nullptr && info->si_code > 0;
+  auto const fault_addr = has_addr ? reinterpret_cast<unsigned long>(info->si_addr) : 0UL;
+  auto const pc         = fault_pc(context);
+  auto write_fault      = [has_addr, fault_addr, pc](int fd) {
+    if (has_addr) { write_hex_line(fd, "Fault address: ", fault_addr); }
+    write_hex_line(fd, "Faulting instruction: ", pc);
+  };
+
   // Emit the async-signal-safe form FIRST. backtrace_symbols_fd() writes straight to the fd with
   // no allocation and no loader lock, so this reaches stderr even if the demangled pass below
   // blocks and the deadline has to kill us. Un-demangled frames are far less readable, but a raw
@@ -189,6 +201,7 @@ static void segfault_handler(int sig, siginfo_t* info, void* context)
     write(STDERR_FILENO, sname, strlen(sname));
     const char* raw_suffix = " — raw frames (async-signal-safe) ***\n";
     write(STDERR_FILENO, raw_suffix, __builtin_strlen(raw_suffix));
+    write_fault(STDERR_FILENO);
     backtrace_symbols_fd(frames.data(), n, STDERR_FILENO);
   }
 
@@ -206,14 +219,6 @@ static void segfault_handler(int sig, siginfo_t* info, void* context)
     write(fd, suffix, __builtin_strlen(suffix));
   };
 
-  // The address the access faulted at (SIGSEGV, SIGBUS) or of the faulting instruction (SIGILL,
-  // SIGFPE); a small address is a member read through a null pointer.
-  auto const fault_addr = info != nullptr ? reinterpret_cast<unsigned long>(info->si_addr) : 0UL;
-  auto const pc         = fault_pc(context);
-  auto write_fault      = [fault_addr, pc](int fd) {
-    write_hex_line(fd, "Fault address: ", fault_addr);
-    write_hex_line(fd, "Faulting instruction: ", pc);
-  };
   auto write_tid = [tid](int fd) {
     write(fd, "Faulting thread id: ", 19);
     std::array<char, 24> buf{};
@@ -250,7 +255,6 @@ static void segfault_handler(int sig, siginfo_t* info, void* context)
 
   write_header(STDERR_FILENO);
   write_tid(STDERR_FILENO);
-  write_fault(STDERR_FILENO);
   write_backtrace(STDERR_FILENO);
   const char* tail = "*** end backtrace ***\n";
   write(STDERR_FILENO, tail, __builtin_strlen(tail));

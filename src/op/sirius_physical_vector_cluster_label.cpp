@@ -82,7 +82,6 @@ std::unique_ptr<operator_data> sirius_physical_vector_cluster_label::execute(
   auto& input        = dynamic_cast<const pipelineable_operator_data&>(input_data);
   auto input_batches = input.get_read_only_batches();
   rmm::cuda_stream_view const task_stream{stream.get()};
-  auto const mr = cudf::get_current_device_resource_ref();
 
   // Built here, on the task's thread and stream: device memory is accounted to the thread that
   // allocates it, and the handle's workspace is tied to the stream.
@@ -94,6 +93,7 @@ std::unique_ptr<operator_data> sirius_physical_vector_cluster_label::execute(
   for (auto& input_ro : input_batches) {
     auto const input_view = sirius::get_cudf_table_view(input_ro);
     auto& mem             = *input_ro.get_memory_space();
+    auto const mr         = mem.get_default_allocator();
     if (_vector_column >= static_cast<std::size_t>(input_view.num_columns()) ||
         _label_index > static_cast<std::size_t>(input_view.num_columns())) {
       throw invalid_input_exception(
