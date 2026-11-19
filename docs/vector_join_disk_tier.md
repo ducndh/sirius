@@ -76,14 +76,8 @@ NVIDIA_TF32_OVERRIDE=0 pixi run build/release/test/cpp/sirius_unittest "[vss],[v
 ```
 
 On a GH200: 351 test cases, 349 passed, 2 skipped. Compare case counts, not assertion totals: one
-case's assertion count varies from run to run. On an A100 40 GB, 5 cases fail, and they fail the same
-way on the base branch:
-
-- 4 assume a planner path (brute force over host lists) that the A100's measured device rates do
-  not pick (`test_gpu_execution_kmeans.cpp` lines 5073, 5178, 5319; `..._exact_per_row.cpp` line
-  781). They pass with `SIRIUS_VSS_DEVICE_RATES=reference`.
-- 1 (`test_gpu_execution_kmeans.cpp` line 3346) is a single probe row whose two nearest centroids
-  differ by 2.5e-6 relative and route differently on two paths.
+case's assertion count varies from run to run. On an A100 40 GB, the same cases fail as on the base
+branch (see Known issues): 4 planner-path cases always, and a near-tie case in some runs.
 
 ## Config
 
@@ -155,7 +149,7 @@ The vectors as `FLOAT[d]` in a DuckDB table, checkpointed (pins and scans read c
 
 ```sql
 SET force_compression='uncompressed'; SET preserve_insertion_order=false;
-SET temp_directory='/mnt/work/duckdb_tmp'; SET threads=64;
+SET temp_directory='/nvme/duckdb_tmp'; SET threads=64;
 CREATE TABLE base AS SELECT id::BIGINT AS id, vec::FLOAT[1024] AS vec FROM read_parquet('/data/pq/part-*.parquet');
 CHECKPOINT;
 SELECT count(*), count(DISTINCT id) FROM base;
@@ -244,7 +238,7 @@ GH200 (96 GB HBM, 480 GB host), GPU limit 0.563, host pool 80 GB, process inside
   (not budgeted by the engine) must fit under the process limit.
 - Blocks: about one pass over the corpus per block; the block count follows from the GPU limit.
 - Quarter scale (28.4M rows) on an A100 40 GB, GPU limit 14.47 GB, host pool 20 GB, 60 GB cgroup:
-  self-join `TIER_HALF=1` 589-617 s, 13 blocks; with `PAIR_ONCE=1` 511 s.
+  self-join `TIER_HALF=1` 577-617 s, 13 blocks; with `PAIR_ONCE=1` 495-528 s.
 
 ## Checking the answer
 
@@ -266,6 +260,23 @@ CREATE TABLE d AS (SELECT left_id, right_id FROM 'ref.parquet' EXCEPT SELECT lef
 SELECT count(DISTINCT left_id) FROM d WHERE left_id NOT IN (SELECT left_id FROM tied);  -- expect 0
 ```
 
+## Smoke test on a new machine
+
+Before a large run: the unit gate, then a quarter of the MS MARCO corpus, then a slice of the real
+corpus to calibrate tier peak and time.
+
+```sql
+CREATE TABLE base_q AS SELECT id, vec FROM base WHERE hash(id) % 4 = 0;  -- 28,378,095 rows
+CHECKPOINT;
+```
+
+Self-join with `SIRIUS_VSS_TIER_HALF=1`, k 10, 32 probes: 283,780,950 pairs. With our quarter
+centroids (`cents_q`, ask for the parquet file) loaded as the clustering, the distance sum is
+175,910,598.078 in every `TIER_HALF=1` run we made (GH200 and A100; with and without pair-once;
+self-join or two-table over `base_q`). With a clustering of your own only the pair count
+is comparable. Our quarter caps: GPU `usage_limit_bytes: 14470348800`, host pool 20 GB, tier 200 GB
+(330 GB for two tables), the process in a 60 GB cgroup.
+
 ## What to watch during a run
 
 - **Tier drive temperature.** At full size the GH200's tier drive sat at 84 C or more for most of the
@@ -280,6 +291,28 @@ SELECT count(DISTINCT left_id) FROM d WHERE left_id NOT IN (SELECT left_id FROM 
   `du -sb` of the tier directory against `capacity_bytes` and the drive's free space.
 - **File handles.** Raise `ulimit -n` to the hard limit before every run; the build parks many range
   pieces as files.
+
+## Known issues
+
+- **Unit gate on a non-reference GPU.** 4 cases assume a planner path (brute force over host lists)
+  that the GPU's measured rates may not pick (`test_gpu_execution_kmeans.cpp` lines 5073, 5178,
+  5319; `..._exact_per_row.cpp` line 781). A fifth (`test_gpu_execution_kmeans.cpp` line 3346) has
+  one probe row whose two nearest centroids differ by 2.5e-6 relative; it fails in some runs and
+  passes in others. On an A100 every case passes with the reference rates (349 passed, 2 skipped):
+  `SIRIUS_VSS_DEVICE_RATES=reference NVIDIA_TF32_OVERRIDE=0 pixi run build/release/test/cpp/sirius_unittest "[vss],[vector_join]"`.
+- **Scan batch size and the build.** With `scan_task_batch_size` large enough for a scan batch to
+  hold 3 DuckDB row groups (122,880 rows each, ~0.5 GB at 1,024-d FP32), the full-size build took
+  377 s instead of 462 s on a GH200 (single runs), and 7% less at quarter scale on an A100 (x86).
+  4 row groups gave no further gain. Larger batches raise a scan task's device peak (~1.0 GB to
+  ~3.6 GB at 3 row groups) and brought MERGE_SORT OOM retries in the first wave; the retries are
+  safe and cost only time.
+- **Approximate threshold joins.** Membership and reported distances come from an FP32 expanded
+  form with no exact re-score, so pairs within ~1e-6 of the threshold, and the reported distances
+  (by up to ~1e-3), can differ with batching and from run to run. Top-k joins re-score and are
+  exact within the probed clusters.
+- **Pair-once** is for self-joins only and needs host memory outside the pools: rows x (8k + 4)
+  bytes + rows x n_probes x 2 bytes (148 B/row at k 10 and 32 probes). With `TIER_HALF=2` it is not
+  taken; the join logs why and runs the usual schedule.
 
 ## Tested and not tested
 
