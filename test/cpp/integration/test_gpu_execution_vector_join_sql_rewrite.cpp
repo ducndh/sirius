@@ -901,6 +901,48 @@ TEST_CASE_METHOD(SqlRewriteFixture,
 }
 
 TEST_CASE_METHOD(SqlRewriteFixture,
+                 "INT8 codes built inside the query over float vectors answer exactly",
+                 "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
+{
+  // SIRIUS_VSS_EXACT_CODES=int8 stands for the cost model preferring INT8 codes, which it does
+  // only for joins far larger than a test's: the per-row top-k join's codes are then rotated INT8,
+  // every candidate is re-scored in FP32, and the answer is DuckDB's. The codes stay for the next
+  // statement. A join their search does not run (a threshold join here) does not take them: it
+  // writes FLOAT16 codes in their place, which the top-k join then searches too.
+  SqlRewriteTables tables(*this);
+  auto const floats = [](const std::string& seed) {
+    return "list_transform(range(32), lambda d: ((hash(i * 100 + d + " + seed +
+           ") % 100000) / 977.0)::FLOAT)::FLOAT[32]";
+  };
+  run_ok("CREATE TABLE sr_f8 AS SELECT i::INTEGER AS id, " + floats("0") +
+         " AS vec FROM range(4000) t(i);");
+  run_ok("CREATE TABLE sr_f8_probe AS SELECT i::INTEGER AS id, " + floats("9999") +
+         " AS vec FROM range(30) t(i);");
+  run_ok("CHECKPOINT;");
+  run_ok("SELECT * FROM pin_table(name => 'sr_f8', tier => 'gpu', format => 'duckdb');");
+  ::setenv("SIRIUS_VSS_ACCESS_PATH", "lists", 1);
+  ::setenv("SIRIUS_VSS_EXACT_CODES", "int8", 1);
+  struct unset_on_exit {
+    ~unset_on_exit()
+    {
+      ::unsetenv("SIRIUS_VSS_ACCESS_PATH");
+      ::unsetenv("SIRIUS_VSS_EXACT_CODES");
+    }
+  } unset_env;
+  std::string const top_k =
+    "SELECT p.id, n.id, n.d FROM sr_f8_probe p, LATERAL (SELECT c.id, "
+    "array_distance(p.vec, c.vec) AS d FROM sr_f8 c ORDER BY d LIMIT 5) n;";
+  auto const before = sirius::test::get_vector_join_prune_stats(*con);
+  require_gpu_matches_duckdb(*con, top_k);
+  CHECK(sirius::test::get_vector_join_prune_stats(*con).pairs_exhaustive > before.pairs_exhaustive);
+  require_gpu_matches_duckdb(*con, top_k);
+  require_gpu_matches_duckdb(
+    *con,
+    "SELECT p.id, c.id FROM sr_f8_probe p JOIN sr_f8 c ON array_distance(p.vec, c.vec) < 120.0;");
+  require_gpu_matches_duckdb(*con, top_k);
+}
+
+TEST_CASE_METHOD(SqlRewriteFixture,
                  "a probe row outside float16's range is searched in FP32 over float16 lists",
                  "[integration][gpu_execution][array][vss][vector_join][sql_rewrite]")
 {

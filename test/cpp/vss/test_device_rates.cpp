@@ -110,6 +110,35 @@ TEST_CASE("the exact join's one list costs a read of the rows, not a clustering"
   CHECK(tensor2.codes(s) == cost.codes(s));
 }
 
+TEST_CASE("the exact join codes float rows as INT8 where that repays the rotation", "[vss]")
+{
+  using sirius::vss::choose_exact_codes;
+  using sirius::vss::exact_codes_choice;
+  access_path_cost const cost{device_scale{}};
+  sirius::vss::access_path_shape s;
+  s.corpus_rows      = 1e6;
+  s.dim              = 1024;
+  s.corpus_on_device = true;
+
+  // A thousand probe rows do not repay rotating a million rows; a million do.
+  s.probe_rows = 1e3;
+  CHECK(choose_exact_codes(cost, s) == exact_codes_choice::float16);
+  s.probe_rows = 1e6;
+  CHECK(choose_exact_codes(cost, s) == exact_codes_choice::int8);
+
+  // Wide rows: the INT8 kernel's higher rate outweighs what it spends on each pair.
+  s.corpus_rows = 9e5;
+  s.dim         = 3072;
+  s.probe_rows  = 1e5;
+  CHECK(choose_exact_codes(cost, s) == exact_codes_choice::int8);
+
+  // Narrow rows: it does not, at any probe count.
+  s.corpus_rows = 1e7;
+  s.dim         = 96;
+  s.probe_rows  = 1e6;
+  CHECK(choose_exact_codes(cost, s) == exact_codes_choice::float16);
+}
+
 TEST_CASE("lists a statement builds for itself get more clusters for a larger probe side", "[vss]")
 {
   using sirius::vss::choose_cluster_count;

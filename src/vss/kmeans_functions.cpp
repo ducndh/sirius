@@ -536,7 +536,8 @@ std::optional<exact_lists_choice> find_exact_lists(duckdb::ClientContext& contex
                                                    bool cosine,
                                                    std::int64_t n_rows,
                                                    std::int64_t min_clusters,
-                                                   bool float_rows_only)
+                                                   bool float_rows_only,
+                                                   bool int8_ok)
 {
   std::optional<exact_lists_choice> found;
   for (auto const& name : ctx.get_cuvs_index_cache().names_on_column(
@@ -553,7 +554,10 @@ std::optional<exact_lists_choice> find_exact_lists(duckdb::ClientContext& contex
     bool const exact = lists->encoding == list_encoding::float32 ||
                        (lists->encoding == list_encoding::uint8 && !float_rows_only) ||
                        (lists->encoding == list_encoding::float16 && lists->has_exact_rows() &&
-                        bound_filter_f16_supports(lists->dim));
+                        bound_filter_f16_supports(lists->dim)) ||
+                       (lists->encoding == list_encoding::int8 && int8_ok && !float_rows_only &&
+                        lists->has_exact_rows() && lists->row_sq != nullptr &&
+                        bound_filter_int8_supports(lists->dim, /*rescored=*/true));
     if (!exact) { continue; }
     auto const entry = find_clustering_entry(ctx, name);
     if (entry == nullptr) { continue; }
@@ -957,6 +961,23 @@ cluster_lists_result build_lists(duckdb::SiriusContext& ctx,
                                 stream.get()));
   stream.sync();
   if (storage == list_storage::uint8 && non_uint8_host != 0) { refuse_non_uint8(non_uint8_host); }
+  // A statement's own lists ('exact') under @p int8_if_float16: INT8 codes where they would be
+  // FLOAT16, that is unless every value is a byte.
+  if (storage == list_storage::exact && int8_if_float16) {
+    if (check_uint8 && non_uint8_host == 0) {
+      want_int8 = false;
+      rotated.reset();
+      kept_rotated.reset();
+      rotation.reset();
+    } else {
+      storage = list_storage::int8;
+    }
+    if (dbg) {
+      std::fprintf(stderr,
+                   "[vecjoin-lists] the statement's codes: %s\n",
+                   storage == list_storage::int8 ? "int8" : "uint8 (every value is a byte)");
+    }
+  }
   // 'auto' is the planner's choice, the one a statement that builds its own lists makes ('exact'):
   // bytes as UINT8, anything else as FLOAT16 that the bounded search re-scores in FP32 -- where the
   // width allows it and the FP32 rows can be read, in place from the pin or as a host copy that
@@ -1850,7 +1871,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                             const kmeans_assign_request& req,
                                             list_storage storage,
                                             bool host_tier,
-                                            bool unit_rows)
+                                            bool unit_rows,
+                                            int8_codes int8)
 {
   static const std::string fn = "sirius_kmeans_build_lists";
   // Unit rows refused before the pin is looked for, the width once the clustering is known.
@@ -1883,14 +1905,18 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
   // instead, which keeps them on the device: lists in host memory cross PCIe on every statement.
   // The check is the one build_lists applies, made here because INT8 codes need their range taken
   // in its first pass. Not for inner product, which searches FLOAT16 or FP32 lists only.
-  // SIRIUS_VSS_AUTO_INT8=0 keeps FLOAT16.
+  // SIRIUS_VSS_AUTO_INT8=0 keeps FLOAT16. A statement's own lists ('exact') follow the same
+  // rule under int8_codes::to_fit, and are INT8 without it under int8_codes::preferred.
   bool int8_if_float16 = false;
-  if (storage == list_storage::automatic && !host_tier &&
+  bool const own_lists = storage == list_storage::exact && int8 != int8_codes::never && !unit_rows;
+  if ((storage == list_storage::automatic || own_lists) && !host_tier &&
       entry->meta.metric != cuvs::distance::DistanceType::InnerProduct &&
       bound_filter_f16_supports(req.dim) &&
       bound_filter_int8_supports(req.dim, /*rescored=*/true)) {
     auto const* env = std::getenv("SIRIUS_VSS_AUTO_INT8");
-    if (env == nullptr || std::string_view{env} != "0") {
+    if (own_lists && int8 == int8_codes::preferred) {
+      int8_if_float16 = true;
+    } else if (env == nullptr || std::string_view{env} != "0") {
       auto const values = static_cast<std::size_t>(c.n_rows()) * static_cast<std::size_t>(req.dim);
       bool const f16_fits = reserve_device_lists(index_cache, c, values * 2, c.n_rows()) != nullptr;
       int8_if_float16 =

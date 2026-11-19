@@ -228,6 +228,11 @@ struct cluster_lists_result {
 /// its FP32 copy, so the lists answer exactly either way.
 enum class list_storage : std::uint8_t { automatic, float32, uint8, float16, int8, exact };
 
+/// Whether lists a statement builds for itself (list_storage::exact) may be INT8 codes where they
+/// would be FLOAT16: never; only where FLOAT16 lists would not fit on the device and INT8 lists,
+/// half their size, do; or wherever the rows are not bytes.
+enum class int8_codes : std::uint8_t { never, to_fit, preferred };
+
 /**
  * @brief `sirius_kmeans_build_lists(table, column, clustering)`: build @ref cluster_lists for a
  *        pinned column under a fitted clustering, replacing any lists that clustering had.
@@ -239,7 +244,8 @@ cluster_lists_result run_kmeans_build_lists(duckdb::SiriusContext& ctx,
                                             const kmeans_assign_request& req,
                                             list_storage storage = list_storage::automatic,
                                             bool host_tier       = false,
-                                            bool unit_rows       = false);
+                                            bool unit_rows       = false,
+                                            int8_codes int8      = int8_codes::never);
 
 /// Lists a statement builds for itself over the corpus rows it scanned, and the clustering they
 /// follow. Neither goes into the index cache: they live as long as the join that built them, and
@@ -276,8 +282,8 @@ struct exact_lists_choice {
 /// A clustering of (@p catalog, @p schema, @p table, @p column) whose lists hold all @p n_rows
 /// rows and answer exactly when every cluster is probed: FLOAT32 or UINT8 rows, or FLOAT16 rows
 /// searched with the bounded GEMM and re-scored from the kept FP32 rows. Lists of unit rows
-/// answer cosine joins and only those; INT8 codes are left out (their search refuses too many
-/// shapes to pick them unasked). A single list (the exact join's compact layout, searched whole
+/// answer cosine joins and only those; INT8 codes, re-scored the same way, count only with
+/// @p int8_ok, which a caller sets for a join their search runs (it refuses the others). A single list (the exact join's compact layout, searched whole
 /// with its bound lowered as it goes) is preferred when there is one, and skipped below
 /// @p min_clusters, which an approximate join sets to 2: one list prunes nothing. With
 /// @p float_rows_only, UINT8 lists are left out too: an inner-product join searches FLOAT16 rows
@@ -291,7 +297,8 @@ struct exact_lists_choice {
                                                                  bool cosine,
                                                                  std::int64_t n_rows,
                                                                  std::int64_t min_clusters = 1,
-                                                                 bool float_rows_only      = false);
+                                                                 bool float_rows_only      = false,
+                                                                 bool int8_ok              = false);
 
 /// The lists of the clustering @p clustering when it is one of (@p catalog, @p schema, @p table,
 /// @p column)'s and they hold all @p n_rows rows, unit rows exactly when @p cosine: what a join
