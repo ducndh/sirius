@@ -774,22 +774,21 @@ class corpus_lists_chooser {
     bool const ip     = req.metric == "ip";
     // INT8 codes answer an l2 join through the bounded search, re-scored in FP32; of the joins
     // that reach here, the per-row top-k is the one measured with them, so only it may get them.
-    bool const int8_ok = !scanned && !cosine && !ip &&
-                         req.mode == vector_join_mode::per_row_top_k &&
-                         bound_filter_f16_supports(req.dim) &&
-                         bound_filter_int8_supports(req.dim, /*rescored=*/true);
+    bool const int8_ok =
+      !scanned && !cosine && !ip && req.mode == vector_join_mode::per_row_top_k &&
+      bound_filter_f16_supports(req.dim) && bound_filter_int8_supports(req.dim, /*rescored=*/true);
     auto choice       = scanned ? std::nullopt
                                 : find_exact_lists(_context,
-                                             *sirius_ctx,
-                                             catalog,
-                                             schema,
-                                             table_name,
-                                             column,
-                                             cosine,
-                                             static_cast<std::int64_t>(rows),
-                                             1,
-                                             ip,
-                                             int8_ok);
+                                                   *sirius_ctx,
+                                                   catalog,
+                                                   schema,
+                                                   table_name,
+                                                   column,
+                                                   cosine,
+                                                   static_cast<std::int64_t>(rows),
+                                                   1,
+                                                   ip,
+                                                   int8_ok);
     auto pin          = scanned ? nullptr
                                 : sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
                            catalog, schema, table_name, sirius::vss::table_identity_of(*pinned_table));
@@ -847,13 +846,14 @@ class corpus_lists_chooser {
       if (int8_ok) {
         auto const* codes_env = std::getenv("SIRIUS_VSS_EXACT_CODES");
         std::string_view const asked{codes_env != nullptr ? codes_env : "cost"};
+        shape.k                         = static_cast<double>(std::max<std::int64_t>(req.k, 1));
         access_path_shape float16_shape = shape, int8_shape = shape;
         float16_shape.list_bytes_per_value = 2;
         int8_shape.list_bytes_per_value    = 1;
         bool const prefer_int8 = choose_exact_codes(cost, shape) == exact_codes_choice::int8;
-        int8 = asked == "float16" ? int8_codes::never
-               : asked == "int8" || prefer_int8 ? int8_codes::preferred
-                                                : int8_codes::to_fit;
+        int8                   = asked == "float16"               ? int8_codes::never
+                                 : asked == "int8" || prefer_int8 ? int8_codes::preferred
+                                                                  : int8_codes::to_fit;
         SIRIUS_LOG_INFO(
           "[vector_join_rewrite] '{}': codes as {} (est. float16 {:.3f} s, int8 {:.3f} s, "
           "SIRIUS_VSS_EXACT_CODES = {})",

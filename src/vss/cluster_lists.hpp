@@ -283,7 +283,8 @@ struct exact_lists_choice {
 /// rows and answer exactly when every cluster is probed: FLOAT32 or UINT8 rows, or FLOAT16 rows
 /// searched with the bounded GEMM and re-scored from the kept FP32 rows. Lists of unit rows
 /// answer cosine joins and only those; INT8 codes, re-scored the same way, count only with
-/// @p int8_ok, which a caller sets for a join their search runs (it refuses the others). A single list (the exact join's compact layout, searched whole
+/// @p int8_ok, which a caller sets for a join their search runs (it refuses the others). A
+/// single list (the exact join's compact layout, searched whole
 /// with its bound lowered as it goes) is preferred when there is one, and skipped below
 /// @p min_clusters, which an approximate join sets to 2: one list prunes nothing. With
 /// @p float_rows_only, UINT8 lists are left out too: an inner-product join searches FLOAT16 rows
