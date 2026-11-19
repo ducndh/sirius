@@ -1565,7 +1565,21 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
       widest_chunk = std::max(widest_chunk, _probe->chunk_rows(i));
     }
     auto const chunk_need = fixed + per_row * static_cast<double>(widest_chunk);
-    auto budget = chunk_need <= 0.8 * device ? std::max(device / 3, chunk_need) : 0.8 * device;
+    // Lists in host memory are read whole by each block, and blocks in flight each read them, so
+    // more blocks add PCIe traffic without sharing any: beside host lists a block takes most of
+    // what is free on the device (the engine may still run two at once, as its memory history
+    // allows). MS MARCO 10M x 1,024-d, 10.2 GB of INT8 lists, 1M probes at 288 probes each, k 10,
+    // under a 4 GB pool: one probe chunk a block (25 blocks) 29.7 s, 10 blocks 23.4 s. Only up to
+    // k = 100, as measured: past it the candidate buffer outgrows its estimate (k 1,000 ran out
+    // of memory in blocks of 100k rows), so those blocks keep the third. The same for the exact
+    // join's single list, whose sweep is not what the estimate models (out of memory under 8 GB).
+    bool const host_lists = _lists != nullptr && _lists->tier == cucascade::memory::Tier::HOST &&
+                            _lists->offsets.size() > 2 && k_join <= 100;
+    auto const share =
+      host_lists
+        ? std::max(device / 3, 0.8 * static_cast<double>(spaces.front()->get_available_memory()))
+        : device / 3;
+    auto budget = chunk_need <= 0.8 * device ? std::max(share, chunk_need) : 0.8 * device;
     if (_lists == nullptr && _build_side != nullptr) {
       // A scanned corpus is read whole for every block, from disk once it outgrows host memory, and
       // blocks in flight each read it themselves. The rows one read serves set the cost, so one
@@ -1603,12 +1617,12 @@ void sirius_physical_vector_join_stream::plan_probe_blocks_locked()
   }
   block_rows = std::min<std::int64_t>(
     block_rows, static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) / k_join);
+  // A block's routing edges are one column.
+  block_rows = std::min<std::int64_t>(
+    block_rows,
+    static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) /
+      std::max<std::int64_t>(_request.n_probes, 1));
   if (block_rows_on_host()) {
-    // A block's routing edges are one column.
-    block_rows = std::min<std::int64_t>(
-      block_rows,
-      static_cast<std::int64_t>(std::numeric_limits<cudf::size_type>::max()) /
-        std::max<std::int64_t>(_request.n_probes, 1));
     // The rows live in the host pool. With a disk tier all else there can move out of their way, so
     // they plan on a share of its size; without one nothing there can leave, so on a share of what
     // is free now, the rest of which still has to take what the device spills. Never less than the
