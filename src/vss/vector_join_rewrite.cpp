@@ -74,6 +74,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -771,17 +772,23 @@ class corpus_lists_chooser {
     }
     bool const cosine = req.metric == "cosine";
     bool const ip     = req.metric == "ip";
+    // INT8 codes answer an l2 join through the bounded search, re-scored in FP32; of the joins
+    // that reach here, the per-row top-k is the one measured with them, so only it may get them.
+    bool const int8_ok =
+      !scanned && !cosine && !ip && req.mode == vector_join_mode::per_row_top_k &&
+      bound_filter_f16_supports(req.dim) && bound_filter_int8_supports(req.dim, /*rescored=*/true);
     auto choice       = scanned ? std::nullopt
                                 : find_exact_lists(_context,
-                                             *sirius_ctx,
-                                             catalog,
-                                             schema,
-                                             table_name,
-                                             column,
-                                             cosine,
-                                             static_cast<std::int64_t>(rows),
-                                             1,
-                                             ip);
+                                                   *sirius_ctx,
+                                                   catalog,
+                                                   schema,
+                                                   table_name,
+                                                   column,
+                                                   cosine,
+                                                   static_cast<std::int64_t>(rows),
+                                                   1,
+                                                   ip,
+                                                   int8_ok);
     auto pin          = scanned ? nullptr
                                 : sirius_ctx->get_scan_manager().find_pinned_entry_for_duckdb_table(
                            catalog, schema, table_name, sirius::vss::table_identity_of(*pinned_table));
@@ -793,9 +800,10 @@ class corpus_lists_chooser {
     access_path_cost const cost{current_device_scale()};
     double const brute = cost.brute(shape);
     auto describe      = [&](exact_lists_choice const& c) {
-      shape.list_bytes_per_value = c.encoding == list_encoding::uint8     ? 1
-                                        : c.encoding == list_encoding::float16 ? 2
-                                                                               : 4;
+      shape.list_bytes_per_value =
+        c.encoding == list_encoding::uint8 || c.encoding == list_encoding::int8 ? 1
+        : c.encoding == list_encoding::float16                                  ? 2
+                                                                                : 4;
       shape.lists_on_device      = c.on_device;
       shape.n_clusters           = static_cast<double>(c.n_clusters);
       shape.inexact_unseeded     = c.encoding == list_encoding::float16 && !c.seeded;
@@ -830,6 +838,42 @@ class corpus_lists_chooser {
         table_name,
         built,
         brute);
+      // Float rows are coded as FLOAT16 or as rotated INT8, whichever the cost model estimates
+      // faster for this join (choose_exact_codes); where it prefers FLOAT16, the build still
+      // writes INT8 codes if only they fit on the device. SIRIUS_VSS_EXACT_CODES=float16|int8
+      // forces one.
+      auto int8 = int8_codes::never;
+      if (int8_ok) {
+        auto const* codes_env = std::getenv("SIRIUS_VSS_EXACT_CODES");
+        std::string_view const asked{codes_env != nullptr ? codes_env : "cost"};
+        shape.k                         = static_cast<double>(std::max<std::int64_t>(req.k, 1));
+        access_path_shape float16_shape = shape, int8_shape = shape;
+        float16_shape.list_bytes_per_value = 2;
+        int8_shape.list_bytes_per_value    = 1;
+        bool const prefer_int8 = choose_exact_codes(cost, shape) == exact_codes_choice::int8;
+        int8                   = asked == "float16"               ? int8_codes::never
+                                 : asked == "int8" || prefer_int8 ? int8_codes::preferred
+                                                                  : int8_codes::to_fit;
+        SIRIUS_LOG_INFO(
+          "[vector_join_rewrite] '{}': codes as {} (est. float16 {:.3f} s, int8 {:.3f} s, "
+          "SIRIUS_VSS_EXACT_CODES = {})",
+          table_name,
+          int8 == int8_codes::preferred ? "int8"
+          : int8 == int8_codes::to_fit  ? "float16, or int8 if only they fit on the device"
+                                        : "float16",
+          cost.exact_codes(float16_shape),
+          cost.exact_codes(int8_shape),
+          asked);
+        if (std::getenv("SIRIUS_VECTOR_JOIN_PHASE_DEBUG") != nullptr) {
+          std::fprintf(stderr,
+                       "[vecjoin-plan] codes: %s (est. float16 %.3f s, int8 %.3f s)\n",
+                       int8 == int8_codes::preferred ? "int8"
+                       : int8 == int8_codes::to_fit  ? "float16 unless only int8 fits"
+                                                     : "float16",
+                       cost.exact_codes(float16_shape),
+                       cost.exact_codes(int8_shape));
+        }
+      }
       choice = scanned ? lists_in_statement(req, 1)
                        : build_lists_in_query(*sirius_ctx,
                                               req,
@@ -839,7 +883,8 @@ class corpus_lists_chooser {
                                               column,
                                               rows,
                                               1,
-                                              codes_lists_name(table_name, column, req.metric));
+                                              codes_lists_name(table_name, column, req.metric),
+                                              int8);
       if (!choice) { return false; }
     }
     describe(*choice);
@@ -932,7 +977,8 @@ class corpus_lists_chooser {
                                                          const std::string& column,
                                                          std::uint64_t rows,
                                                          std::int64_t n_clusters,
-                                                         std::string const& name)
+                                                         std::string const& name,
+                                                         int8_codes int8 = int8_codes::never)
   {
     bool const cosine = req.metric == "cosine";
     try {
@@ -962,7 +1008,8 @@ class corpus_lists_chooser {
         lists,
         cosine || req.metric == "ip" ? list_storage::float16 : list_storage::exact,
         false,
-        cosine);
+        cosine,
+        int8);
     } catch (std::exception const& e) {
       SIRIUS_LOG_INFO(
         "[vector_join_rewrite] building lists for '{}' declined: {}", table, e.what());

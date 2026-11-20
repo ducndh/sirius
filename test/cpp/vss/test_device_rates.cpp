@@ -110,6 +110,50 @@ TEST_CASE("the exact join's one list costs a read of the rows, not a clustering"
   CHECK(tensor2.codes(s) == cost.codes(s));
 }
 
+TEST_CASE("the exact join codes float rows as INT8 where that repays the rotation", "[vss]")
+{
+  using sirius::vss::choose_exact_codes;
+  using sirius::vss::exact_codes_choice;
+  access_path_cost const cost{device_scale{}};
+  sirius::vss::access_path_shape s;
+  s.corpus_rows      = 1e6;
+  s.dim              = 1024;
+  s.corpus_on_device = true;
+  s.k                = 10;
+
+  // MS MARCO 1M x 1,024, measured 2026-11-19 (build + first join, FLOAT16 / INT8): 1k probe rows
+  // 0.07 / 0.13 s, 10k 0.324 / 0.296 s, 100k 2.84 / 2.16 s. A thousand probe rows do not repay
+  // rotating a million rows; ten thousand do.
+  s.probe_rows = 1e3;
+  CHECK(choose_exact_codes(cost, s) == exact_codes_choice::float16);
+  s.probe_rows = 1e4;
+  CHECK(choose_exact_codes(cost, s) == exact_codes_choice::int8);
+  s.probe_rows = 1e5;
+  CHECK(choose_exact_codes(cost, s) == exact_codes_choice::int8);
+  // A larger k passes more candidates, INT8's far more: k = 100 at 100k probe rows 3.26 / 4.02 s,
+  // k = 1,000 at 10k 0.64 / 1.75 s.
+  s.k = 100;
+  CHECK(choose_exact_codes(cost, s) == exact_codes_choice::float16);
+  s.k          = 1000;
+  s.probe_rows = 1e4;
+  CHECK(choose_exact_codes(cost, s) == exact_codes_choice::float16);
+  s.k = 1;
+  CHECK(choose_exact_codes(cost, s) == exact_codes_choice::int8);
+
+  // DBpedia 900k x 3,072, 100k probe rows, k = 10: 8.86 / 5.94 s.
+  s.corpus_rows = 9e5;
+  s.dim         = 3072;
+  s.probe_rows  = 1e5;
+  s.k           = 10;
+  CHECK(choose_exact_codes(cost, s) == exact_codes_choice::int8);
+
+  // The break-even k grows with the build side: k = 100 pays against 10M rows.
+  s.corpus_rows = 1e7;
+  s.dim         = 1024;
+  s.k           = 100;
+  CHECK(choose_exact_codes(cost, s) == exact_codes_choice::int8);
+}
+
 TEST_CASE("lists a statement builds for itself get more clusters for a larger probe side", "[vss]")
 {
   using sirius::vss::choose_cluster_count;

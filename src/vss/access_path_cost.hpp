@@ -38,6 +38,7 @@ struct access_path_shape {
   double n_clusters{1024};
   bool inexact_unseeded{false};  ///< FLOAT16 rows in clusters too large to seed (a fixed sweep 0)
   bool unit_rows{false};         ///< cosine lists: unit rows, with their FP32 copy kept on the host
+  double k{10};                  ///< neighbors per probe row (exact_codes only)
 };
 
 /// Seconds for an exact join, by an analytic model fitted on the A5000 grid (RTX A5000 24 GB,
@@ -62,7 +63,12 @@ struct access_path_cost {
       write_per_value_u8{0.55e-9 / d.hbm},
       write_per_value_f16{1.55e-9 / d.hbm},
       codes_per_value_device{0.05e-9 / d.hbm},
-      codes_per_value_host{0.155e-9 / d.pcie}
+      codes_per_value_host{0.155e-9 / d.pcie},
+      codes_f16_gemm{74e12 * d.f16},
+      codes_int8_gemm{116e12 * d.int8},
+      codes_f16_per_neighbor{4.5e-11 / d.fp32},
+      codes_int8_per_neighbor{2.1e-10 / d.fp32},
+      codes_int8_per_value{0.068e-9 / d.hbm}
   {
   }
 
@@ -78,6 +84,13 @@ struct access_path_cost {
   double write_per_value_f16;
   double codes_per_value_device;  ///< the one-list build from a pin on the device, both passes
   double codes_per_value_host;    ///< one pass of it over a pin in host memory: a PCIe copy
+  // The exact join's own codes over float rows (exact_codes), kept apart from the rates above so
+  // that fitting them moves no other choice.
+  double codes_f16_gemm;          ///< bounded FLOAT16 kernel over one list, multiply-adds x 2 per s
+  double codes_int8_gemm;         ///< bounded INT8 kernel over one list of rotated codes
+  double codes_f16_per_neighbor;  ///< candidates kept and re-scored, per probe row x k x dim (s)
+  double codes_int8_per_neighbor;  ///< the same for INT8 codes, which keep more
+  double codes_int8_per_value;     ///< rotating a value and coding it as INT8, beyond FLOAT16's
 
   [[nodiscard]] double brute(access_path_shape const& s) const
   {
@@ -146,7 +159,46 @@ struct access_path_cost {
     if (s.corpus_on_device) { return 0.005 + std::max(copy, values * codes_per_value_device); }
     return 0.005 + (s.unit_rows ? 1.0 : 2.0) * values * codes_per_value_host + copy;
   }
+
+  /// A statement that writes the exact join's codes over float rows and searches them: FLOAT16
+  /// codes (list_bytes_per_value 2) or rotated INT8 codes (1). The INT8 kernel multiplies faster
+  /// and reads half the bytes, but its codes cost more to write (the rotation) and are coarser, so
+  /// more candidates pass its filter to be kept and re-scored, in proportion to k. INT8 codes
+  /// therefore pay on a probe side of several thousand rows or more with a small k, or where only
+  /// they fit on the device. Fitted on MS MARCO 1M x 1,024 (k = 1 to 1,000, 10k and 100k probe
+  /// rows; RTX A5000, 2026-11-19); DBpedia 900k x 3,072 x 100k is within 11%. The candidates per
+  /// neighbor are those of unit-length text embeddings: rows whose components differ widely in
+  /// range pass more. Only the comparison between the two codes is used (choose_exact_codes).
+  [[nodiscard]] double exact_codes(access_path_shape const& s) const
+  {
+    bool const int8    = s.list_bytes_per_value == 1;
+    double const pairs = s.probe_rows * s.corpus_rows;
+    double const gemm  = 2.0 * pairs * s.dim / (int8 ? codes_int8_gemm : codes_f16_gemm);
+    double const neighbors =
+      s.probe_rows * s.k * s.dim * (int8 ? codes_int8_per_neighbor : codes_f16_per_neighbor);
+    double const bytes = s.corpus_rows * s.dim * s.list_bytes_per_value;
+    return codes(s) + (int8 ? codes_int8_per_value * s.corpus_rows * s.dim : 0.0) +
+           std::max(bytes / (s.lists_on_device ? hbm : pcie), gemm) + neighbors;
+  }
 };
+
+/// The codes an exact join writes for itself over float rows.
+enum class exact_codes_choice : std::uint8_t { float16, int8 };
+
+/// FLOAT16 or INT8 codes for the exact join of @p shape, whichever access_path_cost::exact_codes
+/// estimates faster with both on the device. Whether FLOAT16 codes fit there is not known when a
+/// statement is planned: the build settles that (int8_codes::to_fit).
+[[nodiscard]] inline exact_codes_choice choose_exact_codes(access_path_cost const& cost,
+                                                           access_path_shape shape)
+{
+  shape.n_clusters           = 1;
+  shape.lists_on_device      = true;
+  shape.unit_rows            = false;
+  shape.list_bytes_per_value = 2;
+  double const float16       = cost.exact_codes(shape);
+  shape.list_bytes_per_value = 1;
+  return cost.exact_codes(shape) < float16 ? exact_codes_choice::int8 : exact_codes_choice::float16;
+}
 
 /// The cluster count for lists a statement builds for itself, and the probes that go with it.
 struct cluster_count_choice {
